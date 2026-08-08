@@ -1,5 +1,6 @@
 param(
-    [string]$PythonExecutable = ""
+    [string]$PythonExecutable = "",
+    [switch]$SkipArchive
 )
 $ErrorActionPreference = "Stop"
 $AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -59,6 +60,11 @@ New-Item -ItemType Directory -Force -Path $BuildRoot, $ReleaseDir | Out-Null
     --add-data "$ModelRuntimeShijie;model_runtime\shijie" `
     --add-data "$ModelRuntimeModernTCN;model_runtime\modern_TCN_models" `
     --collect-all torch_geometric `
+    --hidden-import sklearn.ensemble._forest `
+    --hidden-import sklearn.linear_model._logistic `
+    --hidden-import sklearn.svm._classes `
+    --hidden-import sklearn.pipeline `
+    --hidden-import sklearn.preprocessing._data `
     --exclude-module PyQt5 `
     --exclude-module IPython `
     --exclude-module pytest `
@@ -81,5 +87,10 @@ $BuiltApp = Join-Path $DistDir "AFP_State_Warning_System"
 if (-not (Test-Path -LiteralPath (Join-Path $BuiltApp "AFP_State_Warning_System.exe"))) {
     throw "The desktop executable was not produced: $BuiltApp"
 }
-Compress-Archive -Path (Join-Path $BuiltApp "*") -DestinationPath $ZipPath -CompressionLevel Optimal
-Write-Host "Portable desktop application archive created:" $ZipPath
+if ($SkipArchive) {
+    Write-Host "Portable desktop application created:" $BuiltApp
+}
+else {
+    Compress-Archive -Path (Join-Path $BuiltApp "*") -DestinationPath $ZipPath -CompressionLevel Optimal
+    Write-Host "Portable desktop application archive created:" $ZipPath
+}

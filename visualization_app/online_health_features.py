@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-import sys
 from typing import Any
 
 import numpy as np
@@ -13,14 +11,7 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from torch import nn
 
-APP_DIR = Path(__file__).resolve().parent
-STATE_DIR = APP_DIR.parent
-WORKSPACE_DIR = STATE_DIR.parent
-for module_path in (WORKSPACE_DIR, STATE_DIR):
-    if str(module_path) not in sys.path:
-        sys.path.insert(0, str(module_path))
-
-from run_physics_guided_health_indicator_v13 import (  # noqa: E402
+from runtime_health_primitives import (
     FeatureScaler,
     build_residual_features,
     response_feature_names,

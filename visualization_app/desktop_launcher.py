@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.request
 import webbrowser
 from pathlib import Path
@@ -18,6 +19,19 @@ APP_DIR = (
 )
 APP_SCRIPT = APP_DIR / "app.py"
 URL = "http://127.0.0.1:8765/"
+
+
+def _write_server_trace(message: str) -> None:
+    """Persist startup diagnostics for a frozen no-console application."""
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        (APP_DIR / "server_startup.log").write_text(
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
 
 def find_edge() -> Path | None:
@@ -154,10 +168,16 @@ class DesktopLauncher:
 
 if __name__ == "__main__":
     if "--server" in sys.argv:
-        sys.argv.remove("--server")
-        from app import main
+        try:
+            _write_server_trace("server mode entered")
+            sys.argv.remove("--server")
+            from app import main
 
-        main()
+            _write_server_trace("application module imported")
+            main()
+        except Exception:
+            _write_server_trace(traceback.format_exc())
+            raise
         raise SystemExit(0)
     if "--self-test" in sys.argv:
         try:
