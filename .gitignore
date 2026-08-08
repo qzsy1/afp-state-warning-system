@@ -1,0 +1,33 @@
+# Python and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.pid
+*.log
+
+# Local experiment outputs and proprietary/raw datasets
+outputs*/
+layer_dataset*/
+hierarchical_dataset*/
+document_build/
+spreadsheet_build/
+thesis_draft/
+*.csv
+*.xlsx
+*.npz
+*.pth
+*.joblib
+
+# Generated desktop distribution and acquisition records
+visualization_app/desktop_build/
+visualization_app/release/
+visualization_app/captured_data/
+visualization_app/data/
+visualization_app/new_collection_demo_v11_3/
+visualization_app/portable_build*.log
+visualization_app/server_*.log
+visualization_app/AFP_State_Warning_System.exe
+
+# User-specific editor files
+.idea/
+.vscode/

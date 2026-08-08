@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AFP 实时预测与状态预警系统</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="system-bar">
+      <div class="system-brand">
+        <div class="brand-mark">AFP</div>
+        <div>
+          <strong>多传感器实时预测与三级状态预警系统</strong>
+          <span>I-ModernTCN · 健康指标 · 层次证据聚合</span>
+        </div>
+      </div>
+      <div class="system-statuses">
+        <div class="system-status-item"><span class="status-dot"></span><div><small>数据连接</small><b id="connectionStatus">正在连接本地数据服务</b></div></div>
+        <div class="system-status-item"><span class="live-dot"></span><div><small>运行状态</small><b id="streamStatus">实时回放已暂停</b></div></div>
+        <div class="system-status-item wide"><div><small>数据位置</small><b id="streamPosition">等待开始</b></div></div>
+        <div class="system-status-item meta"><div><small>数据集 / 模型信息</small><b id="datasetMeta">正在加载数据流信息……</b></div></div>
+      </div>
+    </header>
+
+    <div class="workspace-grid">
+      <aside class="sidebar">
+        <div class="section-heading"><span>01</span><div><b>采集与试样设置</b><small>数据源、试样和通道</small></div></div>
+
+        <details class="control-section" open>
+          <summary>数据定位与运行模式</summary>
+          <div class="control-content">
+            <label>运行模式
+              <select id="dataModeSelect">
+                <option value="replay" selected>历史数据实时回放</option>
+                <option value="live">真实传感器采集</option>
+              </select>
+            </label>
+            <label>试样<select id="specimenSelect"></select></label>
+            <label>重点查看通道<select id="sensorSelect"></select></label>
+          </div>
+        </details>
+
+        <details id="acquisitionSection" class="control-section hidden">
+          <summary>真实采集与保存</summary>
+          <div class="control-content">
+            <label>处理模式
+              <select id="processingModeSelect">
+                <option value="capture_only">仅采集并保存（不加载模型）</option>
+                <option value="prediction_warning" selected>采集＋实时预测与预警</option>
+              </select>
+            </label>
+            <label>数据采集方案<select id="datasetSchemaSelect"></select></label>
+            <label>采集驱动<select id="driverSelect"></select></label>
+            <label>模拟采集数据文件<input id="sourceFileInput" type="text" placeholder="模拟驱动的数据 CSV；真实驱动可留空"></label>
+            <label>连接地址<input id="endpointInput" type="text" placeholder="串口 COM3 或 TCP 127.0.0.1:9000"></label>
+            <div class="compact-input-grid">
+              <label>波特率<input id="baudrateInput" type="number" value="115200" min="1200"></label>
+              <label>采样 Hz<input id="sampleRateInput" type="number" value="10" min="0.1" max="1000" step="0.1"></label>
+            </div>
+            <div class="compact-input-grid">
+              <label>运行编号<input id="runIdInput" type="text" value="LIVE_RUN_001"></label>
+              <label>试样编号<input id="liveSpecimenInput" type="text" value="LIVE_SPECIMEN_001"></label>
+            </div>
+            <label>采集数据保存位置
+              <span class="path-picker-row">
+                <input id="saveRootInput" type="text" placeholder="留空时保存到 captured_data 目录">
+                <button id="selectSaveRootButton" class="secondary-button compact-button" type="button">选择</button>
+              </span>
+            </label>
+            <p class="control-note save-rule-note">自动建立“试样名_p功率_v速度_pr压实力”文件夹，同时保存每层文件、完整试样快照和采集记录。</p>
+            <label class="prediction-setting">已训练预测模型文件
+              <span class="path-picker-row">
+                <input id="predictionModelInput" type="text" placeholder="选择 I-ModernTCN 的 .pth/.pt 模型">
+                <button id="selectPredictionModelButton" class="secondary-button compact-button" type="button">选择</button>
+              </span>
+            </label>
+            <div id="predictionModelStatus" class="model-file-status prediction-setting">尚未检查预测模型</div>
+            <label class="toggle prediction-setting"><input id="bestPredictionOverrideInput" type="checkbox">使用冻结验证集最佳预测模型覆盖当前选择</label>
+            <p id="bestPredictionOverrideNote" class="control-note prediction-setting">未勾选时严格使用手动模型；勾选后只按验证集误差在同一采集方案内选择兼容模型。</p>
+            <div id="legacyParameterGrid" class="compact-input-grid">
+              <label>功率 p<input id="livePowerInput" type="number" value="600"></label>
+              <label>速度 v<input id="liveSpeedInput" type="number" value="100"></label>
+              <label>压实力 pr<input id="livePressureInput" type="number" value="600"></label>
+              <label>层号 0–4<input id="liveLayerInput" type="number" value="0" min="0" max="4"></label>
+            </div>
+            <div id="newParameterGrid" class="compact-input-grid hidden">
+              <label>初始压实力/N<input id="initialForceInput" type="number" value="400"></label>
+              <label>铺放速度/mm·s⁻¹<input id="placementSpeedInput" type="number" value="80"></label>
+              <label>PID 角度/°<input id="pidAngleInput" type="number" value="5"></label>
+              <label>设定温度/°C<input id="temperatureSetpointInput" type="number" value="360"></label>
+              <label>工况编号<input id="conditionIdInput" type="text" value="H06"></label>
+              <label>独立重复<input id="replicateInput" type="number" value="1" min="1" max="2"></label>
+              <label>层号 0–4<input id="newLayerInput" type="number" value="0" min="0" max="4"></label>
+            </div>
+            <div class="sensor-selector-title">采集保存、模型输入与模型输出</div>
+            <div id="liveSensorChecklist" class="sensor-checklist"></div>
+            <p class="control-note sensor-prediction-note">仅采集模式只使用“采集保存”；预测模式要求输入通道与模型元数据一致，输出通道决定预测曲线及健康指标数据。</p>
+            <div class="transport">
+              <button id="testSensorsButton" class="secondary-button">检查连接</button>
+              <button id="startAcquisitionButton" class="primary-button">开始采集</button>
+            </div>
+            <button id="stopAcquisitionButton" class="secondary-button full-button">停止并保存</button>
+            <div id="acquisitionStatus" class="acquisition-status">尚未启动真实采集</div>
+          </div>
+        </details>
+
+        <div class="section-heading compact-heading"><span>02</span><div><b>预测与预警设置</b><small>时间步、指标与模型</small></div></div>
+
+        <details class="control-section" open>
+          <summary>回放与预测控制</summary>
+          <div class="control-content">
+            <div class="transport">
+              <button id="playButton" class="primary-button">▶ 开始</button>
+              <button id="resetButton" class="secondary-button">↻ 重置</button>
+            </div>
+            <label><span>采集进度 <output id="progressValue">0 / 0</output></span><input id="cursorInput" type="range" min="1" max="100" value="24"></label>
+            <div class="compact-input-grid">
+              <label>回放倍速<select id="speedSelect"><option value="0.5">0.5×</option><option value="1" selected>1×（10 Hz）</option><option value="2">2×</option><option value="5">5×</option><option value="10">10×</option></select></label>
+              <label>每次推进<select id="streamStepSelect"><option value="1" selected>1 点</option><option value="2">2 点</option><option value="4">4 点</option><option value="8">8 点</option><option value="24">24 点 / 1窗口</option></select></label>
+              <label>历史长度<select id="lengthSelect"><option value="120">120 点 / 12 s</option><option value="240" selected>240 点 / 24 s</option><option value="480">480 点 / 48 s</option><option value="768">768 点 / 76.8 s</option><option value="1200">1200 点 / 120 s</option></select></label>
+              <label>绘图抽样<select id="stepSelect"><option value="1">1（全部点）</option><option value="2">2</option><option value="4">4</option><option value="6">6</option><option value="12">12</option></select></label>
+            </div>
+            <label><span>距当前时刻的预测步长 <output id="horizonValue">24</output> 点</span><input id="horizonInput" type="range" min="1" max="600" value="24"></label>
+            <div class="range-number-row"><span>1</span><input id="horizonNumber" type="number" min="1" max="600" step="1" value="24" aria-label="直接输入预测步长" title="输入 1 至 600，按 Enter 应用"><span>600</span></div>
+            <label class="checkbox-row"><input id="realtimePredictionInput" type="checkbox">使用 I-ModernTCN 实时计算预测</label>
+            <label class="checkbox-row"><input id="loopInput" type="checkbox" checked>试样结束后循环播放</label>
+          </div>
+        </details>
+
+        <details class="control-section" open>
+          <summary>健康指标与异常分数</summary>
+          <div class="control-content">
+            <label class="checkbox-row auto-indicator-row"><input id="autoIndicatorInput" type="checkbox" checked>根据输入数据方案自动选择健康指标构建形式</label>
+            <div id="indicatorAutoStatus" class="indicator-auto-status">正在识别输入数据与 TC-HI 构建形式……</div>
+            <div class="compact-input-grid">
+              <label>健康指标<select id="indicatorSelect"></select></label>
+              <label>异常分数模型<select id="modelSelect"></select></label>
+            </div>
+            <div id="recommendationCard" class="recommendation-card">正在读取模型推荐……</div>
+            <label><span>异常阈值 <output id="thresholdValue">0.50</output></span><input id="thresholdInput" type="range" min="0.05" max="0.95" step="0.01" value="0.50"></label>
+            <label><span>CAP 聚合强度 ρ <output id="rhoValue">0.50</output></span><input id="rhoInput" type="range" min="0" max="1" step="0.05" value="0.50"></label>
+            <label class="checkbox-row"><input id="optimizedWarningInput" type="checkbox" checked>使用优化预警（回放 v13.8 / 实时因果 v13.9）</label>
+            <p id="calculationModeNote" class="control-note">异常分数由所选分类器实时计算；窗口仅在 24 个真实点全部到达后进入聚合。</p>
+          </div>
+        </details>
+      </aside>
+
+      <div id="leftColumnResizer" class="column-resizer left-resizer" role="separator"
+           aria-label="调整左侧设置栏宽度" aria-orientation="vertical" tabindex="0"
+           title="左右拖动调整设置栏宽度；双击恢复默认">
+        <span class="resizer-grip" aria-hidden="true">⋮</span>
+      </div>
+
+      <main class="main-content">
+        <section class="panel chart-panel primary-workbench">
+          <div class="panel-header">
+            <div><p class="panel-kicker">LIVE I-MODERNTCN FORECAST</p><h1 id="seriesTitle">实测值与未来预测值</h1></div>
+            <div class="legend">
+              <span><i class="legend-line actual"></i>已采集实测</span>
+              <span id="observedPredictionLegend"><i class="legend-line prediction"></i>历史对应预测</span>
+              <span id="futurePredictionLegend"><i class="legend-line future"></i>未来步长预测</span>
+              <label id="residualToggleLabel" class="toggle"><input id="residualToggle" type="checkbox"><span></span>残差</label>
+            </div>
+          </div>
+          <canvas id="seriesChart" height="300"></canvas>
+          <div class="chart-footer"><span>竖线左侧为已采集时刻，右侧为尚未到达的未来预测</span><span id="displayRange">—</span></div>
+        </section>
+
+        <section class="panel channel-panel">
+          <div class="panel-header compact">
+            <div><p class="panel-kicker">ALL ACQUIRED & PREDICTED CHANNELS</p><h2>全部传感器实时采集与预测</h2></div>
+            <span id="allChannelHint" class="muted">所有通道按统一方式显示</span>
+          </div>
+          <div id="sensorCards" class="sensor-grid"></div>
+        </section>
+
+        <details class="panel explanation-panel">
+          <summary>系统功能与判定边界说明</summary>
+          <div class="guide-grid">
+            <div><b>1</b><h3>实时数据流</h3><p>历史数据按采样率逐点回放；接入设备后沿用相同数据接口。</p></div>
+            <div><b>2</b><h3>同步预测</h3><p>实时推理或归档预测可切换，超过训练步长时采用滚动预测。</p></div>
+            <div><b>3</b><h3>窗口更新</h3><p>24 个实测点完整到达后才确认窗口，未来值不提前参与健康指标。</p></div>
+            <div><b>4</b><h3>三级状态</h3><p>窗口证据依次聚合为铺层和五层试样状态，并随新证据更新。</p></div>
+            <div><b>5</b><h3>指标与模型</h3><p>健康指标和四类异常分数模型可切换，界面给出验证推荐。</p></div>
+            <div><b>!</b><h3>使用边界</h3><p>正式准确率需用真实采集、独立试样划分与外部缺陷证据验证。</p></div>
+          </div>
+        </details>
+      </main>
+
+      <div id="rightColumnResizer" class="column-resizer right-resizer" role="separator"
+           aria-label="调整右侧预警栏宽度" aria-orientation="vertical" tabindex="0"
+           title="左右拖动调整预警栏宽度；双击恢复默认">
+        <span class="resizer-grip" aria-hidden="true">⋮</span>
+      </div>
+
+      <aside class="warning-rail">
+        <div class="rail-title"><span>03</span><div><b>三级状态预警</b><small>窗口 → 铺层 → 五层试样</small></div></div>
+        <article class="status-card accent-amber">
+          <div class="card-kicker">窗口级 · 最近完成窗口</div>
+          <div class="state-row"><span id="windowState" class="state-pill">等待窗口</span><strong id="windowScore" class="score-value">—</strong></div>
+          <div id="windowDetail" class="status-detail">窗口需要 24 个实测点</div>
+        </article>
+        <article class="status-card accent-cyan">
+          <div class="card-kicker">层级 · 当前铺层</div>
+          <div class="state-row"><span id="layerState" class="state-pill">等待数据</span><span id="layerScore" class="correctness">—</span></div>
+          <div id="layerDetail" class="status-detail">尚无完整窗口</div>
+        </article>
+        <article class="status-card accent-blue">
+          <div class="card-kicker">试样级 · 五层聚合</div>
+          <div class="state-row"><span id="specimenState" class="state-pill">等待数据</span><span id="specimenScore" class="correctness">—</span></div>
+          <div id="specimenDetail" class="status-detail">尚无层级证据</div>
+        </article>
+        <article class="status-card parameter-card accent-violet">
+          <div class="card-kicker">当前工艺参数</div>
+          <div id="processParameterGrid" class="parameter-grid"><div><span>等待识别</span><strong>—</strong></div></div>
+          <div id="parameterDetail" class="status-detail">—</div>
+        </article>
+        <section class="rail-block">
+          <div class="mini-panel-header"><div><p class="panel-kicker">ANOMALY TYPE</p><h2>异常类型概率</h2></div></div>
+          <div id="probabilityBars" class="probability-bars"></div>
+        </section>
+      </aside>
+
+      <div id="verticalPanelResizer" class="vertical-panel-resizer" role="separator"
+           aria-label="调整上方监测区与下方证据区高度" aria-orientation="horizontal" tabindex="0"
+           title="上下拖动调整监测区与证据区高度；双击恢复默认">
+        <span class="vertical-resizer-grip" aria-hidden="true">•••</span>
+      </div>
+
+      <section class="evidence-dock">
+        <article class="panel layer-panel">
+          <div class="panel-header compact">
+            <div><p class="panel-kicker">FIVE-LAYER EVIDENCE</p><h2>五层证据形成进度</h2></div>
+            <span id="layerPreviewBadge" class="preview-badge">等待完整窗口</span>
+          </div>
+          <div id="layerProgress" class="layer-progress"></div>
+        </article>
+        <article class="panel timeline-panel">
+          <div class="panel-header compact"><div><p class="panel-kicker">CAUSAL WINDOW EVIDENCE</p><h2>当前层窗口健康指标</h2></div></div>
+          <canvas id="timelineChart" height="160"></canvas>
+          <div id="poolingSummary" class="inline-summary">只显示已经完成计算的窗口</div>
+        </article>
+      </section>
+    </div>
+  </div>
+  <div id="toast" class="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
