@@ -1,9 +1,15 @@
+param(
+    [string]$PythonExecutable = ""
+)
 $ErrorActionPreference = "Stop"
 $AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $StateMonitorDir = Split-Path -Parent $AppDir
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $StateMonitorDir))
 $WorkspaceRoot = Split-Path -Parent $ProjectRoot
-$Python = Join-Path $WorkspaceRoot ".venv\Scripts\python.exe"
+$Python = $PythonExecutable
+if ([string]::IsNullOrWhiteSpace($Python)) {
+    $Python = Join-Path $WorkspaceRoot ".venv\Scripts\python.exe"
+}
 if (-not (Test-Path -LiteralPath $Python)) { $Python = "python" }
 
 $LegacyCheckpoint = Join-Path $ProjectRoot "checkpoints\health_i_T_G_MyCustom_ftM_sl24_ll24_pl24_dm128_nh8_el2_dl1_df2048_fc1_ebtimeF_dtTrue_health_v9_conditional_normal_no_param_score_lr0.001_bs128\checkpoint.pth"
@@ -17,11 +23,25 @@ $LegacySource = (
         Where-Object { $_.Length -eq 22912911 } |
         Select-Object -First 1 -ExpandProperty FullName
 )
-$ReleaseDir = Join-Path $AppDir "release\AFP_State_Warning_System"
+$ReleaseDir = Join-Path $AppDir "release"
+$ZipPath = Join-Path $ReleaseDir "AFP_State_Warning_System_Windows.zip"
+# PyInstaller expands dependency paths below the output directory.  A short
+# temporary path avoids Windows MAX_PATH failures for scientific DLL names.
+$BuildRoot = Join-Path $env:TEMP "AFPBuild"
+$DistDir = Join-Path $BuildRoot "dist"
+$WorkDir = Join-Path $BuildRoot "work"
 
 foreach ($Required in @($LegacyCheckpoint, $LegacyReplayDir, $CausalArtifact, $LegacySource, $ModelRuntimeShijie, $ModelRuntimeModernTCN)) {
     if (-not (Test-Path -LiteralPath $Required)) { throw "Required runtime asset is missing: $Required" }
 }
+
+if (Test-Path -LiteralPath $BuildRoot) {
+    Remove-Item -LiteralPath $BuildRoot -Recurse -Force
+}
+if (Test-Path -LiteralPath $ZipPath) {
+    Remove-Item -LiteralPath $ZipPath -Force
+}
+New-Item -ItemType Directory -Force -Path $BuildRoot, $ReleaseDir | Out-Null
 
 & $Python -m PyInstaller `
     --noconfirm `
@@ -48,13 +68,18 @@ foreach ($Required in @($LegacyCheckpoint, $LegacyReplayDir, $CausalArtifact, $L
     --exclude-module paddle `
     --exclude-module cv2 `
     --exclude-module torchaudio `
-    --exclude-module matplotlib `
-    --distpath (Join-Path $AppDir "release") `
-    --workpath (Join-Path $AppDir "desktop_build") `
-    --specpath (Join-Path $AppDir "desktop_build") `
+    --distpath $DistDir `
+    --workpath $WorkDir `
+    --specpath $WorkDir `
     (Join-Path $AppDir "desktop_launcher.py")
 
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller build failed with exit code $LASTEXITCODE"
 }
-Write-Host "Portable desktop application created:" $ReleaseDir
+
+$BuiltApp = Join-Path $DistDir "AFP_State_Warning_System"
+if (-not (Test-Path -LiteralPath (Join-Path $BuiltApp "AFP_State_Warning_System.exe"))) {
+    throw "The desktop executable was not produced: $BuiltApp"
+}
+Compress-Archive -Path (Join-Path $BuiltApp "*") -DestinationPath $ZipPath -CompressionLevel Optimal
+Write-Host "Portable desktop application archive created:" $ZipPath
