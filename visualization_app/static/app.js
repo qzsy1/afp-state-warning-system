@@ -12,10 +12,34 @@ const state = {
   reloadQueued: false,
   requestedHorizon: null,
   showResidual: false,
+  showLayerEvidence: true,
   manualPredictionModels: {},
+  liveScopeKey: null,
 };
 
 const $ = (id) => document.getElementById(id);
+
+// Keep the alignment control beside the horizon control even when an older
+// cached index.html is opened by the browser or an older packaged build.
+function ensureForecastLeadControls() {
+  if ($("leadInput") || !$("horizonNumber")) return;
+  const horizonNumber = $("horizonNumber");
+  if (!horizonNumber?.parentElement) return;
+  const label = document.createElement("label");
+  label.innerHTML =
+    '<span>历史/预警固定提前量 <output id="leadValue">1</output> 点</span>' +
+    '<input id="leadInput" type="range" min="1" max="24" value="1">';
+  const row = document.createElement("div");
+  row.className = "range-number-row";
+  row.innerHTML =
+    '<span>1</span><input id="leadNumber" type="number" min="1" max="24" step="1" value="1" aria-label="固定预测提前量" title="输入1至24"><span>24</span>';
+  const note = document.createElement("p");
+  note.className = "control-note forecast-alignment-note";
+  note.textContent =
+    "未来曲线使用最新滚动预测；历史曲线和实时对齐评价使用冻结的因果提前量。";
+  horizonNumber.parentElement.after(label, row, note);
+}
+ensureForecastLeadControls();
 const controls = {
   dataMode: $("dataModeSelect"),
   specimen: $("specimenSelect"),
@@ -27,6 +51,9 @@ const controls = {
   step: $("stepSelect"),
   horizon: $("horizonInput"),
   horizonNumber: $("horizonNumber"),
+  forecastLead: $("leadInput"),
+  forecastLeadNumber: $("leadNumber"),
+  forecastLeadValue: $("leadValue"),
   realtimePrediction: $("realtimePredictionInput"),
   loop: $("loopInput"),
   threshold: $("thresholdInput"),
@@ -46,6 +73,13 @@ const controls = {
   runId: $("runIdInput"),
   liveSpecimen: $("liveSpecimenInput"),
   saveRoot: $("saveRootInput"),
+  mysqlEnabled: $("mysqlEnabledInput"),
+  mysqlHost: $("mysqlHostInput"),
+  mysqlPort: $("mysqlPortInput"),
+  mysqlUser: $("mysqlUserInput"),
+  mysqlPassword: $("mysqlPasswordInput"),
+  mysqlDatabase: $("mysqlDatabaseInput"),
+  testMysql: $("testMysqlButton"),
   predictionModel: $("predictionModelInput"),
   livePower: $("livePowerInput"),
   liveSpeed: $("liveSpeedInput"),
@@ -58,7 +92,19 @@ const controls = {
   conditionId: $("conditionIdInput"),
   replicate: $("replicateInput"),
   newLayer: $("newLayerInput"),
+  showLayerEvidence: $("showLayerEvidenceInput"),
 };
+
+const LAYER_EVIDENCE_VISIBILITY_KEY = "afp-show-layer-evidence-v1";
+
+function applyLayerEvidenceVisibility() {
+  const visible = Boolean(state.showLayerEvidence);
+  const evidenceDock = $("evidenceDock");
+  if (evidenceDock) evidenceDock.classList.toggle("hidden", !visible);
+  $("layerScore")?.classList.toggle("hidden", !visible);
+  $("specimenScore")?.classList.toggle("hidden", !visible);
+  if (controls.showLayerEvidence) controls.showLayerEvidence.checked = visible;
+}
 
 function option(value, text) {
   const node = document.createElement("option");
@@ -124,12 +170,89 @@ function acquisitionConfig() {
     root: "LIVE",
     source_file: controls.sourceFile.value.trim(),
     save_root: controls.saveRoot.value.trim(),
+    mysql_enabled: Boolean(controls.mysqlEnabled?.checked),
+    mysql_host: controls.mysqlHost?.value.trim() || "127.0.0.1",
+    mysql_port: Number(controls.mysqlPort?.value) || 3306,
+    mysql_user: controls.mysqlUser?.value.trim() || "root",
+    // Preserve an intentionally empty password.  `||` would silently replace
+    // it with the default and make a passwordless local MySQL account fail.
+    mysql_password: controls.mysqlPassword?.value ?? "",
+    mysql_database: controls.mysqlDatabase?.value.trim() || "afp_state_warning",
+    mysql_charset: "utf8mb4",
+    mysql_connect_timeout: 5,
     initial_compaction_force_N: Number(controls.initialForce.value) || 0,
     placement_speed_mm_s: Number(controls.placementSpeed.value) || 0,
     pid_angle_deg: Number(controls.pidAngle.value) || 0,
     temperature_setpoint_C: Number(controls.temperatureSetpoint.value) || 0,
     replicate: Number(controls.replicate.value) || 1,
   };
+}
+
+function liveEvidenceScopeKey() {
+  const newSchema = controls.datasetSchema.value === "new_collection_v11_3";
+  return JSON.stringify({
+    schema: controls.datasetSchema.value || "legacy_original",
+    specimen: controls.liveSpecimen.value.trim() || "LIVE_SPECIMEN",
+    run: controls.runId.value.trim() || "LIVE_RUN",
+    condition: newSchema
+      ? (controls.conditionId.value.trim() || "H06")
+      : "LIVE",
+    replicate: Number(controls.replicate.value) || 1,
+    indicator: controls.indicator.value || "TC-HI",
+    model: controls.model.value || "random_forest",
+    power: Number(controls.livePower.value) || 0,
+    speed: Number(controls.liveSpeed.value) || 0,
+    pressure: Number(controls.livePressure.value) || 0,
+    initialForce: Number(controls.initialForce.value) || 0,
+    placementSpeed: Number(controls.placementSpeed.value) || 0,
+    pidAngle: Number(controls.pidAngle.value) || 0,
+    temperatureSetpoint: Number(controls.temperatureSetpoint.value) || 0,
+  });
+}
+
+function resetLiveEvidenceDisplay() {
+  if (controls.dataMode.value !== "live") return;
+  renderLayerProgress([]);
+  state.payload = null;
+  state.liveScopeKey = liveEvidenceScopeKey();
+  const layerControl = controls.datasetSchema.value === "new_collection_v11_3"
+    ? controls.newLayer
+    : controls.liveLayer;
+  if (layerControl && !layerControl.disabled) layerControl.value = "0";
+  statePill($("layerState"), "等待第1层", "pending");
+  statePill($("specimenState"), "等待新试样", "pending");
+  $("layerScore").textContent = "—";
+  $("specimenScore").textContent = "—";
+  $("layerDetail").textContent = "新试样尚未采集，第1层证据为0";
+  $("specimenDetail").textContent = "当前试样尚无铺层证据";
+  $("layerPreviewBadge").textContent = "等待第1层证据";
+  $("streamStatus").textContent = "等待新试样采集";
+  document.querySelector(".live-dot")?.classList.remove("active");
+}
+
+function markLiveScopeChanged() {
+  if (controls.dataMode.value !== "live") return;
+  const next = liveEvidenceScopeKey();
+  if (state.liveScopeKey !== null && next !== state.liveScopeKey) {
+    resetLiveEvidenceDisplay();
+  } else {
+    state.liveScopeKey = next;
+  }
+}
+
+function enforceStepOneInteger(control, minimum) {
+  if (!control) return;
+  const normalize = () => {
+    const raw = Number(control.value);
+    const value = Number.isFinite(raw)
+      ? Math.max(minimum, Math.trunc(raw))
+      : minimum;
+    control.value = String(value);
+  };
+  // The native number spinner is step=1; normalization also handles pasted
+  // decimals or text without imposing an upper limit on the count.
+  control.addEventListener("change", normalize);
+  control.addEventListener("blur", normalize);
 }
 
 async function postJson(url, payload = {}) {
@@ -146,6 +269,7 @@ async function postJson(url, payload = {}) {
 function renderAcquisitionStatus(status) {
   const node = $("acquisitionStatus");
   const selected = (status.sensors || []).filter((item) => item.selected);
+  renderMysqlStatus(status.mysql);
   const healthy = selected.filter((item) => item.ok);
   const captureOnly = status.config?.processing_mode === "capture_only"
     || controls.processingMode.value === "capture_only";
@@ -160,6 +284,14 @@ function renderAcquisitionStatus(status) {
       : `等待全部${expectedInputCount}个模型输入通道，预测至少24点、首次预警至少48点`;
   const predictionCount = selectedPredictionSensors().length;
   const locked = Boolean(status.running);
+  // Layer and replicate identifiers are frozen for the whole acquisition.
+  // They become editable again only after stop() has completed the file save,
+  // preventing a running stream from silently changing its physical label.
+  [controls.liveLayer, controls.newLayer, controls.replicate]
+    .filter(Boolean)
+    .forEach((control) => {
+      control.disabled = locked;
+    });
   controls.predictionModel.disabled =
     locked || controls.bestPredictionOverride.checked;
   $("selectPredictionModelButton").disabled =
@@ -181,6 +313,49 @@ function renderAcquisitionStatus(status) {
     `${status.layer_file ? ` · 分层文件：${status.layer_file}` : ""}` +
     `${status.full_specimen_file ? ` · 完整试样：${status.full_specimen_file}` : ""}` +
     `${status.last_error ? ` · 错误：${status.last_error}` : ""}`;
+}
+
+function renderRuntimeStatus(payload = state.payload) {
+  const node = $("streamStatus");
+  const dot = document.querySelector(".live-dot");
+  if (!node || !dot) return;
+
+  const liveMode = controls.dataMode.value === "live";
+  if (!liveMode) {
+    node.textContent = state.playing ? "实时回放运行中" : "实时回放已暂停";
+    dot.classList.toggle("active", state.playing);
+    return;
+  }
+
+  const acquisition = payload?.acquisition || {};
+  const captureOnly = acquisition.config?.processing_mode === "capture_only"
+    || controls.processingMode.value === "capture_only";
+  const windowData = payload?.window || {};
+  const warningState = windowData.state_label || "等待窗口证据";
+  let label;
+  if (acquisition.last_error) {
+    label = `采集错误：${acquisition.last_error}`;
+  } else if (acquisition.running) {
+    if (captureOnly) {
+      label = `真实采集中（仅保存） · ${acquisition.sample_count || 0}点`;
+    } else if (!acquisition.model_ready) {
+      label = `真实采集中（等待预测输入） · ${acquisition.sample_count || 0}点`;
+    } else if (windowData.complete) {
+      label = `采集＋预测预警运行中 · 窗口${warningState}`;
+    } else {
+      label = `采集＋预测预警运行中 · 等待完整窗口`;
+    }
+  } else if (captureOnly) {
+    label = acquisition.sample_count
+      ? `采集已停止（仅保存） · ${acquisition.sample_count}点`
+      : "真实采集已停止";
+  } else if (windowData.complete) {
+    label = `预测预警已停止 · 窗口${warningState}`;
+  } else {
+    label = "真实采集已停止";
+  }
+  node.textContent = label;
+  dot.classList.toggle("active", Boolean(acquisition.running));
 }
 
 function applyPredictionModelProfile(profile, setSelections = true) {
@@ -293,6 +468,138 @@ async function selectSaveRoot() {
   }
 }
 
+async function testMysqlConnection() {
+  const status = $("mysqlStatus");
+  try {
+    if (!controls.mysqlEnabled.checked) {
+      status.textContent = "请先勾选 MySQL 保存选项。";
+      status.classList.remove("ok", "error");
+      return;
+    }
+    status.textContent = "正在检查 MySQL 连接并准备数据库表……";
+    const result = await postJson("/api/mysql/test", {
+      mysql_enabled: true,
+      mysql_host: controls.mysqlHost.value.trim() || "127.0.0.1",
+      mysql_port: Number(controls.mysqlPort.value) || 3306,
+      mysql_user: controls.mysqlUser.value.trim() || "root",
+      mysql_password: controls.mysqlPassword.value ?? "",
+      mysql_database: controls.mysqlDatabase.value.trim() || "afp_state_warning",
+      mysql_charset: "utf8mb4",
+    });
+    status.classList.toggle("ok", Boolean(result.ok));
+    status.classList.toggle("error", !result.ok);
+    const errorText = String(result.error || "未知错误");
+    const friendlyError = errorText.includes("1045") || errorText.toLowerCase().includes("access denied")
+      ? "账号或密码错误：请确认 MySQL 用户名和密码设置正确"
+      : errorText;
+    status.textContent = result.ok
+      ? `MySQL 已连接：${result.database}（${result.driver}）`
+      : `MySQL 连接失败：${friendlyError}`;
+  } catch (error) {
+    status.classList.remove("ok");
+    status.classList.add("error");
+    status.textContent = `MySQL 连接失败：${error.message}`;
+  }
+}
+
+async function refreshRelationMap() {
+  const table = $("relationMapTable");
+  const body = table?.querySelector("tbody");
+  if (!body) return;
+  const database = controls.mysqlDatabase.value.trim() || "afp_state_warning";
+  const status = $("mysqlStatus");
+  try {
+    if (!controls.mysqlEnabled.checked) {
+      body.replaceChildren();
+      const row = document.createElement("tr");
+      const cell = document.createElement("td");
+      cell.colSpan = 6;
+      cell.textContent = "请先勾选 MySQL 保存选项";
+      row.appendChild(cell);
+      body.appendChild(row);
+      return;
+    }
+    if (status) status.textContent = `正在读取数据库 ${database} 的关系表……`;
+    const result = await postJson("/api/mysql/relation-map", {
+      mysql_enabled: true,
+      mysql_host: controls.mysqlHost.value.trim() || "127.0.0.1",
+      mysql_port: Number(controls.mysqlPort.value) || 3306,
+      mysql_user: controls.mysqlUser.value.trim() || "root",
+      mysql_password: controls.mysqlPassword.value ?? "",
+      mysql_database: database,
+      mysql_charset: "utf8mb4",
+      limit: 1000,
+    });
+    body.replaceChildren();
+    if (!result.ok || !result.rows?.length) {
+      const row = document.createElement("tr");
+      const cell = document.createElement("td");
+      cell.colSpan = 6;
+      cell.textContent = result.error
+        ? `数据库 ${database} 读取失败：${result.error}`
+        : `数据库 ${database} 已连接，但当前没有已保存的工况—试样—铺层关系`;
+      row.appendChild(cell);
+      body.appendChild(row);
+      if (status && result.ok) {
+        status.textContent = `数据库 ${database} 已连接，关系表当前为 0 行。`;
+        status.classList.remove("error");
+      }
+      return;
+    }
+    result.rows.forEach((item) => {
+      const row = document.createElement("tr");
+      [
+        item.condition_id,
+        item.specimen_id,
+        item.replicate_no,
+        item.layer_no ?? "—",
+        item.sample_count ?? "—",
+        item.saved_at || "—",
+      ].forEach((value) => {
+        const cell = document.createElement("td");
+        cell.textContent = String(value ?? "—");
+        row.appendChild(cell);
+      });
+      body.appendChild(row);
+    });
+    if (status) {
+      status.textContent = `数据库 ${database} 关系表已刷新：${result.count} 条铺层关系`;
+      status.classList.remove("error");
+    }
+  } catch (error) {
+    body.replaceChildren();
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = 6;
+    cell.textContent = `数据库 ${database} 关系表读取失败：${error.message}`;
+    row.appendChild(cell);
+    body.appendChild(row);
+  }
+}
+
+function renderMysqlStatus(mysql) {
+  const status = $("mysqlStatus");
+  if (!status || !mysql) return;
+  status.classList.toggle("ok", Boolean(mysql.ok));
+  status.classList.toggle(
+    "error",
+    Boolean(mysql.enabled && mysql.ok === false && mysql.state !== "pending")
+  );
+  if (!mysql.enabled) {
+    status.textContent = "MySQL 保存未启用；原始文件已完成本地保存。";
+  } else if (mysql.state === "pending" || mysql.ok === null || mysql.ok === undefined) {
+    status.textContent = "MySQL 已启用；等待本次采集完成后批量写入。";
+  } else if (mysql.ok) {
+    status.textContent = `第${mysql.layer || ""}层已写入 MySQL：${mysql.database}，${mysql.saved_rows || 0} 行`;
+  } else if (mysql.error) {
+    const errorText = String(mysql.error);
+    const friendlyError = errorText.includes("1045") || errorText.toLowerCase().includes("access denied")
+      ? "账号或密码错误，请确认 MySQL 用户名和密码设置正确"
+      : errorText;
+    status.textContent = `MySQL 写入失败，已保留本地文件并生成待补写记录：${friendlyError}`;
+  }
+}
+
 async function testSensorConnection() {
   try {
     const result = await postJson("/api/acquisition/test", acquisitionConfig());
@@ -314,6 +621,13 @@ async function testSensorConnection() {
 
 async function startAcquisition() {
   try {
+    const nextScope = liveEvidenceScopeKey();
+    if (state.liveScopeKey !== null && nextScope !== state.liveScopeKey) {
+      // A changed specimen/condition is a new physical evidence stream.  Do
+      // not carry the previous layer number into the new acquisition.
+      resetLiveEvidenceDisplay();
+    }
+    state.liveScopeKey = nextScope;
     const result = await postJson("/api/acquisition/start", acquisitionConfig());
     if (controls.processingMode.value !== "capture_only") {
       applyPredictionModelProfile(result.prediction_model, false);
@@ -335,15 +649,15 @@ async function stopAcquisition() {
     const completedLayer = Number(layerControl.value) || 0;
     const result = await postJson("/api/acquisition/stop", {});
     renderAcquisitionStatus(result);
+    renderMysqlStatus(result.mysql);
     if (
-      completedLayer < 4 &&
       Array.isArray(result.completed_layers) &&
       result.completed_layers.includes(completedLayer + 1)
     ) {
       layerControl.value = String(completedLayer + 1);
       toast(`第${completedLayer + 1}层已完成并保存；下次开始采集将进入第${completedLayer + 2}层`);
-    } else if (completedLayer === 4) {
-      toast("第5层已完成并保存，五层试样证据采集结束");
+    } else if (Array.isArray(result.completed_layers) && result.completed_layers.length) {
+      toast(`已完成第${completedLayer + 1}层并保存；当前试样已采集${result.completed_layers.length}层`);
     }
     await loadRealtime();
   } catch (error) {
@@ -356,16 +670,20 @@ function buildSensorChecklist(sensorNames) {
   sensorHeader.className = "sensor-checklist-header";
   sensorHeader.innerHTML =
     "<span>通道</span><span>采集</span><span>输入</span><span>输出</span>";
+  sensorHeader.innerHTML =
+    '<span title="传感器通道">通道</span><span title="采集并保存">采</span><span title="模型输入">入</span><span title="模型输出/预测">出</span>';
   const sensorRows = sensorNames.map((name) => {
     const row = document.createElement("div");
     row.className = "sensor-checklist-row";
     const channelName = document.createElement("span");
     channelName.className = "sensor-checklist-name";
     channelName.textContent = name;
+    channelName.title = name;
 
     const collectLabel = document.createElement("label");
     const collectInput = document.createElement("input");
     collectInput.type = "checkbox";
+    collectInput.title = "采集并保存该通道";
     collectInput.className = "save-sensor-checkbox";
     collectInput.value = name;
     collectInput.checked = true;
@@ -374,6 +692,7 @@ function buildSensorChecklist(sensorNames) {
     const modelLabel = document.createElement("label");
     const modelInput = document.createElement("input");
     modelInput.type = "checkbox";
+    modelInput.title = "将该通道作为模型输入";
     modelInput.className = "model-input-sensor-checkbox";
     modelInput.value = name;
     modelInput.checked = true;
@@ -382,6 +701,7 @@ function buildSensorChecklist(sensorNames) {
     const outputLabel = document.createElement("label");
     const outputInput = document.createElement("input");
     outputInput.type = "checkbox";
+    outputInput.title = "显示预测结果并用于健康指标";
     outputInput.className = "predict-sensor-checkbox";
     outputInput.value = name;
     outputInput.checked = true;
@@ -561,6 +881,13 @@ function configureDatasetSchema(useDefaults = true) {
         state.bootstrap.acquisition.prediction_model.checkpoint;
     }
   }
+  // Rebuild indicator/model selections after the channel checklist has been
+  // replaced.  This prevents a new-collection indicator or output checkbox
+  // from surviving a switch back to the legacy 12-channel schema.
+  const compatibleDefault = schemaIndicators.find((item) => item.id === "TC-HI")
+    || schemaIndicators[0];
+  if (compatibleDefault) controls.indicator.value = compatibleDefault.id;
+  populateModels(true);
   if (controls.bestPredictionOverride.checked) {
     configureBestPredictionOverride();
   }
@@ -611,6 +938,7 @@ function queryString() {
     indicator: controls.indicator.value,
     model: controls.model.value,
     prediction_horizon: state.requestedHorizon ?? controls.horizon.value,
+    forecast_lead: controls.forecastLead?.value || "1",
     realtime_prediction: controls.realtimePrediction.checked,
     processing_mode: controls.processingMode.value,
     use_optimized_warning: controls.optimizedWarning.checked,
@@ -640,6 +968,7 @@ async function loadRealtime() {
     $("connectionStatus").textContent = "实时数据服务已连接";
     document.querySelector(".status-dot").classList.add("connected");
     if (payload.acquisition) renderAcquisitionStatus(payload.acquisition);
+    renderRuntimeStatus(payload);
     if (payload.progress.finished && state.playing) {
       if (controls.loop.checked) {
         controls.cursor.value = 1;
@@ -651,6 +980,8 @@ async function loadRealtime() {
     stopPlayback();
     toast(error.message);
     $("connectionStatus").textContent = "实时数据服务连接失败";
+    $("streamStatus").textContent = "数据服务异常";
+    document.querySelector(".live-dot")?.classList.remove("active");
   } finally {
     state.busy = false;
     if (state.reloadQueued) {
@@ -840,7 +1171,7 @@ function render(payload) {
     statePill($("specimenState"), specimen.state_label, specimen.state);
     $("specimenScore").textContent = `HI ${fmt(specimen.health)}`;
   $("specimenDetail").textContent =
-      `当前已有 ${specimen.evidence_layers}/5 层形成证据 · ${
+      `当前已有 ${specimen.actual_layer_count ?? specimen.evidence_layers ?? 0} 层形成证据 · ${
         payload.mode === "live_acquisition"
           ? "真实采集不预设真值"
           : `最终离线真值：${payload.official_final.true_state_label}`
@@ -934,7 +1265,7 @@ function render(payload) {
       windowData.optimized_warning_applied
         ? payload.mode === "live_acquisition"
           ? "因果在线一致性v13.9（不使用未来层）"
-          : "原优化五层一致性v13.8"
+          : "原优化层级一致性v13.8"
         : "实时窗口→层→试样聚合"
     }。预测：${forecastSelectionLabel}。`;
 
@@ -1097,7 +1428,7 @@ function renderProbabilities(probabilities) {
   }));
 }
 
-function renderSensorCards(channels, selectedId) {
+function renderSensorCardsInto(target, channels, selectedId) {
   const cards = channels.map((channel) => {
     const card = document.createElement("div");
     const predictionEnabled = channel.prediction_enabled !== false;
@@ -1126,7 +1457,11 @@ function renderSensorCards(channels, selectedId) {
     );
     return card;
   });
-  $("sensorCards").replaceChildren(...cards);
+  if (target) target.replaceChildren(...cards);
+}
+
+function renderSensorCards(channels, selectedId) {
+  renderSensorCardsInto($("sensorCards"), channels, selectedId);
 }
 
 const MODEL_LABELS = {
@@ -1190,7 +1525,35 @@ function renderRecommendation(candidate) {
 }
 
 function renderLayerProgress(layers) {
-  $("layerProgress").replaceChildren(...layers.map((layer) => {
+  const target = $("layerProgress");
+  if (!state.showLayerEvidence) {
+    target.className = "evidence-sensor-panel";
+    const toolbar = document.createElement("div");
+    toolbar.className = "evidence-restore-bar";
+    toolbar.innerHTML =
+      '<span>证据进度与健康指标已隐藏，当前显示全部传感器通道</span>' +
+      '<button type="button" class="secondary-button compact-button">恢复证据进度</button>';
+    const restoreButton = toolbar.querySelector("button");
+    restoreButton.addEventListener("click", () => {
+      state.showLayerEvidence = true;
+      try {
+        localStorage.setItem(LAYER_EVIDENCE_VISIBILITY_KEY, "1");
+      } catch (_error) {}
+      applyLayerEvidenceVisibility();
+      if (state.payload) renderLayerProgress(state.payload.layers);
+    });
+    const grid = document.createElement("div");
+    grid.className = "sensor-grid evidence-sensor-grid";
+    renderSensorCardsInto(
+      grid,
+      state.payload?.channels || [],
+      state.payload?.selection?.sensor,
+    );
+    target.replaceChildren(toolbar, grid);
+    return;
+  }
+  target.className = "layer-progress";
+  target.replaceChildren(...layers.map((layer) => {
     const node = document.createElement("div");
     const health = layer.aggregate?.health;
     const predictedState = layer.aggregate?.state_label;
@@ -1244,6 +1607,7 @@ async function initialize() {
     );
     controls.datasetSchema.value = "legacy_original";
     configureDatasetSchema(true);
+    state.liveScopeKey = liveEvidenceScopeKey();
     controls.dataMode.value = payload.defaults.data_mode || "replay";
     controls.specimen.value = payload.defaults.specimen;
     controls.sensor.value = String(payload.defaults.sensor);
@@ -1253,12 +1617,26 @@ async function initialize() {
     controls.streamStep.value = payload.defaults.stream_step;
     controls.horizon.value = payload.defaults.prediction_horizon;
     controls.horizonNumber.value = payload.defaults.prediction_horizon;
+    if (controls.forecastLead) {
+      const lead = Number(payload.defaults.forecast_lead || 1);
+      controls.forecastLead.value = String(lead);
+      controls.forecastLeadNumber.value = String(lead);
+      controls.forecastLeadValue.textContent = String(lead);
+    }
     controls.realtimePrediction.checked = Boolean(payload.defaults.realtime_prediction);
     controls.optimizedWarning.checked = Boolean(payload.defaults.use_optimized_warning);
     controls.saveRoot.value = payload.acquisition.default_save_root || "";
     controls.threshold.value = payload.defaults.threshold;
     controls.rho.value = payload.defaults.rho;
     controls.indicator.value = payload.defaults.indicator;
+    try {
+      state.showLayerEvidence = localStorage.getItem(
+        LAYER_EVIDENCE_VISIBILITY_KEY
+      ) !== "0";
+    } catch (_error) {
+      state.showLayerEvidence = true;
+    }
+    applyLayerEvidenceVisibility();
     populateModels(true);
     configureAutomaticIndicator(true);
     $("datasetMeta").textContent =
@@ -1286,11 +1664,26 @@ controls.specimen.addEventListener("change", () => {
   controls.cursor.value = "1";
   loadRealtime();
 });
-controls.dataMode.addEventListener("change", configureDataMode);
-controls.processingMode.addEventListener("change", configureProcessingMode);
-controls.datasetSchema.addEventListener("change", () =>
-  configureDatasetSchema(true)
-);
+controls.dataMode.addEventListener("change", () => {
+  const previousScope = state.liveScopeKey;
+  configureDataMode();
+  if (controls.dataMode.value === "live") {
+    const nextScope = liveEvidenceScopeKey();
+    if (previousScope !== null && previousScope !== nextScope) {
+      resetLiveEvidenceDisplay();
+    } else {
+      state.liveScopeKey = nextScope;
+    }
+  }
+});
+controls.processingMode.addEventListener("change", () => {
+  configureProcessingMode();
+  markLiveScopeChanged();
+});
+controls.datasetSchema.addEventListener("change", () => {
+  configureDatasetSchema(true);
+  markLiveScopeChanged();
+});
 controls.autoIndicator.addEventListener("change", () => {
   configureAutomaticIndicator(true);
   loadRealtime();
@@ -1300,10 +1693,12 @@ controls.history.addEventListener("change", loadRealtime);
 controls.step.addEventListener("change", loadRealtime);
 controls.indicator.addEventListener("change", () => {
   populateModels(true);
+  markLiveScopeChanged();
   loadRealtime();
 });
 controls.model.addEventListener("change", () => {
   applyCandidateDefaults();
+  markLiveScopeChanged();
   loadRealtime();
 });
 controls.realtimePrediction.addEventListener("change", loadRealtime);
@@ -1312,6 +1707,15 @@ controls.bestPredictionOverride.addEventListener(
   "change", configureBestPredictionOverride
 );
 $("testSensorsButton").addEventListener("click", testSensorConnection);
+$("testMysqlButton")?.addEventListener("click", testMysqlConnection);
+$("refreshRelationMapButton")?.addEventListener("click", refreshRelationMap);
+controls.mysqlDatabase?.addEventListener("change", () => {
+  const status = $("mysqlStatus");
+  if (status) {
+    const database = controls.mysqlDatabase.value.trim() || "afp_state_warning";
+    status.textContent = `当前选择数据库：${database}；点击“刷新关系表”读取该数据库。`;
+  }
+});
 $("selectSaveRootButton").addEventListener("click", selectSaveRoot);
 $("selectPredictionModelButton").addEventListener("click", selectPredictionModel);
 controls.predictionModel.addEventListener("change", () => {
@@ -1324,6 +1728,24 @@ controls.predictionModel.addEventListener("change", () => {
 });
 $("startAcquisitionButton").addEventListener("click", startAcquisition);
 $("stopAcquisitionButton").addEventListener("click", stopAcquisition);
+[
+  controls.liveSpecimen,
+  controls.runId,
+  controls.conditionId,
+  controls.replicate,
+  controls.livePower,
+  controls.liveSpeed,
+  controls.livePressure,
+  controls.initialForce,
+  controls.placementSpeed,
+  controls.pidAngle,
+  controls.temperatureSetpoint,
+].filter(Boolean).forEach((control) => {
+  control.addEventListener("change", markLiveScopeChanged);
+});
+enforceStepOneInteger(controls.replicate, 1);
+enforceStepOneInteger(controls.liveLayer, 0);
+enforceStepOneInteger(controls.newLayer, 0);
 controls.speed.addEventListener("change", restartPlaybackTimer);
 controls.cursor.addEventListener("input", scheduleLoad);
 controls.horizon.addEventListener("input", () => {
@@ -1357,17 +1779,66 @@ controls.horizonNumber.addEventListener("keydown", (event) => {
     controls.horizonNumber.blur();
   }
 });
+function commitForecastLead() {
+  if (!controls.forecastLead || !controls.forecastLeadNumber) return;
+  const value = Math.max(
+    1,
+    Math.min(24, Number(controls.forecastLeadNumber.value) || 1)
+  );
+  controls.forecastLead.value = String(value);
+  controls.forecastLeadNumber.value = String(value);
+  controls.forecastLeadValue.textContent = String(value);
+  loadRealtime();
+}
+if (controls.forecastLead) {
+  controls.forecastLead.addEventListener("input", () => {
+    const value = Number(controls.forecastLead.value);
+    controls.forecastLeadNumber.value = String(value);
+    controls.forecastLeadValue.textContent = String(value);
+    scheduleLoad();
+  });
+  controls.forecastLeadNumber.addEventListener("input", () => {
+    const rawValue = Number(controls.forecastLeadNumber.value);
+    if (!Number.isFinite(rawValue) || rawValue < 1 || rawValue > 24) return;
+    const value = Math.trunc(rawValue);
+    controls.forecastLead.value = String(value);
+    controls.forecastLeadValue.textContent = String(value);
+    scheduleLoad();
+  });
+  controls.forecastLeadNumber.addEventListener("change", commitForecastLead);
+  controls.forecastLeadNumber.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      commitForecastLead();
+      controls.forecastLeadNumber.blur();
+    }
+  });
+}
 controls.threshold.addEventListener("input", scheduleLoad);
 controls.rho.addEventListener("input", scheduleLoad);
 $("residualToggle").addEventListener("change", (event) => {
   state.showResidual = event.target.checked;
   if (state.payload) renderSeriesChart(state.payload.selected_channel);
 });
+controls.showLayerEvidence?.addEventListener("change", (event) => {
+  state.showLayerEvidence = Boolean(event.target.checked);
+  try {
+    localStorage.setItem(
+      LAYER_EVIDENCE_VISIBILITY_KEY,
+      state.showLayerEvidence ? "1" : "0"
+    );
+  } catch (_error) {
+    // Visibility preference is optional in restricted desktop runtimes.
+  }
+  applyLayerEvidenceVisibility();
+  if (state.payload) renderLayerProgress(state.payload.layers);
+});
 window.addEventListener("resize", () => {
   if (!state.payload) return;
   renderSeriesChart(state.payload.selected_channel);
   renderTimeline(state.payload.timeline);
   renderSensorCards(state.payload.channels, state.payload.selection.sensor);
+  if (!state.showLayerEvidence) renderLayerProgress(state.payload.layers);
 });
 
 const COLUMN_LAYOUT_STORAGE_KEY = "afp-state-monitor-column-layout-v1";
@@ -1378,6 +1849,7 @@ function redrawChartsAfterColumnResize() {
     renderSeriesChart(state.payload.selected_channel);
     renderTimeline(state.payload.timeline);
     renderSensorCards(state.payload.channels, state.payload.selection.sensor);
+    if (!state.showLayerEvidence) renderLayerProgress(state.payload.layers);
   });
 }
 
@@ -1517,7 +1989,9 @@ function initializeVerticalPanelResizer() {
   const main = document.querySelector(".main-content");
   if (!workspace || !handle || !main) return;
   const upperMin = 280;
-  const lowerMin = 180;
+  // Permit the upper monitoring/health-indicator area to cover the evidence
+  // row completely.  A double-click still restores the default split.
+  const lowerMin = 0;
 
   function upperMax() {
     const styles = getComputedStyle(workspace);

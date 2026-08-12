@@ -21,6 +21,10 @@ SENSOR_COLUMNS = [
     *[f"温度{index}" for index in range(1, 9)],
     "转速", "位移", "振动",
 ]
+EXCLUDED_COLLECTION_CHANNELS = {"转速", "位移", "振动"}
+ACTIVE_COLLECTION_CHANNELS = [
+    name for name in SENSOR_COLUMNS if name not in EXCLUDED_COLLECTION_CHANNELS
+]
 PROCESS_COLUMNS = [
     "initial_compaction_force_N",
     "placement_speed_mm_s",
@@ -31,8 +35,11 @@ THERMAL = [
     "温度", "ROI平均温度", *[f"温度{index}" for index in range(1, 9)]
 ]
 COMPACTION = ["压力", "张力"]
-MOTION = ["线速度", "ABB_X", "ABB_Y", "ABB_Z", "转速", "位移"]
-VIBRATION = ["振动"]
+MOTION = ["线速度", "ABB_X", "ABB_Y", "ABB_Z"]
+# Retain the feature slot for compatibility with the existing trained
+# classifiers, but it is explicitly zero because vibration is not acquired in
+# the new collection plan.
+VIBRATION = []
 
 NEW_STATE_LABELS = {
     "normal": "正常",
@@ -160,15 +167,15 @@ INDICATOR_REQUIRED_OUTPUTS = {
     "T-HI": THERMAL,
     "C-HI": COMPACTION,
     "TC-HI": [*THERMAL, *COMPACTION],
-    "RFHI": SENSOR_COLUMNS,
-    "PR-HI": SENSOR_COLUMNS,
-    "MPRF-HI": SENSOR_COLUMNS,
-    "PCA-SPE-HI": SENSOR_COLUMNS,
-    "KECA-SPE-HI": SENSOR_COLUMNS,
-    "McFS-AVAE-HI": SENSOR_COLUMNS,
-    "CNN-LSTM-AE-HI": SENSOR_COLUMNS,
-    "W-HI": SENSOR_COLUMNS,
-    "RMD-HI": SENSOR_COLUMNS,
+    "RFHI": ACTIVE_COLLECTION_CHANNELS,
+    "PR-HI": ACTIVE_COLLECTION_CHANNELS,
+    "MPRF-HI": ACTIVE_COLLECTION_CHANNELS,
+    "PCA-SPE-HI": ACTIVE_COLLECTION_CHANNELS,
+    "KECA-SPE-HI": ACTIVE_COLLECTION_CHANNELS,
+    "McFS-AVAE-HI": ACTIVE_COLLECTION_CHANNELS,
+    "CNN-LSTM-AE-HI": ACTIVE_COLLECTION_CHANNELS,
+    "W-HI": ACTIVE_COLLECTION_CHANNELS,
+    "RMD-HI": ACTIVE_COLLECTION_CHANNELS,
 }
 
 
@@ -321,7 +328,7 @@ def build_master_feature_vector(
     pressure_index = SENSOR_COLUMNS.index("压力")
     tension_index = SENSOR_COLUMNS.index("张力")
     speed_index = SENSOR_COLUMNS.index("线速度")
-    trajectory_indices = _indices(["ABB_X", "ABB_Y", "ABB_Z", "位移"])
+    trajectory_indices = _indices(["ABB_X", "ABB_Y", "ABB_Z"])
 
     summary = summarize_window(actual)
     summary_z = (
@@ -417,7 +424,7 @@ def build_master_feature_vector(
         "motion_residual_rms": _group_rms(residual_z, MOTION),
         "speed_tracking_error": speed_tracking_error,
         "trajectory_residual_rms": float(np.sqrt(np.mean(np.square(residual_z[:, trajectory_indices])))),
-        "vibration_residual_rms": _group_rms(residual_z, VIBRATION),
+        "vibration_residual_rms": 0.0,
         "global_residual_p95": float(np.quantile(absolute_z, 0.95)),
         "cross_channel_residual_coherence": coherence,
         "thermo_compaction_coupling_error": thermo_compaction_coupling_error,
@@ -428,7 +435,7 @@ def build_master_feature_vector(
         ),
         "response_thermal_distance": _robust_group_distance(summary_z, THERMAL),
         "response_compaction_distance": _robust_group_distance(summary_z, COMPACTION),
-        "response_motion_distance": _robust_group_distance(summary_z, [*MOTION, *VIBRATION]),
+        "response_motion_distance": _robust_group_distance(summary_z, MOTION),
         "pca_spe": pca_spe,
         "keca_distance": keca_distance,
         "mcfs_spatial_error": mcfs_spatial_error,

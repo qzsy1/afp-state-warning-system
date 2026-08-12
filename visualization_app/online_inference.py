@@ -332,3 +332,54 @@ class OnlineIModernTCN:
                     rolling = np.concatenate([rolling, prediction], axis=0)[-24:]
             mode = "live_checkpoint_direct_24" if horizon <= 24 else "live_checkpoint_recursive"
             return np.concatenate(outputs, axis=0), mode
+
+    def predict_batch(
+        self, histories: np.ndarray, horizon: int = 24
+    ) -> tuple[np.ndarray, str]:
+        """Predict a batch of causal origins in one forward pass.
+
+        Replay alignment needs the prediction made at many historical origins.
+        Calling ``predict`` once per point makes the browser appear stalled and
+        also encourages callers to reuse a prediction from the wrong origin.
+        The fixed-lead alignment used by the dashboard is within the native
+        24-point checkpoint horizon, so a batched direct pass is both causal
+        and substantially faster.
+        """
+        histories = np.asarray(histories, dtype=np.float32)
+        required_tail = (
+            int(self._profile["seq_len"]),
+            int(self._profile["enc_in"]),
+        )
+        if histories.ndim != 3 or tuple(histories.shape[1:]) != required_tail:
+            raise ValueError(
+                f"online model requires a batch shaped (N,{required_tail[0]},{required_tail[1]}), "
+                f"got {histories.shape}"
+            )
+        horizon = int(np.clip(horizon, 1, 24))
+        if len(histories) == 0:
+            return np.empty((0, horizon, required_tail[1]), dtype=np.float32), "batch_empty"
+        with self._lock:
+            self._load()
+            torch = self._torch
+            batch_size = int(histories.shape[0])
+            with torch.no_grad():
+                x = torch.from_numpy(histories).to(self._device)
+                x_mark = torch.zeros((batch_size, 24, 4), device=self._device)
+                decoder = torch.zeros(
+                    (
+                        batch_size,
+                        int(self._profile["seq_len"])
+                        + int(self._profile["pred_len"]),
+                        int(self._profile["enc_in"]),
+                    ),
+                    device=self._device,
+                )
+                y_mark = torch.zeros((batch_size, 48, 4), device=self._device)
+                prediction = (
+                    self._model(x, x_mark, decoder, y_mark)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32)
+                )
+            return prediction[:, :horizon], "live_checkpoint_batch_direct_24"
