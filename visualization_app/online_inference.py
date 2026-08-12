@@ -11,7 +11,17 @@ import numpy as np
 
 
 APP_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
+# In the source tree this module lives four levels below the workspace root.
+# PyInstaller places it below the extracted `_internal` directory, whose
+# parent chain is much shorter.  Never index a fixed parent level here: doing
+# so makes the frozen desktop application fail before the web server starts.
+_SOURCE_PATH = Path(__file__).resolve()
+_SOURCE_PARENTS = _SOURCE_PATH.parents
+PROJECT_ROOT = (
+    _SOURCE_PARENTS[4]
+    if len(_SOURCE_PARENTS) > 4 and (_SOURCE_PARENTS[4] / "checkpoints").exists()
+    else APP_DIR.parent
+)
 # The installed desktop application carries the I-ModernTCN implementation
 # beside its runtime assets.  Retain the workspace location for development.
 _PACKAGED_MODEL_RUNTIME = APP_DIR / "model_runtime"
