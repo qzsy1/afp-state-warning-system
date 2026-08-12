@@ -109,7 +109,9 @@ class DesktopLauncher:
                 cwd=str(APP_DIR),
                 creationflags=creationflags,
             )
-            for _ in range(80):
+            # CPU-only PyTorch and the bundled checkpoint can take up to a
+            # minute on first launch while DLLs and models are loaded.
+            for _ in range(480):
                 if self.process.poll() is not None:
                     raise RuntimeError("本地服务启动失败")
                 try:
