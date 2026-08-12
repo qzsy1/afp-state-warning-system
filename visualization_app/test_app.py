@@ -293,6 +293,12 @@ class DashboardTests(unittest.TestCase):
                     prediction_horizon=24,
                 )
                 self.assertEqual(payload["forecast"]["returned_horizon"], 24)
+                self.assertEqual(payload["forecast"]["forecast_lead"], 1)
+                self.assertAlmostEqual(
+                    payload["channels"][2]["x_future"][0],
+                    0.001,
+                    places=6,
+                )
                 self.assertTrue(payload["window"]["complete"])
                 self.assertTrue(payload["window"]["optimized_warning_applied"])
                 self.assertEqual(
@@ -305,7 +311,7 @@ class DashboardTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     payload["feature_generation"]["historical_prediction_mode"],
-                    "causal_first_display_frozen",
+                    "target_aligned_causal_lead_1",
                 )
                 self.assertTrue(
                     any(
@@ -538,7 +544,10 @@ class DashboardTests(unittest.TestCase):
                     "TC-HI", "random_forest", 24,
                 )
                 self.assertEqual(payload["mode"], "capture_only")
-                self.assertEqual(len(payload["channels"]), 19)
+                # The new collection plan intentionally acquires 16 physical
+                # channels; rotation speed, displacement and vibration are
+                # excluded from the new dataset.
+                self.assertEqual(len(payload["channels"]), 16)
                 self.assertEqual(payload["forecast"]["returned_horizon"], 0)
                 self.assertEqual(
                     payload["feature_generation"]["mode"], "capture_only"
@@ -599,7 +608,7 @@ class DashboardTests(unittest.TestCase):
                     "TC-HI", "random_forest", 24,
                 )
                 self.assertEqual(payload["mode"], "live_acquisition")
-                self.assertEqual(len(payload["channels"]), 19)
+                self.assertEqual(len(payload["channels"]), 16)
                 self.assertEqual(payload["forecast"]["returned_horizon"], 24)
                 self.assertTrue(payload["window"]["complete"])
                 self.assertEqual(

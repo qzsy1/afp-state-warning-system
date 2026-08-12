@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 import math
+import re
 import socket
 import threading
 import time
@@ -14,6 +15,8 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+from mysql_storage import MySQLCaptureStore, MySQLSettings, validate_database_name
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -53,10 +56,12 @@ NEW_CORE_SENSOR_COLUMNS = [
 ]
 NEW_OPTIONAL_SENSOR_COLUMNS = [
     *[f"温度{index}" for index in range(1, 9)],
-    "转速",
-    "位移",
-    "振动",
 ]
+# These channels are intentionally excluded from the new collection plan.
+# Existing checkpoints may still contain them as virtual model columns; the
+# online runtime fills those columns with their scaler baseline and never
+# saves/displays them as acquired data.
+NEW_EXCLUDED_SENSOR_COLUMNS = {"转速", "位移", "振动"}
 NEW_COLLECTION_SENSOR_COLUMNS = list(
     dict.fromkeys([*NEW_CORE_SENSOR_COLUMNS, *NEW_OPTIONAL_SENSOR_COLUMNS])
 )
@@ -183,6 +188,16 @@ class AcquisitionConfig:
     pid_angle_deg: float = 5.0
     temperature_setpoint_C: float = 360.0
     replicate: int = 1
+    # MySQL is deliberately opt-in.  Local CSV/JSON files remain the primary
+    # raw-data archive and MySQL receives a transaction after each saved layer.
+    mysql_enabled: bool = False
+    mysql_host: str = "127.0.0.1"
+    mysql_port: int = 3306
+    mysql_user: str = "root"
+    mysql_password: str = ""
+    mysql_database: str = "afp_state_warning"
+    mysql_charset: str = "utf8mb4"
+    mysql_connect_timeout: int = 5
 
     def __post_init__(self) -> None:
         if self.processing_mode not in {"capture_only", "prediction_warning"}:
@@ -231,9 +246,21 @@ class AcquisitionConfig:
         self.prediction_sensors = self.model_output_sensors.copy()
         self.sample_rate_hz = max(0.1, min(float(self.sample_rate_hz), 1000.0))
         self.baudrate = int(self.baudrate)
-        self.layer = int(self.layer)
+        self.layer = max(0, int(self.layer))
         self.cycle = int(self.cycle)
-        self.replicate = int(self.replicate)
+        self.replicate = max(1, int(self.replicate))
+        self.mysql_enabled = bool(self.mysql_enabled)
+        self.mysql_host = str(self.mysql_host or "127.0.0.1").strip()
+        self.mysql_port = max(1, min(int(self.mysql_port), 65535))
+        self.mysql_user = str(self.mysql_user or "root")
+        self.mysql_password = str(self.mysql_password or "")
+        self.mysql_database = validate_database_name(
+            self.mysql_database or "afp_state_warning"
+        )
+        self.mysql_charset = str(self.mysql_charset or "utf8mb4")
+        self.mysql_connect_timeout = max(
+            1, min(int(self.mysql_connect_timeout), 60)
+        )
         self.use_best_prediction_override = bool(
             self.use_best_prediction_override
         )
@@ -252,6 +279,10 @@ class AcquisitionConfig:
     def raw_columns(self) -> list[str]:
         return list(ACQUISITION_SCHEMAS[self.dataset_schema]["raw_columns"])
 
+    @property
+    def process_columns(self) -> list[str]:
+        return list(PROCESS_PARAMETER_COLUMNS)
+
 
 def _safe_component(value: Any, max_length: int = 40) -> str:
     """Create a readable Windows-safe path component with a bounded length."""
@@ -266,14 +297,26 @@ def _safe_component(value: Any, max_length: int = 40) -> str:
 
 
 def _parameter_token(config: AcquisitionConfig) -> str:
+    # Keep the physical condition and independent replicate visible in the
+    # folder name.  The layer files and complete-specimen snapshot inherit
+    # this prefix, so files from different conditions/replicates cannot be
+    # mixed accidentally.
+    condition = _safe_component(config.condition_id or "LIVE", max_length=24)
+    replicate = max(1, int(config.replicate or 1))
     if config.dataset_schema == "new_collection_v11_3":
         return (
+            f"C{condition}_R{replicate}_"
             f"F{config.initial_compaction_force_N:g}_"
             f"V{config.placement_speed_mm_s:g}_"
             f"A{config.pid_angle_deg:g}_"
             f"T{config.temperature_setpoint_C:g}"
         )
-    return f"p{config.p:g}_v{config.v:g}_pr{config.pr:g}"
+    # Preserve the historical legacy-default path for existing replay/capture
+    # tests and previously saved data.  As soon as a legacy condition or
+    # replicate is explicitly changed, it is included in the folder name.
+    if condition == "LIVE" and replicate == 1:
+        return f"p{config.p:g}_v{config.v:g}_pr{config.pr:g}"
+    return f"C{condition}_R{replicate}_p{config.p:g}_v{config.v:g}_pr{config.pr:g}"
 
 
 def select_capture_folder(initial_path: str = "") -> str:
@@ -442,6 +485,18 @@ class AcquisitionManager:
         self.full_specimen_path: Path | None = None
         self.completed_layers: list[int] = []
         self.session_stamp = ""
+        self.mysql_status: dict[str, Any] = {
+            "enabled": False,
+            "ok": False,
+            "saved_rows": 0,
+        }
+
+    @staticmethod
+    def _public_config(config: AcquisitionConfig) -> dict[str, Any]:
+        payload = asdict(config)
+        # Never expose or write the database password to a browser or manifest.
+        payload["mysql_password"] = "***" if config.mysql_password else ""
+        return payload
 
     @staticmethod
     def available_drivers() -> list[dict[str, str]]:
@@ -517,6 +572,12 @@ class AcquisitionManager:
             if self.thread is not None and self.thread.is_alive():
                 raise RuntimeError("采集已经在运行")
             self.config = config
+            self.mysql_status = {
+                "enabled": bool(config.mysql_enabled),
+                "ok": None,
+                "state": "pending" if config.mysql_enabled else "disabled",
+                "saved_rows": 0,
+            }
             self.rows.clear()
             self.timestamps.clear()
             self.sensor_received = {
@@ -565,7 +626,7 @@ class AcquisitionManager:
             manifest_path.write_text(
                 json.dumps(
                     {
-                        **asdict(config),
+                        **self._public_config(config),
                         "started_at": datetime.now().isoformat(timespec="milliseconds"),
                         "raw_encoding": "gb18030",
                         "raw_columns": config.raw_columns,
@@ -612,16 +673,19 @@ class AcquisitionManager:
             return None
         safe_specimen = _safe_component(self.config.specimen_id)
         specimen_folder_name = f"{safe_specimen}_{_parameter_token(self.config)}"
-        layer_paths = [
-            self.session_dir
-            / f"{specimen_folder_name}_第{layer + 1}层.CSV"
-            for layer in range(5)
-        ]
-        available = [
-            (layer, path)
-            for layer, path in enumerate(layer_paths)
-            if path.exists() and path.stat().st_size > 0
-        ]
+        # Do not assume a five-layer specimen.  Every layer file collected in
+        # this specimen folder participates in the final snapshot, including
+        # layer numbers beyond the historical 0--4 range.
+        layer_pattern = re.compile(
+            rf"^{re.escape(specimen_folder_name)}_第(\d+)层\.CSV$",
+            re.IGNORECASE,
+        )
+        available = []
+        for path in self.session_dir.glob(f"{specimen_folder_name}_第*层.CSV"):
+            match = layer_pattern.match(path.name)
+            if match and path.stat().st_size > 0:
+                available.append((int(match.group(1)) - 1, path))
+        available.sort(key=lambda item: item[0])
         self.completed_layers = [layer for layer, _ in available]
         if not available:
             return None
@@ -789,6 +853,68 @@ class AcquisitionManager:
                     json.dumps(summary, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
+                if self.config.mysql_enabled and self.raw_path is not None:
+                    settings = MySQLSettings(
+                        enabled=True,
+                        host=self.config.mysql_host,
+                        port=self.config.mysql_port,
+                        user=self.config.mysql_user,
+                        password=self.config.mysql_password,
+                        database=self.config.mysql_database,
+                        charset=self.config.mysql_charset,
+                        connect_timeout=self.config.mysql_connect_timeout,
+                    )
+                    self.mysql_status = MySQLCaptureStore(settings).save_layer(
+                        self.config,
+                        rows=list(self.rows),
+                        layer_file=str(self.raw_path),
+                        full_specimen_file=(
+                            str(full_specimen_path)
+                            if full_specimen_path is not None
+                            else None
+                        ),
+                        timestamp_file=(
+                            str(self.timestamp_path)
+                            if self.timestamp_path is not None
+                            else None
+                        ),
+                        folder_path=(
+                            str(self.session_dir)
+                            if self.session_dir is not None
+                            else None
+                        ),
+                        summary=summary,
+                    )
+                    summary["mysql"] = self.mysql_status
+                    summary_path.write_text(
+                        json.dumps(summary, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    if not self.mysql_status.get("ok"):
+                        pending_path = self.capture_record_dir / (
+                            f"{self.raw_path.stem}_{self.session_stamp}_mysql_pending.json"
+                        )
+                        pending_path.write_text(
+                            json.dumps(
+                                {
+                                    "mysql": self.mysql_status,
+                                    "config": self._public_config(self.config),
+                                    "layer_file": str(self.raw_path),
+                                    "full_specimen_file": str(full_specimen_path)
+                                    if full_specimen_path is not None
+                                    else None,
+                                },
+                                ensure_ascii=False,
+                                indent=2,
+                            ),
+                            encoding="utf-8",
+                        )
+                elif not self.config.mysql_enabled:
+                    self.mysql_status = {
+                        "enabled": False,
+                        "ok": False,
+                        "saved_rows": 0,
+                    }
         return self.status()
 
     def status(self) -> dict:
@@ -867,7 +993,10 @@ class AcquisitionManager:
                 "minimum_prediction_points": 24,
                 "minimum_warning_points": 48,
                 "sensors": sensors,
-                "config": asdict(self.config) if self.config else None,
+                "config": (
+                    self._public_config(self.config) if self.config else None
+                ),
+                "mysql": dict(self.mysql_status),
             }
 
     def numeric_matrix(self) -> tuple[list[dict[str, Any]], list[float]]:

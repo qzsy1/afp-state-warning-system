@@ -12,6 +12,9 @@ hierarchical_dataset*/
 document_build/
 spreadsheet_build/
 thesis_draft/
+!thesis_draft/
+thesis_draft/*
+!thesis_draft/AFP实时预测与三级状态预警系统核心流程说明_软件数据库集成更新版_v5.docx
 *.csv
 *.xlsx
 *.npz

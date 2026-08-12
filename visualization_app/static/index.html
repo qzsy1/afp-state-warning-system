@@ -70,6 +70,30 @@
               </span>
             </label>
             <p class="control-note save-rule-note">自动建立“试样名_p功率_v速度_pr压实力”文件夹，同时保存每层文件、完整试样快照和采集记录。</p>
+            <div class="mysql-settings">
+              <label class="toggle"><input id="mysqlEnabledInput" type="checkbox"> 采集完成后同步保存到 MySQL</label>
+              <div class="compact-input-grid">
+                <label>MySQL 主机<input id="mysqlHostInput" type="text" value="127.0.0.1"></label>
+                <label>端口<input id="mysqlPortInput" type="number" min="1" max="65535" step="1" value="3306"></label>
+                <label>用户名<input id="mysqlUserInput" type="text" value="root"></label>
+                <label>密码<input id="mysqlPasswordInput" type="password" value="" autocomplete="new-password"></label>
+                <label>数据库名称<input id="mysqlDatabaseInput" type="text" value="afp_state_warning" pattern="[A-Za-z][A-Za-z0-9_]{0,63}"></label>
+              </div>
+              <div class="transport">
+                <button id="testMysqlButton" class="secondary-button" type="button">检查 MySQL</button>
+                <button id="refreshRelationMapButton" class="secondary-button" type="button">刷新关系表</button>
+              </div>
+              <p id="mysqlStatus" class="control-note">默认关闭；每次停止并保存一层后进行一次批量事务写入。</p>
+              <div class="relation-map-panel">
+                <div class="sensor-selector-title">工况—试样—独立重复—铺层关系</div>
+                <div class="relation-map-scroll">
+                  <table id="relationMapTable" class="relation-map-table">
+                    <thead><tr><th>工况</th><th>试样</th><th>独立重复</th><th>铺层</th><th>采样点数</th><th>最后保存</th></tr></thead>
+                    <tbody><tr><td colspan="6">点击“刷新关系表”查看 MySQL 中已保存的关系</td></tr></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
             <label class="prediction-setting">已训练预测模型文件
               <span class="path-picker-row">
                 <input id="predictionModelInput" type="text" placeholder="选择 I-ModernTCN 的 .pth/.pt 模型">
@@ -83,7 +107,7 @@
               <label>功率 p<input id="livePowerInput" type="number" value="600"></label>
               <label>速度 v<input id="liveSpeedInput" type="number" value="100"></label>
               <label>压实力 pr<input id="livePressureInput" type="number" value="600"></label>
-              <label>层号 0–4<input id="liveLayerInput" type="number" value="0" min="0" max="4"></label>
+              <label>层号（从0开始，每次递增1）<input id="liveLayerInput" class="step-one-input" type="number" value="0" min="0" step="1" inputmode="numeric"></label>
             </div>
             <div id="newParameterGrid" class="compact-input-grid hidden">
               <label>初始压实力/N<input id="initialForceInput" type="number" value="400"></label>
@@ -91,9 +115,10 @@
               <label>PID 角度/°<input id="pidAngleInput" type="number" value="5"></label>
               <label>设定温度/°C<input id="temperatureSetpointInput" type="number" value="360"></label>
               <label>工况编号<input id="conditionIdInput" type="text" value="H06"></label>
-              <label>独立重复<input id="replicateInput" type="number" value="1" min="1" max="2"></label>
-              <label>层号 0–4<input id="newLayerInput" type="number" value="0" min="0" max="4"></label>
+              <label>独立重复（每次递增1）<input id="replicateInput" class="step-one-input" type="number" value="1" min="1" step="1" inputmode="numeric"></label>
+              <label>层号（从0开始，每次递增1）<input id="newLayerInput" class="step-one-input" type="number" value="0" min="0" step="1" inputmode="numeric"></label>
             </div>
+            <p class="control-note collection-index-note">采集运行期间层号和独立重复编号锁定；只有停止并成功保存本次采集后，才可递增到下一层或下一独立重复。</p>
             <div class="sensor-selector-title">采集保存、模型输入与模型输出</div>
             <div id="liveSensorChecklist" class="sensor-checklist"></div>
             <p class="control-note sensor-prediction-note">仅采集模式只使用“采集保存”；预测模式要求输入通道与模型元数据一致，输出通道决定预测曲线及健康指标数据。</p>
@@ -129,7 +154,7 @@
           </div>
         </details>
 
-        <details class="control-section" open>
+        <details id="healthIndicatorSection" class="control-section" open>
           <summary>健康指标与异常分数</summary>
           <div class="control-content">
             <label class="checkbox-row auto-indicator-row"><input id="autoIndicatorInput" type="checkbox" checked>根据输入数据方案自动选择健康指标构建形式</label>
@@ -142,6 +167,7 @@
             <label><span>异常阈值 <output id="thresholdValue">0.50</output></span><input id="thresholdInput" type="range" min="0.05" max="0.95" step="0.01" value="0.50"></label>
             <label><span>CAP 聚合强度 ρ <output id="rhoValue">0.50</output></span><input id="rhoInput" type="range" min="0" max="1" step="0.05" value="0.50"></label>
             <label class="checkbox-row"><input id="optimizedWarningInput" type="checkbox" checked>使用优化预警（回放 v13.8 / 实时因果 v13.9）</label>
+            <label class="checkbox-row evidence-visibility-setting"><input id="showLayerEvidenceInput" type="checkbox" checked>显示健康指标与铺层证据</label>
             <p id="calculationModeNote" class="control-note">异常分数由所选分类器实时计算；窗口仅在 24 个真实点全部到达后进入聚合。</p>
           </div>
         </details>
@@ -182,7 +208,7 @@
             <div><b>1</b><h3>实时数据流</h3><p>历史数据按采样率逐点回放；接入设备后沿用相同数据接口。</p></div>
             <div><b>2</b><h3>同步预测</h3><p>实时推理或归档预测可切换，超过训练步长时采用滚动预测。</p></div>
             <div><b>3</b><h3>窗口更新</h3><p>24 个实测点完整到达后才确认窗口，未来值不提前参与健康指标。</p></div>
-            <div><b>4</b><h3>三级状态</h3><p>窗口证据依次聚合为铺层和五层试样状态，并随新证据更新。</p></div>
+            <div><b>4</b><h3>三级状态</h3><p>窗口证据依次聚合为铺层和实际层数试样状态，并随新证据更新。</p></div>
             <div><b>5</b><h3>指标与模型</h3><p>健康指标和四类异常分数模型可切换，界面给出验证推荐。</p></div>
             <div><b>!</b><h3>使用边界</h3><p>正式准确率需用真实采集、独立试样划分与外部缺陷证据验证。</p></div>
           </div>
@@ -196,7 +222,7 @@
       </div>
 
       <aside class="warning-rail">
-        <div class="rail-title"><span>03</span><div><b>三级状态预警</b><small>窗口 → 铺层 → 五层试样</small></div></div>
+        <div class="rail-title"><span>03</span><div><b>三级状态预警</b><small>窗口 → 铺层 → 实际层数试样</small></div></div>
         <article class="status-card accent-amber">
           <div class="card-kicker">窗口级 · 最近完成窗口</div>
           <div class="state-row"><span id="windowState" class="state-pill">等待窗口</span><strong id="windowScore" class="score-value">—</strong></div>
@@ -208,7 +234,7 @@
           <div id="layerDetail" class="status-detail">尚无完整窗口</div>
         </article>
         <article class="status-card accent-blue">
-          <div class="card-kicker">试样级 · 五层聚合</div>
+          <div class="card-kicker">试样级 · 实际层数聚合</div>
           <div class="state-row"><span id="specimenState" class="state-pill">等待数据</span><span id="specimenScore" class="correctness">—</span></div>
           <div id="specimenDetail" class="status-detail">尚无层级证据</div>
         </article>
@@ -229,15 +255,15 @@
         <span class="vertical-resizer-grip" aria-hidden="true">•••</span>
       </div>
 
-      <section class="evidence-dock">
-        <article class="panel layer-panel">
+      <section id="evidenceDock" class="evidence-dock">
+        <article id="layerEvidencePanel" class="panel layer-panel">
           <div class="panel-header compact">
-            <div><p class="panel-kicker">FIVE-LAYER EVIDENCE</p><h2>五层证据形成进度</h2></div>
+            <div><p class="panel-kicker">LAYER EVIDENCE</p><h2>铺层证据形成进度</h2></div>
             <span id="layerPreviewBadge" class="preview-badge">等待完整窗口</span>
           </div>
           <div id="layerProgress" class="layer-progress"></div>
         </article>
-        <article class="panel timeline-panel">
+        <article id="timelineEvidencePanel" class="panel timeline-panel">
           <div class="panel-header compact"><div><p class="panel-kicker">CAUSAL WINDOW EVIDENCE</p><h2>当前层窗口健康指标</h2></div></div>
           <canvas id="timelineChart" height="160"></canvas>
           <div id="poolingSummary" class="inline-summary">只显示已经完成计算的窗口</div>

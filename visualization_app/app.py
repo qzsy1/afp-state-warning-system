@@ -26,14 +26,17 @@ from acquisition import (
     AcquisitionConfig,
     AcquisitionManager,
     NEW_COLLECTION_SENSOR_COLUMNS,
+    NEW_EXCLUDED_SENSOR_COLUMNS,
     SENSOR_COLUMNS,
     select_capture_folder,
 )
+from mysql_storage import MySQLCaptureStore, mysql_settings_from_mapping
 from online_health_features import OnlineWindowFeatureEngine
 from causal_online_runtime import CausalOnlineConsistency
 from runtime_scaler import FeatureScaler
 from new_collection_health import (
     INDICATOR_REQUIRED_OUTPUTS as NEW_INDICATOR_REQUIRED_OUTPUTS,
+    SENSOR_COLUMNS as NEW_HEALTH_SENSOR_COLUMNS,
     NEW_ABNORMAL_STATES,
     NEW_STATE_LABELS,
     NewCollectionHealthEngine,
@@ -400,6 +403,15 @@ class DashboardData:
         self.live_prediction_cache: dict[tuple[str, int], np.ndarray] = {}
         self.live_window_result_cache: dict[tuple[str, int, int], dict] = {}
         self.live_forecast_cache: dict[tuple[str, int, int], tuple[np.ndarray, str]] = {}
+        # Causal, target-aligned predictions are keyed by (target_index, lead).
+        # A target is frozen only for the lead at which it was originally
+        # forecast.  This is separate from the latest rolling forecast shown in
+        # the UI, so changing the display horizon cannot create a fixed lag.
+        self.live_causal_prediction_cache: dict[
+            str, dict[tuple[int, int], np.ndarray]
+        ] = {}
+        # Backward-compatible diagnostic cache containing only the latest
+        # rolling forecast.  It is never used for historical alignment.
         self.live_rolling_prediction_cache: dict[str, dict[int, np.ndarray]] = {}
         self.live_cache_lock = threading.RLock()
         self.replay_prediction_cache: dict[int, np.ndarray] = {}
@@ -592,7 +604,11 @@ class DashboardData:
                 "indicator": "TC-HI",
                 "model": "random_forest",
                 "prediction_horizon": 24,
-                "realtime_prediction": False,
+                "forecast_lead": 1,
+                # Replay defaults to the causal checkpoint path so the
+                # displayed historical curve uses the selected forecast lead
+                # instead of the fixed archived target sequence.
+                "realtime_prediction": True,
                 "use_optimized_warning": True,
                 "data_mode": "replay",
             },
@@ -697,6 +713,12 @@ class DashboardData:
             if config.use_best_prediction_override
             else inspect_prediction_model(config.prediction_model_file)
         )
+        auto_corrected = False
+        schema_sensors = list(
+            ACQUISITION_SCHEMAS.get(
+                config.dataset_schema, ACQUISITION_SCHEMAS["legacy_original"]
+            )["sensors"]
+        )
         if config.use_best_prediction_override:
             config.prediction_model_file = profile["checkpoint"]
         acquired_inputs = list(config.model_input_sensors or [])
@@ -704,13 +726,46 @@ class DashboardData:
         missing_inputs = [
             name for name in model_inputs if name not in acquired_inputs
         ]
+        # The new collection plan intentionally omits rotation speed,
+        # displacement and vibration.  Older demo checkpoints may still list
+        # these as model columns; they are virtual baseline-filled inputs, not
+        # required physical channels.
+        virtual_missing_inputs = [
+            name for name in missing_inputs
+            if name in NEW_EXCLUDED_SENSOR_COLUMNS
+            and config.dataset_schema == "new_collection_v11_3"
+        ]
+        effective_missing_inputs = [
+            name for name in missing_inputs if name not in virtual_missing_inputs
+        ]
         unexpected_inputs = [
             name for name in acquired_inputs if name not in model_inputs
         ]
-        if missing_inputs or unexpected_inputs:
+        schema_conflict = bool(
+            unexpected_inputs
+            or any(name not in schema_sensors for name in acquired_inputs)
+            or any(
+                name not in schema_sensors
+                and name not in NEW_EXCLUDED_SENSOR_COLUMNS
+                for name in model_inputs
+            )
+        )
+        if (effective_missing_inputs or unexpected_inputs) and schema_conflict:
+            profile = self.best_prediction_profile(config.dataset_schema)
+            config.prediction_model_file = profile["checkpoint"]
+            config.model_input_sensors = list(profile["input_sensors"])
+            config.model_output_sensors = list(profile["output_sensors"])
+            config.prediction_sensors = list(profile["output_sensors"])
+            config.selected_sensors = list(schema_sensors)
+            acquired_inputs = list(config.model_input_sensors)
+            model_inputs = list(profile["input_sensors"])
+            missing_inputs = []
+            unexpected_inputs = []
+            auto_corrected = True
+        if effective_missing_inputs or unexpected_inputs:
             raise ValueError(
                 "当前采集传感器与所选预测模型输入不一致。"
-                f"缺少：{missing_inputs or '无'}；"
+                f"缺少：{effective_missing_inputs or '无'}；"
                 f"模型未声明：{unexpected_inputs or '无'}"
             )
         if not set(acquired_inputs).issubset(
@@ -722,11 +777,25 @@ class DashboardData:
         selected_outputs = list(config.model_output_sensors or [])
         if not selected_outputs:
             raise ValueError("至少选择一个预测模型输出通道")
+        if not set(acquired_inputs).issubset(set(config.selected_sensors or [])):
+            config.selected_sensors = list(
+                dict.fromkeys([*(config.selected_sensors or []), *acquired_inputs])
+            )
+            auto_corrected = True
         unsupported_outputs = [
             name
             for name in selected_outputs
             if name not in profile["output_sensors"]
         ]
+        if unsupported_outputs:
+            selected_outputs = [
+                name for name in selected_outputs
+                if name in profile["output_sensors"]
+            ] or list(profile["output_sensors"])
+            config.model_output_sensors = list(selected_outputs)
+            config.prediction_sensors = list(selected_outputs)
+            unsupported_outputs = []
+            auto_corrected = True
         if unsupported_outputs:
             raise ValueError(
                 f"所选模型不提供这些输出通道：{unsupported_outputs}"
@@ -748,6 +817,21 @@ class DashboardData:
             name for name in required_outputs if name not in selected_outputs
         ]
         if missing_health_outputs:
+            compatible_indicator = next(
+                (
+                    name
+                    for name in ("TC-HI", "C-HI", "T-HI", "RFHI", "PR-HI", "MPRF-HI")
+                    if name in indicator_outputs
+                    and set(indicator_outputs[name]).issubset(set(selected_outputs))
+                ),
+                None,
+            )
+            if compatible_indicator is not None:
+                config.health_indicator = compatible_indicator
+                required_outputs = indicator_outputs[compatible_indicator]
+                missing_health_outputs = []
+                auto_corrected = True
+        if missing_health_outputs:
             raise ValueError(
                 f"{config.health_indicator}健康指标需要模型输出："
                 f"{missing_health_outputs}"
@@ -762,6 +846,7 @@ class DashboardData:
             "selected_output_sensors": selected_outputs,
             "health_indicator": config.health_indicator,
             "health_required_outputs": required_outputs,
+            "auto_corrected_schema_profile": auto_corrected,
             "compatible": True,
             "best_prediction_override": bool(
                 config.use_best_prediction_override
@@ -984,6 +1069,74 @@ class DashboardData:
             f"{prediction_model_signature}|{int(layer)}"
         )
 
+    @staticmethod
+    def _live_scope_signature(config: dict) -> str:
+        """Return the physical-specimen/condition scope for live evidence.
+
+        Layer evidence must accumulate only within one independent specimen
+        and one fixed process condition.  The previous key used the specimen
+        name and model only, so reusing a specimen name while changing the
+        process parameters could display evidence from the preceding run.
+        Keep the signature deterministic and exclude the layer number so the
+        layers of one specimen still accumulate together.
+        """
+        schema = str(config.get("dataset_schema", "legacy_original"))
+        common = {
+            "schema": schema,
+            "specimen_id": str(config.get("specimen_id", "LIVE_SPECIMEN")),
+            "run_id": str(config.get("run_id", "LIVE_RUN")),
+            "condition_id": str(config.get("condition_id", "LIVE")),
+            "replicate": int(config.get("replicate", 1) or 1),
+        }
+        if schema == "new_collection_v11_3":
+            common.update(
+                {
+                    "initial_force": float(config.get("initial_compaction_force_N", 0) or 0),
+                    "placement_speed": float(config.get("placement_speed_mm_s", 0) or 0),
+                    "pid_angle": float(config.get("pid_angle_deg", 0) or 0),
+                    "temperature_setpoint": float(config.get("temperature_setpoint_C", 0) or 0),
+                }
+            )
+        else:
+            common.update(
+                {
+                    "power": float(config.get("p", 0) or 0),
+                    "speed": float(config.get("v", 0) or 0),
+                    "compaction": float(config.get("pr", 0) or 0),
+                }
+            )
+        return json.dumps(common, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def _stored_live_layers(
+        self,
+        specimen_id: str,
+        indicator: str,
+        model_kind: str,
+        prediction_model_signature: str,
+    ) -> dict[int, dict]:
+        """Return all persisted layers for the active specimen/model.
+
+        The original implementation enumerated ``range(5)`` because the
+        first data-collection plan used five layers.  Live acquisition now
+        accepts any non-negative layer number, so discover the layer index
+        from the persisted key suffix instead of imposing that limit.
+        """
+        prefix = (
+            f"{specimen_id}|{indicator}|{model_kind}|"
+            f"{prediction_model_signature}|"
+        )
+        stored: dict[int, dict] = {}
+        for key, value in self.live_layer_health.items():
+            if not str(key).startswith(prefix):
+                continue
+            try:
+                layer_index = int(str(key)[len(prefix) :])
+            except (TypeError, ValueError):
+                continue
+            if layer_index >= 0 and isinstance(value, dict):
+                stored[layer_index] = value
+        return stored
+
     def _candidate_artifact(self, candidate_index: int) -> dict:
         artifact = self.candidate_model_cache.get(candidate_index)
         if artifact is None:
@@ -1106,6 +1259,7 @@ class DashboardData:
         prediction_horizon: int = 24,
         realtime_prediction: bool = False,
         use_optimized_warning: bool = True,
+        forecast_lead: int = 1,
     ) -> dict:
         if specimen_id not in self.layer_groups:
             specimen_id = self.specimen_ids[0]
@@ -1116,6 +1270,7 @@ class DashboardData:
         rho = float(np.clip(rho, 0.0, 1.0))
         score_mode = "raw" if score_mode == "raw" else "soft"
         prediction_horizon = int(np.clip(prediction_horizon, 1, 600))
+        forecast_lead = int(np.clip(forecast_lead, 1, 24))
         candidate = self.candidate(indicator, model_kind)
         indicator = str(candidate["indicator_family"])
         model_kind = str(candidate["model_kind"])
@@ -1181,6 +1336,8 @@ class DashboardData:
         observed_indices = np.arange(history_start, cursor, step, dtype=int)
         future_end = min(total_points, cursor + prediction_horizon)
         future_indices = np.arange(cursor, future_end, dtype=int)
+        historical_prediction_matrix = specimen_prediction
+        prediction_source = "archived_prediction"
         if realtime_prediction:
             first_visual_index = int(layer_blocks[0]["visual_indices"][0])
             model_history_stream = np.concatenate(
@@ -1196,9 +1353,40 @@ class DashboardData:
                 + self.scaler_mean[self.sensor_model_indices]
             )
             future_prediction_matrix = online_physical
-            future_time = np.arange(prediction_horizon, dtype=int) / _finite(
+            future_time = (np.arange(prediction_horizon, dtype=int) + 1) / _finite(
                 self.manifest.get("sampling_hz"), 10.0
             )
+            # Use the same causal origin for the historical curve.  Previously
+            # the checkbox only changed the future curve while the observed
+            # curve continued to use the archived target sequence, so its
+            # apparent lag never changed when the forecast lead was changed.
+            causal_indices = np.arange(
+                max(0, history_start), cursor, dtype=int
+            )
+            causal_matrix = self._replay_causal_prediction_matrix(
+                model_history_stream=model_history_stream,
+                target_indices=causal_indices,
+                forecast_lead=forecast_lead,
+                profile=self.online_predictor.profile,
+                sensor_columns=[str(item["name"]) for item in self.sensors],
+            )
+            # Start with an empty historical prediction series.  The first
+            # input context is not a prediction target, so it must remain
+            # blank until a causal model origin exists.
+            historical_prediction_matrix = np.full_like(
+                specimen_prediction, np.nan, dtype=float
+            )
+            if len(causal_indices):
+                finite_rows = np.isfinite(causal_matrix).all(axis=1)
+                valid_targets = causal_indices[finite_rows]
+                if len(valid_targets):
+                    historical_prediction_matrix[valid_targets] = causal_matrix[
+                        finite_rows
+                    ]
+            # Keep the legacy source label for clients that already consume it;
+            # the precise causal alignment is exposed separately through
+            # historical_prediction_mode below.
+            prediction_source = "live_checkpoint"
         else:
             future_prediction_matrix = specimen_prediction[future_indices]
             forecast_mode = (
@@ -1206,30 +1394,66 @@ class DashboardData:
                 if prediction_horizon <= int(self.actual.shape[1])
                 else "archived_rolling_windows"
             )
+        # The first model input window is context only.  Do not draw archived
+        # predictions over it; the prediction curve begins after this window.
+        input_context_points = min(
+            len(historical_prediction_matrix),
+            int(self.online_predictor.profile.get("seq_len", 24)),
+        )
+        if input_context_points:
+            historical_prediction_matrix[:input_context_points] = np.nan
         sampling_hz = _finite(self.manifest.get("sampling_hz"), 10.0)
         observed_time = (observed_indices - cursor) / sampling_hz
         if not realtime_prediction:
-            future_time = (future_indices - cursor) / sampling_hz
+            future_time = (future_indices - cursor + 1) / sampling_hz
+
+        # Chart-only smoothing keeps causal predictions visually comparable to
+        # the original overlapping-window curve.  Warning calculations above
+        # continue to use the unsmoothed model outputs.
+        historical_prediction_matrix = self._smooth_prediction_for_display(
+            historical_prediction_matrix
+        )
+        future_prediction_matrix = self._smooth_prediction_for_display(
+            future_prediction_matrix
+        )
 
         channels = []
         for sensor in self.sensors:
             index = int(sensor["id"])
             observed_actual = specimen_actual[observed_indices, index]
-            observed_prediction = specimen_prediction[observed_indices, index]
+            observed_prediction = historical_prediction_matrix[
+                observed_indices, index
+            ]
             future_prediction = future_prediction_matrix[:, index]
-            residual = observed_actual - observed_prediction
+            valid_residual = np.isfinite(observed_actual) & np.isfinite(
+                observed_prediction
+            )
+            residual = observed_actual[valid_residual] - observed_prediction[
+                valid_residual
+            ]
             channels.append(
                 {
                     **sensor,
                     "prediction_enabled": True,
                     "x_observed": observed_time.tolist(),
                     "actual": observed_actual.tolist(),
-                    "prediction_observed": observed_prediction.tolist(),
+                    "prediction_observed": [
+                        float(value) if math.isfinite(value) else None
+                        for value in observed_prediction
+                    ],
                     "x_future": future_time.tolist(),
                     "prediction_future": future_prediction.tolist(),
                     "actual_current": float(observed_actual[-1]),
-                    "prediction_current": float(observed_prediction[-1]),
-                    "rmse": float(np.sqrt(np.mean(residual**2))),
+                    "prediction_current": (
+                        float(observed_prediction[-1])
+                        if math.isfinite(observed_prediction[-1])
+                        else None
+                    ),
+                    "rmse": (
+                        float(np.sqrt(np.mean(residual**2)))
+                        if len(residual)
+                        else None
+                    ),
                 }
             )
 
@@ -1404,6 +1628,7 @@ class DashboardData:
                 "indicator": indicator,
                 "model": model_kind,
                 "prediction_horizon": prediction_horizon,
+                "forecast_lead": forecast_lead,
                 "realtime_prediction": bool(realtime_prediction),
                 "use_optimized_warning": bool(use_optimized_warning),
             },
@@ -1439,6 +1664,8 @@ class DashboardData:
             },
             "forecast": {
                 "requested_horizon": prediction_horizon,
+                "forecast_lead": forecast_lead,
+                "lead_semantics": "历史曲线使用已冻结的因果提前量；回放数据使用窗口起点对齐预测",
                 "returned_horizon": int(len(future_prediction_matrix)),
                 "native_horizon": int(self.actual.shape[1]),
                 "mode": forecast_mode,
@@ -1496,10 +1723,11 @@ class DashboardData:
                 "indicator_variant": indicator_variant(
                     "legacy_original", indicator
                 ),
-                "prediction_source": (
-                    "live_checkpoint"
+                "prediction_source": prediction_source,
+                "historical_prediction_mode": (
+                    f"causal_lead_{forecast_lead}"
                     if realtime_prediction
-                    else "archived_prediction"
+                    else "archived_target_sequence"
                 ),
                 "all_12_indicators_supported": True,
             },
@@ -1532,6 +1760,12 @@ class DashboardData:
         full = np.empty((len(rows), len(model_columns)), dtype=np.float32)
         full[:] = mean
         for sensor_name in profile["input_sensors"]:
+            if sensor_name not in sensor_columns:
+                # New collection data intentionally does not acquire the
+                # legacy rotation/displacement/vibration channels.  Their
+                # model columns remain at the scaler baseline for backward
+                # compatibility with the existing checkpoint.
+                continue
             full[:, column_index[sensor_name]] = sensors[
                 :, sensor_columns.index(sensor_name)
             ]
@@ -1572,12 +1806,125 @@ class DashboardData:
         )
         for sensor_name in profile["output_sensors"]:
             model_index = model_columns.index(sensor_name)
-            sensor_index = sensor_columns.index(sensor_name)
+            display_name = sensor_name
+            if display_name not in sensor_columns:
+                # The archived dashboard calls the force channel 压实力 while
+                # the acquisition/model schema uses 压力.  Treat them as the
+                # same physical channel at the conversion boundary.
+                display_name = {
+                    "压力": "压实力",
+                    "压实力": "压力",
+                }.get(display_name, display_name)
+            if display_name not in sensor_columns:
+                continue
+            sensor_index = sensor_columns.index(display_name)
             converted[:, sensor_index] = (
                 standardized[:, model_index] * scale[model_index]
                 + mean[model_index]
             )
         return converted
+
+    @staticmethod
+    def _smooth_prediction_for_display(values: np.ndarray) -> np.ndarray:
+        """Reduce point-to-point display jitter without changing warning data.
+
+        The archived dashboard curve is produced from overlapping 24-point
+        forecasts and is consequently smoother than a point-by-point causal
+        replay.  Apply a causal three-point median followed by a light low-pass
+        blend only to the values sent to the chart.  Raw model predictions used
+        by health features, thresholds and warning aggregation remain intact.
+        """
+        source = np.asarray(values, dtype=float)
+        if source.ndim != 2 or len(source) < 2:
+            return source.copy()
+        result = np.full_like(source, np.nan, dtype=float)
+        for column in range(source.shape[1]):
+            source_finite_rows = np.flatnonzero(np.isfinite(source[:, column]))
+            leading_blank = (
+                int(source_finite_rows[0])
+                if len(source_finite_rows)
+                else len(source)
+            )
+            previous = np.nan
+            for row in range(len(source)):
+                window = source[max(0, row - 2) : row + 1, column]
+                finite = window[np.isfinite(window)]
+                if not len(finite):
+                    continue
+                median = float(np.median(finite))
+                if math.isfinite(previous):
+                    value = 0.65 * median + 0.35 * previous
+                else:
+                    value = median
+                result[row, column] = value
+                previous = value
+            finite_rows = np.flatnonzero(np.isfinite(result[:, column]))
+            if len(finite_rows):
+                first = int(finite_rows[0])
+                # Preserve the intentional blank model-input context.  The
+                # smoothing routine may fill leading gaps for ordinary
+                # display data, but it must not invent predictions before the
+                # first forecast target exists.
+                result[:max(first, leading_blank), column] = np.nan
+                for row in range(first + 1, len(result)):
+                    if not np.isfinite(result[row, column]):
+                        result[row, column] = result[row - 1, column]
+        return result
+
+    def _replay_causal_prediction_matrix(
+        self,
+        *,
+        model_history_stream: np.ndarray,
+        target_indices: np.ndarray,
+        forecast_lead: int,
+        profile: dict,
+        sensor_columns: list[str],
+    ) -> np.ndarray:
+        """Recompute replay predictions at their causal forecast origins.
+
+        The archived dashboard prediction is a window-level target sequence and
+        is useful for reproducing the original benchmark.  It is not, however,
+        a prediction made at a selectable lead for every displayed point.  The
+        online model can predict a batch of causal origins, so replay mode uses
+        this helper when the realtime-prediction option is enabled.  A target at
+        index ``t`` is taken from the ``forecast_lead``-th output of the model
+        origin immediately before it, which makes changing the lead change the
+        historical alignment rather than only the future panel.
+        """
+        targets = np.asarray(target_indices, dtype=int)
+        output = np.full(
+            (len(targets), len(sensor_columns)), np.nan, dtype=float
+        )
+        if not len(targets):
+            return output
+        lead = int(np.clip(forecast_lead, 1, 24))
+        stream = np.asarray(model_history_stream, dtype=np.float32)
+        seq_len = int(profile.get("seq_len", 24))
+        if stream.ndim != 2 or stream.shape[1] != int(profile["enc_in"]):
+            return output
+        valid_targets: list[int] = []
+        histories: list[np.ndarray] = []
+        for position, target in enumerate(targets):
+            # The stream begins with one 24-point context block.  The target
+            # t is generated from the origin t-lead+1.
+            origin = int(target) - lead + 1
+            stream_end = seq_len + origin
+            if origin < 0 or stream_end < seq_len or stream_end > len(stream):
+                continue
+            history = stream[stream_end - seq_len : stream_end]
+            if history.shape == (seq_len, int(profile["enc_in"])) and np.isfinite(history).all():
+                valid_targets.append(position)
+                histories.append(history)
+        if not histories:
+            return output
+        batch = np.stack(histories, axis=0)
+        standardized, _ = self.online_predictor.predict_batch(batch, lead)
+        rows = standardized[:, lead - 1, :]
+        physical = self._prediction_to_sensor_matrix(
+            rows, profile, sensor_columns
+        )
+        output[np.asarray(valid_targets, dtype=int)] = physical
+        return output
 
     def _health_feature_arrays(
         self,
@@ -1618,16 +1965,17 @@ class DashboardData:
         if self.new_collection_health_engine is None:
             raise RuntimeError("新数据集健康指标模型尚未生成")
         artifact = self.new_collection_health_engine.artifact
+        health_sensor_count = len(NEW_HEALTH_SENSOR_COLUMNS)
         baseline = np.asarray(
             artifact["summary_center"], dtype=float
-        )[: len(NEW_COLLECTION_SENSOR_COLUMNS)]
+        )[:health_sensor_count]
         health_actual = np.broadcast_to(
-            baseline, (len(actual), len(NEW_COLLECTION_SENSOR_COLUMNS))
+            baseline, (len(actual), health_sensor_count)
         ).copy()
         health_prediction = health_actual.copy()
         for sensor_name in selected_outputs:
             source_index = sensor_columns.index(sensor_name)
-            target_index = NEW_COLLECTION_SENSOR_COLUMNS.index(sensor_name)
+            target_index = NEW_HEALTH_SENSOR_COLUMNS.index(sensor_name)
             if (
                 not np.isfinite(actual[:, source_index]).all()
                 or not np.isfinite(prediction[:, source_index]).all()
@@ -1691,7 +2039,12 @@ class DashboardData:
             )
         if not channels:
             raise ValueError("仅采集模式至少需要一个传感器通道")
-        current_layer = int(np.clip(config.get("layer", 0), 0, 4))
+        current_layer = max(0, int(config.get("layer", 0) or 0))
+        completed_file_layers = {
+            max(0, int(layer) - 1)
+            for layer in (status.get("completed_layers") or [])
+        }
+        live_layer_indices = sorted(completed_file_layers | {current_layer})
         layers = [
             {
                 "id": f"{config.get('specimen_id', 'LIVE')}_L{layer}",
@@ -1702,7 +2055,7 @@ class DashboardData:
                 "status": "active" if layer == current_layer else "waiting",
                 "aggregate": None,
             }
-            for layer in range(5)
+            for layer in live_layer_indices
         ]
         process = build_process_payload(
             str(config.get("dataset_schema", "legacy_original")),
@@ -1820,6 +2173,7 @@ class DashboardData:
         use_optimized_warning: bool = True,
         prediction_sensors: list[str] | None = None,
         processing_mode: str | None = None,
+        forecast_lead: int = 1,
     ) -> dict:
         """Real acquisition -> live model -> live HI features -> warning."""
         status = self.acquisition.status()
@@ -1838,6 +2192,7 @@ class DashboardData:
         threshold = float(np.clip(threshold, 0.0, 1.0))
         rho = float(np.clip(rho, 0.0, 1.0))
         prediction_horizon = int(np.clip(prediction_horizon, 1, 600))
+        forecast_lead = int(np.clip(forecast_lead, 1, 24))
         if config.get("processing_mode") == "capture_only":
             return self._capture_only_live(
                 status=status,
@@ -1868,6 +2223,24 @@ class DashboardData:
             and model_kind == "random_forest"
         )
         active_profile = self.online_predictor.profile
+        # A schema switch can arrive while an acquisition session is being
+        # reused.  Reload the registered checkpoint compatible with the active
+        # sensor set before constructing health features; otherwise an old
+        # in-memory profile is reported as a health-indicator mismatch.
+        active_sensor_names = set(active_sensor_columns)
+        if any(
+            str(name) not in active_sensor_names
+            and not (
+                new_schema
+                and str(name) in NEW_EXCLUDED_SENSOR_COLUMNS
+            )
+            for name in active_profile.get("input_sensors", [])
+        ):
+            compatible_profile = self.best_prediction_profile(
+                "new_collection_v11_3" if new_schema else "legacy_original"
+            )
+            self.online_predictor.configure(compatible_profile["checkpoint"])
+            active_profile = self.online_predictor.profile
         configured_prediction_sensors = (
             prediction_sensors
             if prediction_sensors is not None
@@ -1899,10 +2272,28 @@ class DashboardData:
             if name not in prediction_sensor_names
         ]
         if missing_health_outputs:
-            raise ValueError(
-                f"{indicator}健康指标缺少模型输出通道："
-                f"{missing_health_outputs}"
+            # A schema switch may leave the previous indicator/output checklist
+            # in the browser.  Select a compatible family instead of making
+            # every live refresh fail until the page is manually reloaded.
+            compatible_indicator = next(
+                (
+                    name
+                    for name in ("TC-HI", "C-HI", "T-HI", "RFHI", "PR-HI", "MPRF-HI")
+                    if name in indicator_output_catalog
+                    and set(indicator_output_catalog[name]).issubset(
+                        prediction_sensor_names
+                    )
+                ),
+                None,
             )
+            if compatible_indicator is None:
+                raise ValueError(
+                    f"{indicator}健康指标缺少模型输出通道："
+                    f"{missing_health_outputs}；当前可用输出："
+                    f"{sorted(prediction_sensor_names)}"
+                )
+            indicator = compatible_indicator
+            required_health_outputs = indicator_output_catalog[indicator]
         prediction_model_signature = (
             f"{active_profile['checkpoint']}|"
             f"{','.join(sorted(prediction_sensor_names))}"
@@ -1935,9 +2326,14 @@ class DashboardData:
                     continue
                 if math.isfinite(number):
                     sensors[row_index, column_index] = number
+        acquired_model_inputs = [
+            name
+            for name in active_profile["input_sensors"]
+            if name in active_sensor_columns
+        ]
         input_indices = [
             active_sensor_columns.index(name)
-            for name in active_profile["input_sensors"]
+            for name in acquired_model_inputs
         ]
         all_channels_ready = (
             len(rows) >= 24
@@ -1959,6 +2355,9 @@ class DashboardData:
             f"{status.get('started_at') or 0.0}"
         )
         completed: list[dict] = []
+        # Keep the native 24-point window prediction for warning scores.  The
+        # chart uses a separate target-aligned causal prediction series below.
+        warning_prediction = np.full_like(sensors, np.nan)
         historical_prediction = np.full_like(sensors, np.nan)
         if all_channels_ready and len(rows) >= 48:
             for target_start in range(24, len(rows) - 23, 24):
@@ -1977,7 +2376,7 @@ class DashboardData:
                     with self.live_cache_lock:
                         self.live_prediction_cache[cache_key] = prediction
                 actual_window = sensors[target_start : target_start + 24]
-                historical_prediction[
+                warning_prediction[
                     target_start : target_start + 24
                 ] = prediction
                 result_key = (session_key, candidate_index, target_start)
@@ -2083,7 +2482,7 @@ class DashboardData:
             # UI requests only 1 future point, this lets the next refresh align
             # every newly arrived observation with a prediction made before it
             # arrived instead of waiting for a complete 24-point target block.
-            inference_horizon = max(24, prediction_horizon)
+            inference_horizon = max(24, prediction_horizon, forecast_lead)
             forecast_key = (session_key, len(rows), inference_horizon)
             with self.live_cache_lock:
                 cached_forecast = self.live_forecast_cache.get(forecast_key)
@@ -2112,37 +2511,56 @@ class DashboardData:
             else:
                 rolling_forecast_prediction, forecast_mode = cached_forecast
 
-            # For each target sample, keep updating the forecast while that
-            # target is still in the future. Once the observation arrives it
-            # becomes immutable causal evidence and is back-filled into the
-            # historical prediction curve.
+            # The future curve is always the latest rolling forecast.  For the
+            # historical curve, freeze only the prediction made with the
+            # selected causal lead.  This prevents an old 24-step forecast
+            # from being mistaken for a current prediction after the UI
+            # horizon is changed.
             with self.live_cache_lock:
-                rolling_predictions = self.live_rolling_prediction_cache.setdefault(
+                latest_predictions = self.live_rolling_prediction_cache.setdefault(
                     session_key, {}
                 )
-                for offset, predicted_row in enumerate(
-                    rolling_forecast_prediction
-                ):
-                    rolling_predictions.setdefault(
-                        len(rows) + offset,
-                        np.asarray(predicted_row, dtype=float).copy(),
+                latest_predictions.clear()
+                latest_predictions.update(
+                    {
+                        len(rows) + offset: np.asarray(predicted_row, dtype=float).copy()
+                        for offset, predicted_row in enumerate(
+                            rolling_forecast_prediction
+                        )
+                    }
+                )
+                causal_predictions = self.live_causal_prediction_cache.setdefault(
+                    session_key, {}
+                )
+                max_causal_lead = min(24, len(rolling_forecast_prediction))
+                for lead in range(1, max_causal_lead + 1):
+                    target_index = len(rows) + lead - 1
+                    causal_predictions.setdefault(
+                        (target_index, lead),
+                        np.asarray(
+                            rolling_forecast_prediction[lead - 1],
+                            dtype=float,
+                        ).copy(),
                     )
-                for target_index, predicted_row in rolling_predictions.items():
-                    if 0 <= target_index < len(rows):
-                        historical_prediction[target_index] = predicted_row
                 oldest_required = max(0, len(rows) - 2400)
-                stale_targets = [
-                    target_index
-                    for target_index in rolling_predictions
-                    if target_index < oldest_required
+                stale_keys = [
+                    key for key in causal_predictions if key[0] < oldest_required
                 ]
-                for target_index in stale_targets:
-                    rolling_predictions.pop(target_index, None)
+                for key in stale_keys:
+                    causal_predictions.pop(key, None)
+
+                historical_prediction = np.full_like(sensors, np.nan)
+                for target_index in range(len(rows)):
+                    predicted_row = causal_predictions.get(
+                        (target_index, forecast_lead)
+                    )
+                    if predicted_row is not None:
+                        historical_prediction[target_index] = predicted_row
+
+                # Do not show stale values from a previous origin in the
+                # future region.  Every refresh uses the newest model output.
                 future_prediction = np.asarray(
-                    [
-                        rolling_predictions[len(rows) + offset]
-                        for offset in range(prediction_horizon)
-                    ],
+                    rolling_forecast_prediction[:prediction_horizon],
                     dtype=float,
                 )
 
@@ -2150,7 +2568,12 @@ class DashboardData:
             [item["score"] for item in completed], dtype=float
         )
         specimen_id = str(config.get("specimen_id", "LIVE_SPECIMEN"))
-        current_layer = int(config.get("layer", 0))
+        # Include specimen/process condition in the persistence namespace so
+        # a new independent specimen or changed parameters starts at layer 0
+        # and cannot inherit evidence from a previous condition.
+        live_scope_signature = self._live_scope_signature(config)
+        evidence_namespace = f"{prediction_model_signature}|{live_scope_signature}"
+        current_layer = max(0, int(config.get("layer", 0) or 0))
         layer_aggregate = None
         specimen_aggregate = None
         persist_layer_health = False
@@ -2212,7 +2635,7 @@ class DashboardData:
                 current_layer,
                 indicator,
                 model_kind,
-                prediction_model_signature,
+                evidence_namespace,
             )
             previous_layer = self.live_layer_health.get(layer_key)
             layer_complete = not bool(status.get("running"))
@@ -2244,17 +2667,19 @@ class DashboardData:
             if persist_layer_health and not causal_optimized:
                 self._save_live_layer_health()
 
-        stored_layers: dict[int, dict] = {}
-        for layer_index in range(5):
-            layer_key = self._live_layer_key(
-                specimen_id,
-                layer_index,
-                indicator,
-                model_kind,
-                prediction_model_signature,
-            )
-            if layer_key in self.live_layer_health:
-                stored_layers[layer_index] = self.live_layer_health[layer_key]
+        stored_layers = self._stored_live_layers(
+            specimen_id,
+            indicator,
+            model_kind,
+            evidence_namespace,
+        )
+        completed_file_layers = {
+            max(0, int(layer) - 1)
+            for layer in (status.get("completed_layers") or [])
+        }
+        live_layer_indices = sorted(
+            set(stored_layers) | completed_file_layers | {max(0, current_layer)}
+        )
         if stored_layers:
             layer_items = [stored_layers[index] for index in sorted(stored_layers)]
             layer_scores = np.asarray(
@@ -2281,17 +2706,22 @@ class DashboardData:
                 if specimen_health < specimen_threshold
                 else max(specimen_type_probs, key=specimen_type_probs.get)
             )
+            actual_layer_count = len(layer_items)
+            specimen_complete = bool(layer_items) and all(
+                bool(item.get("layer_complete", True)) for item in layer_items
+            )
             specimen_aggregate = {
                 "health": specimen_health,
                 "state": specimen_state,
                 "state_label": STATE_LABELS[specimen_state],
                 "type_probabilities": specimen_type_probs,
-                "evidence_layers": len(layer_items),
+                "evidence_layers": actual_layer_count,
+                "actual_layer_count": actual_layer_count,
                 "effective_layers": float(
                     1.0 / np.sum(specimen_weights**2)
                 ),
-                "complete": len(layer_items) == 5,
-                "aggregation": "CAP pooling across available physical layers",
+                "complete": specimen_complete,
+                "aggregation": "CAP pooling across all available physical layers",
             }
 
         latest = completed[-1] if completed else None
@@ -2416,7 +2846,7 @@ class DashboardData:
                     current_layer,
                     indicator,
                     model_kind,
-                    prediction_model_signature,
+                    evidence_namespace,
                 )
                 self.live_layer_health[current_key][
                     "optimized_aggregate"
@@ -2436,7 +2866,17 @@ class DashboardData:
             if len(observed_indices)
             else np.asarray([], dtype=float)
         )
-        future_time = np.arange(len(future_prediction), dtype=float) / sampling_hz
+        future_time = (
+            np.arange(len(future_prediction), dtype=float) + 1
+        ) / sampling_hz
+        # Smooth only the visual series.  The raw matrices were already used
+        # for the current window, layer and specimen health decisions.
+        historical_prediction = self._smooth_prediction_for_display(
+            historical_prediction
+        )
+        future_prediction = self._smooth_prediction_for_display(
+            future_prediction
+        )
         channels = []
         for index, source_sensor_name in enumerate(active_sensor_columns):
             if source_sensor_name in SENSOR_COLUMNS:
@@ -2506,16 +2946,22 @@ class DashboardData:
                         else None
                     ),
                     "prediction_current": (
-                        float(future_prediction[0, index])
-                        if prediction_enabled and len(future_prediction)
-                        else None
+                        float(prediction_values[-1])
+                        if prediction_enabled
+                        and len(prediction_values)
+                        and math.isfinite(prediction_values[-1])
+                        else (
+                            float(future_prediction[0, index])
+                            if prediction_enabled and len(future_prediction)
+                            else None
+                        )
                     ),
                     "rmse": rmse if prediction_enabled else None,
                 }
             )
 
         layers = []
-        for layer_index in range(5):
+        for layer_index in live_layer_indices:
             is_current = layer_index == current_layer
             stored = stored_layers.get(layer_index)
             current_layer_complete = bool(
@@ -2581,6 +3027,7 @@ class DashboardData:
                 "indicator": indicator,
                 "model": model_kind,
                 "prediction_horizon": prediction_horizon,
+                "forecast_lead": forecast_lead,
                 "realtime_prediction": True,
                 "prediction_sensors": sorted(prediction_sensor_names),
                 "prediction_model": active_profile["checkpoint"],
@@ -2623,8 +3070,10 @@ class DashboardData:
                 ),
                 "cap_rho": rho,
             },
-            "forecast": {
-                "requested_horizon": prediction_horizon,
+                "forecast": {
+                    "requested_horizon": prediction_horizon,
+                    "forecast_lead": forecast_lead,
+                    "lead_semantics": "历史曲线使用冻结的因果提前量；未来曲线每次刷新使用最新滚动预测",
                 "returned_horizon": len(future_prediction),
                 "native_horizon": 24,
                 "mode": forecast_mode,
@@ -2637,7 +3086,8 @@ class DashboardData:
                 "best_prediction_override": bool(
                     config.get("use_best_prediction_override", False)
                 ),
-                "display_consistency": "first_display_frozen_until_arrival",
+                "display_consistency": "latest_rolling_future_target_aligned_history",
+                "warning_prediction_alignment": "native_24_window_origin",
             },
             "progress": {
                 "cursor": len(rows),
@@ -2692,7 +3142,9 @@ class DashboardData:
                 "all_12_indicators_supported": True,
                 "completed_windows_reused": len(completed),
                 "incremental_cache": True,
-                "historical_prediction_mode": "causal_first_display_frozen",
+                "historical_prediction_mode": (
+                    f"target_aligned_causal_lead_{forecast_lead}"
+                ),
                 "health_indicator_output_sensors": required_health_outputs,
                 "selected_model_output_sensors": sorted(
                     prediction_sensor_names
@@ -2959,7 +3411,7 @@ class AppHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
-            self._send_json({"status": "ok", "version": "1.9.0"})
+            self._send_json({"status": "ok", "version": "1.11.0"})
             return
         if parsed.path == "/api/bootstrap":
             self._send_json(self.dashboard.bootstrap())
@@ -2982,6 +3434,9 @@ class AppHandler(BaseHTTPRequestHandler):
                     ),
                     prediction_horizon=int(
                         self._one(query, "prediction_horizon", "24")
+                    ),
+                    forecast_lead=int(
+                        self._one(query, "forecast_lead", "1")
                     ),
                     use_optimized_warning=self._one(
                         query, "use_optimized_warning", "true"
@@ -3049,6 +3504,9 @@ class AppHandler(BaseHTTPRequestHandler):
                     realtime_prediction=self._one(
                         query, "realtime_prediction", "false"
                     ).lower() in {"1", "true", "yes", "on"},
+                    forecast_lead=int(
+                        self._one(query, "forecast_lead", "1")
+                    ),
                     use_optimized_warning=self._one(
                         query, "use_optimized_warning", "true"
                     ).lower() in {"1", "true", "yes", "on"},
@@ -3080,6 +3538,17 @@ class AppHandler(BaseHTTPRequestHandler):
                 )
                 result = self.dashboard.acquisition.test_connection(config)
                 result["prediction_model"] = model_validation
+                self._send_json(result)
+                return
+            if parsed.path == "/api/mysql/test":
+                settings = mysql_settings_from_mapping(payload)
+                self._send_json(MySQLCaptureStore(settings).test_connection())
+                return
+            if parsed.path == "/api/mysql/relation-map":
+                settings = mysql_settings_from_mapping(payload)
+                result = MySQLCaptureStore(settings).relation_map(
+                    int(payload.get("limit", 1000))
+                )
                 self._send_json(result)
                 return
             if parsed.path == "/api/prediction-model/select-file":
