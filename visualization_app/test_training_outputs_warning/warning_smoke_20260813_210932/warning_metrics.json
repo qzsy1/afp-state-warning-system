@@ -1,0 +1,17 @@
+{
+  "selected_model": "random_forest",
+  "validation_balanced_accuracy": 0.8,
+  "all_models": {
+    "logistic": 0.7,
+    "svm_rbf": 0.7,
+    "random_forest": 0.8,
+    "extra_trees": 0.7
+  },
+  "feature_names": [
+    "mae",
+    "rmse",
+    "max_abs",
+    "bias",
+    "std"
+  ]
+}

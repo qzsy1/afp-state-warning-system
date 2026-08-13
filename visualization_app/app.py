@@ -129,6 +129,32 @@ def select_prediction_model_file(initial_path: str = "") -> str:
         root.destroy()
 
 
+def select_training_file(initial_path: str = "", kind: str = "csv") -> str:
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    initial = Path(initial_path).expanduser() if initial_path else Path.home()
+    filetypes = (
+        [("已整合训练CSV", "*.csv"), ("所有文件", "*.*")]
+        if kind == "csv"
+        else [("PyTorch模型", "*.pth *.pt"), ("所有文件", "*.*")]
+    )
+    try:
+        selected = filedialog.askopenfilename(
+            parent=root,
+            title="选择已整合训练CSV" if kind == "csv" else "选择用于继续训练的模型",
+            initialdir=str(initial.parent if initial.suffix else initial),
+            initialfile=initial.name if initial.suffix else "",
+            filetypes=filetypes,
+        )
+        return str(Path(selected).resolve()) if selected else ""
+    finally:
+        root.destroy()
+
+
 def _finite(value, default=0.0):
     try:
         number = float(value)
@@ -419,7 +445,7 @@ class DashboardData:
         self.live_layer_health_path = (
             self.acquisition.capture_root / "specimen_layer_health.json"
         )
-        self.web_training = WebTrainingManager(APP_DIR / "trained_models_web")
+        self.web_training = WebTrainingManager(Path(r"F:\AFP_Training_Models"))
         self.live_layer_health = self._load_live_layer_health()
 
         if len(self.windows) != len(self.actual) or len(self.index) != len(self.actual):
@@ -3416,7 +3442,12 @@ class AppHandler(BaseHTTPRequestHandler):
             self._send_json({"status": "ok", "version": "1.11.0"})
             return
         if parsed.path == "/api/training/status":
-            self._send_json(self.dashboard.web_training.status())
+            query = parse_qs(parsed.query)
+            self._send_json(self.dashboard.web_training.status(int(self._one(query, "after_seq", "0"))))
+            return
+        if parsed.path == "/api/training/defaults":
+            query = parse_qs(parsed.query)
+            self._send_json(self.dashboard.web_training.defaults(self._one(query, "mode", "new")))
             return
         if parsed.path == "/api/bootstrap":
             self._send_json(self.dashboard.bootstrap())
@@ -3546,26 +3577,20 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._send_json(result)
                 return
             if parsed.path == "/api/training/import":
-                if str(payload.get("source", "csv")).lower() == "mysql":
-                    self._send_json(self.dashboard.web_training.import_mysql(payload.get("mysql", {}), str(payload.get("query", ""))))
-                else:
-                    self._send_json(self.dashboard.web_training.import_data(str(payload.get("path", ""))))
+                self._send_json(self.dashboard.web_training.import_source(payload))
                 return
             if parsed.path == "/api/training/start":
-                self._send_json(self.dashboard.web_training.start(
-                    path=str(payload.get("path", "")) or None,
-                    mysql=payload.get("mysql") if payload.get("source") == "mysql" else None,
-                    query=str(payload.get("query", "")),
-                    epochs=int(payload.get("epochs", 1)),
-                    patience=int(payload.get("patience", 1)),
-                    batch_size=int(payload.get("batch_size", 32)),
-                    learning_rate=float(payload.get("learning_rate", 8e-4)),
-                    device=str(payload.get("device", "auto")),
-                    output_root=str(payload.get("output_root", "")) or None,
-                ))
+                self._send_json(self.dashboard.web_training.start(payload))
                 return
             if parsed.path == "/api/training/stop":
                 self._send_json(self.dashboard.web_training.stop())
+                return
+            if parsed.path == "/api/training/select-file":
+                selected = select_training_file(
+                    str(payload.get("initial_path", "")),
+                    str(payload.get("kind", "csv")),
+                )
+                self._send_json({"selected": bool(selected), "path": selected})
                 return
             if parsed.path == "/api/mysql/test":
                 settings = mysql_settings_from_mapping(payload)

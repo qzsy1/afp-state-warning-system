@@ -1,0 +1,21 @@
+{
+  "ok": true,
+  "rows": 3840,
+  "columns": 31,
+  "specimens": 8,
+  "conditions": 32,
+  "layers": 320,
+  "accepted_files": 320,
+  "missing_columns": [],
+  "nonfinite_values": 0,
+  "short_layers": 0,
+  "minimum_points_per_layer": 48,
+  "state_counts": {
+    "0": 15360,
+    "1": 15360
+  },
+  "warning_ready": true,
+  "dropped_short_layers": 0,
+  "warnings": [],
+  "source": "F:\\AFP_Training_Simulated_CSV"
+}

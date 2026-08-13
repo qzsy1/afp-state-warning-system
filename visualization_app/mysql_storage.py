@@ -30,6 +30,39 @@ def validate_database_name(value: str) -> str:
     return name
 
 
+def _number_token(value: Any) -> str:
+    """Stable, readable numeric token used by condition/specimen identities."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "NA"
+    if not (number == number and abs(number) != float("inf")):
+        return "NA"
+    return f"{number:.12g}".replace("-", "m").replace(".", "d")
+
+
+def process_condition_key(config: Any) -> str:
+    """Return a process-parameter identity shared by conditions and specimens."""
+    schema = str(getattr(config, "dataset_schema", "legacy_original"))
+    if schema == "new_collection_v11_3":
+        parts = (
+            ("F", getattr(config, "initial_compaction_force_N", None)),
+            ("V", getattr(config, "placement_speed_mm_s", None)),
+            ("A", getattr(config, "pid_angle_deg", None)),
+            ("T", getattr(config, "temperature_setpoint_C", None)),
+        )
+    else:
+        parts = (
+            ("p", getattr(config, "p", None)),
+            ("v", getattr(config, "v", None)),
+            ("pr", getattr(config, "pr", None)),
+        )
+    parameter_token = "_".join(
+        f"{name}{_number_token(value)}" for name, value in parts
+    )
+    return f"{schema}|{parameter_token}"[:160]
+
+
 @dataclass(frozen=True)
 class MySQLSettings:
     enabled: bool = False
@@ -500,14 +533,12 @@ class MySQLCaptureStore:
 
     @staticmethod
     def specimen_key(config: Any) -> str:
-        parameter_token = getattr(config, "condition_id", "LIVE")
+        condition_key = process_condition_key(config)
         return "|".join(
             [
-                str(getattr(config, "dataset_schema", "legacy_original")),
+                condition_key,
                 str(getattr(config, "specimen_id", "LIVE_SPECIMEN")),
-                str(getattr(config, "condition_id", "LIVE")),
-                str(getattr(config, "replicate", 1)),
-                str(parameter_token),
+                f"R{int(getattr(config, 'replicate', 1))}",
             ]
         )[:320]
 
@@ -545,7 +576,7 @@ class MySQLCaptureStore:
                 )
             }
             cursor = self._cursor(connection)
-            condition_id = str(getattr(config, "condition_id", "LIVE"))
+            condition_id = process_condition_key(config)
             schema_id = str(getattr(config, "dataset_schema", "legacy_original"))
             cursor.execute(
                 """
@@ -583,7 +614,7 @@ class MySQLCaptureStore:
                 (
                     specimen_key,
                     str(getattr(config, "specimen_id", "LIVE_SPECIMEN")),
-                    str(getattr(config, "condition_id", "LIVE")),
+                    condition_id,
                     int(getattr(config, "replicate", 1)),
                     str(getattr(config, "dataset_schema", "legacy_original")),
                     str(getattr(config, "run_id", "LIVE_RUN")),
@@ -661,6 +692,14 @@ class MySQLCaptureStore:
                 # Keep the historical table for compatibility and maintain a
                 # clearly named all-data table for downstream analysis.
                 for target in ("afp_sensor_sample", "afp_sample_all"):
+                    # A repeated save of the same physical layer replaces the
+                    # complete point sequence.  Without this delete, a shorter
+                    # retry would leave stale high-index rows from the earlier
+                    # capture in MySQL.
+                    cursor.execute(
+                        f"DELETE FROM {target} WHERE specimen_key=%s AND layer_no=%s",
+                        (specimen_key, layer_no),
+                    )
                     cursor.executemany(
                         sample_sql.replace("afp_sensor_sample", target),
                         sample_values,
