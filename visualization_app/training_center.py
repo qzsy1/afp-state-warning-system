@@ -119,8 +119,12 @@ class TrainingCenter:
     def _run_training(self, dataset_root: Path, epochs: int, patience: int, batch_size: int, learning_rate: float, device: str) -> None:
         started = time.time()
         try:
-            if TRAINING_CORE_DIR.exists() and str(TRAINING_CORE_DIR) not in sys.path:
-                sys.path.insert(0, str(TRAINING_CORE_DIR))
+            # The packaged training core keeps the prediction runner at its
+            # root and the health-model runner in ``core``.  Add both paths so
+            # the same workflow works from source and from the frozen EXE.
+            for _training_path in (TRAINING_CORE_DIR, TRAINING_CORE_DIR / "core"):
+                if _training_path.exists() and str(_training_path) not in sys.path:
+                    sys.path.insert(0, str(_training_path))
             if str(APP_DIR) not in sys.path:
                 sys.path.insert(0, str(APP_DIR))
             self._emit("training_started", dataset_root=dataset_root, epochs=epochs, patience=patience)
