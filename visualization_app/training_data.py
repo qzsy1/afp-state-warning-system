@@ -28,6 +28,12 @@ CANONICAL_ALIASES: dict[str, tuple[str, ...]] = {
     "abnormal_type": ("abnormal_type", "异常类型", "故障类型", "状态类型"),
 }
 
+# These channels remain in the legacy model tensor for compatibility, but the
+# current collection plan does not acquire them.  A MySQL query may therefore
+# omit them; they are deterministically filled with zero rather than reported
+# as a mysterious missing training field.
+OPTIONAL_ZERO_CHANNELS = ("转速", "位移", "振动")
+
 
 @dataclass
 class ImportResult:
@@ -35,6 +41,35 @@ class ImportResult:
     source_description: str
     source_files: list[str]
     warnings: list[str]
+
+
+def _expand_json_fields(frame: pd.DataFrame) -> pd.DataFrame:
+    """Expand the JSON columns used by the acquisition MySQL schema.
+
+    The training center also accepts an already flattened SQL result.  When a
+    user selects ``afp_flat_all`` directly, however, the sensor and process
+    values are stored in ``sensor_json``/``process_json``.  Expanding them at
+    the import boundary makes both query styles equivalent.
+    """
+    out = frame.copy()
+    for source in ("sensor_json", "process_json"):
+        if source not in out.columns:
+            continue
+        values: list[dict[str, Any]] = []
+        for value in out[source]:
+            if isinstance(value, dict):
+                values.append(value)
+                continue
+            try:
+                decoded = json.loads(value) if isinstance(value, str) else {}
+            except Exception:
+                decoded = {}
+            values.append(decoded if isinstance(decoded, dict) else {})
+        expanded = pd.DataFrame(values, index=out.index)
+        for column in expanded.columns:
+            if column not in out.columns:
+                out[column] = expanded[column]
+    return out
 
 
 def _read_table(path: Path) -> pd.DataFrame:
@@ -96,6 +131,7 @@ def read_mysql(connection: dict[str, Any], query: str) -> ImportResult:
         frame = pd.read_sql(query, conn)
     finally:
         conn.close()
+    frame = _expand_json_fields(frame)
     frame["__source_query__"] = query
     return ImportResult(frame, f"MySQL：{config['host']}:{config['port']}/{config['database']}", [query], [])
 
@@ -160,6 +196,9 @@ def normalize_frame(frame: pd.DataFrame, mapping: dict[str, str]) -> pd.DataFram
         if canonical not in out.columns:
             match = next((col for col in out.columns if str(col).lower() in {name.lower() for name in names}), None)
             out[canonical] = pd.to_numeric(out[match], errors="coerce") if match else 0.0
+    for column in OPTIONAL_ZERO_CHANNELS:
+        if column not in out.columns:
+            out[column] = 0.0
     return out
 
 
@@ -173,13 +212,23 @@ def validate_frame(frame: pd.DataFrame, sensor_columns: list[str], process_colum
     specimens = frame["specimen_id"].nunique() if "specimen_id" in frame else 0
     layers = frame[["specimen_id", "layer_id"]].drop_duplicates().shape[0] if {"specimen_id", "layer_id"}.issubset(frame.columns) else 0
     leakage = frame.groupby("specimen_id")["condition_id"].nunique().gt(1).sum() if {"specimen_id", "condition_id"}.issubset(frame.columns) else 0
+    layer_sizes = (
+        frame.groupby(["specimen_id", "layer_id"], dropna=False).size()
+        if {"specimen_id", "layer_id"}.issubset(frame.columns)
+        else pd.Series(dtype=int)
+    )
+    short_layers = int((layer_sizes < 48).sum())
+    state_counts = frame["state_label"].value_counts().sort_index().astype(int).to_dict() if "state_label" in frame else {}
     return {
         "rows": int(len(frame)), "columns": int(len(frame.columns)), "specimens": int(specimens),
         "layers": int(layers), "missing_required": missing, "missing_rates": missing_rates,
         "nonfinite_values": nonfinite, "specimen_condition_conflicts": int(leakage),
-        "states": frame["state_label"].value_counts().sort_index().astype(int).to_dict() if "state_label" in frame else {},
+        "states": state_counts,
+        "short_layers": short_layers,
+        "minimum_points_per_layer": 48,
+        "has_normal_and_abnormal": bool(0 in state_counts and any(int(k) != 0 for k in state_counts)),
         "conditions": int(frame["condition_id"].nunique()) if "condition_id" in frame else 0,
-        "ok": not missing and nonfinite == 0 and leakage == 0 and specimens >= 2,
+        "ok": not missing and nonfinite == 0 and leakage == 0 and specimens >= 2 and short_layers == 0 and bool(0 in state_counts and any(int(k) != 0 for k in state_counts)),
     }
 
 
