@@ -209,3 +209,21 @@ MySQL为可选的事务同步层，不替代本地CSV/JSON原始档案。每次�
 - 串口/TCP驱动已经实现，但具体采集卡或PLC若不输出上述JSON协议，需要增加设备厂商SDK适配器。
 - 真实采集中的异常状态是模型对工艺/响应异常的判断；是否形成真实AFP缺陷仍需C扫、力学或其他独立检测证据确认。
 - 1–24点预测是模型直接预测；更远步长是递归预测，距离越远误差累积风险越高。
+# 原生训练中心
+
+`training_center.py` 提供不依赖浏览器和 Flask 的训练链路：
+
+1. `read_excel_or_folder()` 读取 Excel、CSV 文件或文件夹；`read_mysql()` 读取 MySQL 查询结果。
+2. `guess_mapping()` 与 `normalize_frame()` 统一工况、试样、铺层、状态和传感器字段。
+3. `validate_frame()` 检查缺失值、非有限值、试样—工况冲突和样本数量。
+4. `write_manifest_dataset()` 生成试样隔离的 manifest 和分层数据文件。
+5. `TrainingCenter.start_training()` 调用现有 I-ModernTCN 训练入口，再调用完整的 12 指标×4 分类器健康预警训练。
+6. `trained_models/<时间戳>/` 保存 checkpoint、元数据、预警 artifact、阈值、数据划分和来源快照。
+
+命令行预检示例：
+
+```powershell
+python training_center_cli.py --demo --prepare-only --output trained_models
+```
+
+该模块可直接接入原生 PySide6 界面；训练过程通过回调返回 `data_imported`、`data_validated`、`split_ready`、`prediction_training_finished` 和 `training_finished` 事件。

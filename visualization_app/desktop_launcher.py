@@ -74,6 +74,12 @@ class DesktopLauncher:
             command=self.open_capture_folder,
             width=30,
         ).pack(pady=5)
+        Button(
+            self.root,
+            text="打开模型训练中心",
+            command=self.open_training_center,
+            width=30,
+        ).pack(pady=5)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         threading.Thread(target=self.start_server, daemon=True).start()
 
@@ -154,6 +160,14 @@ class DesktopLauncher:
         path = APP_DIR / "captured_data"
         path.mkdir(parents=True, exist_ok=True)
         os.startfile(path)
+
+    def open_training_center(self) -> None:
+        try:
+            from training_center_ui import open_training_center
+
+            open_training_center(self.root)
+        except Exception as exc:
+            messagebox.showerror("训练中心打开失败", str(exc))
 
     def close(self) -> None:
         if self.process is not None and self.process.poll() is None:
