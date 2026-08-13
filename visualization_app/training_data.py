@@ -190,20 +190,21 @@ def write_manifest_dataset(frame: pd.DataFrame, output: str | Path, sensor_colum
     data_dir = root / "layers"
     data_dir.mkdir(parents=True, exist_ok=True)
     work = frame.sort_values(["specimen_id", "layer_id", "timestamp"], kind="stable")
-    specimens = sorted(work["specimen_id"].unique())
-    train_n = max(1, int(round(len(specimens) * 0.6)))
-    val_n = max(1, int(round(len(specimens) * 0.2))) if len(specimens) >= 4 else 1
-    test_n = max(1, len(specimens) - train_n - val_n)
-    interpolation_n = max(1, test_n // 2)
-    split_map = {
-        sid: (
-            "train" if i < train_n
-            else "validation" if i < train_n + val_n
-            else "test_interpolation" if i < train_n + val_n + interpolation_n
-            else "test_extrapolation"
-        )
-        for i, sid in enumerate(specimens)
-    }
+    specimen_state = work.groupby("specimen_id", sort=True)["state_label"].first()
+    split_map: dict[str, str] = {}
+    for state, state_series in specimen_state.groupby(specimen_state):
+        specimens = list(state_series.index)
+        train_n = max(1, int(round(len(specimens) * 0.6)))
+        val_n = max(1, int(round(len(specimens) * 0.2))) if len(specimens) >= 4 else 1
+        test_n = max(0, len(specimens) - train_n - val_n)
+        interpolation_n = (test_n + 1) // 2
+        for i, sid in enumerate(specimens):
+            split_map[str(sid)] = (
+                "train" if i < train_n
+                else "validation" if i < train_n + val_n
+                else "test_interpolation" if i < train_n + val_n + interpolation_n
+                else "test_extrapolation"
+            )
     records: list[dict[str, Any]] = []
     for (specimen, layer), group in work.groupby(["specimen_id", "layer_id"], sort=False):
         rel = Path("layers") / f"{specimen}_layer_{layer}.csv"

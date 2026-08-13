@@ -297,7 +297,11 @@ def main() -> None:
                 "validation_window_balanced_accuracy": window_ba,
                 "validation_layer_balanced_accuracy": layer_ba,
                 "validation_specimen_balanced_accuracy": specimen_ba,
-                "validation_auc": roc_auc_score(labels[validation], validation_scores),
+                "validation_auc": (
+                    roc_auc_score(labels[validation], validation_scores)
+                    if np.unique(labels[validation]).size == 2
+                    else float("nan")
+                ),
                 "window_threshold": window_threshold,
                 "layer_threshold": layer_threshold,
                 "specimen_threshold": specimen_threshold,
