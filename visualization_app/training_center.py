@@ -143,6 +143,12 @@ class TrainingCenter:
             self._emit("training_failed", error=str(exc))
 
     def _fit_health_models(self, dataset_root: Path, checkpoint: Path) -> dict[str, Any]:
+        labels = pd.read_csv(dataset_root / "manifest.csv", encoding="utf-8-sig")["state_label"]
+        if labels.nunique() < 2:
+            raise ValueError(
+                "预测模型可以使用单一状态数据训练，但健康指标预警模型至少需要正常和异常两类试样；"
+                "请在 MySQL 查询中加入 state_label=1 的异常试样，并填写 abnormal_type。"
+            )
         import fit_new_collection_health as health
         health.DATA_ROOT = dataset_root
         health.MODEL_DIR = dataset_root / "models"

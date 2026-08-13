@@ -22,7 +22,7 @@ CANONICAL_ALIASES: dict[str, tuple[str, ...]] = {
     "timestamp": ("timestamp", "time", "时间", "时刻", "采样时间"),
     "specimen_id": ("specimen_id", "specimen", "试样", "试件", "样件", "sample_id"),
     "layer_id": ("layer_id", "layer", "铺层", "层数", "铺层号", "layer_no"),
-    "repeat_id": ("repeat_id", "repeat", "重复", "独立重复", "重复次数"),
+    "repeat_id": ("repeat_id", "replicate_no", "replicate", "repeat", "重复", "独立重复", "重复次数"),
     "condition_id": ("condition_id", "condition", "工况", "工艺参数组合", "工况编号"),
     "state_label": ("state_label", "state", "状态", "健康状态", "label"),
     "abnormal_type": ("abnormal_type", "异常类型", "故障类型", "状态类型"),
@@ -166,6 +166,7 @@ def _from_filename(path: str) -> dict[str, str]:
 
 def normalize_frame(frame: pd.DataFrame, mapping: dict[str, str]) -> pd.DataFrame:
     out = frame.copy()
+    out = _expand_json_fields(out)
     for canonical, source in mapping.items():
         if source and source in out.columns:
             out[canonical] = out[source]
@@ -174,6 +175,16 @@ def normalize_frame(frame: pd.DataFrame, mapping: dict[str, str]) -> pd.DataFram
     for name in ("specimen_id", "layer_id", "repeat_id", "condition_id"):
         if name not in out.columns:
             out[name] = inferred.map(lambda x, key=name: x[key]) if inferred is not None else "unknown"
+    # Rows read directly from afp_sensor_sample carry a stable specimen_key.
+    # Preserve it as the specimen identity when the joined view was not used.
+    if "specimen_id" in out.columns and out["specimen_id"].eq("unknown").all() and "specimen_key" in out.columns:
+        out["specimen_id"] = out["specimen_key"].astype(str)
+    if "condition_id" in out.columns and out["condition_id"].eq("unknown").all() and "schema_id" in out.columns:
+        out["condition_id"] = out["schema_id"].astype(str)
+    if "layer_id" in out.columns and out["layer_id"].eq("unknown").all() and "layer_no" in out.columns:
+        out["layer_id"] = out["layer_no"].astype(str)
+    if "repeat_id" in out.columns and out["repeat_id"].eq("unknown").all() and "replicate_no" in out.columns:
+        out["repeat_id"] = out["replicate_no"].astype(str)
     if "state_label" not in out.columns:
         out["state_label"] = 0
     if "abnormal_type" not in out.columns:
@@ -226,9 +237,12 @@ def validate_frame(frame: pd.DataFrame, sensor_columns: list[str], process_colum
         "states": state_counts,
         "short_layers": short_layers,
         "minimum_points_per_layer": 48,
-        "has_normal_and_abnormal": bool(0 in state_counts and any(int(k) != 0 for k in state_counts)),
+        "warning_training_ready": bool(0 in state_counts and any(int(k) != 0 for k in state_counts)),
         "conditions": int(frame["condition_id"].nunique()) if "condition_id" in frame else 0,
-        "ok": not missing and nonfinite == 0 and leakage == 0 and specimens >= 2 and short_layers == 0 and bool(0 in state_counts and any(int(k) != 0 for k in state_counts)),
+        # A normal-only capture is valid for training the forecasting model.
+        # The warning classifiers are marked separately as not ready until
+        # abnormal specimens with labels are imported as well.
+        "ok": not missing and nonfinite == 0 and leakage == 0 and specimens >= 2 and short_layers == 0,
     }
 
 
