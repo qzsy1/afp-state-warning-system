@@ -85,7 +85,7 @@ def _read_table(path: Path) -> pd.DataFrame:
             return pd.DataFrame()
         return pd.concat(frames, ignore_index=True)
     errors: list[str] = []
-    for encoding in ("utf-8-sig", "gb18030", "utf-8"):
+    for encoding in ("utf-8-sig", "gb18030", "utf-8", "cp1252"):
         try:
             return pd.read_csv(path, encoding=encoding)
         except Exception as exc:
@@ -99,6 +99,9 @@ def read_excel_or_folder(path: str | Path) -> ImportResult:
         p for p in root.rglob("*")
         if p.suffix.lower() in {".csv", ".xlsx", ".xls", ".xlsm"}
         and p.name.lower() not in {"manifest.csv", "import_summary.csv"}
+        and "采集记录" not in p.parts
+        and "时间戳" not in p.name
+        and "完整试样" not in p.name
     )
     if not files:
         raise FileNotFoundError(f"没有找到 Excel/CSV 文件：{root}")
@@ -169,6 +172,16 @@ def _from_filename(path: str) -> dict[str, str]:
 def normalize_frame(frame: pd.DataFrame, mapping: dict[str, str]) -> pd.DataFrame:
     out = frame.copy()
     out = _expand_json_fields(out)
+    # Native acquisition files use the exact new-collection columns, while
+    # legacy capture files use the original sensor names.  Translate the
+    # legacy names here so a saved layer can be trained without reformatting.
+    legacy_aliases = {
+        "温度": "温度1", "线速度": "v", "initial_compaction_force_N": "pr",
+        "placement_speed_mm_s": "v", "pid_angle_deg": "angle", "temperature_setpoint_C": "temperature_setpoint",
+    }
+    for target, source in legacy_aliases.items():
+        if target not in out.columns and source in out.columns:
+            out[target] = out[source]
     for canonical, source in mapping.items():
         if source and source in out.columns:
             out[canonical] = out[source]
@@ -177,6 +190,18 @@ def normalize_frame(frame: pd.DataFrame, mapping: dict[str, str]) -> pd.DataFram
     for name in ("specimen_id", "layer_id", "repeat_id", "condition_id"):
         if name not in out.columns:
             out[name] = inferred.map(lambda x, key=name: x[key]) if inferred is not None else "unknown"
+    # Infer the same identifiers from native acquisition columns/filenames.
+    if "specimen_id" in out.columns and out["specimen_id"].eq("unknown").all():
+        for candidate in ("试件", "specimen", "specimen_id"):
+            if candidate in out.columns:
+                out["specimen_id"] = out[candidate].astype(str)
+                break
+    if "condition_id" in out.columns and out["condition_id"].eq("unknown").all() and "root" in out.columns:
+        out["condition_id"] = out["root"].astype(str)
+    if "layer_id" in out.columns and out["layer_id"].eq("unknown").all() and "l" in out.columns:
+        out["layer_id"] = (pd.to_numeric(out["l"], errors="coerce").fillna(0) + 1).astype(int).astype(str)
+    if "repeat_id" in out.columns and out["repeat_id"].eq("unknown").all() and "cycle" in out.columns:
+        out["repeat_id"] = out["cycle"].astype(str)
     # Rows read directly from afp_sensor_sample carry a stable specimen_key.
     # Preserve it as the specimen identity when the joined view was not used.
     if "specimen_id" in out.columns and out["specimen_id"].eq("unknown").all() and "specimen_key" in out.columns:
@@ -192,7 +217,10 @@ def normalize_frame(frame: pd.DataFrame, mapping: dict[str, str]) -> pd.DataFram
     if "abnormal_type" not in out.columns:
         out["abnormal_type"] = np.where(pd.to_numeric(out["state_label"], errors="coerce").fillna(0).eq(0), "normal", "unknown")
     if "timestamp" not in out.columns:
-        out["timestamp"] = np.arange(len(out), dtype=float)
+        if "时间" in out.columns:
+            out["timestamp"] = out["时间"]
+        else:
+            out["timestamp"] = np.arange(len(out), dtype=float)
     for name in ("specimen_id", "layer_id", "repeat_id", "condition_id", "abnormal_type"):
         out[name] = out[name].astype(str)
     out["state_label"] = pd.to_numeric(out["state_label"], errors="coerce").fillna(0).astype(int)

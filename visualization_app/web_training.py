@@ -32,11 +32,22 @@ class WebTrainingManager:
             self._events.append({"event": "web_data_imported", **result})
         return result
 
-    def start(self, path: str | None = None, epochs: int = 1, patience: int = 1,
+    def import_mysql(self, connection: dict[str, Any], query: str) -> dict[str, Any]:
+        result = self.center.import_mysql(connection, query)
+        with self._lock:
+            self.source_path = result.get("source", "MySQL")
+            self.last_import = result
+            self._events.append({"event": "web_mysql_imported", **result})
+        return result
+
+    def start(self, path: str | None = None, mysql: dict[str, Any] | None = None,
+              query: str = "", epochs: int = 1, patience: int = 1,
               batch_size: int = 32, learning_rate: float = 8e-4,
               device: str = "auto") -> dict[str, Any]:
         if path:
             self.import_data(path)
+        if mysql is not None:
+            self.import_mysql(mysql, query)
         if self.center.last_frame is None:
             raise ValueError("请先选择 CSV 文件夹并点击导入预检")
         dataset = self.center.prepare_dataset(self.output_root / "dataset")

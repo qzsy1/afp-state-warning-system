@@ -3546,11 +3546,16 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._send_json(result)
                 return
             if parsed.path == "/api/training/import":
-                self._send_json(self.dashboard.web_training.import_data(str(payload.get("path", ""))))
+                if str(payload.get("source", "csv")).lower() == "mysql":
+                    self._send_json(self.dashboard.web_training.import_mysql(payload.get("mysql", {}), str(payload.get("query", ""))))
+                else:
+                    self._send_json(self.dashboard.web_training.import_data(str(payload.get("path", ""))))
                 return
             if parsed.path == "/api/training/start":
                 self._send_json(self.dashboard.web_training.start(
                     path=str(payload.get("path", "")) or None,
+                    mysql=payload.get("mysql") if payload.get("source") == "mysql" else None,
+                    query=str(payload.get("query", "")),
                     epochs=int(payload.get("epochs", 1)),
                     patience=int(payload.get("patience", 1)),
                     batch_size=int(payload.get("batch_size", 32)),
