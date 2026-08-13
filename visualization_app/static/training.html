@@ -1,15 +1,65 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>AFP 模型训练中心</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AFP 模型训练工作台</title>
   <style>
-    body{margin:0;background:#f3f7fb;color:#17324d;font:15px "Microsoft YaHei",sans-serif}.wrap{max-width:1180px;margin:28px auto;padding:0 20px}.card{background:#fff;border:1px solid #d9e5ef;border-radius:12px;padding:20px;margin:14px 0;box-shadow:0 4px 16px #163d5d12}h1{margin:0 0 4px}.muted{color:#6e8395}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}label{display:flex;flex-direction:column;gap:5px;font-weight:600}input,select,button{font:inherit;padding:9px;border:1px solid #b9cad8;border-radius:6px}button{background:#166eaa;color:#fff;border:0;cursor:pointer;font-weight:600}button.secondary{background:#eef5fa;color:#166eaa;border:1px solid #a9c6dc}.row{display:flex;gap:10px;align-items:end}.path{flex:1}.status{padding:12px;background:#eef7fc;border-left:4px solid #1e82b7;white-space:pre-wrap}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.metric{background:#f7fafc;padding:12px;border-radius:8px}.log{height:260px;overflow:auto;background:#102536;color:#d9f1ff;padding:12px;border-radius:8px;font:12px Consolas,monospace}.ok{color:#16834b}.bad{color:#b32727}@media(max-width:800px){.grid,.metrics{grid-template-columns:1fr 1fr}}
+    :root{--navy:#123b63;--blue:#1677b8;--cyan:#22a7c7;--bg:#f2f6fa;--line:#d7e2ec;--muted:#657b8d;--good:#148458;--bad:#bf3b3b;--warn:#b26c13}
+    *{box-sizing:border-box}html,body{max-width:100%;overflow-x:hidden}body{margin:0;background:var(--bg);color:#18334a;font:14px "Microsoft YaHei","Segoe UI",sans-serif}.shell{width:100%;max-width:1280px;margin:auto;padding:18px}.hero{background:linear-gradient(120deg,#10385f,#176da4);color:white;padding:20px 24px;border-radius:14px;display:flex;align-items:center;justify-content:space-between;gap:20px}.hero h1{margin:0 0 7px;font-size:26px}.hero p{margin:0;color:#d9ecf8}.hero a{color:white;border:1px solid #ffffff88;border-radius:8px;padding:9px 14px;text-decoration:none;white-space:nowrap}.steps{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:15px 0}.step{min-width:0;background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px}.step b{display:inline-grid;place-items:center;width:25px;height:25px;border-radius:50%;background:#e1f1fa;color:var(--blue);margin-right:8px}.layout{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,.95fr);gap:15px}.layout>div,.card,.grid>*,label,.line,.line .grow{min-width:0}.card{max-width:100%;overflow:hidden;background:#fff;border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:15px;box-shadow:0 3px 12px #173c5c0d}.card h2{font-size:18px;margin:0 0 14px;color:var(--navy)}.card h3{font-size:15px;margin:16px 0 9px}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.grid.four{grid-template-columns:repeat(4,minmax(0,1fr))}.span2{grid-column:span 2}.span3{grid-column:span 3}label{display:flex;flex-direction:column;gap:5px;font-weight:600;color:#294861}input,select,textarea,button{max-width:100%;font:inherit;border:1px solid #b9cbd9;border-radius:7px;padding:9px 10px;background:white;color:#17324b}input,select,textarea{width:100%}textarea{resize:vertical;min-height:58px}input:disabled,textarea:disabled{background:#edf2f6;color:#6b7f8f}button{border:0;background:var(--blue);color:white;cursor:pointer;font-weight:700}button:hover{filter:brightness(.96)}button.secondary{background:#eef6fb;color:var(--blue);border:1px solid #a9c8dd}button.danger{background:#c54141}.line{display:flex;align-items:end;gap:8px;max-width:100%}.line .grow{flex:1}.help{overflow-wrap:anywhere;color:var(--muted);font-size:12px;line-height:1.7;margin-top:7px}.source-panel{max-width:100%;margin-top:10px;padding:12px;background:#f7fafc;border:1px solid #e1e9ef;border-radius:8px}.status{max-width:100%;overflow-wrap:anywhere;word-break:break-word;white-space:pre-wrap;line-height:1.65;background:#eef7fc;border-left:4px solid var(--blue);padding:11px 12px;margin-top:11px;border-radius:3px}.status.ok{border-color:var(--good);background:#eff9f4}.status.bad{border-color:var(--bad);background:#fff2f2}.status.warn{border-color:var(--warn);background:#fff8ed}.actions{display:flex;gap:10px;margin-top:14px}.actions button{min-height:42px;flex:1}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px}.metric{min-width:0;background:#f5f8fb;border:1px solid #e2e9ef;border-radius:8px;padding:10px}.metric span{display:block;color:var(--muted);font-size:12px}.metric b{display:block;margin-top:5px;font-size:17px;color:var(--navy);word-break:break-all}.bar-label{display:flex;justify-content:space-between;margin:12px 0 5px;font-weight:600}.bar{height:12px;border-radius:10px;background:#e5edf3;overflow:hidden}.bar>i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--blue),var(--cyan));transition:width .25s}.bar.patience>i{background:linear-gradient(90deg,#e3aa36,#d96341)}canvas{display:block;max-width:100%;width:100%;height:280px;border:1px solid #e1e8ee;border-radius:8px;background:#fff}.preview{display:block;width:100%;max-width:100%;min-width:0;overflow-x:auto;overflow-y:auto;max-height:235px;border:1px solid var(--line);border-radius:8px}.preview table{border-collapse:collapse;width:max-content;min-width:100%;font-size:12px}.preview th,.preview td{max-width:240px;overflow:hidden;text-overflow:ellipsis;padding:7px 9px;border-bottom:1px solid #e5edf3;white-space:nowrap}.preview th{position:sticky;top:0;background:#153f65;color:white}.log{max-width:100%;height:210px;overflow:auto;overflow-wrap:anywhere;background:#10283b;color:#d7edfa;border-radius:8px;padding:11px;font:12px Consolas,monospace;white-space:pre-wrap}.output{max-width:100%;overflow-wrap:anywhere;font-size:12px;word-break:break-all;background:#f6f9fb;border-radius:7px;padding:10px;min-height:42px}.hidden{display:none!important}@media(max-width:1000px){.layout{grid-template-columns:1fr}.grid.four{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:720px){.shell{padding:10px}.steps,.grid,.grid.four,.metrics{grid-template-columns:1fr 1fr}.span2,.span3{grid-column:span 2}}
   </style>
 </head>
-<body><div class="wrap">
-  <div class="card"><h1>AFP 模型训练中心</h1><div class="muted">导入模拟 CSV 或真实采集数据，训练 I-ModernTCN 预测模型和健康指标预警模型</div></div>
-  <div class="card"><h2>1. 选择训练数据</h2><div class="row"><label>来源<select id="source"><option value="csv">采集 CSV 文件夹</option><option value="mysql">MySQL 数据库</option></select></label><label class="path" id="pathBox">CSV 文件夹或文件<input id="path" placeholder="例如 F:\\AFP_Capture\\试样目录"></label><button class="secondary" id="pick">选择文件夹</button><button id="import">导入并预检</button></div><div id="mysqlBox" style="display:none;margin-top:12px"><div class="grid"><label>主机<input id="host" value="127.0.0.1"></label><label>端口<input id="port" value="3306"></label><label>用户名<input id="user" value="root"></label><label>密码<input id="password" type="password"></label><label>数据库<input id="database" value="afp_state_warning"></label></div><label style="margin-top:10px">SQL 查询<textarea id="query" rows="3" style="font:inherit;padding:8px">SELECT * FROM afp_flat_all;</textarea></label></div><div id="precheck" class="status">尚未导入数据</div></div>
-  <div class="card"><h2>2. 训练设置</h2><div class="grid"><label>Epoch<input id="epochs" type="number" value="10" min="1"></label><label>Patience<input id="patience" type="number" value="3" min="1"></label><label>Batch size<input id="batch" type="number" value="32" min="1"></label><label>Learning rate<input id="lr" type="number" value="0.0008" step="0.0001"></label></div><label style="margin-top:12px">模型保存位置<input id="outputRoot" placeholder="留空则保存到网页程序的 trained_models_web"></label><p><button id="start" disabled>开始训练</button> <button class="secondary" id="stop" disabled>停止训练</button> <a href="/" style="margin-left:15px">返回实时预警</a></p></div>
-  <div class="card"><h2>3. 训练状态与结果</h2><div id="summary" class="metrics"><div class="metric">状态<br><b id="state">等待开始</b></div><div class="metric">Epoch<br><b id="epoch">0 / 0</b></div><div class="metric">Patience<br><b id="bad">0 / 0</b></div><div class="metric">数据集<br><b id="dataset">—</b></div><div class="metric">模型输出<br><b id="output">训练完成后显示</b></div></div><progress id="progress" max="1" value="0" style="width:100%;margin-top:15px"></progress><h3>日志</h3><div id="log" class="log"></div></div>
-</div><script src="/training.js"></script></body></html>
+<body><main class="shell">
+  <header class="hero"><div><h1>AFP 模型训练工作台</h1><p>采集数据统一化 → I-ModernTCN 预测模型 → 可选状态预警模型 → 完整结果归档</p></div><a href="/">返回实时监测系统</a></header>
+  <section class="steps"><div class="step"><b>1</b>选择数据模式与来源</div><div class="step"><b>2</b>整合为标准完整 CSV</div><div class="step"><b>3</b>训练并实时观察</div><div class="step"><b>4</b>结束后保存模型与结果</div></section>
+  <div class="layout">
+    <div>
+      <section class="card"><h2>1. 数据定义</h2>
+        <div class="grid">
+          <label>数据模式<select id="dataMode"><option value="new">新数据</option><option value="legacy">旧数据</option><option value="other">其它数据</option></select></label>
+          <label>数据来源<select id="source"><option value="csv">采集保存的 CSV 文件夹</option><option value="mysql">MySQL 数据库</option><option value="complete_csv">单个 CSV（普通或已整合）</option></select></label>
+          <label>训练任务<select id="trainingType"><option value="prediction">只训练预测模型</option><option value="prediction_warning">训练预测 + 预警模型</option></select></label>
+        </div>
+        <h3>列定义（其它数据模式可编辑）</h3>
+        <div class="grid">
+          <label>工况数据<textarea id="conditions"></textarea></label>
+          <label>模型输入数据<textarea id="inputs"></textarea></label>
+          <label>模型输出数据<textarea id="outputs"></textarea></label>
+        </div>
+        <div class="help">列名使用逗号分隔。新、旧数据模式使用固定格式并严格过滤不匹配文件；其它数据模式完全按这里填写的列训练。其它模式首次打开时默认采用新数据列。</div>
+        <div id="fileSource" class="source-panel">
+          <div class="line"><label class="grow" id="pathLabel">CSV 文件夹或单个文件<input id="path" placeholder="例如 F:\AFP_Capture"></label><button class="secondary" id="pickPath">浏览</button></div>
+        </div>
+        <div id="mysqlSource" class="source-panel hidden">
+          <div class="grid"><label>主机<input id="host" value="127.0.0.1"></label><label>端口<input id="port" type="number" value="3306"></label><label>用户<input id="user" value="root"></label><label>密码<input id="password" type="password" value=""></label><label>数据库<input id="database" value="afp_state_warning"></label></div>
+          <label style="margin-top:10px">SQL 查询<textarea id="query" rows="9"></textarea></label>
+          <div class="help">默认查询已按采集数据库的工况—试样—铺层—采样点关系填写。新/旧模式还会根据 schema_id 二次过滤。</div>
+        </div>
+        <div class="grid four" style="margin-top:12px"><label>历史输入步长<input id="history" type="number" min="1" value="24"></label><label>预测未来步长<input id="prediction" type="number" min="1" value="24"></label><label>窗口滑动步长<input id="stride" type="number" min="1" value="24"></label><button id="import" style="align-self:end">导入并预检</button></div>
+        <div id="precheck" class="status">尚未导入数据。</div>
+        <div id="preview" class="preview hidden"></div>
+      </section>
+
+      <section class="card"><h2>2. 模型与训练参数</h2>
+        <div class="grid">
+          <label>初始化方式<select id="initialization"><option value="scratch">从头训练</option><option value="pretrained">基于已有模型继续训练</option></select></label>
+          <label class="span2">已有预测模型<div class="line"><input class="grow" id="pretrained" disabled><button class="secondary" id="pickModel" disabled>选择</button></div></label>
+        </div>
+        <div class="grid four" style="margin-top:12px"><label>Epoch<input id="epochs" type="number" min="1" value="100"></label><label>Patience<input id="patience" type="number" min="1" value="10"></label><label>Batch size<input id="batch" type="number" min="1" value="32"></label><label>学习率<input id="lr" type="number" min="0.000001" step="0.0001" value="0.0008"></label><label>权重衰减<input id="weightDecay" type="number" min="0" step="0.00001" value="0.0001"></label><label>Dropout<input id="dropout" type="number" min="0" max="0.9" step="0.01" value="0.05"></label><label>最小改进量<input id="minDelta" type="number" min="0" step="0.000001" value="0.000001"></label><label>计算设备<select id="device"><option value="auto">自动</option><option value="cpu">CPU</option><option value="cuda">GPU (CUDA)</option></select></label><label>随机种子<input id="seed" type="number" value="20260813"></label><label class="span3">任务名称<input id="taskName" value="AFP训练任务"></label></div>
+        <div class="line" style="margin-top:12px"><label class="grow">模型与整合 CSV 保存位置<input id="outputRoot"></label><button class="secondary" id="pickOutput">选择</button></div>
+        <div class="help">每个任务新建一个时间戳文件夹；整合 CSV、数据划分、最佳模型、可继续训练模型、训练历史、配置和预警模型都放在该文件夹内。</div>
+        <div class="actions"><button id="train" disabled>开始训练</button></div>
+      </section>
+    </div>
+
+    <div>
+      <section class="card"><h2>3. 实时训练过程</h2>
+        <div class="metrics"><div class="metric"><span>当前阶段</span><b id="stage">等待导入</b></div><div class="metric"><span>Epoch</span><b id="epochText">0 / 0</b></div><div class="metric"><span>Patience</span><b id="patienceText">0 / 0</b></div><div class="metric"><span>最佳验证损失</span><b id="bestLoss">—</b></div></div>
+        <div class="bar-label"><span>Epoch 进度</span><span id="epochPercent">0%</span></div><div class="bar"><i id="epochBar"></i></div>
+        <div class="bar-label"><span>Patience 占用</span><span id="patiencePercent">0%</span></div><div class="bar patience"><i id="patienceBar"></i></div>
+        <h3>训练损失 / 验证损失</h3><canvas id="lossChart" width="850" height="300"></canvas>
+      </section>
+      <section class="card"><h2>4. 输出与日志</h2><div class="metrics"><div class="metric"><span>数据行数</span><b id="rows">—</b></div><div class="metric"><span>工况种数</span><b id="conditionsCount">—</b></div><div class="metric"><span>保留文件数</span><b id="retainedFiles">—</b></div><div class="metric"><span>剔除文件数</span><b id="rejectedFiles">—</b></div></div><h3>最终输出</h3><div id="result" class="output">训练完成或人工停止后显示保存位置。</div><h3>运行日志</h3><div id="log" class="log"></div></section>
+    </div>
+  </div>
+</main><script src="/training.js"></script></body></html>

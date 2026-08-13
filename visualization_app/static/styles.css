@@ -57,7 +57,7 @@ button, select, input { outline: none; }
 }
 .system-brand strong { display: block; font-size: 18px; line-height: 1.25; }
 .system-brand span { display: block; margin-top: 3px; color: #bcd2e4; font-size: 11px; }
-.system-statuses { flex: 1; display: grid; grid-template-columns: 1fr 1fr .9fr 1.65fr; gap: 7px; min-width: 0; }
+.system-statuses { flex: 1; display: grid; grid-template-columns: auto 1fr 1fr .9fr 1.65fr; gap: 7px; min-width: 0; }
 .system-status-item {
   min-width: 0;
   height: 46px;
@@ -71,6 +71,8 @@ button, select, input { outline: none; }
 }
 .system-status-item small { display: block; color: #a9c7dc; font-size: 9px; letter-spacing: .5px; }
 .system-status-item b { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 600; }
+.system-training-link { align-self: center; display: inline-flex; align-items: center; justify-content: center; min-height: 32px; padding: 0 11px; border: 1px solid rgba(255,255,255,.42); border-radius: 6px; color: #fff; background: rgba(255,255,255,.1); font-size: 11px; font-weight: 700; text-decoration: none; white-space: nowrap; transition: background .15s ease, border-color .15s ease; }
+.system-training-link:hover { background: rgba(255,255,255,.2); border-color: rgba(255,255,255,.72); }
 .status-dot, .live-dot { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; background: #829bb0; box-shadow: 0 0 0 4px rgba(130,155,176,.15); }
 .status-dot.connected, .live-dot.active { background: #3ddaa1; box-shadow: 0 0 0 4px rgba(61,218,161,.14); }
 
