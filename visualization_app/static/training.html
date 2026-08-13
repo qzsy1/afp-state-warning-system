@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AFP 模型训练中心</title>
+  <style>
+    body{margin:0;background:#f3f7fb;color:#17324d;font:15px "Microsoft YaHei",sans-serif}.wrap{max-width:1180px;margin:28px auto;padding:0 20px}.card{background:#fff;border:1px solid #d9e5ef;border-radius:12px;padding:20px;margin:14px 0;box-shadow:0 4px 16px #163d5d12}h1{margin:0 0 4px}.muted{color:#6e8395}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}label{display:flex;flex-direction:column;gap:5px;font-weight:600}input,select,button{font:inherit;padding:9px;border:1px solid #b9cad8;border-radius:6px}button{background:#166eaa;color:#fff;border:0;cursor:pointer;font-weight:600}button.secondary{background:#eef5fa;color:#166eaa;border:1px solid #a9c6dc}.row{display:flex;gap:10px;align-items:end}.path{flex:1}.status{padding:12px;background:#eef7fc;border-left:4px solid #1e82b7;white-space:pre-wrap}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.metric{background:#f7fafc;padding:12px;border-radius:8px}.log{height:260px;overflow:auto;background:#102536;color:#d9f1ff;padding:12px;border-radius:8px;font:12px Consolas,monospace}.ok{color:#16834b}.bad{color:#b32727}@media(max-width:800px){.grid,.metrics{grid-template-columns:1fr 1fr}}
+  </style>
+</head>
+<body><div class="wrap">
+  <div class="card"><h1>AFP 模型训练中心</h1><div class="muted">导入模拟 CSV 或真实采集数据，训练 I-ModernTCN 预测模型和健康指标预警模型</div></div>
+  <div class="card"><h2>1. 选择训练数据</h2><div class="row"><label class="path">CSV 文件夹或文件<input id="path" placeholder="例如 F:\\AFP_Training_Simulated_CSV"></label><button class="secondary" id="pick">选择文件夹</button><button id="import">导入并预检</button></div><div id="precheck" class="status">尚未导入数据</div></div>
+  <div class="card"><h2>2. 训练设置</h2><div class="grid"><label>Epoch<input id="epochs" type="number" value="1" min="1"></label><label>Patience<input id="patience" type="number" value="1" min="1"></label><label>Batch size<input id="batch" type="number" value="32" min="1"></label><label>Learning rate<input id="lr" type="number" value="0.0008" step="0.0001"></label></div><p><button id="start" disabled>开始训练</button> <a href="/" style="margin-left:15px">返回实时预警</a></p></div>
+  <div class="card"><h2>3. 训练状态与结果</h2><div id="summary" class="metrics"><div class="metric">状态<br><b id="state">等待开始</b></div><div class="metric">数据集<br><b id="dataset">—</b></div><div class="metric">模型输出<br><b id="output">训练完成后显示</b></div></div><h3>日志</h3><div id="log" class="log"></div></div>
+</div><script src="/training.js"></script></body></html>

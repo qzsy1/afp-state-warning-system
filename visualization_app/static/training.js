@@ -1,0 +1,8 @@
+"use strict";
+const $=id=>document.getElementById(id); let imported=false;
+function show(x){$("log").textContent+=JSON.stringify(x,null,2)+"\n";$("log").scrollTop=$("log").scrollHeight}
+async function post(url,data){const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});const x=await r.json();if(!r.ok||x.error)throw Error(x.error||"请求失败");return x}
+$("pick").onclick=async()=>{try{const x=await post("/api/acquisition/select-folder",{initial_path:$("path").value});if(x.selected)$("path").value=x.path}catch(e){alert(e.message)}};
+$("import").onclick=async()=>{try{const x=await post("/api/training/import",{path:$("path").value});imported=!!x.validation?.ok;$("start").disabled=!imported;$("precheck").textContent=JSON.stringify(x.validation,null,2);$("precheck").className="status "+(imported?"ok":"bad");show({event:"imported",validation:x.validation})}catch(e){$("precheck").textContent=e.message;$("precheck").className="status bad"}};
+$("start").onclick=async()=>{try{const x=await post("/api/training/start",{epochs:+$("epochs").value,patience:+$("patience").value,batch_size:+$("batch").value,learning_rate:+$("lr").value});$("state").textContent="训练运行中";show(x);poll()}catch(e){alert(e.message)}};
+async function poll(){const x=await (await fetch("/api/training/status")).json();if(x.last_event){show(x.last_event);$("state").textContent=x.running?String(x.last_event.event||"训练运行中"):String(x.last_event.event||"已结束");$("dataset").textContent=x.dataset||"—";if(x.last_event.package)$("output").textContent=x.last_event.package.path||"已导出"}if(x.running)setTimeout(poll,1500)}

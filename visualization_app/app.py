@@ -41,6 +41,7 @@ from new_collection_health import (
     NEW_STATE_LABELS,
     NewCollectionHealthEngine,
 )
+from web_training import WebTrainingManager
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -418,6 +419,7 @@ class DashboardData:
         self.live_layer_health_path = (
             self.acquisition.capture_root / "specimen_layer_health.json"
         )
+        self.web_training = WebTrainingManager(APP_DIR / "trained_models_web")
         self.live_layer_health = self._load_live_layer_health()
 
         if len(self.windows) != len(self.actual) or len(self.index) != len(self.actual):
@@ -3413,6 +3415,9 @@ class AppHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/health":
             self._send_json({"status": "ok", "version": "1.11.0"})
             return
+        if parsed.path == "/api/training/status":
+            self._send_json(self.dashboard.web_training.status())
+            return
         if parsed.path == "/api/bootstrap":
             self._send_json(self.dashboard.bootstrap())
             return
@@ -3539,6 +3544,19 @@ class AppHandler(BaseHTTPRequestHandler):
                 result = self.dashboard.acquisition.test_connection(config)
                 result["prediction_model"] = model_validation
                 self._send_json(result)
+                return
+            if parsed.path == "/api/training/import":
+                self._send_json(self.dashboard.web_training.import_data(str(payload.get("path", ""))))
+                return
+            if parsed.path == "/api/training/start":
+                self._send_json(self.dashboard.web_training.start(
+                    path=str(payload.get("path", "")) or None,
+                    epochs=int(payload.get("epochs", 1)),
+                    patience=int(payload.get("patience", 1)),
+                    batch_size=int(payload.get("batch_size", 32)),
+                    learning_rate=float(payload.get("learning_rate", 8e-4)),
+                    device=str(payload.get("device", "auto")),
+                ))
                 return
             if parsed.path == "/api/mysql/test":
                 settings = mysql_settings_from_mapping(payload)
