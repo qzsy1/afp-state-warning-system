@@ -34,3 +34,6 @@ visualization_app/AFP_State_Warning_System.exe
 # User-specific editor files
 .idea/
 .vscode/
+visualization_app/trained_models_web/
+visualization_app/req.json
+visualization_app/test_training_request.json
