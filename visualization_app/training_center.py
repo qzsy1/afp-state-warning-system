@@ -105,10 +105,12 @@ class TrainingCenter:
         self._emit("dataset_prepared", path=root, manifest=root / "manifest.csv")
         return root
 
-    def start_training(self, dataset_root: str | Path, epochs: int = 100, patience: int = 10, batch_size: int = 64, learning_rate: float = 8e-4, device: str = "auto") -> None:
+    def start_training(self, dataset_root: str | Path, epochs: int = 100, patience: int = 10, batch_size: int = 64, learning_rate: float = 8e-4, device: str = "auto", output_root: str | Path | None = None) -> None:
         if self._thread and self._thread.is_alive():
             raise RuntimeError("已有训练任务正在运行")
         self._stop.clear()
+        if output_root is not None:
+            self.output_root = Path(output_root).expanduser().resolve()
         self._thread = threading.Thread(target=self._run_training, args=(Path(dataset_root), epochs, patience, batch_size, learning_rate, device), daemon=True)
         self._thread.start()
 
@@ -133,7 +135,15 @@ class TrainingCenter:
             self._emit("split_ready", counts=manifest.groupby("split")["specimen_id"].nunique().to_dict())
             if self._stop.is_set():
                 return
-            result = train_predictor(TrainConfig(data_root=dataset_root, epochs=epochs, patience=patience, batch_size=batch_size, learning_rate=learning_rate, device=device))
+            result = train_predictor(TrainConfig(
+                data_root=dataset_root, epochs=epochs, patience=patience,
+                batch_size=batch_size, learning_rate=learning_rate, device=device,
+                stop_event=self._stop,
+                progress_callback=lambda update: self._emit("epoch_progress", **update),
+            ))
+            if result.get("stopped"):
+                self._emit("training_stopped", history=result.get("history", []))
+                return
             self._emit("prediction_training_finished", result=result)
             checkpoint = Path(result["checkpoint"])
             health = self._fit_health_models(dataset_root, checkpoint)

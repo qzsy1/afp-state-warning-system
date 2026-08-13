@@ -3561,7 +3561,11 @@ class AppHandler(BaseHTTPRequestHandler):
                     batch_size=int(payload.get("batch_size", 32)),
                     learning_rate=float(payload.get("learning_rate", 8e-4)),
                     device=str(payload.get("device", "auto")),
+                    output_root=str(payload.get("output_root", "")) or None,
                 ))
+                return
+            if parsed.path == "/api/training/stop":
+                self._send_json(self.dashboard.web_training.stop())
                 return
             if parsed.path == "/api/mysql/test":
                 settings = mysql_settings_from_mapping(payload)

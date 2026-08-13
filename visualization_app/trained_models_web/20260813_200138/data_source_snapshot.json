@@ -1,0 +1,52 @@
+{
+  "source": "MySQL：127.0.0.1:3306/afp_state_warning",
+  "mapping": {
+    "timestamp": "timestamp_iso",
+    "specimen_id": "specimen_id",
+    "layer_id": "layer_no",
+    "repeat_id": "replicate_no",
+    "condition_id": "condition_id"
+  },
+  "validation": {
+    "rows": 2262,
+    "columns": 42,
+    "specimens": 2,
+    "layers": 4,
+    "missing_required": [],
+    "missing_rates": {
+      "转速": 0.8244916003536693,
+      "振动": 0.8244916003536693,
+      "位移": 0.8244916003536693,
+      "温度": 0.1755083996463307,
+      "pid_angle_deg": 0.1755083996463307,
+      "placement_speed_mm_s": 0.1755083996463307,
+      "initial_compaction_force_N": 0.1755083996463307,
+      "temperature_setpoint_C": 0.1755083996463307,
+      "ABB_Z": 0.1755083996463307,
+      "ABB_Y": 0.1755083996463307,
+      "ABB_X": 0.1755083996463307,
+      "线速度": 0.1755083996463307,
+      "张力": 0.1755083996463307,
+      "ROI平均温度": 0.1755083996463307,
+      "温度1": 0.0,
+      "温度2": 0.0,
+      "温度3": 0.0,
+      "压力": 0.0,
+      "温度5": 0.0,
+      "温度6": 0.0,
+      "温度7": 0.0,
+      "温度8": 0.0,
+      "温度4": 0.0
+    },
+    "nonfinite_values": 9962,
+    "specimen_condition_conflicts": 1,
+    "states": {
+      "0": 2262
+    },
+    "short_layers": 1,
+    "minimum_points_per_layer": 48,
+    "warning_training_ready": false,
+    "conditions": 4,
+    "ok": false
+  }
+}

@@ -43,7 +43,7 @@ class WebTrainingManager:
     def start(self, path: str | None = None, mysql: dict[str, Any] | None = None,
               query: str = "", epochs: int = 1, patience: int = 1,
               batch_size: int = 32, learning_rate: float = 8e-4,
-              device: str = "auto") -> dict[str, Any]:
+              device: str = "auto", output_root: str | None = None) -> dict[str, Any]:
         if path:
             self.import_data(path)
         if mysql is not None:
@@ -52,8 +52,12 @@ class WebTrainingManager:
             raise ValueError("请先选择 CSV 文件夹并点击导入预检")
         dataset = self.center.prepare_dataset(self.output_root / "dataset")
         self.last_dataset = str(dataset)
-        self.center.start_training(dataset, epochs, patience, batch_size, learning_rate, device)
+        self.center.start_training(dataset, epochs, patience, batch_size, learning_rate, device, output_root)
         return {"started": True, "dataset": self.last_dataset}
+
+    def stop(self) -> dict[str, Any]:
+        self.center.stop_training()
+        return {"stop_requested": True}
 
     def status(self) -> dict[str, Any]:
         with self._lock:

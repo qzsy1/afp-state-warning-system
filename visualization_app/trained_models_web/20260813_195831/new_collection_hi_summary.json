@@ -1,0 +1,24 @@
+{
+  "schema_version": "new_collection_hi_v2",
+  "indicator_count": 12,
+  "candidate_count": 48,
+  "selected_models": {
+    "T-HI": "random_forest",
+    "C-HI": "extra_trees",
+    "TC-HI": "logistic",
+    "RFHI": "svm_rbf",
+    "PR-HI": "logistic",
+    "MPRF-HI": "logistic",
+    "PCA-SPE-HI": "extra_trees",
+    "KECA-SPE-HI": "logistic",
+    "McFS-AVAE-HI": "random_forest",
+    "CNN-LSTM-AE-HI": "extra_trees",
+    "W-HI": "logistic",
+    "RMD-HI": "logistic"
+  },
+  "artifact": "F:\\program\\channel_independent_MTSF-main\\channel_independent_MTSF-main\\auto_fiber_placement\\new-state-monitor\\state_monitor_v13\\visualization_app\\trained_models_web\\dataset\\models\\new_collection_hi_artifacts.joblib",
+  "catalog": "F:\\program\\channel_independent_MTSF-main\\channel_independent_MTSF-main\\auto_fiber_placement\\new-state-monitor\\state_monitor_v13\\visualization_app\\trained_models_web\\dataset\\models\\new_collection_hi_catalog.csv",
+  "metrics": "F:\\program\\channel_independent_MTSF-main\\channel_independent_MTSF-main\\auto_fiber_placement\\new-state-monitor\\state_monitor_v13\\visualization_app\\trained_models_web\\dataset\\models\\new_collection_hi_metrics.csv",
+  "training_boundary": "正常基线仅用训练集正常窗口；模型仅用训练集；阈值与推荐模型仅用验证集；内推和外推测试集锁定",
+  "warning": "当前为模拟新数据集联调结果，不能代表真实AFP缺陷识别性能"
+}
