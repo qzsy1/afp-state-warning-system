@@ -96,7 +96,9 @@ def _read_table(path: Path) -> pd.DataFrame:
 def read_excel_or_folder(path: str | Path) -> ImportResult:
     root = Path(path).expanduser().resolve()
     files = [root] if root.is_file() else sorted(
-        p for p in root.rglob("*") if p.suffix.lower() in {".csv", ".xlsx", ".xls", ".xlsm"}
+        p for p in root.rglob("*")
+        if p.suffix.lower() in {".csv", ".xlsx", ".xls", ".xlsm"}
+        and p.name.lower() not in {"manifest.csv", "import_summary.csv"}
     )
     if not files:
         raise FileNotFoundError(f"没有找到 Excel/CSV 文件：{root}")
