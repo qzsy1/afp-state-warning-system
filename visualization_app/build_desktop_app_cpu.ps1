@@ -7,5 +7,10 @@ $script = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) "build_des
 if (-not (Test-Path -LiteralPath $PythonExecutable)) {
     throw "CPU Python environment not found: $PythonExecutable"
 }
-& powershell -NoProfile -ExecutionPolicy Bypass -File $script -PythonExecutable $PythonExecutable -SkipArchive:$SkipArchive
+if ($SkipArchive) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $script -PythonExecutable $PythonExecutable -SkipArchive
+}
+else {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $script -PythonExecutable $PythonExecutable
+}
 if ($LASTEXITCODE -ne 0) { throw "CPU portable build failed with exit code $LASTEXITCODE" }
