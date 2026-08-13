@@ -19,6 +19,7 @@ $CausalArtifact = Join-Path $StateMonitorDir "outputs_causal_online_consistency_
 $ModelRuntimeRoot = "F:\program\XJUsorceopen"
 $ModelRuntimeShijie = Join-Path $ModelRuntimeRoot "shijie"
 $ModelRuntimeModernTCN = Join-Path $ModelRuntimeRoot "modern_TCN_models"
+$TrainingCore = Join-Path (Split-Path -Parent $StateMonitorDir) "final_training_packages\new_data_full_pipeline"
 $LegacySource = (
     Get-ChildItem -LiteralPath (Split-Path -Parent $StateMonitorDir) -File -Filter "*.csv" |
         Where-Object { $_.Length -eq 22912911 } |
@@ -32,7 +33,7 @@ $BuildRoot = Join-Path $env:TEMP "AFPBuild"
 $DistDir = Join-Path $BuildRoot "dist"
 $WorkDir = Join-Path $BuildRoot "work"
 
-foreach ($Required in @($LegacyCheckpoint, $LegacyReplayDir, $CausalArtifact, $LegacySource, $ModelRuntimeShijie, $ModelRuntimeModernTCN)) {
+foreach ($Required in @($LegacyCheckpoint, $LegacyReplayDir, $CausalArtifact, $LegacySource, $ModelRuntimeShijie, $ModelRuntimeModernTCN, $TrainingCore)) {
     if (-not (Test-Path -LiteralPath $Required)) { throw "Required runtime asset is missing: $Required" }
 }
 
@@ -59,12 +60,15 @@ New-Item -ItemType Directory -Force -Path $BuildRoot, $ReleaseDir | Out-Null
     --add-data "$LegacySource;data" `
     --add-data "$ModelRuntimeShijie;model_runtime\shijie" `
     --add-data "$ModelRuntimeModernTCN;model_runtime\modern_TCN_models" `
+    --add-data "$TrainingCore;training_core" `
     --collect-all torch_geometric `
     --hidden-import sklearn.ensemble._forest `
     --hidden-import sklearn.linear_model._logistic `
     --hidden-import sklearn.svm._classes `
     --hidden-import sklearn.pipeline `
     --hidden-import sklearn.preprocessing._data `
+    --hidden-import training_center --hidden-import training_center_ui --hidden-import training_data `
+    --hidden-import train_predictor --hidden-import fit_new_collection_health --hidden-import new_collection_health `
     --exclude-module PyQt5 `
     --exclude-module IPython `
     --exclude-module pytest `

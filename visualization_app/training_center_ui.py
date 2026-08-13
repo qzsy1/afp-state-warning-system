@@ -26,12 +26,26 @@ class TrainingCenterWindow:
     def _build(self) -> None:
         top = ttk.Frame(self.window, padding=12)
         top.pack(fill="x")
-        ttk.Label(top, text="数据来源").grid(row=0, column=0, sticky="w")
+        ttk.Label(top, text="来源类型").grid(row=0, column=0, sticky="w")
+        self.source_mode = tk.StringVar(value="Excel/CSV")
+        mode = ttk.Combobox(top, textvariable=self.source_mode, values=("Excel/CSV", "MySQL"), state="readonly", width=12)
+        mode.grid(row=0, column=1, padx=6, sticky="w")
+        mode.bind("<<ComboboxSelected>>", lambda _event: self.toggle_source_mode())
+        ttk.Label(top, text="数据来源").grid(row=0, column=2, sticky="w")
         self.source = tk.StringVar()
-        ttk.Entry(top, textvariable=self.source, width=86).grid(row=0, column=1, padx=8, sticky="ew")
-        ttk.Button(top, text="选择文件/文件夹", command=self.choose_source).grid(row=0, column=2)
-        ttk.Button(top, text="导入并预检", command=self.import_source).grid(row=0, column=3, padx=6)
-        top.columnconfigure(1, weight=1)
+        self.source_entry = ttk.Entry(top, textvariable=self.source, width=70)
+        self.source_entry.grid(row=0, column=3, padx=8, sticky="ew")
+        self.source_button = ttk.Button(top, text="选择文件/文件夹", command=self.choose_source)
+        self.source_button.grid(row=0, column=4)
+        ttk.Button(top, text="导入并预检", command=self.import_source).grid(row=0, column=5, padx=6)
+        top.columnconfigure(3, weight=1)
+        self.mysql_frame = ttk.Frame(top)
+        self.mysql_vars = {name: tk.StringVar(value=value) for name, value in (("host", "127.0.0.1"), ("port", "3306"), ("user", "root"), ("password", ""), ("database", ""), ("query", "SELECT * FROM your_table LIMIT 100000"))}
+        for col, name in enumerate(("host", "port", "user", "password", "database")):
+            ttk.Label(self.mysql_frame, text=name).grid(row=0, column=col * 2, padx=3)
+            ttk.Entry(self.mysql_frame, textvariable=self.mysql_vars[name], width=12, show="*" if name == "password" else "").grid(row=0, column=col * 2 + 1, padx=3)
+        ttk.Label(self.mysql_frame, text="query").grid(row=1, column=0, padx=3)
+        ttk.Entry(self.mysql_frame, textvariable=self.mysql_vars["query"], width=75).grid(row=1, column=1, columnspan=9, padx=3, sticky="ew")
 
         config = ttk.LabelFrame(self.window, text="训练设置", padding=10)
         config.pack(fill="x", padx=12, pady=6)
@@ -72,11 +86,14 @@ class TrainingCenterWindow:
             self.source.set(path)
 
     def import_source(self) -> None:
-        if not self.source.get().strip():
+        if self.source_mode.get() == "Excel/CSV" and not self.source.get().strip():
             messagebox.showwarning("未选择数据", "请选择 Excel/CSV 文件或文件夹")
             return
         try:
-            result = self.center.import_files(self.source.get().strip())
+            if self.source_mode.get() == "MySQL":
+                result = self.center.import_mysql({name: var.get() for name, var in self.mysql_vars.items() if name != "query"}, self.mysql_vars["query"].get())
+            else:
+                result = self.center.import_files(self.source.get().strip())
             self.data_text.delete("1.0", "end")
             self.data_text.insert("end", json.dumps(result, ensure_ascii=False, indent=2, default=str))
             if result["validation"]["ok"]:
@@ -86,6 +103,17 @@ class TrainingCenterWindow:
                 self.status.set("数据预检未通过，请修正字段或数据")
         except Exception as exc:
             messagebox.showerror("导入失败", str(exc))
+
+    def toggle_source_mode(self) -> None:
+        mysql = self.source_mode.get() == "MySQL"
+        if mysql:
+            self.source_entry.grid_remove()
+            self.source_button.grid_remove()
+            self.mysql_frame.grid(row=1, column=0, columnspan=6, pady=(8, 0), sticky="ew")
+        else:
+            self.mysql_frame.grid_remove()
+            self.source_entry.grid()
+            self.source_button.grid()
 
     def start_training(self) -> None:
         try:

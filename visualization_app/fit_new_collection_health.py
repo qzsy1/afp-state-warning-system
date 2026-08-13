@@ -32,7 +32,11 @@ ARTIFACT = MODEL_DIR / "new_collection_hi_artifacts.joblib"
 METRICS_FILE = MODEL_DIR / "new_collection_hi_metrics.csv"
 CATALOG_FILE = MODEL_DIR / "new_collection_hi_catalog.csv"
 SUMMARY_FILE = MODEL_DIR / "new_collection_hi_summary.json"
-XJU_ROOT = Path(r"F:\program\XJUsorceopen")
+XJU_ROOT = (
+    Path(getattr(sys, "_MEIPASS")) / "model_runtime"
+    if getattr(sys, "frozen", False)
+    else Path(r"F:\program\XJUsorceopen")
+)
 MODEL_COLUMNS = [*SENSOR_COLUMNS, *PROCESS_COLUMNS]
 RANDOM_SEED = 20260730
 

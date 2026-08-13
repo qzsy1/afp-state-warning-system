@@ -32,6 +32,11 @@ from training_data import (
 APP_DIR = Path(__file__).resolve().parent
 DEMO_ROOT = APP_DIR / "new_collection_demo_v11_3"
 TRAINING_CORE_DIR = APP_DIR.parent.parent / "final_training_packages" / "new_data_full_pipeline"
+if getattr(sys, "frozen", False):
+    _MEIPASS = Path(getattr(sys, "_MEIPASS"))
+    _PACKAGED_TRAINING_CORE = _MEIPASS / "training_core"
+    if _PACKAGED_TRAINING_CORE.exists():
+        TRAINING_CORE_DIR = _PACKAGED_TRAINING_CORE
 
 
 def _jsonable(value: Any) -> Any:
