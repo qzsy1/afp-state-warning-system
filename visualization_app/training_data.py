@@ -105,6 +105,24 @@ def read_excel_or_folder(path: str | Path) -> ImportResult:
     )
     if not files:
         raise FileNotFoundError(f"没有找到 Excel/CSV 文件：{root}")
+    # A capture root can contain legacy and new-schema specimens.  Select the
+    # schema represented by the first usable layer, so mixed historical files
+    # do not make an otherwise valid new collection fail precheck.
+    if len(files) > 1:
+        selected: list[Path] = []
+        schema_width: int | None = None
+        for candidate in files:
+            try:
+                header = _read_table(candidate).columns
+            except Exception:
+                continue
+            width = len(header)
+            if schema_width is None and width >= 20:
+                schema_width = width
+            if schema_width is not None and width == schema_width:
+                selected.append(candidate)
+        if selected:
+            files = selected
     frames: list[pd.DataFrame] = []
     warnings: list[str] = []
     for file in files:
