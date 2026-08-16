@@ -19,6 +19,8 @@ from online_inference import (
     DEFAULT_CHECKPOINT,
     OnlineIModernTCN,
     inspect_prediction_model,
+    model_catalog,
+    normalize_model_type,
 )
 from acquisition import (
     ALL_SENSOR_COLUMNS,
@@ -632,6 +634,7 @@ class DashboardData:
                 "indicator": "TC-HI",
                 "model": "random_forest",
                 "prediction_horizon": 24,
+                "prediction_model_type": "i_T_G",
                 "forecast_lead": 1,
                 # Replay defaults to the causal checkpoint path so the
                 # displayed historical curve uses the selected forecast lead
@@ -645,6 +648,7 @@ class DashboardData:
                 "schemas": self.acquisition.available_schemas(),
                 "sensors": SENSOR_COLUMNS,
                 "prediction_model": self.online_predictor.profile,
+                "prediction_models": model_catalog(),
                 "best_prediction_models": {
                     schema_id: self.best_prediction_profile(schema_id)
                     for schema_id in ACQUISITION_SCHEMAS
@@ -656,7 +660,9 @@ class DashboardData:
                         else ""
                     ),
                     "prediction_model": (
-                        inspect_prediction_model(NEW_DEMO_CHECKPOINT)
+                        inspect_prediction_model(
+                            NEW_DEMO_CHECKPOINT, schema_mode="new_collection_v11_3"
+                        )
                         if NEW_DEMO_CHECKPOINT.exists()
                         else None
                     ),
@@ -681,15 +687,23 @@ class DashboardData:
             },
         }
 
-    def inspect_prediction_model(self, checkpoint: str = "") -> dict:
-        return inspect_prediction_model(checkpoint)
+    def inspect_prediction_model(
+        self, checkpoint: str = "", model_type: str = "", architecture: str = "",
+        schema_mode: str = "",
+    ) -> dict:
+        return inspect_prediction_model(
+            checkpoint, model_type=model_type, architecture=architecture,
+            schema_mode=schema_mode,
+        )
 
     def best_prediction_profile(self, dataset_schema: str) -> dict:
         if (
             dataset_schema == "new_collection_v11_3"
             and NEW_DEMO_CHECKPOINT.exists()
         ):
-            profile = inspect_prediction_model(NEW_DEMO_CHECKPOINT)
+            profile = inspect_prediction_model(
+                NEW_DEMO_CHECKPOINT, schema_mode="new_collection_v11_3"
+            )
             metric_value = None
             if NEW_DEMO_METRICS.exists():
                 metrics = json.loads(
@@ -708,7 +722,9 @@ class DashboardData:
                 ),
                 "registry_scope": "new_collection_v11_3",
             }
-        profile = inspect_prediction_model(DEFAULT_CHECKPOINT)
+        profile = inspect_prediction_model(
+            DEFAULT_CHECKPOINT, schema_mode="legacy_original"
+        )
         return {
             **profile,
             "selection_metric": "registered_default",
@@ -739,7 +755,11 @@ class DashboardData:
         profile = (
             self.best_prediction_profile(config.dataset_schema)
             if config.use_best_prediction_override
-            else inspect_prediction_model(config.prediction_model_file)
+            else inspect_prediction_model(
+                config.prediction_model_file,
+                model_type=getattr(config, "prediction_model_type", "i_T_G"),
+                schema_mode=config.dataset_schema,
+            )
         )
         auto_corrected = False
         schema_sensors = list(
@@ -866,7 +886,9 @@ class DashboardData:
             )
         if load_model:
             profile = self.online_predictor.configure(
-                profile["checkpoint"]
+                profile["checkpoint"],
+                model_type=getattr(config, "prediction_model_type", profile.get("model_type", "i_T_G")),
+                schema_mode=config.dataset_schema,
             )
         return {
             **profile,
@@ -2267,7 +2289,11 @@ class DashboardData:
             compatible_profile = self.best_prediction_profile(
                 "new_collection_v11_3" if new_schema else "legacy_original"
             )
-            self.online_predictor.configure(compatible_profile["checkpoint"])
+            self.online_predictor.configure(
+                compatible_profile["checkpoint"],
+                model_type=compatible_profile.get("model_type", "i_T_G"),
+                schema_mode="new_collection_v11_3" if new_schema else "legacy_original",
+            )
             active_profile = self.online_predictor.profile
         configured_prediction_sensors = (
             prediction_sensors
@@ -3612,7 +3638,10 @@ class AppHandler(BaseHTTPRequestHandler):
                         "selected": bool(selected),
                         "path": selected,
                         "model": (
-                            self.dashboard.inspect_prediction_model(selected)
+                            self.dashboard.inspect_prediction_model(
+                                selected, str(payload.get("model_type", "")),
+                                schema_mode=str(payload.get("schema_mode", "")),
+                            )
                             if selected
                             else None
                         ),
@@ -3622,7 +3651,9 @@ class AppHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/prediction-model/inspect":
                 self._send_json(
                     self.dashboard.inspect_prediction_model(
-                        str(payload.get("path", ""))
+                        str(payload.get("path", "")),
+                        str(payload.get("model_type", "")),
+                        schema_mode=str(payload.get("schema_mode", "")),
                     )
                 )
                 return
