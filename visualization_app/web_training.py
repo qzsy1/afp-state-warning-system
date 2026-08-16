@@ -59,6 +59,8 @@ class WebTrainingManager:
                     "bad_epochs": 0,
                     "patience": int(payload.get("patience", 0)),
                     "task_dir": payload.get("task_dir", ""),
+                    "model_type": payload.get("model_type", "i_T_G"),
+                    "model_label": payload.get("model_label", ""),
                 })
             elif event == "epoch_progress":
                 self._progress.update({

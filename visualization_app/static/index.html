@@ -101,6 +101,9 @@
                 <button id="selectPredictionModelButton" class="secondary-button compact-button" type="button">选择</button>
               </span>
             </label>
+            <label class="prediction-setting">预测算法
+              <select id="predictionModelTypeSelect"></select>
+            </label>
             <div id="predictionModelStatus" class="model-file-status prediction-setting">尚未检查预测模型</div>
             <label class="toggle prediction-setting"><input id="bestPredictionOverrideInput" type="checkbox">使用冻结验证集最佳预测模型覆盖当前选择</label>
             <p id="bestPredictionOverrideNote" class="control-note prediction-setting">未勾选时严格使用手动模型；勾选后只按验证集误差在同一采集方案内选择兼容模型。</p>

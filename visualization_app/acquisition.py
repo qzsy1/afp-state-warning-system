@@ -171,6 +171,7 @@ class AcquisitionConfig:
     model_input_sensors: list[str] | None = None
     model_output_sensors: list[str] | None = None
     prediction_model_file: str = ""
+    prediction_model_type: str = "i_T_G"
     health_indicator: str = "TC-HI"
     run_id: str = "LIVE_RUN"
     specimen_id: str = "LIVE_SPECIMEN"

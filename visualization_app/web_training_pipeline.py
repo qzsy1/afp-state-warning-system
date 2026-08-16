@@ -653,11 +653,44 @@ def train_models(
         xju_root = Path(getattr(sys, "_MEIPASS")) / "model_runtime"
     else:
         xju_root = Path(r"F:\program\XJUsorceopen")
-    if not (xju_root / "shijie").exists():
+    if False and not (xju_root / "shijie").exists():
         raise FileNotFoundError(f"I-ModernTCN模型源码目录不存在：{xju_root / 'shijie'}")
-    if str(xju_root) not in sys.path:
-        sys.path.insert(0, str(xju_root))
-    import shijie.model_mine.I_modernTCN_GAT_abalation as model_module
+    # Add both the I-ModernTCN source and the thesis comparison-model source.
+    import_roots = [
+        xju_root,
+        Path(__file__).resolve().parents[4],
+        Path(__file__).resolve().parents[4].parent,
+    ]
+    for import_root in import_roots:
+        if import_root.exists() and str(import_root) not in sys.path:
+            sys.path.insert(0, str(import_root))
+    from online_inference import MODEL_REGISTRY, normalize_model_type
+    from atavn import metadata as atavn_metadata, normalize as atavn_normalize
+    selected_model_type = normalize_model_type(settings.get("model_type", "i_T_G"))
+    definition = MODEL_REGISTRY[selected_model_type]
+    if definition.get("training_only"):
+        raise ValueError(f"算法 {definition['label']} 当前没有可训练的 PyTorch 适配器")
+    # Both the I-ModernTCN source and the baseline models expose a top-level
+    # package named ``models``.  A single training process may run all 11
+    # algorithms, so clear the previous namespace before importing a
+    # comparison architecture just as the online runtime does.
+    if selected_model_type != "i_T_G":
+        for module_name in list(sys.modules):
+            if (module_name == "models" or module_name.startswith("models.")
+                    or module_name == "layers" or module_name.startswith("layers.")
+                    or module_name == "utilsaa" or module_name.startswith("utilsaa.")):
+                del sys.modules[module_name]
+        sys.path[:] = [item for item in sys.path if Path(item).name.lower() != "modern_tcn_models"]
+        comparison_root = str(Path(__file__).resolve().parents[4])
+        if comparison_root in sys.path:
+            sys.path.remove(comparison_root)
+        sys.path.insert(0, comparison_root)
+    try:
+        model_module = __import__(definition["module"], fromlist=[definition["class_name"]])
+    except Exception as exc:
+        raise ImportError(
+            f"算法 {definition['label']} 的模型代码未随当前环境安装：{definition['module']}"
+        ) from exc
 
     seed = int(settings.get("seed", 20260813))
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
@@ -700,11 +733,35 @@ def train_models(
     prediction_length = int(config["prediction_length"])
     model_config = SimpleNamespace(
         enc_in=len(config["model_columns"]),
+        c_out=len(config["model_columns"]),
+        dec_in=len(config["model_columns"]),
         seq_len=history_length,
+        label_len=history_length,
         pred_len=prediction_length,
         dropout=float(settings.get("dropout", 0.05)),
+        d_model=int(settings.get("d_model", 128)),
+        n_heads=int(settings.get("n_heads", 8)),
+        e_layers=int(settings.get("e_layers", 2)),
+        d_layers=int(settings.get("d_layers", 1)),
+        d_ff=int(settings.get("d_ff", 2048)),
+        factor=int(settings.get("factor", 1)),
+        embed="timeF", freq="h", activation="gelu", output_attention=False,
+        distil=True, individual=False, flat_input=False, low_rank=False,
+        rank_ratio=4, version=1, model=selected_model_type,
     )
-    model = model_module.Model(model_config).to(device)
+    if selected_model_type in {"FNN_2024", "FNN_2025_Base"} and prediction_length != 24:
+        raise ValueError("FNN 2024/2025 的论文复现实现固定输出24步，请将预测未来步长设为24")
+    model = getattr(model_module, definition["class_name"])(model_config).to(device)
+    # I-ModernTCN-GAT already contains the manuscript's terminal-aligned
+    # shift/variance restoration internally.  The comparison architectures
+    # receive the same ATAVN transform externally so every new checkpoint
+    # uses an explicit, auditable mechanism without double normalizing it.
+    atavn_enabled = bool(settings.get("atavn_enabled", True))
+    atavn_external = atavn_enabled and selected_model_type != "i_T_G"
+    atavn_mode = (
+        "native" if selected_model_type == "i_T_G" and atavn_enabled
+        else ("external" if atavn_external else "disabled")
+    )
     pretrained = str(settings.get("pretrained_model", "")).strip()
     if pretrained:
         pretrained_path = Path(pretrained).expanduser().resolve()
@@ -722,6 +779,8 @@ def train_models(
             "pred_len": prediction_length,
         }
         mismatches = [key for key, value in expected.items() if old_metadata.get(key) != value]
+        if normalize_model_type(old_metadata.get("model_type", "i_T_G")) != selected_model_type:
+            mismatches.append("model_type")
         if mismatches:
             raise ValueError(f"已有模型与当前训练定义不一致：{', '.join(mismatches)}")
         state = torch.load(pretrained, map_location="cpu", weights_only=False)
@@ -734,15 +793,50 @@ def train_models(
     train_dataset = torch.utils.data.TensorDataset(torch.from_numpy(x[train_mask]), torch.from_numpy(y[train_mask]))
     loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
     output_indices = torch.tensor(config["output_indices"], dtype=torch.long, device=device)
+    def _atavn_input(batch: Any) -> tuple[Any, Any, Any]:
+        if not atavn_external:
+            return batch, None, None
+        normalized, terminal, scale = atavn_normalize(batch)
+        return normalized, terminal, scale
+
+    def _atavn_target(batch_x: Any, batch_y: Any) -> Any:
+        if not atavn_external:
+            return batch_y
+        _, terminal, scale = _atavn_input(batch_x)
+        return (batch_y - terminal) / scale
+
     def forward(batch: Any) -> Any:
+        model_batch, _, _ = _atavn_input(batch)
         mark = torch.zeros((len(batch), history_length, 4), device=device)
         decoder = torch.zeros((len(batch), history_length + prediction_length, len(config["model_columns"])), device=device)
-        return model(batch, mark, decoder, mark)
+        decoder_mark = torch.zeros((len(batch), history_length + prediction_length, 4), device=device)
+        output = model(model_batch.contiguous(), mark, decoder, decoder_mark)
+        if isinstance(output, (tuple, list)):
+            output = output[0]
+        if output.ndim == 2:
+            output = output.unsqueeze(1)
+        if output.ndim != 3:
+            raise ValueError(
+                f"算法 {definition['label']} 输出维度应为 [batch, horizon, channels]，实际为 {tuple(output.shape)}"
+            )
+        if output.shape[-1] != len(config["model_columns"]):
+            raise ValueError(
+                f"算法 {definition['label']} 输出通道数为 {output.shape[-1]}，当前数据需要 {len(config['model_columns'])}"
+            )
+        if output.shape[1] >= prediction_length:
+            return output[:, -prediction_length:, :]
+        pad = output[:, -1:, :].repeat(1, prediction_length - output.shape[1], 1)
+        return torch.cat([output, pad], dim=1)
 
     epochs = max(1, int(settings.get("epochs", 100))); patience = max(1, int(settings.get("patience", 10)))
     best_loss = math.inf; best_state = None; bad_epochs = 0; history_rows: list[dict[str, Any]] = []
     val_x = torch.from_numpy(x[val_mask]).to(device); val_y = torch.from_numpy(y[val_mask]).to(device)
-    emit("training_started", task_dir=str(task_dir), epochs=epochs, patience=patience, device=str(device))
+    emit(
+        "training_started",
+        task_dir=str(task_dir), epochs=epochs, patience=patience,
+        device=str(device), model_type=selected_model_type,
+        model_label=definition["label"],
+    )
     stopped = False
     for epoch in range(1, epochs + 1):
         model.train(); losses: list[float] = []
@@ -751,14 +845,14 @@ def train_models(
             batch_x = batch_x.to(device); batch_y = batch_y.to(device)
             optimizer.zero_grad(set_to_none=True)
             prediction = forward(batch_x).index_select(2, output_indices)
-            target = batch_y.index_select(2, output_indices)
+            target = _atavn_target(batch_x, batch_y).index_select(2, output_indices)
             loss = torch.nn.functional.mse_loss(prediction, target)
             loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
             losses.append(float(loss.detach().cpu()))
         if stopped: break
         model.eval()
         with torch.no_grad():
-            validation_loss = float(torch.nn.functional.mse_loss(forward(val_x).index_select(2, output_indices), val_y.index_select(2, output_indices)).cpu())
+            validation_loss = float(torch.nn.functional.mse_loss(forward(val_x).index_select(2, output_indices), _atavn_target(val_x, val_y).index_select(2, output_indices)).cpu())
         train_loss = float(np.mean(losses))
         improved = validation_loss < best_loss - float(settings.get("min_delta", 1e-6))
         if improved:
@@ -777,12 +871,17 @@ def train_models(
     torch.save({"model_state_dict": current_state, "optimizer_state_dict": optimizer.state_dict(), "epoch": len(history_rows), "best_validation_loss": best_loss, "bad_epochs": bad_epochs}, task_dir / "prediction_training_resume.pth")
     pd.DataFrame(history_rows).to_csv(task_dir / "training_history.csv", index=False, encoding="utf-8-sig")
     metadata = {
-        "model_type": "I-ModernTCN", "enc_in": len(config["model_columns"]),
+        "model_type": selected_model_type,
+        "architecture": definition["architecture"],
+        "model_module": definition["module"],
+        "model_class": definition["class_name"],
+        "enc_in": len(config["model_columns"]),
         "seq_len": history_length, "pred_len": prediction_length,
         "model_columns": config["model_columns"], "condition_columns": config["condition_columns"],
         "input_sensors": config["input_columns"], "output_sensors": config["output_columns"],
         "scaler_mean": mean.tolist(), "scaler_scale": scale.tolist(),
         "stopped_by_user": stopped, "epochs_completed": len(history_rows),
+        "atavn": atavn_metadata(atavn_mode) if atavn_enabled else {"enabled": False, "mode": "disabled"},
     }
     (task_dir / "prediction_model_best.pth.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -798,7 +897,18 @@ def train_models(
                 value = forward(torch.from_numpy(x[start:start + batch_size]).to(device)).cpu().numpy()
                 predictions.append(value)
         predicted = np.concatenate(predictions)[:, :, config["output_indices"]]
-        truth = y[:, :, config["output_indices"]]
+        if atavn_external:
+            target_batches = []
+            for start in range(0, len(x), batch_size):
+                target_batches.append(
+                    _atavn_target(
+                        torch.from_numpy(x[start:start + batch_size]).to(device),
+                        torch.from_numpy(y[start:start + batch_size]).to(device),
+                    ).detach().cpu().numpy()
+                )
+            truth = np.concatenate(target_batches, axis=0)[:, :, config["output_indices"]]
+        else:
+            truth = y[:, :, config["output_indices"]]
         residual = truth - predicted
         features = np.column_stack([
             np.mean(np.abs(residual), axis=(1, 2)), np.sqrt(np.mean(residual ** 2, axis=(1, 2))),
