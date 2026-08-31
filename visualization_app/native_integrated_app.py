@@ -33,6 +33,7 @@ from acquisition import (  # noqa: E402
     ACQUISITION_SCHEMAS,
     DEFAULT_SIMULATOR_FILE,
     AcquisitionConfig,
+    AcquisitionManager,
 )
 from mysql_storage import MySQLCaptureStore, MySQLSettings  # noqa: E402
 from web_training import WebTrainingManager  # noqa: E402
@@ -173,7 +174,11 @@ class LineChart(tk.Canvas):
             self.create_text(left - 7, y, text=f"{value:.2f}", anchor="e", fill=COLORS["muted"], font=("Segoe UI", 8))
 
         def draw(series: list[tuple[float, float]], color: str, width_px: int = 2) -> None:
-            if len(series) < 2:
+            if not series:
+                return
+            if len(series) == 1:
+                x, y = point(series[0])
+                self.create_oval(x - 3, y - 3, x + 3, y + 3, fill=color, outline=color)
                 return
             coords: list[float] = []
             for pair in series:
@@ -258,6 +263,8 @@ class AcquisitionPanel(ttk.Frame):
         ttk.Label(basic, text="数据方案").grid(row=0, column=0, sticky="w", padx=3, pady=3)
         self.schema_combo = ttk.Combobox(basic, textvariable=self._v("dataset_schema", "new_collection_v11_3"), state="readonly", values=("new_collection_v11_3", "legacy_original"), width=20)
         self.schema_combo.grid(row=0, column=1, columnspan=3, sticky="ew", padx=3, pady=3)
+        self.schema_info = tk.StringVar(value="")
+        ttk.Label(basic, textvariable=self.schema_info, foreground=COLORS["blue"]).grid(row=0, column=4, sticky="w", padx=4)
         self.schema_combo.bind("<<ComboboxSelected>>", lambda _e: self._schema_changed())
         ttk.Label(basic, text="处理模式").grid(row=1, column=0, sticky="w", padx=3, pady=3)
         self.mode_combo = ttk.Combobox(basic, textvariable=self._v("processing_mode", "prediction_warning"), state="readonly", values=("prediction_warning", "capture_only"), width=20)
@@ -266,14 +273,61 @@ class AcquisitionPanel(ttk.Frame):
         ttk.Label(basic, text="连接方式").grid(row=2, column=0, sticky="w", padx=3, pady=3)
         self.driver_combo = ttk.Combobox(basic, textvariable=self._v("driver", "simulator"), state="readonly", values=("simulator", "serial_json", "tcp_json"), width=15)
         self.driver_combo.grid(row=2, column=1, sticky="ew", padx=3, pady=3)
+        interfaces = ttk.LabelFrame(basic, text="多接口采集（默认热电偶 + 其它传感器）", padding=5)
+        interfaces.grid(row=5, column=0, columnspan=4, sticky="ew", padx=3, pady=4)
+        interfaces.columnconfigure(3, weight=1)
+        ttk.Button(interfaces, text="自动识别接口", command=self._discover_interfaces).grid(row=0, column=0, sticky="ew", padx=2)
+        ttk.Label(interfaces, text="勾选 / 角色 / 类型 / 地址 / 映射(JSON)").grid(row=0, column=1, columnspan=4, sticky="w")
+        self.interface_vars: list[dict[str, tk.Variable]] = []
+        for index, (role, endpoint) in enumerate((("thermocouple", "COM3"), ("other", "COM4")), start=1):
+            values = {
+                "enabled": self._v(f"interface_{index}_enabled", True), "role": self._v(f"interface_{index}_role", role),
+                "driver": self._v(f"interface_{index}_driver", "serial_json"), "endpoint": self._v(f"interface_{index}_endpoint", endpoint),
+                "map": self._v(f"interface_{index}_map", "{}"),
+            }
+            self.interface_vars.append(values)
+            ttk.Checkbutton(interfaces, variable=values["enabled"]).grid(row=index, column=0)
+            ttk.Combobox(interfaces, textvariable=values["role"], values=("thermocouple", "other"), state="readonly", width=14).grid(row=index, column=1, padx=2)
+            ttk.Combobox(interfaces, textvariable=values["driver"], values=("serial_json", "tcp_json", "simulator"), state="readonly", width=12).grid(row=index, column=2, padx=2)
+            ttk.Entry(interfaces, textvariable=values["endpoint"], width=15).grid(row=index, column=3, sticky="ew", padx=2)
+            ttk.Entry(interfaces, textvariable=values["map"], width=22).grid(row=index, column=4, sticky="ew", padx=2)
         self._entry(basic, "采样Hz", "sample_rate_hz", 10.0, 2, 2)
         self._entry(basic, "端点/模拟CSV", "endpoint", "", 3, 0, width=30)
         ttk.Button(basic, text="浏览", command=self._pick_endpoint).grid(row=3, column=2, columnspan=2, sticky="ew", padx=3)
         self._entry(basic, "串口波特率", "baudrate", 115200, 4, 0)
 
         identity = ttk.LabelFrame(parent, text="试样、工况与铺层", padding=8)
-        identity.grid(row=1, column=0, sticky="ew", pady=4)
+        identity.grid(row=2, column=0, sticky="ew", pady=4)
         identity.columnconfigure(1, weight=1); identity.columnconfigure(3, weight=1)
+
+        # Keep the simulation source explicit in the native UI.  This mirrors
+        # the web controls and prevents MySQL replay from silently falling
+        # back to the default CSV source.
+        simulation = ttk.LabelFrame(parent, text="模拟数据源（仅模拟采集时使用）", padding=8)
+        simulation.grid(row=1, column=0, sticky="ew", pady=4)
+        simulation.columnconfigure(1, weight=1); simulation.columnconfigure(3, weight=1)
+        ttk.Label(simulation, text="数据形式").grid(row=0, column=0, sticky="w", padx=3, pady=3)
+        self.simulation_source_combo = ttk.Combobox(
+            simulation,
+            textvariable=self._v("simulation_source_type", "single_csv"),
+            values=("single_csv", "folder_csv", "mysql"),
+            state="readonly",
+            width=15,
+        )
+        self.simulation_source_combo.grid(row=0, column=1, sticky="ew", padx=3, pady=3)
+        self.simulation_source_combo.bind("<<ComboboxSelected>>", lambda _e: self._simulation_source_changed())
+        self._entry(simulation, "文件/文件夹", "simulation_source_path", "", 1, 0, width=28)
+        ttk.Button(simulation, text="选择", command=self._pick_simulation_source).grid(row=1, column=2, columnspan=2, sticky="ew", padx=3)
+        self._entry(simulation, "MySQL主机", "simulation_mysql_host", "127.0.0.1", 2, 0)
+        self._entry(simulation, "端口", "simulation_mysql_port", 3306, 2, 2)
+        self._entry(simulation, "MySQL用户", "simulation_mysql_user", "root", 3, 0)
+        self._entry(simulation, "密码", "simulation_mysql_password", "", 3, 2, show="*")
+        self._entry(simulation, "数据库", "simulation_mysql_database", "afp_state_warning", 4, 0, width=20)
+        ttk.Label(simulation, text="查询").grid(row=5, column=0, sticky="nw", padx=3, pady=3)
+        self.simulation_mysql_query = tk.Text(simulation, height=3, wrap="none")
+        self.simulation_mysql_query.grid(row=5, column=1, columnspan=3, sticky="ew", padx=3, pady=3)
+        self.simulation_mysql_query.insert("1.0", "SELECT * FROM afp_flat_all ORDER BY specimen_key, layer_no, sample_index")
+        self.simulation_frame = simulation
         self._entry(identity, "试样名", "specimen_id", "LIVE_SPECIMEN_001", 0, 0)
         self._entry(identity, "工况编号", "condition_id", "C001", 0, 2)
         self._entry(identity, "独立重复", "replicate", 1, 1, 0)
@@ -287,19 +341,22 @@ class AcquisitionPanel(ttk.Frame):
         self._entry(identity, "温度设定°C", "temperature_setpoint_C", 360.0, 5, 2)
 
         channels = ttk.LabelFrame(parent, text="采集、模型输入与模型输出", padding=8)
-        channels.grid(row=2, column=0, sticky="ew", pady=4)
+        channels.grid(row=3, column=0, sticky="ew", pady=4)
         for col, title in enumerate(("采集保存", "模型输入", "模型输出")):
             ttk.Label(channels, text=title, foreground=COLORS["navy"]).grid(row=0, column=col, pady=(0, 3))
         self.sensor_lists: list[tk.Listbox] = []
         for col in range(3):
-            box = tk.Listbox(channels, selectmode="multiple", exportselection=False, height=8, width=15)
+            # The new collection plan has 16 physical sensor channels.  Keep
+            # all channels visible in the native window instead of clipping
+            # the lower half of the checklist at the historical height of 8.
+            box = tk.Listbox(channels, selectmode="multiple", exportselection=False, height=16, width=15)
             box.grid(row=1, column=col, sticky="nsew", padx=2)
             self.sensor_lists.append(box)
             channels.columnconfigure(col, weight=1)
         ttk.Button(channels, text="当前方案全选", command=self._select_all_sensors).grid(row=2, column=0, columnspan=3, sticky="ew", pady=(5, 0))
 
         prediction = ttk.LabelFrame(parent, text="预测与健康指标", padding=8)
-        prediction.grid(row=3, column=0, sticky="ew", pady=4)
+        prediction.grid(row=4, column=0, sticky="ew", pady=4)
         prediction.columnconfigure(1, weight=1); prediction.columnconfigure(3, weight=1)
         ttk.Checkbutton(prediction, text="使用登记的最佳预测模型", variable=self._v("use_best_prediction_override", True)).grid(row=0, column=0, columnspan=4, sticky="w")
         self._entry(prediction, "模型文件", "prediction_model_file", "", 1, 0, width=30)
@@ -318,7 +375,7 @@ class AcquisitionPanel(ttk.Frame):
         ttk.Checkbutton(prediction, text="启用因果在线优化（兼容时）", variable=self._v("use_optimized_warning", True)).grid(row=5, column=0, columnspan=4, sticky="w")
 
         saving = ttk.LabelFrame(parent, text="本地与 MySQL 保存", padding=8)
-        saving.grid(row=4, column=0, sticky="ew", pady=4)
+        saving.grid(row=5, column=0, sticky="ew", pady=4)
         saving.columnconfigure(1, weight=1); saving.columnconfigure(3, weight=1)
         self._entry(saving, "保存根目录", "save_root", r"F:\AFP_Capture", 0, 0, width=28)
         ttk.Button(saving, text="选择", command=self._pick_save_root).grid(row=0, column=2, columnspan=2, sticky="ew", padx=3)
@@ -331,7 +388,7 @@ class AcquisitionPanel(ttk.Frame):
         ttk.Button(saving, text="查看工况—试样—铺层关系", command=self._show_mysql_relations).grid(row=5, column=0, columnspan=4, sticky="ew", pady=(5, 0))
 
         actions = ttk.Frame(parent)
-        actions.grid(row=5, column=0, sticky="ew", pady=8)
+        actions.grid(row=6, column=0, sticky="ew", pady=8)
         for col in range(4): actions.columnconfigure(col, weight=1)
         self.test_button = ttk.Button(actions, text="检查连接", command=self.test_connection, state="disabled")
         self.start_button = ttk.Button(actions, text="开始采集", command=self.start, state="disabled")
@@ -342,7 +399,7 @@ class AcquisitionPanel(ttk.Frame):
         self.stop_button.grid(row=0, column=2, sticky="ew", padx=2)
         self.open_button.grid(row=0, column=3, sticky="ew", padx=2)
         self.status_text = tk.StringVar(value="正在加载模型与健康指标资源……")
-        ttk.Label(parent, textvariable=self.status_text, wraplength=350, foreground=COLORS["muted"]).grid(row=6, column=0, sticky="ew", pady=4)
+        ttk.Label(parent, textvariable=self.status_text, wraplength=350, foreground=COLORS["muted"]).grid(row=7, column=0, sticky="ew", pady=4)
 
     def _build_monitor(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1); parent.rowconfigure(2, weight=1)
@@ -399,11 +456,17 @@ class AcquisitionPanel(ttk.Frame):
         self.status_text.set("后台加载完成；可检查连接或开始采集。")
         self.monitor_status.set("就绪（原生直连，无本地网页服务）")
         self._schema_changed()
+        self._simulation_source_changed()
         self.after(250, self._poll)
 
     def _schema_changed(self) -> None:
         schema = str(self.vars["dataset_schema"].get())
         sensors = list(ACQUISITION_SCHEMAS[schema]["sensors"])
+        self.schema_info.set(
+            f"{len(sensors)} 个传感器通道"
+            if schema == "new_collection_v11_3"
+            else f"{len(sensors)} 个传感器通道"
+        )
         for box in self.sensor_lists:
             box.delete(0, "end")
             for sensor in sensors: box.insert("end", sensor)
@@ -441,9 +504,37 @@ class AcquisitionPanel(ttk.Frame):
     def _select_all_sensors(self) -> None:
         for box in self.sensor_lists: box.select_set(0, "end")
 
+    def _discover_interfaces(self) -> None:
+        result = AcquisitionManager.discover_interfaces()
+        ports = result.get("ports", [])
+        defaults = result.get("defaults", [])
+        for values, item in zip(self.interface_vars, defaults):
+            values["endpoint"].set(item.get("endpoint", ""))
+            values["role"].set(item.get("role", "other"))
+        self.status_text.set(f"发现 {len(ports)} 个串口；已填入前两个接口，可继续修改角色和通道映射")
+
     def _pick_endpoint(self) -> None:
         selected = filedialog.askopenfilename(title="选择模拟采集CSV", filetypes=[("CSV", "*.csv"), ("所有文件", "*.*")])
         if selected: self.vars["endpoint"].set(selected)
+
+    def _simulation_source_changed(self) -> None:
+        source_type = str(self.vars["simulation_source_type"].get())
+        if hasattr(self, "simulation_frame"):
+            self.simulation_frame.configure(text=f"模拟数据源（{source_type}）")
+
+    def _pick_simulation_source(self) -> None:
+        source_type = str(self.vars["simulation_source_type"].get())
+        if source_type == "folder_csv":
+            selected = filedialog.askdirectory(title="选择模拟采集数据文件夹")
+        elif source_type == "mysql":
+            return
+        else:
+            selected = filedialog.askopenfilename(
+                title="选择模拟采集 CSV",
+                filetypes=[("CSV", "*.csv"), ("所有文件", "*.*")],
+            )
+        if selected:
+            self.vars["simulation_source_path"].set(selected)
 
     def _pick_model(self) -> None:
         selected = filedialog.askopenfilename(title="选择预测模型", filetypes=[("PyTorch模型", "*.pth *.pt"), ("所有文件", "*.*")])
@@ -459,11 +550,35 @@ class AcquisitionPanel(ttk.Frame):
         capture = self._selected(self.sensor_lists[0])
         inputs = self._selected(self.sensor_lists[1])
         outputs = self._selected(self.sensor_lists[2])
+        interfaces = []
+        for index, values in enumerate(getattr(self, "interface_vars", []), start=1):
+            try:
+                channel_map = json.loads(str(values["map"].get() or "{}"))
+            except json.JSONDecodeError:
+                channel_map = {}
+            interfaces.append({
+                "id": f"interface_{index}", "enabled": bool(values["enabled"].get()),
+                "role": str(values["role"].get()), "driver": str(values["driver"].get()),
+                "endpoint": str(values["endpoint"].get()).strip(), "baudrate": _safe_int(self.vars["baudrate"].get(), 115200, 1),
+                "channel_map": channel_map,
+            })
+        simulation_source_type = str(self.vars["simulation_source_type"].get() or "single_csv")
+        simulation_source_path = str(self.vars["simulation_source_path"].get()).strip()
+        acquisition_mode = "simulation" if str(self.vars["driver"].get()) == "simulator" else "real"
         return AcquisitionConfig(
             processing_mode=str(self.vars["processing_mode"].get()),
             dataset_schema=str(self.vars["dataset_schema"].get()),
             use_best_prediction_override=bool(self.vars["use_best_prediction_override"].get()),
-            driver=str(self.vars["driver"].get()), endpoint=str(self.vars["endpoint"].get()).strip(),
+            driver=str(self.vars["driver"].get()), endpoint=str(self.vars["endpoint"].get()).strip(), interfaces=interfaces,
+            acquisition_mode=acquisition_mode,
+            simulation_source_type=simulation_source_type,
+            simulation_source_path=simulation_source_path or (str(self.vars["endpoint"].get()).strip() if acquisition_mode == "simulation" else ""),
+            simulation_mysql_query=self.simulation_mysql_query.get("1.0", "end").strip(),
+            simulation_mysql_host=str(self.vars["simulation_mysql_host"].get()).strip(),
+            simulation_mysql_port=_safe_int(self.vars["simulation_mysql_port"].get(), 3306, 1),
+            simulation_mysql_user=str(self.vars["simulation_mysql_user"].get()).strip(),
+            simulation_mysql_password=str(self.vars["simulation_mysql_password"].get()),
+            simulation_mysql_database=str(self.vars["simulation_mysql_database"].get()).strip(),
             source_file=(str(self.vars["endpoint"].get()).strip() if str(self.vars["driver"].get()) == "simulator" else ""),
             baudrate=_safe_int(self.vars["baudrate"].get(), 115200, 1), sample_rate_hz=_safe_float(self.vars["sample_rate_hz"].get(), 10.0),
             selected_sensors=capture, model_input_sensors=inputs, model_output_sensors=outputs,
@@ -881,6 +996,9 @@ def main() -> None:
                 "min_delta": 1e-6,
                 "device": "cpu",
                 "seed": 20260813,
+                # Exercise the packaged comparison-model import path here;
+                # --model-smoke separately covers inference for all 22 weights.
+                "model_type": "TCN",
                 "task_name": "packaged_integration_smoke",
             },
             report_root / "training",

@@ -1,11 +1,11 @@
 param(
     [string]$PythonExecutable = "",
-    [string]$TargetDir = "F:\AFP_Integrated_Native_InterfaceMapped\AFP_Integrated_System_SMRF_HID_Fixed_20260823_v1.12.0\AFP_Integrated_System"
+    [string]$TargetDir = "F:\AFP_Integrated_Native_InterfaceMapped\AFP_Integrated_System_SMRF_HID_Restored_20260824_v1.12.1\AFP_Integrated_System"
 )
 
 $ErrorActionPreference = "Stop"
-$AppVersion = "1.12.0"
-$BuildId = "20260823-schema-contract-fix"
+$AppVersion = "1.12.1"
+$BuildId = "20260824-interface-logic-restored"
 $AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $StateMonitorDir = Split-Path -Parent $AppDir
 $ModelsRoot = Join-Path $AppDir "models"
@@ -20,7 +20,10 @@ if (-not $PythonExecutable) {
     throw "Pass -PythonExecutable with the Python environment that contains PyInstaller and pywebview."
 }
 
-$BuildRoot = Join-Path $env:TEMP "AFPIntegratedNativeBuild_v1_12_0"
+$HardwareDllRoot = Join-Path $AppDir "hardware_dlls"
+$BsvUvcDll = Join-Path $HardwareDllRoot "BsvUvcNative.dll"
+$LibUsbDll = Join-Path $HardwareDllRoot "libusb-1.0.dll"
+$BuildRoot = Join-Path $env:TEMP "AFPIntegratedNativeBuild_v1_12_1"
 $StageRoot = Join-Path $BuildRoot "stage"
 $StageData = Join-Path $StageRoot "data"
 $StageDemo = Join-Path $StageRoot "new_collection_demo_v11_3"
@@ -31,6 +34,7 @@ $VersionFile = Join-Path $BuildRoot "version_info.txt"
 foreach ($Required in @(
     $PythonExecutable, $ModelsRoot, $RuntimeRoot, $LegacyReplayDir,
     $CausalArtifact, $LegacySource,
+    $BsvUvcDll, $LibUsbDll,
     (Join-Path $AppDir "static"),
     (Join-Path $AppDir "data\candidate_models"),
     (Join-Path $AppDir "new_collection_demo_v11_3\models\new_collection_hi_artifacts.joblib")
@@ -102,7 +106,7 @@ foreach ($Name in @(
 # UTF-8
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1,12,0,0), prodvers=(1,12,0,0),
+    filevers=(1,12,1,0), prodvers=(1,12,1,0),
     mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0,
     date=(0, 0)
   ),
@@ -145,7 +149,7 @@ $PyInstallerArgs = @(
     "--hidden-import", "sklearn.preprocessing._data",
     "--hidden-import", "sklearn.decomposition._pca",
     "--hidden-import", "sklearn.metrics.cluster._expected_mutual_info_fast",
-    "--hidden-import", "app", "--hidden-import", "acquisition",
+    "--hidden-import", "app", "--hidden-import", "acquisition", "--hidden-import", "smrf_hid",
     "--hidden-import", "mysql_storage", "--hidden-import", "native_integrated_app",
     "--hidden-import", "native_frontend_launcher", "--hidden-import", "webview",
     "--hidden-import", "webview.platforms.winforms",
@@ -166,6 +170,7 @@ $PyInstallerArgs = @(
     "--exclude-module", "tensorboard", "--exclude-module", "keras",
     "--exclude-module", "paddle", "--exclude-module", "cv2",
     "--exclude-module", "torchaudio", "--exclude-module", "torchvision",
+    "--add-binary", "$BsvUvcDll;.", "--add-binary", "$LibUsbDll;.",
     "--distpath", $DistDir, "--workpath", $WorkDir, "--specpath", $WorkDir,
     (Join-Path $AppDir "native_frontend_launcher.py")
 )
@@ -188,10 +193,11 @@ $SourceTarget = Join-Path $TargetDir "source\visualization_app"
 New-Item -ItemType Directory -Force -Path $SourceTarget | Out-Null
 $SourceFiles = @(
     "native_frontend_launcher.py", "native_integrated_app.py", "app.py",
-    "acquisition.py", "mysql_storage.py", "online_inference.py", "atavn.py",
+    "acquisition.py", "smrf_hid.py", "mysql_storage.py", "online_inference.py", "atavn.py",
     "online_health_features.py", "causal_online_runtime.py", "runtime_scaler.py",
     "new_collection_health.py", "fit_new_collection_health.py", "runtime_health_primitives.py", "web_training.py",
     "web_training_pipeline.py", "training_data.py", "build_native_integrated_app.ps1",
+    "build_native_integrated_app_restored.ps1", "hardware_dlls\BsvUvcNative.dll", "hardware_dlls\libusb-1.0.dll",
     "test_app.py", "test_mysql_identity.py", "test_new_collection_health.py",
     "test_native_integrated_app.py", "README.md"
 )

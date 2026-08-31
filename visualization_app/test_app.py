@@ -44,6 +44,16 @@ class DashboardTests(unittest.TestCase):
 
     def test_bootstrap_and_view(self) -> None:
         bootstrap = self.dashboard.bootstrap()
+        self.assertEqual(bootstrap["application"]["version"], "1.12.0")
+        prediction_models = bootstrap["acquisition"]["prediction_models"]
+        self.assertEqual(len(prediction_models), 11)
+        self.assertTrue(
+            all(
+                model["available_by_schema"][schema]
+                for model in prediction_models
+                for schema in ("legacy_original", "new_collection_v11_3")
+            )
+        )
         defaults = bootstrap["defaults"]
         payload = self.dashboard.view(
             defaults["specimen"],
@@ -197,8 +207,10 @@ class DashboardTests(unittest.TestCase):
             "raw", "TC-HI", "random_forest", 48, True, True,
         )
         self.assertEqual(raw["forecast"]["mode"], "archived_direct_24")
-        self.assertEqual(optimized["forecast"]["mode"], "live_checkpoint_recursive")
+        self.assertEqual(optimized["forecast"]["mode"], "i_T_G_recursive")
         self.assertEqual(optimized["forecast"]["returned_horizon"], 48)
+        self.assertEqual(optimized["forecast"]["model_type"], "i_T_G")
+        self.assertEqual(len(optimized["forecast"]["checkpoint_sha256"]), 64)
         self.assertEqual(
             raw["window"]["decision_mode"],
             "realtime_features_archived_prediction",
@@ -482,19 +494,11 @@ class DashboardTests(unittest.TestCase):
             root = Path(temporary)
             first = capture_layer(root, 0)
             second = capture_layer(root, 1)
-            specimen_dir = (
-                root / "用户选择目录" / "试样A_p600_v100_pr600"
-            )
-            layer_1 = specimen_dir / "试样A_p600_v100_pr600_第1层.CSV"
-            layer_2 = specimen_dir / "试样A_p600_v100_pr600_第2层.CSV"
-            whole_1 = (
-                specimen_dir
-                / "试样A_p600_v100_pr600_完整试样_已采1层.CSV"
-            )
-            whole_2 = (
-                specimen_dir
-                / "试样A_p600_v100_pr600_完整试样_已采2层.CSV"
-            )
+            specimen_dir = root / "用户选择目录" / "R1_p600_v100_pr600"
+            layer_1 = specimen_dir / "R1_p600_v100_pr600_第1层.CSV"
+            layer_2 = specimen_dir / "R1_p600_v100_pr600_第2层.CSV"
+            whole_1 = specimen_dir / "R1_p600_v100_pr600_完整试样.CSV"
+            whole_2 = whole_1
             self.assertEqual(Path(first["raw_file"]), layer_1)
             self.assertEqual(Path(second["raw_file"]), layer_2)
             self.assertEqual(Path(first["full_specimen_file"]), whole_1)
@@ -503,6 +507,9 @@ class DashboardTests(unittest.TestCase):
             self.assertTrue(layer_2.exists())
             self.assertTrue(whole_1.exists())
             self.assertTrue(whole_2.exists())
+            self.assertEqual(
+                len(list(specimen_dir.glob("*完整试样*.CSV"))), 1
+            )
             first_rows = pd.read_csv(layer_1, encoding="gb18030")
             second_rows = pd.read_csv(layer_2, encoding="gb18030")
             combined = pd.read_csv(whole_2, encoding="gb18030")
@@ -574,7 +581,8 @@ class DashboardTests(unittest.TestCase):
             profile = self.dashboard.inspect_prediction_model(
                 str(NEW_DEMO_CHECKPOINT)
             )
-            self.assertEqual(profile["enc_in"], 23)
+            self.assertEqual(profile["enc_in"], 20)
+            self.assertEqual(profile["input_sensors"], NEW_COLLECTION_SENSOR_COLUMNS)
             config = AcquisitionConfig(
                 processing_mode="prediction_warning",
                 dataset_schema="new_collection_v11_3",
@@ -611,6 +619,17 @@ class DashboardTests(unittest.TestCase):
                 self.assertEqual(len(payload["channels"]), 16)
                 self.assertEqual(payload["forecast"]["returned_horizon"], 24)
                 self.assertTrue(payload["window"]["complete"])
+                self.assertTrue(
+                    payload["window"]["optimized_warning_applied"]
+                )
+                self.assertEqual(
+                    payload["feature_generation"]["warning_optimization"],
+                    "validation_calibrated_cap_16s4p",
+                )
+                probabilities = list(
+                    payload["window"]["type_probabilities"].values()
+                )
+                self.assertGreater(max(probabilities) - min(probabilities), 1e-6)
                 self.assertEqual(
                     payload["forecast"]["checkpoint"],
                     str(NEW_DEMO_CHECKPOINT.resolve()),
@@ -648,12 +667,9 @@ class DashboardTests(unittest.TestCase):
         )
         self.assertEqual(
             result["selection_metric"],
-            "validation_mse_standardized",
+            "minimum_validation_loss",
         )
-        self.assertAlmostEqual(
-            float(result["selection_metric_value"]),
-            0.035947587341070175,
-        )
+        self.assertLess(float(result["selection_metric_value"]), 0.01)
         self.assertNotIn("test", result["selection_basis"].lower())
 
 

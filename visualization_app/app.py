@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import mimetypes
+import sys
 import threading
 import webbrowser
 from http import HTTPStatus
@@ -17,8 +18,11 @@ import joblib
 
 from online_inference import (
     DEFAULT_CHECKPOINT,
+    DEFAULT_MODEL_METADATA,
     OnlineIModernTCN,
     inspect_prediction_model,
+    model_catalog,
+    normalize_model_type,
 )
 from acquisition import (
     ALL_SENSOR_COLUMNS,
@@ -26,9 +30,10 @@ from acquisition import (
     AcquisitionConfig,
     AcquisitionManager,
     NEW_COLLECTION_SENSOR_COLUMNS,
-    NEW_EXCLUDED_SENSOR_COLUMNS,
     SENSOR_COLUMNS,
+    integrate_capture_sources,
     select_capture_folder,
+    select_simulation_source,
 )
 from mysql_storage import MySQLCaptureStore, mysql_settings_from_mapping
 from online_health_features import OnlineWindowFeatureEngine
@@ -45,6 +50,18 @@ from web_training import WebTrainingManager
 
 
 APP_DIR = Path(__file__).resolve().parent
+APP_VERSION = "1.12.0"
+BUILD_ID = "20260823-schema-contract-fix"
+EXECUTABLE_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else APP_DIR
+)
+RUNTIME_MODEL_DIR = (
+    EXECUTABLE_DIR / "models"
+    if (EXECUTABLE_DIR / "models").exists()
+    else APP_DIR / "models"
+)
 STATIC_DIR = APP_DIR / "static"
 DATA_DIR = APP_DIR / "data"
 _PACKAGED_REPLAY_DIR = DATA_DIR / "legacy_replay"
@@ -97,12 +114,7 @@ LIVE_SENSOR_UNITS = {
 }
 NEW_DEMO_ROOT = APP_DIR / "new_collection_demo_v11_3"
 NEW_DEMO_SOURCE = NEW_DEMO_ROOT / "simulator_stream.csv"
-NEW_DEMO_CHECKPOINT = (
-    NEW_DEMO_ROOT
-    / "models"
-    / "i_modern_tcn_new_collection_v11_3.pth"
-)
-NEW_DEMO_METRICS = NEW_DEMO_ROOT / "models" / "test_metrics.json"
+NEW_DEMO_CHECKPOINT = RUNTIME_MODEL_DIR / "new" / "i_T_G" / "checkpoint.pth"
 
 
 def select_prediction_model_file(initial_path: str = "") -> str:
@@ -202,6 +214,15 @@ INDICATOR_VARIANTS = {
         }
     },
 }
+
+
+INDICATOR_VARIANTS["new_collection_v11_3"]["TC-HI"].update(
+    {
+        "variant_id": "TC-HI-New-16S4P",
+        "label": "新数据热－压实耦合指标（16路传感器＋4工艺参数）",
+        "construction": "16路实际传感器响应与4项工艺参数的耦合特征",
+    }
+)
 
 
 def _finite_or_none(value):
@@ -441,7 +462,10 @@ class DashboardData:
         # rolling forecast.  It is never used for historical alignment.
         self.live_rolling_prediction_cache: dict[str, dict[int, np.ndarray]] = {}
         self.live_cache_lock = threading.RLock()
-        self.replay_prediction_cache: dict[int, np.ndarray] = {}
+        # A replay prediction depends on both the archived window and the
+        # selected checkpoint.  Keying only by window reused stale results
+        # after the user changed the prediction algorithm.
+        self.replay_prediction_cache: dict[tuple[str, int], np.ndarray] = {}
         self.live_layer_health_path = (
             self.acquisition.capture_root / "specimen_layer_health.json"
         )
@@ -480,6 +504,7 @@ class DashboardData:
         }
 
     def bootstrap(self) -> dict:
+        interface_discovery = self.acquisition.discover_interfaces()
         specimens = []
         for _, row in self.specimens.iterrows():
             specimens.append(
@@ -597,7 +622,11 @@ class DashboardData:
                         "label": (
                             variant_info["label"]
                             if str(indicator) == "TC-HI"
-                            else str(recommended["indicator_label"])
+                            else (
+                                "16通道预测残差融合指标"
+                                if str(indicator) == "RFHI"
+                                else str(recommended["indicator_label"])
+                            )
                         ),
                         "variant": variant_info,
                         "required_outputs": variant_info["required_outputs"],
@@ -606,6 +635,7 @@ class DashboardData:
                     }
                 )
         return {
+            "application": {"version": APP_VERSION, "build_id": BUILD_ID},
             "manifest": self.manifest,
             "state_labels": STATE_LABELS,
             "sensors": self.sensors,
@@ -632,6 +662,7 @@ class DashboardData:
                 "indicator": "TC-HI",
                 "model": "random_forest",
                 "prediction_horizon": 24,
+                "prediction_model_type": "i_T_G",
                 "forecast_lead": 1,
                 # Replay defaults to the causal checkpoint path so the
                 # displayed historical curve uses the selected forecast lead
@@ -642,9 +673,14 @@ class DashboardData:
             },
             "acquisition": {
                 "drivers": self.acquisition.available_drivers(),
+                "interface_defaults": interface_discovery.get("defaults", []),
+                "sensor_types": interface_discovery.get("sensor_type_profiles", []),
+                "channel_metadata": interface_discovery.get("channel_metadata", {}),
+                "interface_discovery": interface_discovery,
                 "schemas": self.acquisition.available_schemas(),
                 "sensors": SENSOR_COLUMNS,
                 "prediction_model": self.online_predictor.profile,
+                "prediction_models": model_catalog(),
                 "best_prediction_models": {
                     schema_id: self.best_prediction_profile(schema_id)
                     for schema_id in ACQUISITION_SCHEMAS
@@ -656,7 +692,9 @@ class DashboardData:
                         else ""
                     ),
                     "prediction_model": (
-                        inspect_prediction_model(NEW_DEMO_CHECKPOINT)
+                        inspect_prediction_model(
+                            NEW_DEMO_CHECKPOINT, schema_mode="new_collection_v11_3"
+                        )
                         if NEW_DEMO_CHECKPOINT.exists()
                         else None
                     ),
@@ -681,42 +719,53 @@ class DashboardData:
             },
         }
 
-    def inspect_prediction_model(self, checkpoint: str = "") -> dict:
-        return inspect_prediction_model(checkpoint)
+    def inspect_prediction_model(
+        self, checkpoint: str = "", model_type: str = "", architecture: str = "",
+        schema_mode: str = "",
+    ) -> dict:
+        return inspect_prediction_model(
+            checkpoint, model_type=model_type, architecture=architecture,
+            schema_mode=schema_mode,
+        )
 
     def best_prediction_profile(self, dataset_schema: str) -> dict:
-        if (
-            dataset_schema == "new_collection_v11_3"
-            and NEW_DEMO_CHECKPOINT.exists()
-        ):
-            profile = inspect_prediction_model(NEW_DEMO_CHECKPOINT)
-            metric_value = None
-            if NEW_DEMO_METRICS.exists():
-                metrics = json.loads(
-                    NEW_DEMO_METRICS.read_text(encoding="utf-8")
+        schema_id = (
+            "new_collection_v11_3"
+            if dataset_schema == "new_collection_v11_3"
+            else "legacy_original"
+        )
+        candidates = []
+        for entry in model_catalog():
+            scope = "new" if schema_id == "new_collection_v11_3" else "legacy"
+            packaged_checkpoint = (
+                RUNTIME_MODEL_DIR / scope / str(entry["id"]) / "checkpoint.pth"
+            )
+            if not packaged_checkpoint.is_file():
+                continue
+            try:
+                profile = inspect_prediction_model(
+                    packaged_checkpoint,
+                    model_type=str(entry["id"]),
+                    schema_mode=schema_id,
                 )
-                metric_value = _finite(
-                    metrics.get("best_validation_mse_standardized"),
-                    None,
-                )
-            return {
-                **profile,
-                "selection_metric": "validation_mse_standardized",
-                "selection_metric_value": metric_value,
-                "selection_basis": (
-                    "仅使用冻结验证集误差；未使用内推/外推测试集"
-                ),
-                "registry_scope": "new_collection_v11_3",
-            }
-        profile = inspect_prediction_model(DEFAULT_CHECKPOINT)
+            except (FileNotFoundError, ValueError, RuntimeError):
+                continue
+            metric = profile.get("validation_loss")
+            if metric is not None and math.isfinite(float(metric)):
+                candidates.append((float(metric), profile))
+        if not candidates:
+            raise FileNotFoundError(
+                f"{schema_id}没有可用且带验证记录的预测模型权重"
+            )
+        metric_value, profile = min(candidates, key=lambda item: item[0])
         return {
             **profile,
-            "selection_metric": "registered_default",
-            "selection_metric_value": None,
+            "selection_metric": "minimum_validation_loss",
+            "selection_metric_value": metric_value,
             "selection_basis": (
-                "旧方案当前登记的唯一兼容论文检查点；未用测试集重选"
+                "仅比较训练时冻结验证集损失；未使用测试集重选"
             ),
-            "registry_scope": "legacy_original",
+            "registry_scope": schema_id,
         }
 
     def validate_prediction_setup(
@@ -739,7 +788,11 @@ class DashboardData:
         profile = (
             self.best_prediction_profile(config.dataset_schema)
             if config.use_best_prediction_override
-            else inspect_prediction_model(config.prediction_model_file)
+            else inspect_prediction_model(
+                config.prediction_model_file,
+                model_type=getattr(config, "prediction_model_type", "i_T_G"),
+                schema_mode=config.dataset_schema,
+            )
         )
         auto_corrected = False
         schema_sensors = list(
@@ -754,46 +807,21 @@ class DashboardData:
         missing_inputs = [
             name for name in model_inputs if name not in acquired_inputs
         ]
-        # The new collection plan intentionally omits rotation speed,
-        # displacement and vibration.  Older demo checkpoints may still list
-        # these as model columns; they are virtual baseline-filled inputs, not
-        # required physical channels.
-        virtual_missing_inputs = [
-            name for name in missing_inputs
-            if name in NEW_EXCLUDED_SENSOR_COLUMNS
-            and config.dataset_schema == "new_collection_v11_3"
-        ]
-        effective_missing_inputs = [
-            name for name in missing_inputs if name not in virtual_missing_inputs
-        ]
         unexpected_inputs = [
             name for name in acquired_inputs if name not in model_inputs
         ]
-        schema_conflict = bool(
-            unexpected_inputs
-            or any(name not in schema_sensors for name in acquired_inputs)
-            or any(
-                name not in schema_sensors
-                and name not in NEW_EXCLUDED_SENSOR_COLUMNS
-                for name in model_inputs
+        model_schema_violations = [
+            name for name in model_inputs if name not in schema_sensors
+        ]
+        if model_schema_violations:
+            raise ValueError(
+                f"所选模型与{config.dataset_schema}数据方案不兼容，"
+                f"模型包含该方案未采集的通道：{model_schema_violations}"
             )
-        )
-        if (effective_missing_inputs or unexpected_inputs) and schema_conflict:
-            profile = self.best_prediction_profile(config.dataset_schema)
-            config.prediction_model_file = profile["checkpoint"]
-            config.model_input_sensors = list(profile["input_sensors"])
-            config.model_output_sensors = list(profile["output_sensors"])
-            config.prediction_sensors = list(profile["output_sensors"])
-            config.selected_sensors = list(schema_sensors)
-            acquired_inputs = list(config.model_input_sensors)
-            model_inputs = list(profile["input_sensors"])
-            missing_inputs = []
-            unexpected_inputs = []
-            auto_corrected = True
-        if effective_missing_inputs or unexpected_inputs:
+        if missing_inputs or unexpected_inputs:
             raise ValueError(
                 "当前采集传感器与所选预测模型输入不一致。"
-                f"缺少：{effective_missing_inputs or '无'}；"
+                f"缺少：{missing_inputs or '无'}；"
                 f"模型未声明：{unexpected_inputs or '无'}"
             )
         if not set(acquired_inputs).issubset(
@@ -866,7 +894,9 @@ class DashboardData:
             )
         if load_model:
             profile = self.online_predictor.configure(
-                profile["checkpoint"]
+                profile["checkpoint"],
+                model_type=getattr(config, "prediction_model_type", profile.get("model_type", "i_T_G")),
+                schema_mode=config.dataset_schema,
             )
         return {
             **profile,
@@ -917,7 +947,7 @@ class DashboardData:
                 "candidate_index": -1 - candidate_index,
                 "indicator_family": candidate["indicator"],
                 "model_kind": candidate["model"],
-                "feature_key": "new_collection_multiphysics_v2",
+                "feature_key": "new_collection_multiphysics_v3_16s4p",
                 "recommended_for_indicator": candidate["recommended"],
             }
         )
@@ -1048,19 +1078,43 @@ class DashboardData:
     def _replay_live_predictions(
         self, visual_indices: np.ndarray
     ) -> np.ndarray:
+        profile = self.online_predictor.profile
+        mean, scale = self._prediction_model_scaler(profile)
+        target_columns = list(profile["model_columns"])
+        archived_columns = list(DEFAULT_MODEL_METADATA["model_columns"])
+        sensor_columns = [str(item["name"]) for item in self.sensors]
         outputs = []
         for visual_index in np.asarray(visual_indices, dtype=int):
-            cached = self.replay_prediction_cache.get(int(visual_index))
+            cache_key = (str(profile["checkpoint"]), int(visual_index))
+            cached = self.replay_prediction_cache.get(cache_key)
             if cached is None:
+                archived_physical = (
+                    self.model_input[int(visual_index)]
+                    * self.scaler_scale[None, :]
+                    + self.scaler_mean[None, :]
+                )
+                physical = np.broadcast_to(
+                    mean, (len(archived_physical), len(target_columns))
+                ).astype(float).copy()
+                for name in target_columns:
+                    if name in archived_columns:
+                        physical[:, target_columns.index(name)] = archived_physical[
+                            :, archived_columns.index(name)
+                        ]
+                model_input = ((physical - mean[None, :]) / scale[None, :]).astype(
+                    np.float32
+                )
                 standardized, _ = self.online_predictor.predict(
-                    self.model_input[int(visual_index)], 24
+                    model_input, 24
                 )
-                cached = (
-                    standardized[:, self.sensor_model_indices]
-                    * self.scaler_scale[self.sensor_model_indices]
-                    + self.scaler_mean[self.sensor_model_indices]
+                cached = self._prediction_to_sensor_matrix(
+                    standardized, profile, sensor_columns
                 )
-                self.replay_prediction_cache[int(visual_index)] = cached
+                if not np.isfinite(cached).all():
+                    raise ValueError(
+                        "所选预测模型未覆盖历史回放状态预警所需的全部传感器输出"
+                    )
+                self.replay_prediction_cache[cache_key] = cached
             outputs.append(cached)
         return np.stack(outputs, axis=0)
 
@@ -1288,7 +1342,24 @@ class DashboardData:
         realtime_prediction: bool = False,
         use_optimized_warning: bool = True,
         forecast_lead: int = 1,
+        dataset_schema: str = "legacy_original",
+        prediction_model_type: str = "i_T_G",
     ) -> dict:
+        if dataset_schema != "legacy_original":
+            raise ValueError("历史回放数据仅支持旧数据12传感器方案")
+        selected_model_type = normalize_model_type(prediction_model_type)
+        active_profile = self.online_predictor.profile
+        if realtime_prediction and (
+            active_profile.get("schema_mode") != "legacy_original"
+            or active_profile.get("model_type") != selected_model_type
+            or int(active_profile.get("enc_in", 0)) not in {15, 17}
+        ):
+            self.online_predictor.configure(
+                "",
+                model_type=selected_model_type,
+                schema_mode="legacy_original",
+            )
+            active_profile = self.online_predictor.profile
         if specimen_id not in self.layer_groups:
             specimen_id = self.specimen_ids[0]
         sensor_id = int(np.clip(sensor_id, 0, len(self.sensors) - 1))
@@ -1354,11 +1425,6 @@ class DashboardData:
         ]
         specimen_actual = np.concatenate(actual_parts, axis=0)
         specimen_prediction = np.concatenate(prediction_parts, axis=0)
-        full_true_parts = [
-            self.model_true[block["visual_indices"]].reshape(-1, self.model_true.shape[-1])
-            for block in layer_blocks
-        ]
-        specimen_model_true = np.concatenate(full_true_parts, axis=0)
 
         history_start = max(0, cursor - history)
         observed_indices = np.arange(history_start, cursor, step, dtype=int)
@@ -1368,17 +1434,19 @@ class DashboardData:
         prediction_source = "archived_prediction"
         if realtime_prediction:
             first_visual_index = int(layer_blocks[0]["visual_indices"][0])
-            model_history_stream = np.concatenate(
-                [self.model_input[first_visual_index], specimen_model_true[:cursor]],
-                axis=0,
+            model_history_stream = self._legacy_replay_model_stream(
+                profile=active_profile,
+                first_visual_index=first_visual_index,
+                specimen_actual=specimen_actual[:cursor],
+                layer_blocks=layer_blocks,
             )
             online_standardized, forecast_mode = self.online_predictor.predict(
                 model_history_stream[-24:], prediction_horizon
             )
-            online_physical = (
-                online_standardized[:, self.sensor_model_indices]
-                * self.scaler_scale[self.sensor_model_indices]
-                + self.scaler_mean[self.sensor_model_indices]
+            online_physical = self._prediction_to_sensor_matrix(
+                online_standardized,
+                active_profile,
+                [str(item["name"]) for item in self.sensors],
             )
             future_prediction_matrix = online_physical
             future_time = (np.arange(prediction_horizon, dtype=int) + 1) / _finite(
@@ -1395,7 +1463,7 @@ class DashboardData:
                 model_history_stream=model_history_stream,
                 target_indices=causal_indices,
                 forecast_lead=forecast_lead,
-                profile=self.online_predictor.profile,
+                profile=active_profile,
                 sensor_columns=[str(item["name"]) for item in self.sensors],
             )
             # Start with an empty historical prediction series.  The first
@@ -1426,7 +1494,7 @@ class DashboardData:
         # predictions over it; the prediction curve begins after this window.
         input_context_points = min(
             len(historical_prediction_matrix),
-            int(self.online_predictor.profile.get("seq_len", 24)),
+            int(active_profile.get("seq_len", 24)),
         )
         if input_context_points:
             historical_prediction_matrix[:input_context_points] = np.nan
@@ -1701,6 +1769,11 @@ class DashboardData:
                 "checkpoint": (
                     self.online_predictor.checkpoint if realtime_prediction else None
                 ),
+                "model_type": active_profile.get("model_type"),
+                "input_sensors": active_profile.get("input_sensors", []),
+                "available_output_sensors": active_profile.get("output_sensors", []),
+                "checkpoint_sha256": active_profile.get("checkpoint_sha256"),
+                "atavn": active_profile.get("atavn"),
             },
             "progress": {
                 "cursor": cursor,
@@ -1789,11 +1862,10 @@ class DashboardData:
         full[:] = mean
         for sensor_name in profile["input_sensors"]:
             if sensor_name not in sensor_columns:
-                # New collection data intentionally does not acquire the
-                # legacy rotation/displacement/vibration channels.  Their
-                # model columns remain at the scaler baseline for backward
-                # compatibility with the existing checkpoint.
-                continue
+                raise ValueError(
+                    f"实时数据缺少模型输入通道：{sensor_name}；"
+                    "禁止用标准化基线伪造未采集的传感器数据"
+                )
             full[:, column_index[sensor_name]] = sensors[
                 :, sensor_columns.index(sensor_name)
             ]
@@ -1953,6 +2025,65 @@ class DashboardData:
         )
         output[np.asarray(valid_targets, dtype=int)] = physical
         return output
+
+    def _legacy_replay_model_stream(
+        self,
+        *,
+        profile: dict,
+        first_visual_index: int,
+        specimen_actual: np.ndarray,
+        layer_blocks: list[dict],
+    ) -> np.ndarray:
+        """Map archived physical replay data into the selected model contract."""
+        mean, scale = self._prediction_model_scaler(profile)
+        model_columns = list(profile["model_columns"])
+        physical = np.broadcast_to(
+            mean, (len(specimen_actual), len(model_columns))
+        ).astype(float).copy()
+        sensor_names = [str(item["name"]) for item in self.sensors]
+        for model_sensor in profile["input_sensors"]:
+            display_sensor = "压实力" if model_sensor == "压力" else model_sensor
+            if display_sensor not in sensor_names:
+                raise ValueError(f"历史回放缺少模型输入传感器：{model_sensor}")
+            physical[:, model_columns.index(model_sensor)] = specimen_actual[
+                :, sensor_names.index(display_sensor)
+            ]
+
+        point_offset = 0
+        for block in layer_blocks:
+            for _, row in block["group"].iterrows():
+                stop = min(point_offset + 24, len(physical))
+                for context_name in ("p", "v", "pr", "cycle", "l"):
+                    if context_name in model_columns:
+                        index = model_columns.index(context_name)
+                        physical[point_offset:stop, index] = _finite(
+                            row.get(context_name), mean[index]
+                        )
+                point_offset = stop
+
+        archived_columns = list(DEFAULT_MODEL_METADATA["model_columns"])
+        archived_physical = (
+            self.model_input[int(first_visual_index)] * self.scaler_scale[None, :]
+            + self.scaler_mean[None, :]
+        )
+        context = np.broadcast_to(
+            mean, (len(archived_physical), len(model_columns))
+        ).astype(float).copy()
+        for name in model_columns:
+            target_index = model_columns.index(name)
+            if name in archived_columns:
+                context[:, target_index] = archived_physical[
+                    :, archived_columns.index(name)
+                ]
+            elif len(physical):
+                context[:, target_index] = physical[0, target_index]
+        return np.concatenate(
+            [
+                ((context - mean[None, :]) / scale[None, :]).astype(np.float32),
+                ((physical - mean[None, :]) / scale[None, :]).astype(np.float32),
+            ],
+            axis=0,
+        )
 
     def _health_feature_arrays(
         self,
@@ -2202,15 +2333,33 @@ class DashboardData:
         prediction_sensors: list[str] | None = None,
         processing_mode: str | None = None,
         forecast_lead: int = 1,
+        dataset_schema: str | None = None,
+        prediction_model_type: str | None = None,
     ) -> dict:
         """Real acquisition -> live model -> live HI features -> warning."""
         status = self.acquisition.status()
         rows, timestamps = self.acquisition.numeric_matrix()
         config = status.get("config") or {}
+        requested_schema = (
+            dataset_schema
+            if dataset_schema in ACQUISITION_SCHEMAS
+            else str(config.get("dataset_schema") or "legacy_original")
+        )
+        if config.get("dataset_schema") and config.get("dataset_schema") != requested_schema:
+            raise ValueError(
+                "界面数据方案与当前采集会话不一致，请先停止采集后重新开始"
+            )
+        config = {**config, "dataset_schema": requested_schema}
+        requested_model_type = normalize_model_type(
+            prediction_model_type
+            or config.get("prediction_model_type")
+            or "i_T_G"
+        )
         if processing_mode in {"capture_only", "prediction_warning"}:
             config = {**config, "processing_mode": processing_mode}
         active_sensor_columns = list(
-            config.get("selected_sensors") or SENSOR_COLUMNS
+            config.get("selected_sensors")
+            or ACQUISITION_SCHEMAS[requested_schema]["sensors"]
         )
         sensor_id = int(
             np.clip(sensor_id, 0, max(len(active_sensor_columns) - 1, 0))
@@ -2250,24 +2399,48 @@ class DashboardData:
             and indicator == "TC-HI"
             and model_kind == "random_forest"
         )
+        calibrated_optimized = bool(use_optimized_warning and new_schema)
+        optimized_warning_applied = causal_optimized or calibrated_optimized
+        effective_rho = (
+            float(np.clip(_finite(candidate.get("cap_rho"), rho), 0.0, 1.0))
+            if calibrated_optimized
+            else rho
+        )
+        effective_window_threshold = (
+            float(
+                np.clip(
+                    _finite(candidate.get("window_threshold"), threshold),
+                    0.0,
+                    1.0,
+                )
+            )
+            if calibrated_optimized
+            else threshold
+        )
         active_profile = self.online_predictor.profile
         # A schema switch can arrive while an acquisition session is being
         # reused.  Reload the registered checkpoint compatible with the active
         # sensor set before constructing health features; otherwise an old
         # in-memory profile is reported as a health-indicator mismatch.
         active_sensor_names = set(active_sensor_columns)
-        if any(
+        if (
+            active_profile.get("schema_mode") != requested_schema
+            or active_profile.get("model_type") != requested_model_type
+            or any(
             str(name) not in active_sensor_names
-            and not (
-                new_schema
-                and str(name) in NEW_EXCLUDED_SENSOR_COLUMNS
-            )
             for name in active_profile.get("input_sensors", [])
-        ):
-            compatible_profile = self.best_prediction_profile(
-                "new_collection_v11_3" if new_schema else "legacy_original"
             )
-            self.online_predictor.configure(compatible_profile["checkpoint"])
+        ):
+            compatible_profile = inspect_prediction_model(
+                "",
+                model_type=requested_model_type,
+                schema_mode=requested_schema,
+            )
+            self.online_predictor.configure(
+                compatible_profile["checkpoint"],
+                model_type=compatible_profile.get("model_type", requested_model_type),
+                schema_mode=requested_schema,
+            )
             active_profile = self.online_predictor.profile
         configured_prediction_sensors = (
             prediction_sensors
@@ -2480,7 +2653,7 @@ class DashboardData:
                 type_probs = dict(cached_result["type_probabilities"])
                 predicted_state = (
                     "normal"
-                    if score < threshold
+                    if score < effective_window_threshold
                     else max(type_probs, key=type_probs.get)
                 )
                 completed.append(
@@ -2606,7 +2779,7 @@ class DashboardData:
         specimen_aggregate = None
         persist_layer_health = False
         if len(evidence_scores):
-            layer_health, weights = cap_pool(evidence_scores, rho)
+            layer_health, weights = cap_pool(evidence_scores, effective_rho)
             layer_type_probs = {
                 state: float(
                     np.dot(
@@ -2622,7 +2795,11 @@ class DashboardData:
                 )
                 for state in abnormal_states
             }
-            layer_threshold = _finite(candidate["layer_threshold"], threshold)
+            layer_threshold = (
+                _finite(candidate["layer_threshold"], threshold)
+                if optimized_warning_applied
+                else threshold
+            )
             layer_state = (
                 "normal"
                 if layer_health < layer_threshold
@@ -2636,8 +2813,12 @@ class DashboardData:
                 "evidence_count": len(completed),
                 "maximum_weight": float(np.max(weights)),
                 "effective_count": float(1.0 / np.sum(weights**2)),
-                "decision_mode": "live_features_and_classifier",
-                "optimized_warning_applied": False,
+                "decision_mode": (
+                    "validation_calibrated_cap_16s4p"
+                    if calibrated_optimized
+                    else "live_features_and_classifier"
+                ),
+                "optimized_warning_applied": calibrated_optimized,
             }
             causal_summary = None
             if not new_schema:
@@ -2713,7 +2894,9 @@ class DashboardData:
             layer_scores = np.asarray(
                 [item["health"] for item in layer_items], dtype=float
             )
-            specimen_health, specimen_weights = cap_pool(layer_scores, rho)
+            specimen_health, specimen_weights = cap_pool(
+                layer_scores, effective_rho
+            )
             specimen_type_probs = {
                 state: float(
                     np.dot(
@@ -2726,8 +2909,10 @@ class DashboardData:
                 )
                 for state in abnormal_states
             }
-            specimen_threshold = _finite(
-                candidate["specimen_threshold"], threshold
+            specimen_threshold = (
+                _finite(candidate["specimen_threshold"], threshold)
+                if optimized_warning_applied
+                else threshold
             )
             specimen_state = (
                 "normal"
@@ -2750,6 +2935,12 @@ class DashboardData:
                 ),
                 "complete": specimen_complete,
                 "aggregation": "CAP pooling across all available physical layers",
+                "decision_mode": (
+                    "validation_calibrated_cap_16s4p"
+                    if calibrated_optimized
+                    else "live_features_and_classifier"
+                ),
+                "optimized_warning_applied": calibrated_optimized,
             }
 
         latest = completed[-1] if completed else None
@@ -2778,8 +2969,12 @@ class DashboardData:
                 **latest,
                 "raw_realtime_score": latest["score"],
                 "complete": True,
-                "decision_mode": "live_features_and_classifier",
-                "optimized_warning_applied": False,
+                "decision_mode": (
+                    "validation_calibrated_cap_16s4p"
+                    if calibrated_optimized
+                    else "live_features_and_classifier"
+                ),
+                "optimized_warning_applied": calibrated_optimized,
             }
 
         if causal_optimized and latest is not None and layer_aggregate is not None:
@@ -3049,8 +3244,8 @@ class DashboardData:
                 "cursor": len(rows),
                 "history": history,
                 "step": step,
-                "threshold": threshold,
-                "rho": rho,
+                "threshold": effective_window_threshold,
+                "rho": effective_rho,
                 "score_mode": "live",
                 "indicator": indicator,
                 "model": model_kind,
@@ -3062,7 +3257,7 @@ class DashboardData:
                 "best_prediction_override": bool(
                     config.get("use_best_prediction_override", False)
                 ),
-                "use_optimized_warning": causal_optimized,
+                "use_optimized_warning": optimized_warning_applied,
             },
             "candidate": {
                 "indicator": indicator,
@@ -3089,14 +3284,18 @@ class DashboardData:
                 "test_specimen_balanced_accuracy": _finite(
                     candidate.get("test_specimen_balanced_accuracy"), None
                 ),
-                "window_threshold": threshold,
-                "layer_threshold": _finite(
-                    candidate["layer_threshold"], threshold
+                "window_threshold": effective_window_threshold,
+                "layer_threshold": (
+                    _finite(candidate["layer_threshold"], threshold)
+                    if optimized_warning_applied
+                    else threshold
                 ),
-                "specimen_threshold": _finite(
-                    candidate["specimen_threshold"], threshold
+                "specimen_threshold": (
+                    _finite(candidate["specimen_threshold"], threshold)
+                    if optimized_warning_applied
+                    else threshold
                 ),
-                "cap_rho": rho,
+                "cap_rho": effective_rho,
             },
                 "forecast": {
                     "requested_horizon": prediction_horizon,
@@ -3140,7 +3339,7 @@ class DashboardData:
             "layers": layers,
             "timeline": {
                 "scores": [item["score"] for item in completed] + [None],
-                "threshold": threshold,
+                "threshold": effective_window_threshold,
                 "active_index": len(completed),
                 "completed_count": len(completed),
             },
@@ -3180,6 +3379,8 @@ class DashboardData:
                 "warning_optimization": (
                     "causal_online_v13_9"
                     if causal_optimized
+                    else "validation_calibrated_cap_16s4p"
+                    if calibrated_optimized
                     else "none"
                 ),
             },
@@ -3439,7 +3640,9 @@ class AppHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
-            self._send_json({"status": "ok", "version": "1.11.0"})
+            self._send_json(
+                {"status": "ok", "version": APP_VERSION, "build_id": BUILD_ID}
+            )
             return
         if parsed.path == "/api/training/status":
             query = parse_qs(parsed.query)
@@ -3454,6 +3657,9 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/acquisition/status":
             self._send_json(self.dashboard.acquisition.status())
+            return
+        if parsed.path == "/api/acquisition/discover":
+            self._send_json(self.dashboard.acquisition.discover_interfaces())
             return
         if parsed.path == "/api/live":
             try:
@@ -3496,6 +3702,12 @@ class AppHandler(BaseHTTPRequestHandler):
                     ),
                     processing_mode=self._one(
                         query, "processing_mode", "prediction_warning"
+                    ),
+                    dataset_schema=self._one(
+                        query, "dataset_schema", "legacy_original"
+                    ),
+                    prediction_model_type=self._one(
+                        query, "prediction_model_type", "i_T_G"
                     ),
                 )
                 self._send_json(payload)
@@ -3546,6 +3758,12 @@ class AppHandler(BaseHTTPRequestHandler):
                     use_optimized_warning=self._one(
                         query, "use_optimized_warning", "true"
                     ).lower() in {"1", "true", "yes", "on"},
+                    dataset_schema=self._one(
+                        query, "dataset_schema", "legacy_original"
+                    ),
+                    prediction_model_type=self._one(
+                        query, "prediction_model_type", "i_T_G"
+                    ),
                 )
                 self._send_json(payload)
             except Exception as exc:  # pragma: no cover - returned to browser
@@ -3575,6 +3793,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 result = self.dashboard.acquisition.test_connection(config)
                 result["prediction_model"] = model_validation
                 self._send_json(result)
+                return
+            if parsed.path == "/api/acquisition/reset-check":
+                self._send_json(self.dashboard.acquisition.reset_check_state())
                 return
             if parsed.path == "/api/training/import":
                 self._send_json(self.dashboard.web_training.import_source(payload))
@@ -3612,7 +3833,10 @@ class AppHandler(BaseHTTPRequestHandler):
                         "selected": bool(selected),
                         "path": selected,
                         "model": (
-                            self.dashboard.inspect_prediction_model(selected)
+                            self.dashboard.inspect_prediction_model(
+                                selected, str(payload.get("model_type", "")),
+                                schema_mode=str(payload.get("schema_mode", "")),
+                            )
                             if selected
                             else None
                         ),
@@ -3622,7 +3846,9 @@ class AppHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/prediction-model/inspect":
                 self._send_json(
                     self.dashboard.inspect_prediction_model(
-                        str(payload.get("path", ""))
+                        str(payload.get("path", "")),
+                        str(payload.get("model_type", "")),
+                        schema_mode=str(payload.get("schema_mode", "")),
                     )
                 )
                 return
@@ -3633,6 +3859,28 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     {"selected": bool(selected), "path": selected}
                 )
+                return
+            if parsed.path == "/api/acquisition/select-source":
+                source_type = str(payload.get("source_type", "single_csv"))
+                if source_type == "mysql":
+                    self._send_json({"selected": False, "path": ""})
+                    return
+                selected = select_simulation_source(
+                    source_type, str(payload.get("initial_path", ""))
+                )
+                self._send_json({"selected": bool(selected), "path": selected})
+                return
+            if parsed.path == "/api/acquisition/integrate":
+                result = integrate_capture_sources(
+                    str(payload.get("source_type", "folder_csv")),
+                    str(payload.get("source_path", "")),
+                    str(payload.get("output_file", "")),
+                    payload.get("mysql_settings")
+                    if isinstance(payload.get("mysql_settings"), dict)
+                    else payload,
+                    str(payload.get("query", "")),
+                )
+                self._send_json(result)
                 return
             if parsed.path == "/api/acquisition/start":
                 config = AcquisitionConfig(**payload)

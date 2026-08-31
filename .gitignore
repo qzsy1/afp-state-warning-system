@@ -37,3 +37,18 @@ visualization_app/AFP_State_Warning_System.exe
 visualization_app/trained_models_web/
 visualization_app/req.json
 visualization_app/test_training_request.json
+
+# Modular runtime: generated delivery, user data, models and local state
+modular_runtime/dist/
+modular_runtime/build/
+modular_runtime/runtime/
+modular_runtime/logs/
+modular_runtime/rollback/
+modular_runtime/updates/inbox/
+modular_runtime/updates/staging/
+modular_runtime/config/local/
+modular_runtime/models/
+!modular_runtime/models/README.md
+*.zip
+*.7z
+*.bak

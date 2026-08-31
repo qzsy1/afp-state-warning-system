@@ -2,10 +2,33 @@
 const $=id=>document.getElementById(id);
 let imported=false,running=false,lastSeq=0,pollTimer=null,lossRows=[];
 
+// Keep the training page compatible with cached older HTML while exposing the
+// same thesis-model registry as the realtime prediction page.
+function ensureModelSelector(){
+  if($('trainingModelType')) return;
+  const host=document.querySelector('.card .grid');
+  if(!host) return;
+  const label=document.createElement('label'); label.textContent='预测算法';
+  const select=document.createElement('select'); select.id='trainingModelType';
+  select.innerHTML='<option value="i_T_G">I-ModernTCN-GAT（默认）</option>';
+  label.appendChild(select); host.appendChild(label);
+}
+async function loadModelCatalog(){
+  ensureModelSelector();
+  try{
+    const payload=await request('/api/bootstrap');
+    const list=payload?.acquisition?.prediction_models||[];
+    const select=$('trainingModelType'); if(!select||!list.length) return;
+    select.innerHTML=list.map(item=>`<option value="${escapeHtml(item.id)}">${escapeHtml(item.label)}${item.training_only?'（仅离线训练）':''}</option>`).join('');
+  }catch(e){log('模型列表读取失败，将使用默认算法',{error:e.message})}
+}
+
 async function request(url,options={}){const response=await fetch(url,options);const data=await response.json();if(!response.ok||data.error)throw new Error(data.error||`请求失败 (${response.status})`);return data}
 async function post(url,data){return request(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)})}
 function log(message,data){const line=`[${new Date().toLocaleTimeString()}] ${message}${data?"\n"+JSON.stringify(data,null,2):""}\n`;$('log').textContent+=line;$('log').scrollTop=$('log').scrollHeight}
 function number(id){return Number($(id).value)}
+ensureModelSelector();
+loadModelCatalog();
 function mysqlPayload(){return {host:$('host').value,port:number('port'),user:$('user').value,password:$('password').value,database:$('database').value}}
 function columnPayload(){return {condition_columns:$('conditions').value,input_columns:$('inputs').value,output_columns:$('outputs').value}}
 function sourcePayload(){return {source:$('source').value,path:$('path').value,mysql:mysqlPayload(),query:$('query').value,data_mode:$('dataMode').value,...columnPayload(),history_length:number('history'),prediction_length:number('prediction'),stride:number('stride')}}
@@ -26,7 +49,7 @@ function escapeHtml(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':
 function showValidation(v){$('rows').textContent=v.rows??'—';$('conditionsCount').textContent=v.conditions??'—';$('retainedFiles').textContent=v.retained_files??v.accepted_files??'—';$('rejectedFiles').textContent=v.rejected_files??0;const lines=[`结果：${v.ok?'通过':'未通过'}`,`数据行数：${v.rows}；工况种数：${v.conditions}；保留文件数：${v.retained_files??v.accepted_files??0}；剔除文件数：${v.rejected_files??0}`,`独立试样：${v.specimens}；铺层：${v.layers}；预警标签：${v.warning_ready?'正常/异常齐全':'未齐全'}`,`非有限值：${v.nonfinite_values}；过短铺层：${v.short_layers}；要求每层至少 ${v.minimum_points_per_layer} 点`,`标签统计：${JSON.stringify(v.state_counts)}`];if(v.missing_columns?.length)lines.push(`缺失列：${v.missing_columns.join(', ')}`);if(v.warnings?.length)lines.push(`跳过/警告（${v.warnings.length}）：\n${v.warnings.slice(0,8).join('\n')}`);$('precheck').textContent=lines.join('\n');$('precheck').className=`status ${v.ok?'ok':'bad'}`}
 $('import').onclick=async()=>{try{$('import').disabled=true;$('precheck').textContent='正在读取、筛选并整合数据……';const x=await post('/api/training/import',sourcePayload());imported=!!x.validation.ok;showValidation(x.validation);previewTable(x.preview||[]);$('train').disabled=!imported;log('数据导入完成',x.validation)}catch(e){imported=false;$('precheck').textContent=e.message;$('precheck').className='status bad';$('train').disabled=true;log('导入失败',{error:e.message})}finally{$('import').disabled=false}};
 
-function settings(){return {training_type:$('trainingType').value,epochs:number('epochs'),patience:number('patience'),batch_size:number('batch'),learning_rate:number('lr'),weight_decay:number('weightDecay'),dropout:number('dropout'),min_delta:number('minDelta'),device:$('device').value,seed:number('seed'),task_name:$('taskName').value,output_root:$('outputRoot').value,pretrained_model:$('initialization').value==='pretrained'?$('pretrained').value:''}}
+function settings(){return {training_type:$('trainingType').value,model_type:$('trainingModelType')?.value||'i_T_G',epochs:number('epochs'),patience:number('patience'),batch_size:number('batch'),learning_rate:number('lr'),weight_decay:number('weightDecay'),dropout:number('dropout'),min_delta:number('minDelta'),device:$('device').value,seed:number('seed'),task_name:$('taskName').value,output_root:$('outputRoot').value,pretrained_model:$('initialization').value==='pretrained'?$('pretrained').value:''}}
 function setRunning(value){running=value;$('train').textContent=value?'结束并保存':'开始训练';$('train').className=value?'danger':'';$('import').disabled=value;for(const id of ['dataMode','source','trainingType','conditions','inputs','outputs','path','history','prediction','stride','initialization','epochs','patience','batch','lr','weightDecay','dropout','minDelta','device','seed','taskName','outputRoot'])$(id).disabled=value||(['conditions','inputs','outputs'].includes(id)&&$('dataMode').value!=='other');$('pickPath').disabled=value;$('pickOutput').disabled=value;$('pickModel').disabled=value||$('initialization').value!=='pretrained';$('train').disabled=value?false:!imported}
 $('train').onclick=async()=>{try{if(running){await post('/api/training/stop',{});$('stage').textContent='正在停止并保存';log('已请求结束训练，正在保存当前模型');return}lossRows=[];drawChart();const x=await post('/api/training/start',settings());setRunning(true);$('stage').textContent='准备数据';$('result').textContent='训练运行中……';log('训练任务已启动',x);poll()}catch(e){alert(e.message);log('训练启动失败',{error:e.message})}};
 

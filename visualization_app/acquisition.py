@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import base64
 import csv
+import ctypes
 import hashlib
 import json
 import math
+import os
 import re
 import socket
+import struct
 import threading
 import time
+import tempfile
+import sys
+import urllib.request
 from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -17,6 +24,7 @@ from typing import Any
 import pandas as pd
 
 from mysql_storage import MySQLCaptureStore, MySQLSettings, validate_database_name
+from smrf_hid import SmrfHidDriver, enumerate_smrf_hid_devices
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -57,10 +65,9 @@ NEW_CORE_SENSOR_COLUMNS = [
 NEW_OPTIONAL_SENSOR_COLUMNS = [
     *[f"温度{index}" for index in range(1, 9)],
 ]
-# These channels are intentionally excluded from the new collection plan.
-# Existing checkpoints may still contain them as virtual model columns; the
-# online runtime fills those columns with their scaler baseline and never
-# saves/displays them as acquired data.
+# These legacy channels are intentionally excluded from the new collection
+# plan.  New-schema checkpoints must not request them: missing physical sensor
+# inputs are never replaced with a synthetic baseline during live inference.
 NEW_EXCLUDED_SENSOR_COLUMNS = {"转速", "位移", "振动"}
 NEW_COLLECTION_SENSOR_COLUMNS = list(
     dict.fromkeys([*NEW_CORE_SENSOR_COLUMNS, *NEW_OPTIONAL_SENSOR_COLUMNS])
@@ -113,11 +120,12 @@ ACQUISITION_SCHEMAS = {
         "raw_columns": ORIGINAL_COLUMNS,
     },
     "new_collection_v11_3": {
-        "label": "新数据集采集方案 v11.3（19传感器＋4工艺参数）",
+        "label": "新数据集采集方案（16传感器＋4工艺参数）",
         "sensors": NEW_COLLECTION_SENSOR_COLUMNS,
         "raw_columns": NEW_COLLECTION_COLUMNS,
     },
 }
+
 ALIASES = {
     "rotation": "转速",
     "rotation_speed": "转速",
@@ -138,6 +146,252 @@ ALIASES = {
 }
 
 
+DEFAULT_PLC_IP = "192.168.125.5"
+DEFAULT_PLC_PORT = 502
+DEFAULT_PLC_SLAVE_ID = 255
+PLC_DEFAULT_REGISTER_MAP = {
+    "温度": 28,
+    "压力": 37,
+    "张力": 23,
+}
+PLC_REGISTER_DECODERS: dict[str, tuple[str, float]] = {}
+PLC_COMPUTED_CHANNELS: dict[str, list[str]] = {}
+DEFAULT_ABB_IP = "192.168.125.1"
+DEFAULT_ABB_USER = "Default User"
+DEFAULT_ABB_PASSWORD = "robotics"
+ABB_ROBTARGET_PATH = (
+    "/rw/motionsystem/mechunits/ROB_1/robtarget?coordinate=Base&json=1"
+)
+BSV_UVC_WIDTH = 256
+BSV_UVC_HEIGHT = 192
+BSV_UVC_PIXELS = BSV_UVC_WIDTH * BSV_UVC_HEIGHT
+BSV_UVC_YUV_BYTES = BSV_UVC_PIXELS * 2
+BSV_UVC_TEMP_RANGE_CODE = 4
+BSV_UVC_TEMP_FORMULA_SCALE = 64.0
+BSV_UVC_TEMP_FORMULA_OFFSET = -50.0
+BSV_UVC_DLL_NAME = "BsvUvcNative.dll"
+DEFAULT_RTSP_URL = "rtsp://192.168.125.2:554/"
+M3232_BAUDRATE = 230400
+
+# The 16-channel collection plan remains authoritative.  This metadata only
+# restores the verified physical source, unit and decoder contract used by the
+# 2026-08-18 interface-mapped build.
+SENSOR_CHANNEL_METADATA: dict[str, dict[str, str]] = {
+    "温度": {"unit": "°C", "dtype": "float32", "source": "松下PLC DT28/DT29"},
+    "压力": {"unit": "N", "dtype": "float32", "source": "松下PLC DT37/DT38或M3232薄膜压力"},
+    "ROI平均温度": {"unit": "°C", "dtype": "float32", "source": "BSV UVC温度矩阵ROI均值"},
+    "张力": {"unit": "N", "dtype": "float32", "source": "松下PLC DT23/DT24"},
+    "线速度": {"unit": "mm/s", "dtype": "float32", "source": "ABB相邻位置/时间差"},
+    "ABB_X": {"unit": "mm", "dtype": "float32", "source": "ABB RWS robtarget.x"},
+    "ABB_Y": {"unit": "mm", "dtype": "float32", "source": "ABB RWS robtarget.y"},
+    "ABB_Z": {"unit": "mm", "dtype": "float32", "source": "ABB RWS robtarget.z"},
+    **{
+        f"温度{index}": {
+            "unit": "°C", "dtype": "float32", "source": f"八通道热电偶 CH{index}"
+        }
+        for index in range(1, 9)
+    },
+}
+
+# Selecting a sensor type is the routing authority: the type fixes its driver,
+# default endpoint, decoding rule and compatible canonical channels.  Only the
+# custom JSON profile permits manual driver/channel-map editing.
+SENSOR_INTERFACE_PROFILES: dict[str, dict[str, Any]] = {
+    "thermocouple": {
+        "label": "八通道热电偶",
+        "driver": "smrf_hid",
+        "endpoint": "SMRFCT08B",
+        "channels": [f"温度{index}" for index in range(1, 9)],
+        "channel_types": ["K"] * 8,
+        "processing": (
+            "USB HID；SMRF型号/序列号识别；SSPEED+HIDREAD；异或校验；"
+            "CH1～CH8按K型热电偶和冷端温度换算"
+        ),
+    },
+    "plc": {
+        "label": "松下PLC过程传感器",
+        "driver": "modbus_tcp",
+        "endpoint": f"{DEFAULT_PLC_IP}:{DEFAULT_PLC_PORT}",
+        "channels": ["温度", "压力", "张力"],
+        "processing": "Modbus TCP FC03；float32低字在前",
+    },
+    "robot": {
+        "label": "ABB机器人",
+        "driver": "abb_robot",
+        "endpoint": DEFAULT_ABB_IP,
+        "channels": ["ABB_X", "ABB_Y", "ABB_Z", "线速度"],
+        "processing": "RWS读取robtarget；相邻XYZ欧氏距离除以时间差得到线速度",
+    },
+    "thermal_uvc": {
+        "label": "BSV UVC测温热像仪",
+        "driver": "uvc_thermal",
+        "endpoint": "BSV UVC (WinUSB)",
+        "channels": ["ROI平均温度"],
+        "processing": "256×192温度矩阵按raw/64-50换算后计算ROI均值",
+    },
+    "thermal_rtsp": {
+        "label": "IP热像仪RTSP视频",
+        "driver": "rtsp_thermal",
+        "endpoint": DEFAULT_RTSP_URL,
+        "channels": [],
+        "processing": "仅预览/录像；无辐射测温标定时不生成数值温度通道",
+    },
+    "pressure": {
+        "label": "M3232薄膜压力",
+        "driver": "m3232_pressure",
+        "endpoint": "COM8",
+        "baudrate": M3232_BAUDRATE,
+        "channels": ["压力"],
+        "processing": "32×32矩阵→有效像素合计→空载调零→中值滤波（N）",
+    },
+    "custom": {
+        "label": "自定义JSON传感器",
+        "driver": "serial_json",
+        "endpoint": "COM4",
+        "baudrate": 115200,
+        "channels": [],
+        "processing": "按显式JSON键名映射；未映射通道不会进入采集数据",
+        "editable_driver": True,
+    },
+}
+
+
+def default_capture_interfaces() -> list[dict[str, Any]]:
+    """Restore the four verified interfaces used by the 16-channel plan."""
+    return [
+        {
+            "id": "thermocouple_8ch", "enabled": True,
+            "role": "thermocouple", "driver": "smrf_hid",
+            "endpoint": "SMRFCT08B", "channel_types": ["K"] * 8,
+            "channel_map": {},
+        },
+        {
+            "id": "plc_process", "enabled": True,
+            "role": "plc", "driver": "modbus_tcp",
+            "endpoint": f"{DEFAULT_PLC_IP}:{DEFAULT_PLC_PORT}",
+            "slave_id": DEFAULT_PLC_SLAVE_ID,
+            "register_map": dict(PLC_DEFAULT_REGISTER_MAP),
+            "channel_map": {},
+        },
+        {
+            "id": "uvc_temperature", "enabled": True,
+            "role": "thermal_uvc", "driver": "uvc_thermal",
+            "endpoint": "BSV UVC (WinUSB)", "roi": "", "channel_map": {},
+        },
+        {
+            "id": "abb_motion", "enabled": True,
+            "role": "robot", "driver": "abb_robot",
+            "endpoint": DEFAULT_ABB_IP, "channel_map": {},
+        },
+    ]
+
+
+def _canonical_sensor_type(role: Any, driver: Any = "") -> str:
+    role_text = str(role or "custom").strip().lower()
+    driver_text = str(driver or "").strip().lower()
+    if role_text == "thermal":
+        return "thermal_rtsp" if driver_text == "rtsp_thermal" else "thermal_uvc"
+    if role_text in {"other", "new_sensor"}:
+        return "custom"
+    return role_text if role_text in SENSOR_INTERFACE_PROFILES else "custom"
+
+
+def sensor_interface_profiles() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": profile_id,
+            **{
+                key: (list(value) if isinstance(value, list) else value)
+                for key, value in profile.items()
+            },
+        }
+        for profile_id, profile in SENSOR_INTERFACE_PROFILES.items()
+    ]
+
+
+def _apply_sensor_interface_profile(interface: dict[str, Any]) -> dict[str, Any]:
+    sensor_type = _canonical_sensor_type(interface.get("role"), interface.get("driver"))
+    profile = SENSOR_INTERFACE_PROFILES[sensor_type]
+    interface["role"] = sensor_type
+    if not profile.get("editable_driver"):
+        interface["driver"] = str(profile["driver"])
+    else:
+        interface["driver"] = str(interface.get("driver") or profile["driver"])
+    endpoint_text = str(interface.get("endpoint") or "").strip()
+    if (
+        not endpoint_text
+        or (
+            sensor_type == "thermocouple"
+            and re.fullmatch(r"COM\d+", endpoint_text, re.IGNORECASE)
+        )
+    ):
+        interface["endpoint"] = str(profile.get("endpoint") or "")
+    if profile.get("baudrate"):
+        interface["baudrate"] = int(profile["baudrate"])
+    if profile.get("channel_types") and not interface.get("channel_types"):
+        interface["channel_types"] = list(profile["channel_types"])
+    if sensor_type == "plc":
+        if not interface.get("register_map"):
+            interface["register_map"] = dict(PLC_DEFAULT_REGISTER_MAP)
+        interface["slave_id"] = int(
+            interface.get("slave_id") or DEFAULT_PLC_SLAVE_ID
+        )
+    return interface
+
+
+def _resolve_interface_channel_assignments(
+    interfaces: list[dict[str, Any]],
+    requested: dict[str, list[str]] | None,
+    capture_sensors: list[str],
+) -> dict[str, list[str]]:
+    requested = requested or {}
+    capture_set = set(capture_sensors)
+    resolved: dict[str, list[str]] = {}
+    enabled = [item for item in interfaces if item.get("enabled", True)]
+    dedicated_pressure = any(item.get("role") == "pressure" for item in enabled)
+    for item in interfaces:
+        interface_id = str(item.get("id") or "")
+        if not item.get("enabled", True):
+            resolved[interface_id] = []
+            continue
+        role = str(item.get("role") or "custom")
+        profile = SENSOR_INTERFACE_PROFILES.get(
+            role, SENSOR_INTERFACE_PROFILES["custom"]
+        )
+        allowed = set(profile.get("channels") or []) & capture_set
+        if role == "custom":
+            channel_map = item.get("channel_map") or {}
+            if isinstance(channel_map, dict):
+                allowed.update(
+                    str(value) for value in channel_map.values()
+                    if str(value) in capture_set
+                )
+            if interface_id in requested:
+                allowed.update(
+                    str(name) for name in requested[interface_id]
+                    if str(name) in capture_set
+                )
+        if role == "plc" and dedicated_pressure:
+            allowed.discard("压力")
+        chosen = allowed
+        if interface_id in requested:
+            chosen &= {str(name) for name in requested[interface_id]}
+        resolved[interface_id] = [
+            name for name in capture_sensors if name in chosen
+        ]
+    owners: dict[str, str] = {}
+    for interface_id, channels in resolved.items():
+        for channel in channels:
+            previous = owners.get(channel)
+            if previous and previous != interface_id:
+                raise ValueError(
+                    f"数据通道“{channel}”同时分配给{previous}和{interface_id}；"
+                    "每个实际数据通道只能有一个传感器来源"
+                )
+            owners[channel] = interface_id
+    return resolved
+
+
 def _finite(value: Any) -> float | None:
     try:
         number = float(value)
@@ -147,9 +401,56 @@ def _finite(value: Any) -> float | None:
 
 
 def normalize_sample(payload: dict[str, Any]) -> dict[str, float]:
+    """Normalize one interface payload into the canonical AFP channel names.
+
+    Hardware gateways are allowed to send either a flat JSON object or a
+    ``channels``/``values`` object.  A thermocouple interface may also send an
+    array; its values are mapped to 温度1..温度8 in order.  ``channel_map`` is
+    intentionally explicit so a user can rename vendor channels without
+    changing the saved/displayed schema.
+    """
+    return _normalize_interface_sample(payload)
+
+
+def _normalize_interface_sample(
+    payload: dict[str, Any],
+    role: str = "other",
+    channel_map: dict[str, str] | None = None,
+) -> dict[str, float]:
+    if not isinstance(payload, dict):
+        return {}
+    channel_map = channel_map or {}
+    flattened: dict[str, Any] = dict(payload)
+    for nested_key in ("channels", "values", "data"):
+        nested = payload.get(nested_key)
+        if isinstance(nested, dict):
+            flattened.update(nested)
+        elif isinstance(nested, (list, tuple)):
+            flattened.pop(nested_key, None)
+            if role == "thermocouple":
+                for index, value in enumerate(nested[:8], start=1):
+                    flattened[f"temperature_{index}"] = value
+    # Common vendor spelling for a temperature array.
+    for array_key in ("thermocouples", "thermocouple", "temperatures", "tc"):
+        values = payload.get(array_key)
+        if isinstance(values, (list, tuple)):
+            for index, value in enumerate(values[:8], start=1):
+                flattened[f"temperature_{index}"] = value
     normalized: dict[str, float] = {}
-    for key, value in payload.items():
-        target = ALIASES.get(str(key), str(key))
+    for key, value in flattened.items():
+        if isinstance(value, (dict, list, tuple)):
+            continue
+        source = str(key)
+        target = channel_map.get(source) or channel_map.get(source.lower())
+        if not target:
+            target = ALIASES.get(source, source)
+        # Generic CH1/CH2 names on a thermocouple adapter are interpreted in
+        # channel order.  Other interfaces must use an explicit map or a
+        # canonical/aliased name to prevent accidental column mislabelling.
+        if role == "thermocouple" and target == source:
+            match = re.fullmatch(r"(?:ch|channel|tc|t)[_ -]?(\d+)", source, re.I)
+            if match:
+                target = f"温度{int(match.group(1))}"
         if target in ALL_SENSOR_COLUMNS:
             number = _finite(value)
             if number is not None:
@@ -165,12 +466,16 @@ class AcquisitionConfig:
     driver: str = "simulator"
     endpoint: str = ""
     baudrate: int = 115200
+    # Multiple physical interfaces can be used in one acquisition.
+    interfaces: list[dict[str, Any]] | None = None
+    interface_channel_assignments: dict[str, list[str]] | None = None
     sample_rate_hz: float = 10.0
     selected_sensors: list[str] | None = None
     prediction_sensors: list[str] | None = None
     model_input_sensors: list[str] | None = None
     model_output_sensors: list[str] | None = None
     prediction_model_file: str = ""
+    prediction_model_type: str = "i_T_G"
     health_indicator: str = "TC-HI"
     run_id: str = "LIVE_RUN"
     specimen_id: str = "LIVE_SPECIMEN"
@@ -188,6 +493,18 @@ class AcquisitionConfig:
     pid_angle_deg: float = 5.0
     temperature_setpoint_C: float = 360.0
     replicate: int = 1
+    # Explicitly separate real interfaces from local simulation sources.
+    # Empty keeps backward compatibility with older callers: a simulator
+    # driver implies simulation, while serial/TCP implies real interfaces.
+    acquisition_mode: str = ""
+    simulation_source_type: str = "single_csv"
+    simulation_source_path: str = ""
+    simulation_mysql_query: str = ""
+    simulation_mysql_host: str = "127.0.0.1"
+    simulation_mysql_port: int = 3306
+    simulation_mysql_user: str = "root"
+    simulation_mysql_password: str = ""
+    simulation_mysql_database: str = "afp_state_warning"
     # MySQL is deliberately opt-in.  Local CSV/JSON files remain the primary
     # raw-data archive and MySQL receives a transaction after each saved layer.
     mysql_enabled: bool = False
@@ -200,12 +517,93 @@ class AcquisitionConfig:
     mysql_connect_timeout: int = 5
 
     def __post_init__(self) -> None:
+        requested_mode = str(self.acquisition_mode or "").lower()
+        if not requested_mode:
+            requested_mode = "simulation" if self.driver == "simulator" else "real"
+        self.acquisition_mode = requested_mode
+        if self.acquisition_mode not in {"real", "simulation"}:
+            raise ValueError("acquisition_mode must be real or simulation")
+        self.simulation_source_type = str(self.simulation_source_type or "single_csv").lower()
+        if self.simulation_source_type not in {"single_csv", "folder_csv", "mysql"}:
+            raise ValueError("simulation_source_type must be single_csv, folder_csv or mysql")
+        self.simulation_source_path = str(self.simulation_source_path or self.source_file or "").strip()
+        self.simulation_mysql_query = str(self.simulation_mysql_query or "").strip()
+        self.simulation_mysql_host = str(self.simulation_mysql_host or "127.0.0.1").strip()
+        self.simulation_mysql_port = max(1, min(int(self.simulation_mysql_port or 3306), 65535))
+        self.simulation_mysql_user = str(self.simulation_mysql_user or "root").strip()
+        self.simulation_mysql_password = str(self.simulation_mysql_password or "")
+        self.simulation_mysql_database = validate_database_name(self.simulation_mysql_database or "afp_state_warning")
         if self.processing_mode not in {"capture_only", "prediction_warning"}:
             raise ValueError(
                 "processing_mode必须是capture_only或prediction_warning"
             )
         if self.dataset_schema not in ACQUISITION_SCHEMAS:
             raise ValueError(f"未知数据采集方案：{self.dataset_schema}")
+        if self.interfaces is None:
+            self.interfaces = [{
+                "id": "interface_1", "enabled": True,
+                "driver": self.driver, "endpoint": self.endpoint,
+                "baudrate": self.baudrate, "role": "other",
+                "channel_map": {},
+            }]
+        normalized_interfaces: list[dict[str, Any]] = []
+        for index, item in enumerate(self.interfaces):
+            if not isinstance(item, dict):
+                continue
+            interface = dict(item)
+            interface["id"] = str(interface.get("id") or f"interface_{index + 1}")
+            interface["enabled"] = bool(interface.get("enabled", True))
+            interface["driver"] = str(interface.get("driver") or self.driver)
+            interface["endpoint"] = str(interface.get("endpoint") or "").strip()
+            interface["baudrate"] = int(interface.get("baudrate") or self.baudrate)
+            interface["timeout"] = max(0.01, min(float(interface.get("timeout") or 0.05), 2.0))
+            interface["role"] = _canonical_sensor_type(
+                interface.get("role"), interface.get("driver")
+            )
+            channel_map = interface.get("channel_map") or {}
+            if isinstance(channel_map, str):
+                try:
+                    channel_map = json.loads(channel_map)
+                except json.JSONDecodeError:
+                    channel_map = {}
+            interface["channel_map"] = (
+                {str(key): str(value) for key, value in channel_map.items()}
+                if isinstance(channel_map, dict) else {}
+            )
+            register_map = interface.get("register_map") or {}
+            interface["register_map"] = (
+                {str(key): int(value) for key, value in register_map.items()}
+                if isinstance(register_map, dict) else {}
+            )
+            interface["slave_id"] = int(
+                interface.get("slave_id") or DEFAULT_PLC_SLAVE_ID
+            )
+            _apply_sensor_interface_profile(interface)
+            normalized_interfaces.append(interface)
+        if not normalized_interfaces:
+            raise ValueError("至少配置一个采集接口")
+        self.interfaces = normalized_interfaces
+        raw_assignments = self.interface_channel_assignments or {}
+        requested_assignments = {
+            str(key): [str(name) for name in (value or [])]
+            for key, value in raw_assignments.items()
+            if isinstance(value, (list, tuple, set))
+        }
+        self.interface_channel_assignments = requested_assignments
+        enabled = [item for item in normalized_interfaces if item["enabled"]]
+        if enabled:
+            self.driver = str(enabled[0]["driver"])
+            self.endpoint = str(enabled[0]["endpoint"])
+            self.baudrate = int(enabled[0]["baudrate"])
+        if self.acquisition_mode == "real":
+            if not enabled:
+                raise ValueError("真实接口采集模式至少要启用一个传感器接口")
+            if any(item.get("driver") == "simulator" for item in normalized_interfaces if item.get("enabled", True)):
+                raise ValueError("真实接口采集模式不能使用本地模拟驱动")
+            self.source_file = ""
+            self.simulation_source_path = ""
+        else:
+            self.source_file = self.simulation_source_path
         allowed_sensors = list(
             ACQUISITION_SCHEMAS[self.dataset_schema]["sensors"]
         )
@@ -214,8 +612,82 @@ class AcquisitionConfig:
         self.selected_sensors = [
             name for name in self.selected_sensors if name in allowed_sensors
         ]
+        if self.acquisition_mode == "real":
+            self.interface_channel_assignments = _resolve_interface_channel_assignments(
+                normalized_interfaces, requested_assignments, allowed_sensors
+            )
+            enabled_ids = {
+                str(item.get("id"))
+                for item in normalized_interfaces
+                if item.get("enabled", True)
+            }
+            routed = {
+                channel
+                for interface_id, channels in self.interface_channel_assignments.items()
+                if interface_id in enabled_ids
+                for channel in channels
+            }
+            self.selected_sensors = [
+                name for name in self.selected_sensors if name in routed
+            ]
+            if not self.selected_sensors:
+                raise ValueError("已启用的传感器类型没有对应的采集数据通道")
         if not self.selected_sensors:
             raise ValueError("至少选择一个采集传感器")
+        if self.acquisition_mode == "simulation":
+            # Simulation follows the same routing contract as a physical
+            # capture: only channels assigned to enabled interfaces are read,
+            # saved and passed to the model.  The browser normally sends the
+            # explicit channel mapping; older callers without that mapping use
+            # the role-based defaults for backward compatibility.
+            enabled_ids = {
+                str(item.get("id"))
+                for item in normalized_interfaces
+                if item.get("enabled", True)
+            }
+            explicit = {
+                str(channel)
+                for interface_id, channels in self.interface_channel_assignments.items()
+                if str(interface_id) in enabled_ids
+                for channel in channels
+                if str(channel) in allowed_sensors
+            }
+            if self.interface_channel_assignments:
+                routed = explicit
+            elif (
+                len(enabled_ids) == 1
+                and normalized_interfaces[0].get("driver") == "simulator"
+            ):
+                # Backward-compatible single-file replay: without an explicit
+                # map, the one simulator supplies every channel the operator
+                # selected.  The browser sends an explicit map whenever more
+                # than one logical interface is configured.
+                routed = set(self.selected_sensors)
+            else:
+                routed: set[str] = set()
+                for item in normalized_interfaces:
+                    if not item.get("enabled", True):
+                        continue
+                    role = str(item.get("role") or "other").lower()
+                    if role == "thermocouple":
+                        routed.update(
+                            name for name in allowed_sensors
+                            if re.fullmatch(r"温度[1-8]", name)
+                        )
+                    elif role == "other":
+                        routed.update(
+                            name for name in allowed_sensors
+                            if not re.fullmatch(r"温度[1-8]", name)
+                        )
+                    else:
+                        routed.update(allowed_sensors)
+            self.selected_sensors = [
+                name for name in self.selected_sensors if name in routed
+            ]
+            if not self.selected_sensors:
+                raise ValueError(
+                    "模拟采集没有可用通道：请在通道映射中把至少一个通道分配给已启用接口"
+                )
         if self.model_input_sensors is None:
             self.model_input_sensors = self.selected_sensors.copy()
         self.model_input_sensors = [
@@ -311,12 +783,8 @@ def _parameter_token(config: AcquisitionConfig) -> str:
             f"A{config.pid_angle_deg:g}_"
             f"T{config.temperature_setpoint_C:g}"
         )
-    # Preserve the historical legacy-default path for existing replay/capture
-    # tests and previously saved data.  As soon as a legacy condition or
-    # replicate is explicitly changed, it is included in the folder name.
-    if condition == "LIVE" and replicate == 1:
-        return f"p{config.p:g}_v{config.v:g}_pr{config.pr:g}"
-    return f"C{condition}_R{replicate}_p{config.p:g}_v{config.v:g}_pr{config.pr:g}"
+    prefix = f"R{replicate}" if condition == "LIVE" else f"C{condition}_R{replicate}"
+    return f"{prefix}_p{config.p:g}_v{config.v:g}_pr{config.pr:g}"
 
 
 def select_capture_folder(initial_path: str = "") -> str:
@@ -337,6 +805,173 @@ def select_capture_folder(initial_path: str = "") -> str:
         return str(Path(selected).resolve()) if selected else ""
     finally:
         root.destroy()
+
+
+def select_simulation_source(source_type: str, initial_path: str = "") -> str:
+    """Select one CSV or a capture-folder source for simulation replay."""
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    try:
+        if source_type == "folder_csv":
+            selected = filedialog.askdirectory(
+                parent=root, title="选择模拟采集数据文件夹",
+                initialdir=initial_path or str(DEFAULT_CAPTURE_ROOT), mustexist=True,
+            )
+        else:
+            selected = filedialog.askopenfilename(
+                parent=root, title="选择模拟采集 CSV 文件",
+                initialdir=initial_path or str(DEFAULT_CAPTURE_ROOT),
+                filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
+            )
+        return str(Path(selected).resolve()) if selected else ""
+    finally:
+        root.destroy()
+
+
+def integrate_capture_sources(
+    source_type: str,
+    source_path: str = "",
+    output_file: str = "",
+    mysql_settings: dict[str, Any] | None = None,
+    query: str = "",
+) -> dict[str, Any]:
+    """Merge complete-specimen capture data from a folder or MySQL into CSV.
+
+    Folder integration deliberately selects only the current complete file
+    for each specimen folder.  Historical snapshots and layer-only files are
+    ignored, preventing duplicate rows when old captures are imported.
+    """
+    kind = str(source_type or "folder_csv").strip().lower()
+    frames: list[pd.DataFrame] = []
+    source_count = 0
+    specimen_keys: set[str] = set()
+    if kind in {"folder", "folder_csv", "csv_folder"}:
+        root = Path(source_path).expanduser().resolve()
+        if not root.exists() or not root.is_dir():
+            raise ValueError(f"Capture folder does not exist: {root}")
+        candidates: list[Path] = []
+        for path in root.rglob("*"):
+            if not path.is_file() or path.suffix.lower() != ".csv":
+                continue
+            if any(part in {"\u5386\u53f2\u7248\u672c", "\u5206\u5c42\u6570\u636e", "\u5b8c\u6574\u8bd5\u6837\u5feb\u7167"} for part in path.parts):
+                continue
+            if "\u5b8c\u6574\u8bd5\u6837" in path.name:
+                candidates.append(path)
+        # Select the newest complete snapshot when an old folder contains
+        # several _已采N层 files.
+        selected: dict[str, Path] = {}
+        for path in candidates:
+            key = str(path.parent.resolve())
+            previous = selected.get(key)
+            if previous is None or path.stat().st_mtime > previous.stat().st_mtime:
+                selected[key] = path
+        if not selected:
+            raise ValueError("No complete-specimen CSV files were found in the selected folder")
+        for path in sorted(selected.values()):
+            try:
+                frame = pd.read_csv(path, encoding="utf-8-sig")
+            except UnicodeDecodeError:
+                frame = pd.read_csv(path, encoding="gb18030")
+            if frame.empty:
+                continue
+            frame["source_file"] = str(path)
+            frames.append(frame)
+            specimen_keys.add(str(path.parent.resolve()))
+        source_count = len(selected)
+        default_output = root / "\u6574\u5408\u6570\u636e.csv"
+    elif kind == "mysql":
+        settings = MySQLSettings.from_mapping(mysql_settings or {})
+        store = MySQLCaptureStore(settings)
+        driver, connection = store._connect(settings.database)
+        try:
+            sql = str(query or "").strip() or (
+                "SELECT * FROM afp_flat_all "
+                "ORDER BY specimen_key, layer_no, sample_index"
+            )
+            cursor = connection.cursor()
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+            names = [item[0] for item in cursor.description or []]
+            records = [dict(zip(names, row)) for row in rows]
+        finally:
+            connection.close()
+        if not records:
+            raise ValueError("The MySQL query returned no rows")
+        expanded: list[dict[str, Any]] = []
+        for row in records:
+            item = dict(row)
+            for json_name in ("sensor_json", "process_json"):
+                raw = item.pop(json_name, None)
+                if isinstance(raw, (bytes, bytearray)):
+                    raw = raw.decode("utf-8", errors="ignore")
+                if isinstance(raw, str):
+                    try:
+                        parsed = json.loads(raw)
+                    except json.JSONDecodeError:
+                        parsed = {}
+                    if isinstance(parsed, dict):
+                        item.update(parsed)
+            item["source_file"] = f"mysql:{settings.database}"
+            expanded.append(item)
+            specimen_keys.add(str(row.get("specimen_key") or row.get("specimen_id") or "unknown"))
+        frames.append(pd.DataFrame(expanded))
+        source_count = len(specimen_keys)
+        default_output = APP_DIR / "\u6574\u5408\u6570\u636e.csv"
+    else:
+        raise ValueError("source_type must be folder_csv or mysql")
+    merged = pd.concat(frames, ignore_index=True, sort=False)
+    requested_output = str(output_file or "").strip()
+    if requested_output:
+        destination = Path(requested_output).expanduser().resolve()
+        # Users often choose a folder in the save-location field.  Treat an
+        # existing directory (or a path ending with a separator) as a folder
+        # and place the canonical CSV inside it instead of opening the folder
+        # as if it were a file.
+        if destination.exists() and destination.is_dir():
+            destination = destination / "\u6574\u5408\u6570\u636e.csv"
+        elif requested_output.endswith(("\\", "/")):
+            destination = destination / "\u6574\u5408\u6570\u636e.csv"
+    else:
+        destination = default_output.resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    # Write beside the destination first and replace atomically.  This avoids
+    # partial CSV files and handles an existing file that is being refreshed.
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8-sig",
+            newline="",
+            suffix=".tmp",
+            prefix=".afp_integrate_",
+            dir=str(destination.parent),
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            merged.to_csv(temporary, index=False)
+        os.replace(temporary_path, destination)
+    except PermissionError as exc:
+        try:
+            if "temporary_path" in locals() and temporary_path.exists():
+                temporary_path.unlink()
+        except OSError:
+            pass
+        raise PermissionError(
+            f"无法写入整合文件：{destination}。请关闭同名 CSV，"
+            "或在“整合文件保存位置”中选择一个可写的新文件名。"
+        ) from exc
+    return {
+        "ok": True,
+        "source_type": kind,
+        "output_file": str(destination),
+        "rows": int(len(merged)),
+        "columns": [str(name) for name in merged.columns],
+        "source_files": int(source_count),
+        "specimens": int(len(specimen_keys)),
+    }
 
 
 class SampleDriver:
@@ -380,10 +1015,126 @@ class SimulatorDriver(SampleDriver):
         return normalize_sample(record)
 
 
+class FolderCsvSimulatorDriver(SimulatorDriver):
+    """Replay every CSV in a capture folder in lexical file order."""
+    def open(self) -> None:
+        if not self.path.exists() or not self.path.is_dir():
+            raise FileNotFoundError(f"模拟采集文件夹不存在：{self.path}")
+        files = sorted(self.path.rglob("*.csv"))
+        if not files:
+            raise FileNotFoundError(f"模拟采集文件夹不包含 CSV：{self.path}")
+        frames = []
+        for file in files:
+            try:
+                frames.append(pd.read_csv(file, encoding="utf-8-sig"))
+            except UnicodeDecodeError:
+                frames.append(pd.read_csv(file, encoding="gb18030"))
+        frame = pd.concat(frames, ignore_index=True, sort=False)
+        missing = [name for name in self.sensor_columns if name not in frame.columns]
+        if missing:
+            raise ValueError(f"模拟采集文件夹缺少传感器列：{missing}")
+        self.records = frame[self.sensor_columns].to_dict(orient="records")
+        self.index = 0
+
+
+class MySQLSimulatorDriver(SampleDriver):
+    """Replay rows from the same flat MySQL view used by acquisition storage."""
+    def __init__(self, settings: dict[str, Any], sensor_columns: list[str]) -> None:
+        self.settings = settings
+        self.sensor_columns = sensor_columns
+        self.records: list[dict[str, Any]] = []
+        self.index = 0
+        self.connection = None
+        self.driver_name = ""
+
+    def open(self) -> None:
+        """Load the replay rows with either supported MySQL Python driver.
+
+        The native bundle includes ``mysql-connector-python`` because it is
+        also used by the normal MySQL capture store.  Older builds required
+        PyMySQL only here, which made the refresh/connection check succeed but
+        the actual MySQL simulation fail at start-up.  Prefer PyMySQL when it
+        is installed and fall back to mysql.connector so both paths use the
+        same available dependency.
+        """
+        pymysql = None
+        try:
+            import pymysql
+            self.driver_name = "pymysql"
+        except ImportError:
+            try:
+                import mysql.connector as mysql_connector
+                self.driver_name = "mysql.connector"
+            except ImportError as exc:
+                raise RuntimeError(
+                    "未找到可用的 MySQL 驱动，请安装 mysql-connector-python 或 PyMySQL"
+                ) from exc
+        query = str(self.settings.get("query") or "").strip() or (
+            "SELECT * FROM afp_flat_all ORDER BY specimen_key, layer_no, sample_index"
+        )
+        connection_args = {
+            "host": str(self.settings.get("host") or "127.0.0.1"),
+            "port": int(self.settings.get("port") or 3306),
+            "user": str(self.settings.get("user") or "root"),
+            "password": str(self.settings.get("password") or ""),
+            "database": str(self.settings.get("database") or "afp_state_warning"),
+        }
+        if self.driver_name == "pymysql":
+            connection_args.update(
+                {"charset": "utf8mb4", "connect_timeout": 5,
+                 "cursorclass": pymysql.cursors.DictCursor}
+            )
+            self.connection = pymysql.connect(**connection_args)
+            with self.connection.cursor() as cursor:
+                cursor.execute(query)
+                rows = cursor.fetchall()
+        else:
+            import mysql.connector as mysql_connector
+            connection_args["connection_timeout"] = 5
+            self.connection = mysql_connector.connect(**connection_args)
+            cursor = self.connection.cursor(dictionary=True)
+            try:
+                cursor.execute(query)
+                rows = cursor.fetchall()
+            finally:
+                cursor.close()
+        self.records = []
+        for row in rows:
+            payload: dict[str, Any] = {}
+            sensor_json = row.get("sensor_json") if isinstance(row, dict) else None
+            if isinstance(sensor_json, str):
+                try:
+                    parsed = json.loads(sensor_json)
+                    if isinstance(parsed, dict): payload.update(parsed)
+                except json.JSONDecodeError:
+                    pass
+            if isinstance(row, dict):
+                payload.update({name: row[name] for name in self.sensor_columns if name in row})
+            normalized = normalize_sample(payload)
+            if normalized: self.records.append(normalized)
+        self.index = 0
+        if not self.records:
+            raise ValueError("MySQL 查询没有包含可用传感器数据")
+
+    def read_sample(self) -> dict[str, float] | None:
+        if not self.records: return None
+        record = self.records[self.index % len(self.records)]
+        self.index += 1
+        return record
+
+    def close(self) -> None:
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+
+
 class SerialJsonDriver(SampleDriver):
-    def __init__(self, endpoint: str, baudrate: int) -> None:
+    def __init__(self, endpoint: str, baudrate: int, role: str = "other", channel_map: dict[str, str] | None = None, timeout: float = 0.5) -> None:
         self.endpoint = endpoint
         self.baudrate = baudrate
+        self.role = role
+        self.channel_map = channel_map or {}
+        self.timeout = max(0.01, float(timeout))
         self.serial = None
 
     def open(self) -> None:
@@ -394,7 +1145,7 @@ class SerialJsonDriver(SampleDriver):
         self.serial = serial.Serial(
             self.endpoint,
             self.baudrate,
-            timeout=0.5,
+            timeout=self.timeout,
         )
 
     def read_sample(self) -> dict[str, float] | None:
@@ -404,7 +1155,7 @@ class SerialJsonDriver(SampleDriver):
         payload = json.loads(raw.decode("utf-8-sig").strip())
         if not isinstance(payload, dict):
             raise ValueError("串口每行必须是JSON对象")
-        return normalize_sample(payload)
+        return _normalize_interface_sample(payload, self.role, self.channel_map)
 
     def close(self) -> None:
         if self.serial is not None:
@@ -413,8 +1164,11 @@ class SerialJsonDriver(SampleDriver):
 
 
 class TcpJsonDriver(SampleDriver):
-    def __init__(self, endpoint: str) -> None:
+    def __init__(self, endpoint: str, role: str = "other", channel_map: dict[str, str] | None = None, timeout: float = 0.5) -> None:
         self.endpoint = endpoint
+        self.role = role
+        self.channel_map = channel_map or {}
+        self.timeout = max(0.01, float(timeout))
         self.sock: socket.socket | None = None
         self.file = None
 
@@ -423,7 +1177,7 @@ class TcpJsonDriver(SampleDriver):
             raise ValueError("TCP地址格式必须是 host:port")
         host, port_text = self.endpoint.rsplit(":", 1)
         self.sock = socket.create_connection((host, int(port_text)), timeout=2.0)
-        self.sock.settimeout(0.5)
+        self.sock.settimeout(self.timeout)
         self.file = self.sock.makefile("rb")
 
     def read_sample(self) -> dict[str, float] | None:
@@ -436,7 +1190,7 @@ class TcpJsonDriver(SampleDriver):
         payload = json.loads(raw.decode("utf-8-sig").strip())
         if not isinstance(payload, dict):
             raise ValueError("TCP每行必须是JSON对象")
-        return normalize_sample(payload)
+        return _normalize_interface_sample(payload, self.role, self.channel_map)
 
     def close(self) -> None:
         if self.file is not None:
@@ -447,7 +1201,579 @@ class TcpJsonDriver(SampleDriver):
             self.sock = None
 
 
+class ModbusTcpDriver(SampleDriver):
+    """Panasonic PLC Modbus/TCP FC03 reader from the mapped field build."""
+
+    def __init__(self, endpoint: str, register_map: dict[str, int] | None = None,
+                 slave_id: int = DEFAULT_PLC_SLAVE_ID, timeout: float = 1.0) -> None:
+        self.endpoint = endpoint or f"{DEFAULT_PLC_IP}:{DEFAULT_PLC_PORT}"
+        self.register_map = dict(register_map or PLC_DEFAULT_REGISTER_MAP)
+        self.slave_id = int(slave_id)
+        self.timeout = max(0.1, float(timeout))
+        self.sock: socket.socket | None = None
+        self._transaction_id = 0
+
+    def open(self) -> None:
+        self._connect()
+
+    def _connect(self) -> None:
+        host, port_text = (
+            self.endpoint.rsplit(":", 1)
+            if ":" in self.endpoint
+            else (self.endpoint, str(DEFAULT_PLC_PORT))
+        )
+        self.sock = socket.create_connection((host, int(port_text)), timeout=2.0)
+        self.sock.settimeout(self.timeout)
+
+    def _reconnect(self) -> None:
+        self.close()
+        try:
+            self._connect()
+        except OSError:
+            return
+
+    def _recv_exact(self, size: int) -> bytes:
+        data = b""
+        while len(data) < size:
+            chunk = self.sock.recv(size - len(data))
+            if not chunk:
+                break
+            data += chunk
+        return data
+
+    def _read_holding_registers(self, start_address: int, quantity: int) -> list[int]:
+        self._transaction_id = (self._transaction_id + 1) & 0xFFFF
+        request = struct.pack(
+            ">HHHBBHH", self._transaction_id, 0, 6,
+            self.slave_id, 3, int(start_address), int(quantity),
+        )
+        self.sock.sendall(request)
+        header = self._recv_exact(7)
+        if len(header) < 7:
+            raise IOError("Modbus TCP 响应头不完整")
+        _, _, length, _unit = struct.unpack(">HHHB", header)
+        pdu = self._recv_exact(length)
+        if len(pdu) < 2:
+            raise IOError("Modbus TCP 响应PDU不完整")
+        function_code = pdu[0]
+        if function_code & 0x80:
+            exception_code = pdu[1] if len(pdu) > 1 else 0
+            raise IOError(
+                f"Modbus 异常响应: 功能码={function_code:#x}, "
+                f"异常码={exception_code:#x}"
+            )
+        byte_count = pdu[1]
+        register_data = pdu[2:2 + byte_count]
+        return [
+            struct.unpack(">H", register_data[index:index + 2])[0]
+            for index in range(0, len(register_data), 2)
+            if len(register_data[index:index + 2]) == 2
+        ]
+
+    @staticmethod
+    def _registers_to_float(low_word: int, high_word: int) -> float:
+        value = struct.unpack("<f", struct.pack("<HH", low_word, high_word))[0]
+        return 0.0 if not math.isfinite(value) else round(float(value), 2)
+
+    def _read_registers(self) -> dict[int, int]:
+        addresses = sorted({
+            offset
+            for address in self.register_map.values()
+            for offset in (address, address + 1)
+        })
+        registers: dict[int, int] = {}
+        cursor = 0
+        while cursor < len(addresses):
+            group_start = addresses[cursor]
+            group_end = group_start
+            next_cursor = cursor
+            while (
+                next_cursor < len(addresses)
+                and addresses[next_cursor] - group_start < 120
+            ):
+                group_end = addresses[next_cursor]
+                next_cursor += 1
+            values = self._read_holding_registers(
+                group_start, group_end - group_start + 1
+            )
+            registers.update({
+                group_start + offset: value
+                for offset, value in enumerate(values)
+            })
+            cursor = next_cursor
+        return registers
+
+    def read_sample(self) -> dict[str, float] | None:
+        if self.sock is None:
+            self._reconnect()
+        if self.sock is None:
+            return None
+        try:
+            registers = self._read_registers()
+        except (OSError, IOError):
+            self._reconnect()
+            if self.sock is None:
+                return None
+            try:
+                registers = self._read_registers()
+            except (OSError, IOError):
+                return None
+        result: dict[str, float] = {}
+        for name, address in self.register_map.items():
+            low, high = registers.get(address), registers.get(address + 1)
+            if low is not None and high is not None:
+                result[name] = self._registers_to_float(low, high)
+        return result or None
+
+    def close(self) -> None:
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+
+class AbbRobotDriver(SampleDriver):
+    def __init__(self, endpoint: str = DEFAULT_ABB_IP,
+                 username: str = DEFAULT_ABB_USER,
+                 password: str = DEFAULT_ABB_PASSWORD,
+                 timeout: float = 1.5) -> None:
+        if str(endpoint).startswith("http"):
+            self.base_url = str(endpoint).rstrip("/")
+        else:
+            self.base_url = f"http://{str(endpoint).split(':')[0]}"
+        self.username = username
+        self.password = password
+        self.timeout = max(0.1, float(timeout))
+        self._last_time: float | None = None
+        self._last_x: float | None = None
+        self._last_y: float | None = None
+        self._last_z: float | None = None
+
+    def open(self) -> None:
+        return
+
+    def _fetch_position(self) -> tuple[float, float, float]:
+        credentials = base64.b64encode(
+            f"{self.username}:{self.password}".encode("utf-8")
+        ).decode("ascii")
+        request = urllib.request.Request(
+            self.base_url + ABB_ROBTARGET_PATH,
+            headers={
+                "Authorization": f"Basic {credentials}",
+                "Accept": "application/json",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        state = payload["_embedded"]["_state"][0]
+        return float(state["x"]), float(state["y"]), float(state["z"])
+
+    def read_sample(self) -> dict[str, float] | None:
+        try:
+            x, y, z = self._fetch_position()
+        except Exception:
+            return None
+        now = time.time()
+        speed = 0.0
+        if self._last_time is not None and self._last_x is not None:
+            delta_time = now - self._last_time
+            if delta_time > 0:
+                speed = round(math.sqrt(
+                    (x - self._last_x) ** 2
+                    + (y - self._last_y) ** 2
+                    + (z - self._last_z) ** 2
+                ) / delta_time, 2)
+        self._last_time, self._last_x, self._last_y, self._last_z = now, x, y, z
+        return {"ABB_X": x, "ABB_Y": y, "ABB_Z": z, "线速度": speed}
+
+
+def _parse_roi(value: Any) -> tuple[int, int, int, int] | None:
+    if value in (None, "", []):
+        return None
+    pieces = (
+        [part.strip() for part in value.split(",") if part.strip()]
+        if isinstance(value, str) else list(value)
+        if isinstance(value, (list, tuple)) else []
+    )
+    if len(pieces) != 4:
+        return None
+    try:
+        return tuple(int(float(part)) for part in pieces)
+    except (TypeError, ValueError):
+        return None
+
+
+class UvcThermalDriver(SampleDriver):
+    """BSV UVC native DLL reader; produces a calibrated ROI temperature."""
+
+    def __init__(self, dll_path: str = "", roi: Any = None, poll_retries: int = 3) -> None:
+        self.dll_path = str(dll_path or "").strip()
+        self.roi = _parse_roi(roi)
+        self.poll_retries = max(1, int(poll_retries))
+        self.dll = None
+        self.yuv_buffer = (ctypes.c_ubyte * BSV_UVC_YUV_BYTES)()
+        self.temp_buffer = (ctypes.c_ushort * BSV_UVC_PIXELS)()
+
+    def _find_dll(self) -> Path:
+        candidates = []
+        if self.dll_path:
+            candidates.append(Path(self.dll_path))
+        candidates.extend([
+            APP_DIR / BSV_UVC_DLL_NAME,
+            APP_DIR.parent / BSV_UVC_DLL_NAME,
+            Path.cwd() / BSV_UVC_DLL_NAME,
+            Path(BSV_UVC_DLL_NAME),
+        ])
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    return candidate.resolve()
+            except OSError:
+                continue
+        raise FileNotFoundError(
+            "未找到 BsvUvcNative.dll；请将该 DLL 放到程序目录或通过接口配置 dll_path 指定路径"
+        )
+
+    def _bind_api(self) -> None:
+        if self.dll is None:
+            raise RuntimeError("BSV UVC DLL尚未加载")
+        self.dll.BsvSetTempRangeCode.argtypes = [ctypes.c_int]
+        self.dll.BsvSetTempRangeCode.restype = ctypes.c_int
+        self.dll.BsvOpen.argtypes = []
+        self.dll.BsvOpen.restype = ctypes.c_int
+        self.dll.BsvStart.argtypes = []
+        self.dll.BsvStart.restype = ctypes.c_int
+        self.dll.BsvHasFrame.argtypes = []
+        self.dll.BsvHasFrame.restype = ctypes.c_int
+        self.dll.BsvGetFrame.argtypes = [
+            ctypes.POINTER(ctypes.c_ubyte), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_ushort), ctypes.c_int,
+        ]
+        self.dll.BsvGetFrame.restype = ctypes.c_int
+        self.dll.BsvGetLastError.argtypes = []
+        self.dll.BsvGetLastError.restype = ctypes.c_int
+        self.dll.BsvStop.argtypes = []
+        self.dll.BsvStop.restype = None
+        self.dll.BsvClose.argtypes = []
+        self.dll.BsvClose.restype = None
+
+    def open(self) -> None:
+        self.dll = ctypes.CDLL(str(self._find_dll()))
+        self._bind_api()
+        if self.dll.BsvSetTempRangeCode(BSV_UVC_TEMP_RANGE_CODE) < 0:
+            raise IOError("BSV UVC 设置温度量程失败")
+        result = self.dll.BsvOpen()
+        if result <= 0:
+            error = self.dll.BsvGetLastError()
+            self.dll = None
+            raise IOError(f"BSV UVC 打开设备失败：code={result}, lastError={error}")
+        result = self.dll.BsvStart()
+        if result <= 0:
+            error = self.dll.BsvGetLastError()
+            self.close()
+            raise IOError(f"BSV UVC 启动视频流失败：code={result}, lastError={error}")
+
+    def _roi_average_temperature(self) -> float:
+        x1, y1, x2, y2 = self.roi or (0, 0, BSV_UVC_WIDTH, BSV_UVC_HEIGHT)
+        x1 = max(0, min(int(x1), BSV_UVC_WIDTH - 1))
+        x2 = max(x1 + 1, min(int(x2), BSV_UVC_WIDTH))
+        y1 = max(0, min(int(y1), BSV_UVC_HEIGHT - 1))
+        y2 = max(y1 + 1, min(int(y2), BSV_UVC_HEIGHT))
+        total = 0.0
+        count = 0
+        for row in range(y1, y2):
+            base = row * BSV_UVC_WIDTH
+            for column in range(x1, x2):
+                total += self.temp_buffer[base + column] / BSV_UVC_TEMP_FORMULA_SCALE + BSV_UVC_TEMP_FORMULA_OFFSET
+                count += 1
+        return round(total / count, 2) if count else 0.0
+
+    def read_sample(self) -> dict[str, float] | None:
+        if self.dll is None:
+            return None
+        for _ in range(self.poll_retries):
+            if self.dll.BsvHasFrame() <= 0:
+                return None
+            result = self.dll.BsvGetFrame(
+                self.yuv_buffer, BSV_UVC_YUV_BYTES,
+                self.temp_buffer, BSV_UVC_PIXELS,
+            )
+            if result > 0:
+                return {"ROI平均温度": self._roi_average_temperature()}
+        return None
+
+    def close(self) -> None:
+        if self.dll is None:
+            return
+        try:
+            self.dll.BsvStop()
+        except Exception:
+            pass
+        try:
+            self.dll.BsvClose()
+        except Exception:
+            pass
+        self.dll = None
+
+
+class RtspThermalDriver(SampleDriver):
+    def __init__(self, endpoint: str = DEFAULT_RTSP_URL, roi: Any = None,
+                 temp_scale: float | None = None, temp_offset: float = 0.0,
+                 record_dir: str = "", record_fps: float = 15.0) -> None:
+        self.endpoint = str(endpoint or DEFAULT_RTSP_URL)
+        self.roi = _parse_roi(roi)
+        self.temp_scale = float(temp_scale) if temp_scale not in (None, "", 0) else None
+        self.temp_offset = float(temp_offset or 0.0)
+        self.record_dir = str(record_dir or "").strip()
+        self.record_fps = max(1.0, float(record_fps or 15.0))
+        self.capture = None
+        self.writer = None
+
+    def open(self) -> None:
+        try:
+            import cv2
+        except ImportError as exc:
+            raise RuntimeError("RTSP热像仪需要opencv-python") from exc
+        self.capture = cv2.VideoCapture(self.endpoint)
+        if not self.capture.isOpened():
+            self.capture.release()
+            self.capture = None
+            raise IOError(f"无法打开 RTSP 视频流：{self.endpoint}")
+
+    def read_sample(self) -> dict[str, float] | None:
+        if self.capture is None:
+            return None
+        import cv2
+        ok, frame = self.capture.read()
+        if not ok or frame is None or self.temp_scale is None:
+            return None
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        height, width = gray.shape[:2]
+        x1, y1, x2, y2 = self.roi or (0, 0, width, height)
+        x1, x2 = max(0, min(int(x1), width - 1)), max(1, min(int(x2), width))
+        y1, y2 = max(0, min(int(y1), height - 1)), max(1, min(int(y2), height))
+        return {"ROI平均温度": round(self.temp_offset + float(gray[y1:y2, x1:x2].mean()) * self.temp_scale, 2)}
+
+    def close(self) -> None:
+        if self.writer is not None:
+            try:
+                self.writer.release()
+            except Exception:
+                pass
+            self.writer = None
+        if self.capture is not None:
+            try:
+                self.capture.release()
+            except Exception:
+                pass
+            self.capture = None
+
+
+class M3232PressureDriver(SampleDriver):
+    """M3232 32×32 serial pressure reader with transport freshness checks."""
+
+    def __init__(self, endpoint: str = "COM8", baudrate: int = M3232_BAUDRATE) -> None:
+        self.endpoint = str(endpoint or "COM8").strip()
+        self.baudrate = int(baudrate or M3232_BAUDRATE)
+        self.serial = None
+        self.rx_buffer = ""
+        self.last_data_time: float | None = None
+        self.latest_pressure = 0.0
+        self.median_window: list[float] = []
+
+    def open(self) -> None:
+        import serial
+        self.serial = serial.Serial(
+            self.endpoint, self.baudrate, bytesize=8,
+            parity="N", stopbits=1, timeout=0,
+        )
+        self.rx_buffer = ""
+        self.last_data_time = None
+        self.serial.write(b"begin\n")
+
+    def _extract_frames(self) -> list[list[list[float]]]:
+        frames: list[list[list[float]]] = []
+        decoder = json.JSONDecoder()
+        while True:
+            start = self.rx_buffer.find("[")
+            if start < 0:
+                self.rx_buffer = self.rx_buffer[-1024:]
+                break
+            try:
+                payload, end = decoder.raw_decode(self.rx_buffer[start:])
+            except json.JSONDecodeError:
+                self.rx_buffer = self.rx_buffer[start:]
+                break
+            self.rx_buffer = self.rx_buffer[start + end:]
+            if isinstance(payload, list) and len(payload) == 32 and all(
+                isinstance(row, list) and len(row) == 32 for row in payload
+            ):
+                try:
+                    frames.append([[float(value) for value in row] for row in payload])
+                except (TypeError, ValueError):
+                    pass
+        return frames
+
+    @staticmethod
+    def _frame_pressure(matrix: list[list[float]]) -> float:
+        active = sorted(
+            value for row in matrix for value in row
+            if math.isfinite(value) and value > 5.0
+        )
+        if not active:
+            return 0.0
+        return round(sum(active[:max(1, int(len(active) * 0.9))]), 2)
+
+    def read_sample(self) -> dict[str, float] | None:
+        if self.serial is None:
+            return None
+        pending = int(getattr(self.serial, "in_waiting", 0) or 0)
+        if pending > 0:
+            chunk = self.serial.read(min(pending, 16384))
+            if chunk:
+                self.last_data_time = time.time()
+                self.rx_buffer += chunk.decode("utf-8", errors="ignore")
+        for matrix in self._extract_frames():
+            value = self._frame_pressure(matrix)
+            self.median_window.append(value)
+            self.median_window = self.median_window[-9:]
+            ordered = sorted(self.median_window)
+            self.latest_pressure = ordered[len(ordered) // 2]
+        if self.last_data_time is None or time.time() - self.last_data_time > 2.0:
+            return None
+        return {"压力": round(float(self.latest_pressure), 2)}
+
+    def close(self) -> None:
+        if self.serial is None:
+            return
+        try:
+            self.serial.write(b"end\n")
+        except Exception:
+            pass
+        try:
+            self.serial.close()
+        finally:
+            self.serial = None
+
+
+class MultiInterfaceDriver(SampleDriver):
+    """Read several physical interfaces and merge one time slice."""
+    def __init__(self, configs: list[dict[str, Any]], selected_sensors: list[str], source_file: str = "", assignments: dict[str, list[str]] | None = None) -> None:
+        self.configs = [item for item in configs if item.get("enabled", True)]
+        self.selected_sensors = selected_sensors
+        self.source_file = source_file
+        self.assignments = assignments or {}
+        self.drivers: list[SampleDriver] = []
+
+    def open(self) -> None:
+        self.drivers = []
+        try:
+            for item in self.configs:
+                driver_name = str(item.get("driver") or "serial_json")
+                role = str(item.get("role") or "other")
+                channel_map = item.get("channel_map") if isinstance(item.get("channel_map"), dict) else {}
+                if driver_name == "serial_json":
+                    driver = SerialJsonDriver(str(item.get("endpoint") or ""), int(item.get("baudrate") or 115200), role, channel_map, float(item.get("timeout") or 0.05))
+                elif driver_name == "smrf_hid":
+                    channel_types = item.get("channel_types")
+                    driver = SmrfHidDriver(
+                        str(item.get("endpoint") or "SMRFCT08B"),
+                        channel_types if isinstance(channel_types, (list, tuple)) else None,
+                    )
+                elif driver_name == "tcp_json":
+                    driver = TcpJsonDriver(str(item.get("endpoint") or ""), role, channel_map, float(item.get("timeout") or 0.05))
+                elif driver_name == "modbus_tcp":
+                    register_map = item.get("register_map") if isinstance(item.get("register_map"), dict) else None
+                    driver = ModbusTcpDriver(
+                        str(item.get("endpoint") or f"{DEFAULT_PLC_IP}:{DEFAULT_PLC_PORT}"),
+                        register_map=register_map,
+                        slave_id=int(item.get("slave_id") or DEFAULT_PLC_SLAVE_ID),
+                        timeout=float(item.get("timeout") or 1.0),
+                    )
+                elif driver_name == "abb_robot":
+                    driver = AbbRobotDriver(
+                        str(item.get("endpoint") or DEFAULT_ABB_IP),
+                        str(item.get("username") or DEFAULT_ABB_USER),
+                        str(item.get("password") or DEFAULT_ABB_PASSWORD),
+                        float(item.get("timeout") or 1.5),
+                    )
+                elif driver_name == "uvc_thermal":
+                    driver = UvcThermalDriver(
+                        str(item.get("dll_path") or ""), item.get("roi"),
+                    )
+                elif driver_name == "rtsp_thermal":
+                    scale = item.get("temp_scale")
+                    driver = RtspThermalDriver(
+                        str(item.get("endpoint") or DEFAULT_RTSP_URL),
+                        item.get("roi"),
+                        float(scale) if scale not in (None, "") else None,
+                        float(item.get("temp_offset") or 0.0),
+                        str(item.get("record_dir") or ""),
+                    )
+                elif driver_name == "m3232_pressure":
+                    driver = M3232PressureDriver(
+                        str(item.get("endpoint") or "COM8"),
+                        int(item.get("baudrate") or M3232_BAUDRATE),
+                    )
+                elif driver_name == "simulator":
+                    driver = SimulatorDriver(Path(self.source_file or DEFAULT_SIMULATOR_FILE), self.selected_sensors)
+                else:
+                    raise ValueError(f"unsupported interface driver: {driver_name}")
+                driver.open()
+                self.drivers.append(driver)
+        except Exception:
+            self.close()
+            raise
+
+    def read_sample(self) -> dict[str, float] | None:
+        merged: dict[str, float] = {}
+        for index, driver in enumerate(self.drivers):
+            sample = driver.read_sample()
+            if sample:
+                interface_id = self.configs[index].get("id") if index < len(self.configs) else None
+                allowed = self.assignments.get(str(interface_id))
+                if allowed is not None:
+                    sample = {name: value for name, value in sample.items() if name in allowed}
+                merged.update(sample)
+        return merged or None
+
+    def close(self) -> None:
+        for driver in self.drivers:
+            try:
+                driver.close()
+            except Exception:
+                pass
+        self.drivers = []
+
+
 def build_driver(config: AcquisitionConfig) -> SampleDriver:
+    if config.acquisition_mode == "simulation":
+        if config.simulation_source_type == "mysql":
+            return MySQLSimulatorDriver(
+                {
+                    "host": config.simulation_mysql_host,
+                    "port": config.simulation_mysql_port,
+                    "user": config.simulation_mysql_user,
+                    "password": config.simulation_mysql_password,
+                    "database": config.simulation_mysql_database,
+                    "query": config.simulation_mysql_query,
+                },
+                list(config.selected_sensors or []),
+            )
+        path = Path(config.simulation_source_path or config.source_file)
+        if config.simulation_source_type == "folder_csv":
+            return FolderCsvSimulatorDriver(path, list(config.selected_sensors or []))
+        return SimulatorDriver(path, list(config.selected_sensors or []))
+    enabled_interfaces = [item for item in (config.interfaces or []) if item.get("enabled", True)]
+    if enabled_interfaces:
+        return MultiInterfaceDriver(
+            enabled_interfaces,
+            list(config.selected_sensors or []),
+            config.source_file,
+            config.interface_channel_assignments,
+        )
     if config.driver == "simulator":
         path = (
             Path(config.source_file)
@@ -457,8 +1783,20 @@ def build_driver(config: AcquisitionConfig) -> SampleDriver:
         return SimulatorDriver(path, list(config.selected_sensors or []))
     if config.driver == "serial_json":
         return SerialJsonDriver(config.endpoint, config.baudrate)
+    if config.driver == "smrf_hid":
+        return SmrfHidDriver(config.endpoint or "SMRFCT08B")
     if config.driver == "tcp_json":
         return TcpJsonDriver(config.endpoint)
+    if config.driver == "modbus_tcp":
+        return ModbusTcpDriver(config.endpoint or f"{DEFAULT_PLC_IP}:{DEFAULT_PLC_PORT}")
+    if config.driver == "abb_robot":
+        return AbbRobotDriver(config.endpoint or DEFAULT_ABB_IP)
+    if config.driver == "uvc_thermal":
+        return UvcThermalDriver()
+    if config.driver == "rtsp_thermal":
+        return RtspThermalDriver(config.endpoint or DEFAULT_RTSP_URL)
+    if config.driver == "m3232_pressure":
+        return M3232PressureDriver(config.endpoint or "COM8", config.baudrate or M3232_BAUDRATE)
     raise ValueError(f"不支持的采集驱动：{config.driver}")
 
 
@@ -475,6 +1813,8 @@ class AcquisitionManager:
         self.timestamps: deque[float] = deque(maxlen=200000)
         self.sensor_received = {name: 0 for name in ALL_SENSOR_COLUMNS}
         self.sensor_last_time = {name: None for name in ALL_SENSOR_COLUMNS}
+        self.channel_observed = {name: 0 for name in ALL_SENSOR_COLUMNS}
+        self.channel_last_observed = {name: None for name in ALL_SENSOR_COLUMNS}
         self.last_error = ""
         self.started_at: float | None = None
         self.stopped_at: float | None = None
@@ -503,8 +1843,127 @@ class AcquisitionManager:
         return [
             {"id": "simulator", "label": "模拟采集（CSV数据源）"},
             {"id": "serial_json", "label": "串口 JSON Lines"},
+            {"id": "smrf_hid", "label": "SMRF八通道温度巡检仪（USB HID）"},
             {"id": "tcp_json", "label": "TCP JSON Lines"},
+            {"id": "modbus_tcp", "label": "Modbus TCP（松下PLC）"},
+            {"id": "abb_robot", "label": "ABB机器人 RWS"},
+            {"id": "uvc_thermal", "label": "BSV UVC热像仪（ROI温度）"},
+            {"id": "rtsp_thermal", "label": "IP热像仪 RTSP"},
+            {"id": "m3232_pressure", "label": "M3232薄膜压力（230400）"},
         ]
+
+    @staticmethod
+    def discover_interfaces() -> dict[str, Any]:
+        """Discover local serial interfaces and provide two editable defaults.
+
+        Interface discovery must not depend on a sensor actively streaming
+        data.  ``pyserial`` is the preferred provider, but the portable build
+        also falls back to the Windows serial-device registry when the driver
+        package is unavailable.  This lets the UI distinguish an existing
+        COM interface from a connected sensor (which is checked separately by
+        :meth:`test_connection`).
+        """
+        ports: list[dict[str, Any]] = []
+        error = ""
+        try:
+            from serial.tools import list_ports
+            for item in list_ports.comports():
+                ports.append({
+                    "id": str(item.device),
+                    "endpoint": str(item.device),
+                    "description": str(item.description or ""),
+                    "manufacturer": str(item.manufacturer or ""),
+                    "vid": item.vid,
+                    "pid": item.pid,
+                })
+        except Exception as exc:
+            error = str(exc)
+            # Keep discovery useful in a minimal/frozen Windows runtime even
+            # if pyserial was not bundled.  The registry reports COM devices
+            # without opening them and therefore does not require a sensor.
+            if sys.platform.startswith("win"):
+                try:
+                    import winreg
+
+                    key_path = r"HARDWARE\\DEVICEMAP\\SERIALCOMM"
+                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
+                        index = 0
+                        while True:
+                            try:
+                                value_name, endpoint, _ = winreg.EnumValue(key, index)
+                            except OSError:
+                                break
+                            endpoint = str(endpoint)
+                            ports.append(
+                                {
+                                    "id": endpoint,
+                                    "endpoint": endpoint,
+                                    "description": str(value_name or "Windows serial interface"),
+                                    "manufacturer": "",
+                                    "vid": None,
+                                    "pid": None,
+                                }
+                            )
+                            index += 1
+                except Exception as registry_exc:
+                    error = f"{error}; Windows接口枚举失败：{registry_exc}"
+        smrf_devices: list[dict[str, Any]] = []
+        try:
+            smrf_devices = [
+                {
+                    "id": item.label,
+                    "endpoint": item.label,
+                    "product": item.product,
+                    "serial": item.serial,
+                    "vid": item.vendor_id,
+                    "pid": item.product_id,
+                }
+                for item in enumerate_smrf_hid_devices()
+            ]
+        except Exception as exc:
+            error = f"{error}; SMRF HID枚举失败：{exc}" if error else f"SMRF HID枚举失败：{exc}"
+        plc_reachable = False
+        try:
+            sock = socket.create_connection((DEFAULT_PLC_IP, DEFAULT_PLC_PORT), timeout=1.0)
+            sock.close()
+            plc_reachable = True
+        except OSError:
+            pass
+        abb_reachable = False
+        try:
+            sock = socket.create_connection((DEFAULT_ABB_IP, 80), timeout=1.0)
+            sock.close()
+            abb_reachable = True
+        except OSError:
+            pass
+        uvc_dll_found = any(
+            candidate.is_file()
+            for candidate in (
+                APP_DIR / BSV_UVC_DLL_NAME,
+                APP_DIR.parent / BSV_UVC_DLL_NAME,
+                Path.cwd() / BSV_UVC_DLL_NAME,
+            )
+        )
+        rtsp_reachable = False
+        try:
+            sock = socket.create_connection(("192.168.125.2", 554), timeout=1.0)
+            sock.close()
+            rtsp_reachable = True
+        except OSError:
+            pass
+        return {
+            "ports": ports,
+            "hid_devices": smrf_devices,
+            "defaults": default_capture_interfaces(),
+            "sensor_type_profiles": sensor_interface_profiles(),
+            "channel_metadata": SENSOR_CHANNEL_METADATA,
+            "error": error,
+            "plc_reachable": plc_reachable,
+            "abb_reachable": abb_reachable,
+            "uvc_dll_found": uvc_dll_found,
+            "rtsp_reachable": rtsp_reachable,
+            "thermocouple_reachable": bool(smrf_devices),
+        }
 
     @staticmethod
     def available_schemas() -> list[dict[str, Any]]:
@@ -521,50 +1980,157 @@ class AcquisitionManager:
     def test_connection(
         self, config: AcquisitionConfig, timeout_seconds: float = 2.5
     ) -> dict:
-        driver = build_driver(config)
+        """Check source readiness and report the exact missing endpoint/channel."""
         selected = set(config.selected_sensors or [])
         received = {name: 0 for name in ALL_SENSOR_COLUMNS}
+        invalid_received = {name: 0 for name in ALL_SENSOR_COLUMNS}
         errors: list[str] = []
-        started = time.time()
-        try:
-            driver.open()
-            while time.time() - started < timeout_seconds:
-                try:
+        check_started = time.time()
+        if config.acquisition_mode == "simulation":
+            driver = build_driver(config)
+            try:
+                driver.open()
+                probe_started = time.time()
+                while time.time() - probe_started < max(0.5, float(timeout_seconds)):
                     sample = driver.read_sample()
-                except Exception as exc:
-                    errors.append(str(exc))
-                    break
-                if sample:
-                    for name in selected:
-                        if name in sample and _finite(sample[name]) is not None:
-                            received[name] += 1
-                    if selected and all(received[name] > 0 for name in selected):
+                    if sample:
+                        for name in selected:
+                            if name not in sample:
+                                continue
+                            if _finite(sample[name]) is None:
+                                invalid_received[name] += 1
+                            else:
+                                received[name] += 1
+                        if selected and all(received[name] > 0 for name in selected):
+                            break
+                    time.sleep(min(0.02, 1.0 / max(config.sample_rate_hz, 1.0)))
+            except Exception as exc:
+                errors.append(f"模拟数据源：{exc}")
+            finally:
+                try:
+                    driver.close()
+                except Exception:
+                    pass
+        interface_results: list[dict[str, Any]] = []
+        for item in ([] if config.acquisition_mode == "simulation" else (config.interfaces or [])):
+            interface_id = str(item.get("id") or "")
+            endpoint = str(item.get("endpoint") or interface_id or "未填写地址")
+            expected = [
+                name for name in config.interface_channel_assignments.get(interface_id, [])
+                if name in selected
+            ]
+            if not item.get("enabled", True):
+                interface_results.append({
+                    "id": interface_id, "role": item.get("role", "custom"),
+                    "driver": item.get("driver", ""), "endpoint": endpoint,
+                    "enabled": False, "expected_channels": expected,
+                    "detected_channels": [], "missing_channels": [],
+                    "invalid_channels": [], "sample_counts": {}, "errors": [],
+                    "state": "disabled", "message": "接口已停用", "ok": True,
+                })
+                continue
+            auxiliary_only = str(item.get("role") or "") == "thermal_rtsp"
+            if not expected:
+                interface_results.append({
+                    "id": interface_id, "role": item.get("role", "custom"),
+                    "driver": item.get("driver", ""), "endpoint": endpoint,
+                    "enabled": True, "expected_channels": [],
+                    "detected_channels": [], "missing_channels": [],
+                    "invalid_channels": [], "sample_counts": {}, "errors": [],
+                    "auxiliary_only": auxiliary_only,
+                    "state": "video_only" if auxiliary_only else "no_channels",
+                    "message": "仅提供视频流" if auxiliary_only else "当前未分配已选通道",
+                    "ok": True,
+                })
+                continue
+            detected: dict[str, int] = {}
+            invalid: dict[str, int] = {}
+            probe_errors: list[str] = []
+            interface_driver = None
+            probe_started = time.time()
+            try:
+                interface_driver = MultiInterfaceDriver(
+                    [item], list(config.schema_sensors), config.source_file,
+                    {interface_id: expected},
+                )
+                interface_driver.open()
+                while time.time() - probe_started < max(0.5, min(float(timeout_seconds), 1.5)):
+                    sample = interface_driver.read_sample()
+                    if sample:
+                        for name in expected:
+                            if name not in sample:
+                                continue
+                            if _finite(sample[name]) is None:
+                                invalid[name] = invalid.get(name, 0) + 1
+                                invalid_received[name] += 1
+                            else:
+                                detected[name] = detected.get(name, 0) + 1
+                                received[name] += 1
+                    if detected:
                         break
-                if config.driver == "simulator":
-                    time.sleep(min(0.02, 1.0 / config.sample_rate_hz))
-        except Exception as exc:
-            errors.append(str(exc))
-        finally:
-            driver.close()
-        sensors = [
-            {
-                "name": name,
-                "selected": name in selected,
+                    time.sleep(0.01)
+            except Exception as exc:
+                probe_errors.append(str(exc))
+            finally:
+                if interface_driver is not None:
+                    try:
+                        interface_driver.close()
+                    except Exception:
+                        pass
+            missing = [name for name in expected if detected.get(name, 0) <= 0]
+            invalid_channels = [name for name in missing if invalid.get(name, 0) > 0]
+            if detected:
+                state, message = "ok", f"接口已收到有效数据：{'、'.join(sorted(detected))}"
+                if missing:
+                    message += f"；未收到通道不阻止采集：{'、'.join(missing)}"
+            elif probe_errors:
+                state, message = "not_connected", f"接口无法打开或读取：{'；'.join(probe_errors)}"
+            elif invalid_channels:
+                state, message = "invalid_data", f"收到非数值数据：{'、'.join(invalid_channels)}"
+            else:
+                state, message = "no_data", f"未检测到采集数据：{'、'.join(missing)}"
+            if state != "ok":
+                errors.append(f"{endpoint}：{message}")
+            interface_results.append({
+                "id": interface_id, "role": item.get("role", "custom"),
+                "driver": item.get("driver", ""), "endpoint": endpoint,
+                "enabled": True, "expected_channels": expected,
+                "detected_channels": sorted(detected), "missing_channels": missing,
+                "invalid_channels": invalid_channels, "sample_counts": detected,
+                "invalid_sample_counts": invalid, "errors": probe_errors,
+                "auxiliary_only": auxiliary_only, "state": state,
+                "message": message, "ok": state == "ok",
+            })
+        sensors = []
+        for name in config.schema_sensors:
+            is_selected = name in selected
+            if not is_selected:
+                state = "not_selected"
+            elif received[name] > 0:
+                state = "ok"
+            elif invalid_received[name] > 0:
+                state = "invalid_data"
+            else:
+                state = "no_data"
+            sensors.append({
+                "name": name, "selected": is_selected,
                 "received_samples": int(received[name]),
-                "ok": name not in selected or received[name] > 0,
-            }
-            for name in config.schema_sensors
-        ]
-        ok = bool(selected) and not errors and all(
-            item["ok"] for item in sensors
+                "invalid_samples": int(invalid_received[name]), "state": state,
+                "message": {"not_selected": "未选择采集", "ok": "收到有效数据",
+                             "invalid_data": "收到非数值数据", "no_data": "未检测到数据"}[state],
+                "blocking": config.acquisition_mode == "simulation" and is_selected,
+                "ok": not is_selected or state == "ok",
+            })
+        interface_ok = config.acquisition_mode == "simulation" or all(
+            item["ok"] for item in interface_results if item.get("enabled", True)
         )
+        ok = bool(selected) and not errors and interface_ok
+        if config.acquisition_mode == "simulation":
+            ok = ok and all(item["ok"] for item in sensors)
         return {
-            "ok": ok,
-            "driver": config.driver,
-            "endpoint": config.endpoint,
-            "elapsed_seconds": time.time() - started,
-            "errors": errors,
-            "sensors": sensors,
+            "ok": ok, "driver": config.driver, "endpoint": config.endpoint,
+            "elapsed_seconds": time.time() - check_started, "errors": errors,
+            "sensors": sensors, "interfaces": interface_results,
         }
 
     def start(self, config: AcquisitionConfig) -> dict:
@@ -586,6 +2152,12 @@ class AcquisitionManager:
             self.sensor_last_time = {
                 name: None for name in ALL_SENSOR_COLUMNS
             }
+            self.channel_observed = {
+                name: 0 for name in ALL_SENSOR_COLUMNS
+            }
+            self.channel_last_observed = {
+                name: None for name in ALL_SENSOR_COLUMNS
+            }
             self.last_error = ""
             self.started_at = time.time()
             self.stopped_at = None
@@ -598,16 +2170,12 @@ class AcquisitionManager:
             )
             selected_root = selected_root.resolve()
             selected_root.mkdir(parents=True, exist_ok=True)
-            safe_specimen = _safe_component(config.specimen_id)
             parameter_token = _parameter_token(config)
-            specimen_folder_name = f"{safe_specimen}_{parameter_token}"
+            # Storage names intentionally exclude specimen/run identifiers.
+            specimen_folder_name = parameter_token
             self.session_dir = selected_root / specimen_folder_name
             self.capture_record_dir = self.session_dir / "采集记录"
             self.capture_record_dir.mkdir(parents=True, exist_ok=True)
-            file_name = (
-                f"{specimen_folder_name}_第{config.layer + 1}层.CSV"
-            )
-            self.raw_path = self.session_dir / file_name
             self.timestamp_path = self.capture_record_dir / (
                 f"{specimen_folder_name}_第{config.layer + 1}层_"
                 f"{stamp}_时间戳.csv"
@@ -616,13 +2184,18 @@ class AcquisitionManager:
                 f"{specimen_folder_name}_第{config.layer + 1}层_"
                 f"{stamp}_采集清单.json"
             )
+            # Use stable Unicode layer names for new captures.  The fallback
+            # pattern in _rebuild_whole_specimen still accepts files created
+            # by earlier builds that used replacement characters.
+            self.raw_path = self.session_dir / (
+                f"{specimen_folder_name}_\u7b2c{config.layer + 1}\u5c42.CSV"
+            )
             if max(len(str(self.raw_path)), len(str(self.timestamp_path))) > 235:
                 raise ValueError(
                     "保存路径过长。请改选更短的保存根目录，或缩短试样名。"
                 )
             self.driver = build_driver(config)
             self.driver.open()
-            self._archive_existing(self.raw_path, "分层数据")
             manifest_path.write_text(
                 json.dumps(
                     {
@@ -635,7 +2208,7 @@ class AcquisitionManager:
                         "layer_file": str(self.raw_path),
                         "timestamp_file": str(self.timestamp_path),
                         "whole_specimen_rule": (
-                            f"{specimen_folder_name}_完整试样_已采N层.CSV"
+                            f"{specimen_folder_name}_完整试样.CSV（每层结束后覆盖更新）"
                         ),
                     },
                     ensure_ascii=False,
@@ -669,19 +2242,22 @@ class AcquisitionManager:
         path.replace(archived)
 
     def _rebuild_whole_specimen(self) -> Path | None:
+        """Rebuild one canonical complete specimen CSV in-place.
+
+        The storage path is keyed by process parameters only; specimen/run
+        identifiers are retained as metadata but are deliberately excluded
+        from folder and file names.  Rebuilding overwrites the prior complete
+        file, so a folder contains only the current complete specimen copy.
+        """
         if self.config is None or self.session_dir is None:
             return None
-        safe_specimen = _safe_component(self.config.specimen_id)
-        specimen_folder_name = f"{safe_specimen}_{_parameter_token(self.config)}"
-        # Do not assume a five-layer specimen.  Every layer file collected in
-        # this specimen folder participates in the final snapshot, including
-        # layer numbers beyond the historical 0--4 range.
+        specimen_folder_name = _parameter_token(self.config)
         layer_pattern = re.compile(
-            rf"^{re.escape(specimen_folder_name)}_第(\d+)层\.CSV$",
+            rf"^{re.escape(specimen_folder_name)}_(?:\u7b2c|\ufffd\ufffd)(\d+)(?:\u5c42|\ufffd\ufffd)\.CSV$",
             re.IGNORECASE,
         )
-        available = []
-        for path in self.session_dir.glob(f"{specimen_folder_name}_第*层.CSV"):
+        available: list[tuple[int, Path]] = []
+        for path in self.session_dir.glob(f"{specimen_folder_name}_*.CSV"):
             match = layer_pattern.match(path.name)
             if match and path.stat().st_size > 0:
                 available.append((int(match.group(1)) - 1, path))
@@ -690,24 +2266,17 @@ class AcquisitionManager:
         if not available:
             return None
         combined_path = self.session_dir / (
-            f"{specimen_folder_name}_完整试样_已采{len(available)}层.CSV"
+            f"{specimen_folder_name}_\u5b8c\u6574\u8bd5\u6837.CSV"
         )
-        self._archive_existing(combined_path, "完整试样快照")
-        with combined_path.open(
-            "w", encoding="gb18030", newline=""
-        ) as output_file:
-            writer = csv.DictWriter(
-                output_file, fieldnames=self.config.raw_columns
-            )
+        with combined_path.open("w", encoding="gb18030", newline="") as output_file:
+            writer = csv.DictWriter(output_file, fieldnames=self.config.raw_columns)
             writer.writeheader()
             for _, layer_path in available:
-                with layer_path.open(
-                    "r", encoding="gb18030", newline=""
-                ) as layer_file:
+                with layer_path.open("r", encoding="gb18030", newline="") as layer_file:
                     reader = csv.DictReader(layer_file)
                     if reader.fieldnames != self.config.raw_columns:
                         raise ValueError(
-                            f"分层文件列名与原始格式不一致：{layer_path.name}"
+                            f"Layer file columns do not match the raw schema: {layer_path.name}"
                         )
                     writer.writerows(reader)
         self.full_specimen_path = combined_path
@@ -736,13 +2305,25 @@ class AcquisitionManager:
                 writer.writeheader()
                 timestamp_writer.writeheader()
                 next_deadline = time.perf_counter()
+                empty_since: float | None = None
                 while not self.stop_event.is_set():
                     try:
                         sample = self.driver.read_sample()
                     except Exception as exc:
                         self.last_error = str(exc)
                         break
+                    observed_now = time.time()
                     if sample:
+                        with self.lock:
+                            for name, value in sample.items():
+                                if name in self.channel_observed and _finite(value) is not None:
+                                    self.channel_observed[name] += 1
+                                    self.channel_last_observed[name] = observed_now
+                    valid_sample = bool(sample) and any(
+                        _finite(sample.get(name)) is not None for name in selected
+                    )
+                    if valid_sample:
+                        empty_since = None
                         now = time.time()
                         row_index = len(self.rows)
                         row = {
@@ -808,7 +2389,14 @@ class AcquisitionManager:
                                 if _finite(row.get(name)) is not None:
                                     self.sensor_received[name] += 1
                                     self.sensor_last_time[name] = now
-                    if config.driver == "simulator":
+                    elif config.acquisition_mode == "real":
+                        if empty_since is None:
+                            empty_since = time.monotonic()
+                        elif time.monotonic() - empty_since >= 3.0:
+                            self.last_error = "没有连接到传感器，3秒内没有检测到有效采集数据；请检查接口、串口和数据格式"
+                            break
+                        time.sleep(0.005)
+                    if config.driver == "simulator" or config.acquisition_mode == "simulation":
                         next_deadline += 1.0 / config.sample_rate_hz
                         self.stop_event.wait(
                             max(0.0, next_deadline - time.perf_counter())
@@ -921,38 +2509,96 @@ class AcquisitionManager:
         with self.lock:
             now = time.time()
             running = self.thread is not None and self.thread.is_alive()
-            selected = set(
-                self.config.selected_sensors
-                if self.config is not None
-                else []
-            )
+            selected = set(self.config.selected_sensors if self.config is not None else [])
+            available_sensors = self.config.schema_sensors if self.config is not None else LEGACY_SENSOR_COLUMNS
             sensors = []
-            available_sensors = (
-                self.config.schema_sensors
-                if self.config is not None
-                else LEGACY_SENSOR_COLUMNS
-            )
             for name in available_sensors:
-                last = self.sensor_last_time[name]
+                last = self.channel_last_observed[name]
                 age = None if last is None else now - float(last)
-                sensors.append(
-                    {
-                        "name": name,
-                        "selected": name in selected,
-                        "received_samples": int(self.sensor_received[name]),
-                        "last_sample_age_seconds": age,
-                        "ok": (
-                            name not in selected
-                            or (
-                                self.sensor_received[name] > 0
-                                and (
-                                    not running
-                                    or (age is not None and age <= 2.0)
-                                )
-                            )
-                        ),
-                    }
-                )
+                observed = int(self.channel_observed[name])
+                if name not in selected:
+                    sensor_state = "not_selected"
+                elif observed <= 0 and running and self.started_at is not None and now - self.started_at < 2.0:
+                    sensor_state = "waiting"
+                elif observed <= 0:
+                    sensor_state = "no_data"
+                elif running and (age is None or age > 2.0):
+                    sensor_state = "stale"
+                else:
+                    sensor_state = "ok"
+                sensors.append({
+                    "name": name, "selected": name in selected,
+                    "observed_samples": observed,
+                    "received_samples": int(self.sensor_received[name]),
+                    "saved_samples": int(self.sensor_received[name]),
+                    "last_sample_age_seconds": age,
+                    "last_observed_age_seconds": age,
+                    "state": sensor_state,
+                    "message": {
+                        "not_selected": "未选择采集", "waiting": "等待首个数据",
+                        "no_data": "未检测到采集数据", "stale": "数据已中断",
+                        "ok": "数据正常",
+                    }[sensor_state],
+                    "blocking": False,
+                    "ok": sensor_state in {"not_selected", "ok"},
+                })
+            sensor_by_name = {item["name"]: item for item in sensors}
+            interfaces: list[dict[str, Any]] = []
+            if self.config is not None and self.config.acquisition_mode == "real":
+                for item in self.config.interfaces or []:
+                    interface_id = str(item.get("id") or "")
+                    enabled = bool(item.get("enabled", True))
+                    expected = [
+                        name for name in self.config.interface_channel_assignments.get(interface_id, [])
+                        if name in selected
+                    ]
+                    auxiliary_only = str(item.get("role") or "") == "thermal_rtsp"
+                    if not enabled:
+                        state, message, missing, stale = "disabled", "接口已停用", [], []
+                    elif not expected:
+                        state = "video_only" if auxiliary_only else "no_channels"
+                        message = "仅提供视频流" if auxiliary_only else "当前未分配已选通道"
+                        missing, stale = [], []
+                    else:
+                        healthy = [
+                            name for name in expected
+                            if sensor_by_name.get(name, {}).get("state") == "ok"
+                        ]
+                        missing = [
+                            name for name in expected
+                            if sensor_by_name.get(name, {}).get("state") in {"waiting", "no_data"}
+                        ]
+                        stale = [
+                            name for name in expected
+                            if sensor_by_name.get(name, {}).get("state") == "stale"
+                        ]
+                        if healthy:
+                            state = "ok"
+                            message = f"接口正在采集：{'、'.join(healthy)}"
+                            unavailable = [*missing, *stale]
+                            if unavailable:
+                                message += "；其余通道不作为采集条件：" + "、".join(dict.fromkeys(unavailable))
+                        elif missing and running and all(
+                            sensor_by_name.get(name, {}).get("state") == "waiting" for name in missing
+                        ) and not stale:
+                            state, message = "waiting", f"等待 {len(missing)} 个通道的首个数据"
+                        elif stale:
+                            state, message = "stale", f"接口数据已中断：{'、'.join(stale)}"
+                        else:
+                            state, message = "no_data", f"未检测到采集数据：{'、'.join(missing or expected)}"
+                    detected = [
+                        name for name in expected
+                        if sensor_by_name.get(name, {}).get("observed_samples", 0) > 0
+                    ]
+                    interfaces.append({
+                        "id": interface_id, "role": item.get("role", "custom"),
+                        "driver": item.get("driver", ""), "endpoint": item.get("endpoint", ""),
+                        "enabled": enabled, "expected_channels": expected,
+                        "detected_channels": detected, "missing_channels": missing,
+                        "stale_channels": stale, "auxiliary_only": auxiliary_only,
+                        "state": state, "message": message,
+                        "ok": state in {"disabled", "video_only", "no_channels", "ok"},
+                    })
             model_inputs = (
                 self.config.model_input_sensors
                 if self.config is not None
@@ -993,11 +2639,28 @@ class AcquisitionManager:
                 "minimum_prediction_points": 24,
                 "minimum_warning_points": 48,
                 "sensors": sensors,
+                "interfaces": interfaces,
                 "config": (
                     self._public_config(self.config) if self.config else None
                 ),
                 "mysql": dict(self.mysql_status),
             }
+
+    def reset_check_state(self) -> dict:
+        """Reset interface/channel observations without deleting saved files."""
+        with self.lock:
+            if self.thread is not None and self.thread.is_alive():
+                raise RuntimeError("采集运行中不能重置检查，请先停止并保存")
+            if self.driver is not None:
+                try:
+                    self.driver.close()
+                except Exception:
+                    pass
+                self.driver = None
+            self.channel_observed = {name: 0 for name in ALL_SENSOR_COLUMNS}
+            self.channel_last_observed = {name: None for name in ALL_SENSOR_COLUMNS}
+            self.last_error = ""
+            return self.status()
 
     def numeric_matrix(self) -> tuple[list[dict[str, Any]], list[float]]:
         with self.lock:

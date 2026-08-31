@@ -15,6 +15,16 @@ const state = {
   showLayerEvidence: true,
   manualPredictionModels: {},
   liveScopeKey: null,
+  interfaceCatalog: [],
+  availableInterfaces: [],
+  interfaceAssignments: {},
+  sensorTypeProfiles: [],
+  acquisitionStatus: null,
+  hardwareCheck: null,
+  hardwareCheckFingerprint: "",
+  hardwareCheckInProgress: false,
+  hardwareCheckTimer: null,
+  autoCheckInterval: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -66,6 +76,11 @@ const controls = {
   processingMode: $("processingModeSelect"),
   datasetSchema: $("datasetSchemaSelect"),
   driver: $("driverSelect"),
+  firstInterfaceRole: $("firstInterfaceRole"),
+  interfacePanel: $("interfacePanel"),
+  discoverInterfaces: $("discoverInterfacesButton"),
+  addInterface: $("addInterfaceButton"),
+  interfaceDiscoveryStatus: $("interfaceDiscoveryStatus"),
   sourceFile: $("sourceFileInput"),
   endpoint: $("endpointInput"),
   baudrate: $("baudrateInput"),
@@ -81,6 +96,7 @@ const controls = {
   mysqlDatabase: $("mysqlDatabaseInput"),
   testMysql: $("testMysqlButton"),
   predictionModel: $("predictionModelInput"),
+  predictionModelType: $("predictionModelTypeSelect"),
   livePower: $("livePowerInput"),
   liveSpeed: $("liveSpeedInput"),
   livePressure: $("livePressureInput"),
@@ -93,6 +109,9 @@ const controls = {
   replicate: $("replicateInput"),
   newLayer: $("newLayerInput"),
   showLayerEvidence: $("showLayerEvidenceInput"),
+  autoHardwareCheck: $("autoHardwareCheckInput"),
+  resetSensorCheck: $("resetSensorCheckButton"),
+  hardwareCheckStatus: $("hardwareCheckStatus"),
 };
 
 const LAYER_EVIDENCE_VISIBILITY_KEY = "afp-show-layer-evidence-v1";
@@ -113,10 +132,98 @@ function option(value, text) {
   return node;
 }
 
+function sensorTypeProfile(role) {
+  const canonical = role === "thermal"
+    ? "thermal_uvc"
+    : (["other", "new_sensor"].includes(role) ? "custom" : role);
+  return state.sensorTypeProfiles.find((item) => item.id === canonical)
+    || state.sensorTypeProfiles.find((item) => item.id === "custom")
+    || {
+      id: "custom", label: "自定义JSON传感器", driver: "serial_json",
+      endpoint: "COM4", channels: [], editable_driver: true,
+    };
+}
+
+function applySensorTypeProfile(row, resetEndpoint = true) {
+  const role = row.querySelector(".interface-role");
+  const driver = row.querySelector(".interface-driver");
+  const endpoint = row.querySelector(".interface-endpoint");
+  const map = row.querySelector(".interface-map");
+  const mapLabel = map?.closest(".interface-map-label");
+  const detail = row.querySelector(".interface-profile-detail");
+  const profile = sensorTypeProfile(role?.value || "custom");
+  if (driver) {
+    driver.value = profile.driver || "serial_json";
+    driver.disabled = !profile.editable_driver;
+  }
+  if (endpoint && (resetEndpoint || !endpoint.value.trim())) {
+    endpoint.value = profile.endpoint || "";
+  }
+  if (map) map.disabled = !profile.editable_driver;
+  if (mapLabel) mapLabel.classList.toggle("hidden", !profile.editable_driver);
+  if (detail) {
+    const channels = (profile.channels || []).join("、")
+      || (profile.id === "thermal_rtsp" ? "无数值通道（仅视频）" : "需显式映射");
+    detail.textContent = `数据通道：${channels}；${profile.processing || ""}`;
+  }
+}
+
+function populatePredictionModelTypes() {
+  if (!controls.predictionModelType) return;
+  const models = state.bootstrap?.acquisition?.prediction_models || [];
+  const schemaId = controls.datasetSchema?.value || "legacy_original";
+  const current = state.bootstrap?.acquisition?.prediction_model?.model_type || "i_T_G";
+  const nodes = models.map((item) => {
+    const available = item.available_by_schema?.[schemaId] !== false;
+    const node = option(
+      item.id,
+      `${item.label || item.id}${available ? "" : "（当前方案无权重）"}`
+    );
+    node.disabled = !available;
+    return node;
+  });
+  controls.predictionModelType.replaceChildren(...nodes);
+  const availableModels = models.filter(
+    (item) => item.available_by_schema?.[schemaId] !== false
+  );
+  controls.predictionModelType.value = availableModels.some(
+    (item) => item.id === current
+  ) ? current : (availableModels[0]?.id || "i_T_G");
+}
+
 function fmt(value, digits = 3) {
   if (value === null || value === undefined || value === "") return "—";
   const number = Number(value);
   return Number.isFinite(number) ? number.toFixed(digits) : "—";
+}
+
+// v2 intentionally starts clean so an older installation cannot restore a
+// source-tree/internal checkpoint instead of the matching EXE-local weight.
+// New manual selections are still remembered from this version onward.
+const MODEL_SELECTION_HISTORY_KEY = "afp-model-selection-history-v2";
+function modelSelectionKey(schemaMode, modelType) {
+  return `${schemaMode || "legacy_original"}::${modelType || "i_T_G"}`;
+}
+function readModelSelectionHistory() {
+  try {
+    const value = JSON.parse(localStorage.getItem(MODEL_SELECTION_HISTORY_KEY) || "{}");
+    return value && typeof value === "object" ? value : {};
+  } catch (_) {
+    return {};
+  }
+}
+function rememberModelPath(schemaMode, modelType, checkpoint) {
+  if (!checkpoint) return;
+  const history = readModelSelectionHistory();
+  history[modelSelectionKey(schemaMode, modelType)] = checkpoint;
+  try {
+    localStorage.setItem(MODEL_SELECTION_HISTORY_KEY, JSON.stringify(history));
+  } catch (_) {
+    // Browser storage can be disabled; the server-side history remains active.
+  }
+}
+function lastModelPath(schemaMode, modelType) {
+  return readModelSelectionHistory()[modelSelectionKey(schemaMode, modelType)] || "";
 }
 
 function toast(message) {
@@ -141,52 +248,53 @@ function selectedModelInputSensors() {
     .map((node) => node.value);
 }
 
-function acquisitionConfig() {
-  const newSchema = controls.datasetSchema.value === "new_collection_v11_3";
-  return {
-    processing_mode: controls.processingMode.value,
-    dataset_schema: controls.datasetSchema.value || "legacy_original",
-    use_best_prediction_override: controls.bestPredictionOverride.checked,
-    driver: controls.driver.value,
-    endpoint: controls.endpoint.value.trim(),
-    baudrate: Number(controls.baudrate.value) || 115200,
-    sample_rate_hz: Number(controls.sampleRate.value) || 10,
-    selected_sensors: selectedLiveSensors(),
-    prediction_sensors: selectedPredictionSensors(),
-    model_input_sensors: selectedModelInputSensors(),
-    model_output_sensors: selectedPredictionSensors(),
-    prediction_model_file: controls.predictionModel.value.trim(),
-    health_indicator: controls.indicator.value || "TC-HI",
-    run_id: controls.runId.value.trim() || "LIVE_RUN",
-    specimen_id: controls.liveSpecimen.value.trim() || "LIVE_SPECIMEN",
-    condition_id: newSchema
-      ? (controls.conditionId.value.trim() || "H06")
-      : "LIVE",
-    layer: Number(newSchema ? controls.newLayer.value : controls.liveLayer.value) || 0,
-    cycle: 1,
-    p: Number(controls.livePower.value) || 0,
-    v: Number(controls.liveSpeed.value) || 0,
-    pr: Number(controls.livePressure.value) || 0,
-    root: "LIVE",
-    source_file: controls.sourceFile.value.trim(),
-    save_root: controls.saveRoot.value.trim(),
-    mysql_enabled: Boolean(controls.mysqlEnabled?.checked),
-    mysql_host: controls.mysqlHost?.value.trim() || "127.0.0.1",
-    mysql_port: Number(controls.mysqlPort?.value) || 3306,
-    mysql_user: controls.mysqlUser?.value.trim() || "root",
-    // Preserve an intentionally empty password.  `||` would silently replace
-    // it with the default and make a passwordless local MySQL account fail.
-    mysql_password: controls.mysqlPassword?.value ?? "",
-    mysql_database: controls.mysqlDatabase?.value.trim() || "afp_state_warning",
-    mysql_charset: "utf8mb4",
-    mysql_connect_timeout: 5,
-    initial_compaction_force_N: Number(controls.initialForce.value) || 0,
-    placement_speed_mm_s: Number(controls.placementSpeed.value) || 0,
-    pid_angle_deg: Number(controls.pidAngle.value) || 0,
-    temperature_setpoint_C: Number(controls.temperatureSetpoint.value) || 0,
-    replicate: Number(controls.replicate.value) || 1,
-  };
+
+
+
+
+
+
+
+
+
+
+
+
+
+async function discoverInterfaces() {
+  // A simulation stream is a local CSV/folder/MySQL source.  It must never
+  // be blocked by the presence (or absence) of physical COM ports.
+  if (controls.acquisitionMode?.value === "simulation") {
+    state.availableInterfaces = [];
+    if (controls.interfaceDiscoveryStatus) {
+      controls.interfaceDiscoveryStatus.textContent =
+        "模拟采集不需要识别物理接口；仅使用当前选择的 CSV/文件夹/MySQL 数据源";
+    }
+    return;
+  }
+  try {
+    const result = await fetch("/api/acquisition/discover", {cache: "no-store"}).then((response) => response.json());
+    const firstDefault = result.defaults?.[0];
+    if (firstDefault) {
+      controls.driver.value = firstDefault.driver || "serial_json";
+      controls.endpoint.value = firstDefault.endpoint || controls.endpoint.value;
+      controls.baudrate.value = String(firstDefault.baudrate || 115200);
+      if (controls.firstInterfaceRole) controls.firstInterfaceRole.value = firstDefault.role || "thermocouple";
+    }
+    state.interfaceCatalog = result.defaults || [];
+    renderInterfacePanel(state.interfaceCatalog);
+    const ports = result.ports || [];
+    if (controls.interfaceDiscoveryStatus) {
+      controls.interfaceDiscoveryStatus.textContent = ports.length
+        ? `发现 ${ports.length} 个串口：${ports.map((item) => item.endpoint).join(", ")}`
+        : "未发现串口；可手动填写 COM 端口或 TCP 地址";
+    }
+  } catch (error) {
+    if (controls.interfaceDiscoveryStatus) controls.interfaceDiscoveryStatus.textContent = `接口识别失败：${error.message}`;
+  }
 }
+
+
 
 function liveEvidenceScopeKey() {
   const newSchema = controls.datasetSchema.value === "new_collection_v11_3";
@@ -269,6 +377,28 @@ async function postJson(url, payload = {}) {
 function renderAcquisitionStatus(status) {
   const node = $("acquisitionStatus");
   const selected = (status.sensors || []).filter((item) => item.selected);
+  // The backend applies the authoritative interface-to-channel routing.  In
+  // simulation mode mirror that effective list back into the checklist so a
+  // channel without an enabled interface cannot look as if it was collected.
+  if (
+    status.running
+    && status.config?.acquisition_mode === "simulation"
+    && Array.isArray(status.config?.selected_sensors)
+  ) {
+    const effective = new Set(status.config.selected_sensors);
+    document.querySelectorAll("#liveSensorChecklist .sensor-checklist-row").forEach((row) => {
+      const channel = row.querySelector(".save-sensor-checkbox")?.value;
+      const collected = effective.has(channel);
+      const collect = row.querySelector(".save-sensor-checkbox");
+      const input = row.querySelector(".model-input-sensor-checkbox");
+      const output = row.querySelector(".predict-sensor-checkbox");
+      if (collect) collect.checked = collected;
+      if (!collected) {
+        if (input) input.checked = false;
+        if (output) output.checked = false;
+      }
+    });
+  }
   renderMysqlStatus(status.mysql);
   const healthy = selected.filter((item) => item.ok);
   const captureOnly = status.config?.processing_mode === "capture_only"
@@ -284,6 +414,13 @@ function renderAcquisitionStatus(status) {
       : `等待全部${expectedInputCount}个模型输入通道，预测至少24点、首次预警至少48点`;
   const predictionCount = selectedPredictionSensors().length;
   const locked = Boolean(status.running);
+  // The data scheme belongs to the current acquisition session.  Lock it only
+  // while the stream is actually running; after stop() has completed, both
+  // real and simulated acquisitions must be able to choose a new scheme even
+  // when the previous session left rows/files on disk.
+  if (controls.datasetSchema) controls.datasetSchema.disabled = locked;
+  if (controls.acquisitionMode) controls.acquisitionMode.disabled = locked;
+  if (controls.processingMode) controls.processingMode.disabled = locked;
   // Layer and replicate identifiers are frozen for the whole acquisition.
   // They become editable again only after stop() has completed the file save,
   // preventing a running stream from silently changing its physical label.
@@ -361,6 +498,9 @@ function renderRuntimeStatus(payload = state.payload) {
 function applyPredictionModelProfile(profile, setSelections = true) {
   if (!profile) return;
   controls.predictionModel.value = profile.checkpoint || "";
+  if (controls.predictionModelType && profile.model_type) {
+    controls.predictionModelType.value = profile.model_type;
+  }
   const inputSet = new Set(profile.input_sensors || []);
   const outputSet = new Set(profile.output_sensors || []);
   if (setSelections) {
@@ -383,9 +523,34 @@ function applyPredictionModelProfile(profile, setSelections = true) {
   status.textContent =
     `${profile.name || "I-ModernTCN"} · 模型输入${inputSet.size}通道 · ` +
     `可输出${outputSet.size}通道 · 24点输入→24点预测`;
+  updateDatasetMeta();
   if (state.bootstrap && controls.autoIndicator?.checked) {
     configureAutomaticIndicator(true);
   }
+}
+
+function updateDatasetMeta() {
+  if (!state.bootstrap) return;
+  const node = $("datasetMeta");
+  if (!node) return;
+  if (controls.dataMode.value !== "live") {
+    node.textContent =
+      `实时回放源：${state.bootstrap.manifest.specimen_count} 个试样 · ` +
+      `12个通道 · 24点预测窗口 · ${state.bootstrap.manifest.sampling_hz} Hz`;
+    return;
+  }
+  const schema = state.bootstrap.acquisition.schemas.find(
+    (item) => item.id === (controls.datasetSchema.value || "legacy_original")
+  );
+  const sensorCount = schema?.sensors?.length || 0;
+  const schemaLabel = schema?.label || controls.datasetSchema.value;
+  const captureOnly = controls.processingMode.value === "capture_only";
+  const algorithm = controls.predictionModelType?.selectedOptions?.[0]?.textContent
+    || controls.predictionModelType?.value
+    || "I-ModernTCN";
+  node.textContent = captureOnly
+    ? `${schemaLabel} · ${sensorCount}个传感器 · 仅采集保存`
+    : `${schemaLabel} · ${sensorCount}个传感器 · ${algorithm} · 实时预测与预警`;
 }
 
 function configureBestPredictionOverride() {
@@ -422,10 +587,15 @@ function configureBestPredictionOverride() {
 
 async function inspectPredictionModel(setSelections = true) {
   try {
+    const schemaMode = controls.datasetSchema.value || "legacy_original";
+    const modelType = controls.predictionModelType?.value || "i_T_G";
     const profile = await postJson("/api/prediction-model/inspect", {
       path: controls.predictionModel.value.trim(),
+      model_type: modelType,
+      schema_mode: schemaMode,
     });
     applyPredictionModelProfile(profile, setSelections);
+    rememberModelPath(schemaMode, modelType, profile.checkpoint || "");
     return profile;
   } catch (error) {
     const status = $("predictionModelStatus");
@@ -438,11 +608,16 @@ async function inspectPredictionModel(setSelections = true) {
 
 async function selectPredictionModel() {
   try {
+    const schemaMode = controls.datasetSchema.value || "legacy_original";
+    const modelType = controls.predictionModelType?.value || "i_T_G";
     const result = await postJson("/api/prediction-model/select-file", {
       initial_path: controls.predictionModel.value.trim(),
+      model_type: modelType,
+      schema_mode: schemaMode,
     });
     if (result.selected) {
       applyPredictionModelProfile(result.model, true);
+      rememberModelPath(schemaMode, modelType, result.path || result.model?.checkpoint || "");
       toast("预测模型已选择，并已按模型元数据设置输入/输出通道");
     }
   } catch (error) {
@@ -614,13 +789,43 @@ async function testSensorConnection() {
     node.textContent = result.ok
       ? `连接检查通过：${healthy.length}/${selected.length} 个所选传感器收到有效数据`
       : `连接检查未通过：${healthy.length}/${selected.length} 正常；${result.errors.join("；") || "有传感器未收到数据"}`;
+    /*
+    const interfaceSummary = (result.interfaces || []).map((item) => {
+      const channels = (item.detected_channels || []).join("、") || "未识别通道";
+      return `${item.id || item.endpoint}: ${item.ok ? "正常" : "未收到数据"}（${channels}）`;
+    }).join("；");
+    if (interfaceSummary) node.textContent += ` 接口：${interfaceSummary}`;
+    */
+    const interfaceSummaryText = (result.interfaces || []).map((item) => {
+      const names = Array.isArray(item.detected_channels) ? item.detected_channels.join(", ") : "";
+      return String(item.id || item.endpoint || "interface") + ": " + (item.ok ? "ok" : "no data") + " (" + (names || "no channels") + ")";
+    }).join("; ");
+    if (interfaceSummaryText) node.textContent += " interfaces: " + interfaceSummaryText;
   } catch (error) {
+    const status = $("acquisitionStatus");
+    if (status) {
+      status.classList.add("error");
+      status.classList.remove("ok");
+      status.textContent = `采集启动失败：${error.message}`;
+    }
     toast(error.message);
   }
 }
 
 async function startAcquisition() {
   try {
+    if (state.hardwareCheckInProgress) {
+      throw new Error("接口与传感器通道检查正在进行，请等待检查完成");
+    }
+    if (controls.acquisitionMode?.value !== "simulation") {
+      const fingerprint = hardwareConfigFingerprint();
+      if (!state.hardwareCheck || state.hardwareCheckFingerprint !== fingerprint || !state.hardwareCheck.ok) {
+        const check = await testSensorConnection({automatic: false});
+        if (!check?.ok) {
+          throw new Error("接口或传感器通道检查未通过，已阻止开始采集；请按上方异常明细处理后重检");
+        }
+      }
+    }
     const nextScope = liveEvidenceScopeKey();
     if (state.liveScopeKey !== null && nextScope !== state.liveScopeKey) {
       // A changed specimen/condition is a new physical evidence stream.  Do
@@ -637,6 +842,12 @@ async function startAcquisition() {
     configureDataMode();
     await loadRealtime();
   } catch (error) {
+    const status = $("acquisitionStatus");
+    if (status) {
+      status.classList.add("error");
+      status.classList.remove("ok");
+      status.textContent = `采集启动失败：${error.message}`;
+    }
     toast(error.message);
   }
 }
@@ -672,6 +883,7 @@ function buildSensorChecklist(sensorNames) {
     "<span>通道</span><span>采集</span><span>输入</span><span>输出</span>";
   sensorHeader.innerHTML =
     '<span title="传感器通道">通道</span><span title="采集并保存">采</span><span title="模型输入">入</span><span title="模型输出/预测">出</span>';
+  sensorHeader.innerHTML = "<span>通道</span><span>采集</span><span>输入</span><span>输出</span><span>接口</span>";
   const sensorRows = sensorNames.map((name) => {
     const row = document.createElement("div");
     row.className = "sensor-checklist-row";
@@ -679,6 +891,12 @@ function buildSensorChecklist(sensorNames) {
     channelName.className = "sensor-checklist-name";
     channelName.textContent = name;
     channelName.title = name;
+
+    const routeLabel = document.createElement("label");
+    const routeSelect = document.createElement("select");
+    routeSelect.className = "interface-route-select";
+    routeSelect.dataset.channel = name;
+    routeLabel.append(routeSelect);
 
     const collectLabel = document.createElement("label");
     const collectInput = document.createElement("input");
@@ -727,12 +945,12 @@ function buildSensorChecklist(sensorNames) {
       configureAutomaticIndicator(true);
       if (controls.dataMode.value === "live") loadRealtime();
     });
-    row.append(
-      channelName, collectLabel, modelLabel, outputLabel
-    );
+    row.append(channelName, collectLabel, modelLabel, outputLabel, routeLabel);
     return row;
   });
   $("liveSensorChecklist").replaceChildren(sensorHeader, ...sensorRows);
+  rebuildInterfaceEditors();
+  refreshChannelInterfaceOptions();
 }
 
 function activeInputSchemaId() {
@@ -817,8 +1035,7 @@ function configureProcessingMode() {
       ?.querySelector(".save-sensor-checkbox")?.checked;
     input.disabled = captureOnly || !collected;
   });
-  controls.optimizedWarning.disabled = captureOnly
-    || controls.datasetSchema.value === "new_collection_v11_3";
+  controls.optimizedWarning.disabled = captureOnly;
   controls.bestPredictionOverride.disabled = captureOnly;
   if (captureOnly) {
     $("indicatorAutoStatus").textContent = "仅采集模式：不构建健康指标。";
@@ -832,6 +1049,7 @@ function configureProcessingMode() {
     }
   }
   if (!captureOnly) configureAutomaticIndicator(true);
+  updateDatasetMeta();
   if (controls.dataMode.value === "live") loadRealtime();
 }
 
@@ -841,6 +1059,7 @@ function configureDatasetSchema(useDefaults = true) {
   );
   if (!schema) return;
   const isNew = schema.id === "new_collection_v11_3";
+  populatePredictionModelTypes();
   const schemaIndicators = state.bootstrap.indicator_schemas?.[schema.id]
     || state.bootstrap.indicators;
   const previousIndicator = controls.indicator.value;
@@ -857,6 +1076,8 @@ function configureDatasetSchema(useDefaults = true) {
   document.querySelector(".save-rule-note").textContent = isNew
     ? "自动建立“试样名_F压实力_V速度_A角度_T设定温度”文件夹，同时保存分层文件、完整试样快照和采集记录。"
     : "自动建立“试样名_p功率_v速度_pr压实力”文件夹，同时保存分层文件、完整试样快照和采集记录。";
+  document.querySelector(".save-rule-note").textContent =
+    "文件夹按工况与独立重复命名；每层保留分层文件，完整试样始终覆盖为同一份当前数据文件。";
   buildSensorChecklist(schema.sensors);
   controls.sensor.replaceChildren(...schema.sensors.map((name, index) =>
     option(index, name)
@@ -880,6 +1101,14 @@ function configureDatasetSchema(useDefaults = true) {
       state.manualPredictionModels[schema.id] =
         state.bootstrap.acquisition.prediction_model.checkpoint;
     }
+    const rememberedPath = lastModelPath(
+      schema.id,
+      controls.predictionModelType?.value || "i_T_G"
+    );
+    if (rememberedPath) {
+      controls.predictionModel.value = rememberedPath;
+      inspectPredictionModel(true).catch(() => {});
+    }
   }
   // Rebuild indicator/model selections after the channel checklist has been
   // replaced.  This prevents a new-collection indicator or output checkbox
@@ -891,11 +1120,17 @@ function configureDatasetSchema(useDefaults = true) {
   if (controls.bestPredictionOverride.checked) {
     configureBestPredictionOverride();
   }
-  controls.optimizedWarning.disabled = isNew
-    || controls.processingMode.value === "capture_only";
-  if (isNew) controls.optimizedWarning.checked = false;
+  controls.optimizedWarning.disabled =
+    controls.processingMode.value === "capture_only";
+  const optimizedLabel = $("optimizedWarningLabel");
+  if (optimizedLabel) {
+    optimizedLabel.textContent = isNew
+      ? "使用验证集校准的 CAP 在线优化（16传感器方案）"
+      : "使用优化预警（回放 v13.8 / 实时因果 v13.9）";
+  }
   configureProcessingMode();
   configureAutomaticIndicator(true);
+  updateDatasetMeta();
 }
 
 function configureDataMode() {
@@ -908,7 +1143,8 @@ function configureDataMode() {
   controls.specimen.disabled = live;
   controls.cursor.disabled = live;
   controls.realtimePrediction.disabled = live;
-  controls.optimizedWarning.disabled = false;
+  controls.optimizedWarning.disabled =
+    controls.processingMode.value === "capture_only";
   if (live) {
     stopPlayback();
     controls.realtimePrediction.checked = true;
@@ -920,7 +1156,9 @@ function configureDataMode() {
     window.clearInterval(state.livePollTimer);
     state.livePollTimer = null;
   }
+  updateRealAcquisitionVisibility();
   configureAutomaticIndicator(true);
+  updateDatasetMeta();
   loadRealtime();
 }
 
@@ -942,6 +1180,8 @@ function queryString() {
     realtime_prediction: controls.realtimePrediction.checked,
     processing_mode: controls.processingMode.value,
     use_optimized_warning: controls.optimizedWarning.checked,
+    dataset_schema: activeInputSchemaId(),
+    prediction_model_type: controls.predictionModelType?.value || "i_T_G",
     prediction_sensors: predictionSensors.length
       ? predictionSensors.join(",")
       : "__none__",
@@ -1160,7 +1400,7 @@ function render(payload) {
   $("streamPosition").textContent =
     `第${progress.current_layer}层 · 窗口${progress.current_window}/${progress.total_windows_in_layer} · 点${progress.sample_in_window}/24`;
   if (captureOnly) {
-    $("recommendationCard").classList.add("not-recommended");
+    $("recommendationCard").classList.remove("not-recommended");
     $("recommendationCard").innerHTML =
       "<div><strong>仅采集模式</strong><span>预测模型与预警算法均未运行</span></div>";
   } else {
@@ -1512,7 +1752,7 @@ function applyCandidateDefaults() {
 
 function renderRecommendation(candidate) {
   const node = $("recommendationCard");
-  node.classList.toggle("not-recommended", !candidate.recommended);
+  node.classList.remove("not-recommended");
   node.innerHTML = `
     <div><strong>${candidate.indicator} · ${MODEL_LABELS[candidate.model] || candidate.model}</strong>
       <span>${candidate.recommended ? "当前指标推荐模型" : "非推荐模型，可用于对比"}</span></div>
@@ -1522,6 +1762,10 @@ function renderRecommendation(candidate) {
       <span>层 ${fmt(candidate.validation_layer_balanced_accuracy * 100, 1)}%</span>
       <span>试样 ${fmt(candidate.validation_specimen_balanced_accuracy * 100, 1)}%</span>
     </div>`;
+  if (!candidate.recommended) {
+    const label = node.querySelector("div span");
+    if (label) label.remove();
+  }
 }
 
 function renderLayerProgress(layers) {
@@ -1588,6 +1832,8 @@ async function initialize() {
     if (!response.ok) throw new Error(payload.error || "初始化失败");
     state.bootstrap = payload;
     state.defaults = payload.defaults;
+    state.sensorTypeProfiles = payload.acquisition.sensor_types || [];
+    populatePredictionModelTypes();
     controls.specimen.replaceChildren(...payload.specimens.map((item) =>
       option(item.id, `${item.id} · ${item.true_state_label}`)
     ));
@@ -1600,12 +1846,19 @@ async function initialize() {
     controls.driver.replaceChildren(...payload.acquisition.drivers.map((item) =>
       option(item.id, item.label)
     ));
+    ensureFirstInterfaceRole();
+    ensureFirstInterfaceSummary();
+    placeSecondInterfaceAfterFirst();
+    renderInterfacePanel(payload.acquisition.interface_defaults || []);
+    await discoverInterfaces();
     controls.datasetSchema.replaceChildren(
       ...payload.acquisition.schemas.map((item) =>
         option(item.id, item.label)
       )
     );
-    controls.datasetSchema.value = "legacy_original";
+    controls.datasetSchema.value = payload.acquisition.schemas.some(
+      (item) => item.id === "new_collection_v11_3"
+    ) ? "new_collection_v11_3" : "legacy_original";
     configureDatasetSchema(true);
     state.liveScopeKey = liveEvidenceScopeKey();
     controls.dataMode.value = payload.defaults.data_mode || "replay";
@@ -1639,12 +1892,17 @@ async function initialize() {
     applyLayerEvidenceVisibility();
     populateModels(true);
     configureAutomaticIndicator(true);
-    $("datasetMeta").textContent =
-      `实时回放源：${payload.manifest.specimen_count} 个试样 · 12个通道 · 24点预测窗口 · ${payload.manifest.sampling_hz} Hz`;
+    updateDatasetMeta();
     $("acquisitionSection").classList.toggle(
       "hidden", controls.dataMode.value !== "live"
     );
     await loadRealtime();
+    scheduleAutomaticHardwareCheck(800);
+    if (!state.autoCheckInterval) {
+      state.autoCheckInterval = window.setInterval(
+        () => scheduleAutomaticHardwareCheck(0), 30000,
+      );
+    }
   } catch (error) {
     toast(error.message);
     $("connectionStatus").textContent = "初始化失败";
@@ -1683,7 +1941,16 @@ controls.processingMode.addEventListener("change", () => {
 controls.datasetSchema.addEventListener("change", () => {
   configureDatasetSchema(true);
   markLiveScopeChanged();
+  markHardwareCheckStale("数据方案与默认通道已变化");
+  if (!controls.bestPredictionOverride.checked && controls.predictionModelType) {
+    const schemaMode = controls.datasetSchema.value || "legacy_original";
+    const modelType = controls.predictionModelType.value || "i_T_G";
+    controls.predictionModel.value = lastModelPath(schemaMode, modelType);
+    inspectPredictionModel(true).catch(() => {});
+  }
 });
+controls.driver.addEventListener("change", updateSecondInterfaceVisibility);
+controls.endpoint.addEventListener("input", updateSecondInterfaceVisibility);
 controls.autoIndicator.addEventListener("change", () => {
   configureAutomaticIndicator(true);
   loadRealtime();
@@ -1706,7 +1973,14 @@ controls.optimizedWarning.addEventListener("change", loadRealtime);
 controls.bestPredictionOverride.addEventListener(
   "change", configureBestPredictionOverride
 );
-$("testSensorsButton").addEventListener("click", testSensorConnection);
+$("testSensorsButton").addEventListener("click", () => testSensorConnection({automatic: false}));
+controls.resetSensorCheck?.addEventListener("click", resetAndCheckHardware);
+controls.autoHardwareCheck?.addEventListener("change", () => {
+  if (controls.autoHardwareCheck.checked) scheduleAutomaticHardwareCheck(200);
+  else if (state.hardwareCheckTimer) window.clearTimeout(state.hardwareCheckTimer);
+});
+controls.discoverInterfaces?.addEventListener("click", discoverInterfaces);
+controls.addInterface?.addEventListener("click", addInterface);
 $("testMysqlButton")?.addEventListener("click", testMysqlConnection);
 $("refreshRelationMapButton")?.addEventListener("click", refreshRelationMap);
 controls.mysqlDatabase?.addEventListener("change", () => {
@@ -1720,11 +1994,23 @@ $("selectSaveRootButton").addEventListener("click", selectSaveRoot);
 $("selectPredictionModelButton").addEventListener("click", selectPredictionModel);
 controls.predictionModel.addEventListener("change", () => {
   if (!controls.bestPredictionOverride.checked) {
+    const schemaMode = controls.datasetSchema.value || "legacy_original";
+    const modelType = controls.predictionModelType?.value || "i_T_G";
+    rememberModelPath(schemaMode, modelType, controls.predictionModel.value.trim());
     state.manualPredictionModels[
-      controls.datasetSchema.value || "legacy_original"
+      schemaMode
     ] = controls.predictionModel.value.trim();
     inspectPredictionModel(false).catch(() => {});
   }
+});
+controls.predictionModelType?.addEventListener("change", () => {
+  if (controls.bestPredictionOverride.checked) return;
+  const schemaMode = controls.datasetSchema.value || "legacy_original";
+  const modelType = controls.predictionModelType.value || "i_T_G";
+  controls.predictionModel.value = lastModelPath(schemaMode, modelType);
+  inspectPredictionModel(true)
+    .then(() => toast(`已切换预测算法：${controls.predictionModelType.value}`))
+    .catch(() => {});
 });
 $("startAcquisitionButton").addEventListener("click", startAcquisition);
 $("stopAcquisitionButton").addEventListener("click", stopAcquisition);
@@ -2067,3 +2353,785 @@ function initializeVerticalPanelResizer() {
 initializeColumnResizers();
 initializeVerticalPanelResizer();
 initialize();
+
+// Unified sensor-interface cards.  The legacy driver/endpoint fields remain
+// hidden compatibility fields for older API payloads, while every visible
+// interface (including the first one) is rendered by the same card renderer.
+function hideLegacyInterfaceFields() {
+  [controls.driver, controls.endpoint, controls.baudrate].forEach((node) => {
+    node?.closest("label")?.classList.add("legacy-interface-field");
+  });
+}
+
+function recognizedInterfacePorts() {
+  const ports = Array.isArray(state.availableInterfaces) ? state.availableInterfaces : [];
+  const seen = new Set();
+  return ports.filter((port) => {
+    const endpoint = String(port.endpoint || port.id || "").trim();
+    const key = endpoint.toUpperCase();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function interfaceConfigs() {
+  const rows = [...(controls.interfacePanel?.querySelectorAll(".interface-config-row") || [])];
+  const interfaces = rows.map((row, index) => {
+    const mapText = row.querySelector(".interface-map")?.value || "";
+    let channelMap = {};
+    try { channelMap = mapText.trim() ? JSON.parse(mapText) : {}; } catch (_) { channelMap = {}; }
+    return {
+      id: row.dataset.interfaceId || `interface_${index + 1}`,
+      enabled: row.querySelector(".interface-enabled")?.checked !== false,
+      role: row.querySelector(".interface-role")?.value || (index === 0 ? "thermocouple" : "other"),
+      driver: row.querySelector(".interface-driver")?.value || "serial_json",
+      endpoint: row.querySelector(".interface-endpoint")?.value?.trim() || "",
+      baudrate: Number(row.querySelector(".interface-baudrate")?.value) || 115200,
+      channel_map: channelMap,
+    };
+  });
+  const first = interfaces[0];
+  if (first) {
+    if (controls.driver) controls.driver.value = first.driver;
+    if (controls.endpoint) controls.endpoint.value = first.endpoint;
+    if (controls.baudrate) controls.baudrate.value = String(first.baudrate || 115200);
+  }
+  const assignments = {};
+  document.querySelectorAll(".interface-route-select").forEach((select) => {
+    const id = select.value;
+    const channel = select.dataset.channel;
+    if (id && id !== "__unassigned__" && channel) {
+      (assignments[id] ||= []).push(channel);
+    }
+  });
+  state.interfaceAssignments = assignments;
+  return { interfaces, assignments };
+}
+
+function ensureFirstInterfaceRole() {}
+function ensureFirstInterfaceSummary() {}
+function placeSecondInterfaceAfterFirst() {}
+
+function updateSecondInterfaceVisibility() {
+  controls.interfacePanel?.classList.remove("hidden");
+  document.querySelector(".interface-toolbar")?.classList.remove("hidden");
+  controls.interfacePanel?.nextElementSibling?.classList.remove("hidden");
+  refreshChannelInterfaceOptions();
+}
+
+function currentInterfaceItems() {
+  return [...(controls.interfacePanel?.querySelectorAll(".interface-config-row") || [])]
+    .map((row) => ({
+      id: row.dataset.interfaceId,
+      role: row.querySelector(".interface-role")?.value || "other",
+      driver: row.querySelector(".interface-driver")?.value || "serial_json",
+      endpoint: row.querySelector(".interface-endpoint")?.value?.trim() || "",
+      enabled: row.querySelector(".interface-enabled")?.checked !== false,
+    }))
+    .filter((item) => item.enabled);
+}
+
+function defaultInterfaceForChannel(channel) {
+  const items = currentInterfaceItems();
+  const preferred = items.find((item) => {
+    const profile = sensorTypeProfile(item.role);
+    return (profile.channels || []).includes(channel);
+  }) || items.find((item) => sensorTypeProfile(item.role).editable_driver);
+  return (preferred || items[0])?.id || "";
+}
+
+function refreshInterfaceEndpointOptions() {
+  const rows = [...(controls.interfacePanel?.querySelectorAll(".interface-config-row") || [])];
+    rows.forEach((row) => {
+      const endpoint = row.querySelector(".interface-endpoint");
+      if (!endpoint) return;
+      endpoint.disabled = false;
+    });
+}
+
+function renderInterfacePanel(configs) {
+  if (!controls.interfacePanel) return;
+  const ports = recognizedInterfacePorts();
+  const defaults = Array.isArray(configs) ? configs : [];
+  const initial = defaults.length ? defaults : [{
+    id: "interface_1", enabled: true, role: "thermocouple", driver: "smrf_hid",
+    endpoint: "SMRFCT08B", channel_types: ["K", "K", "K", "K", "K", "K", "K", "K"], channel_map: {},
+  }];
+  const unique = [];
+  const usedEndpoints = new Set();
+  initial.forEach((item, index) => {
+    const endpoint = String(item.endpoint || "").trim();
+    const key = endpoint.toUpperCase();
+    if (key && usedEndpoints.has(key)) return;
+    if (key) usedEndpoints.add(key);
+    unique.push({...item, id: item.id || `interface_${index + 1}`});
+  });
+  controls.interfacePanel.replaceChildren(...unique.map((item, index) => {
+    const row = document.createElement("div");
+    row.className = "interface-config-row";
+    row.dataset.interfaceId = item.id || `interface_${index + 1}`;
+    const addLabel = (text, node, className = "") => {
+      const label = document.createElement("label");
+      if (className) label.className = className;
+      label.append(document.createTextNode(text), node);
+      return label;
+    };
+    const enabled = document.createElement("input");
+    enabled.type = "checkbox"; enabled.className = "interface-enabled"; enabled.checked = item.enabled !== false;
+    const role = document.createElement("select"); role.className = "interface-role";
+    (state.sensorTypeProfiles.length ? state.sensorTypeProfiles : [{id: "custom", label: "自定义JSON传感器"}]).forEach((profile) => {
+      const option = document.createElement("option"); option.value = profile.id; option.textContent = profile.label; role.append(option);
+    });
+    const canonicalRole = item.role === "thermal" ? (item.driver === "rtsp_thermal" ? "thermal_rtsp" : "thermal_uvc") : (["other", "new_sensor"].includes(item.role) ? "custom" : item.role);
+    role.value = state.sensorTypeProfiles.some((profile) => profile.id === canonicalRole) ? canonicalRole : "custom";
+    const driver = document.createElement("select"); driver.className = "interface-driver";
+    [["smrf_hid", "SMRF USB HID"], ["serial_json", "串口 JSON"], ["tcp_json", "TCP JSON"], ["modbus_tcp", "Modbus TCP(PLC)"], ["abb_robot", "ABB RWS"], ["uvc_thermal", "BSV UVC热像仪"], ["rtsp_thermal", "IP热像仪 RTSP"], ["m3232_pressure", "M3232薄膜压力"], ["simulator", "CSV 模拟"]].forEach(([value, text]) => {
+      const option = document.createElement("option"); option.value = value; option.textContent = text; driver.append(option);
+    });
+    driver.value = item.driver || "serial_json";
+    const endpoint = document.createElement("input"); endpoint.className = "interface-endpoint"; endpoint.type = "text";
+    const currentEndpoint = String(item.endpoint || "");
+    endpoint.value = currentEndpoint;
+    const baud = document.createElement("input"); baud.className = "interface-baudrate"; baud.type = "number"; baud.min = "1200"; baud.value = String(Number(item.baudrate || 115200));
+    const map = document.createElement("input"); map.className = "interface-map"; map.type = "text"; map.value = typeof item.channel_map === "string" ? item.channel_map : JSON.stringify(item.channel_map || {}); map.placeholder = '{"force":"压力"}';
+    const summary = document.createElement("div"); summary.className = "interface-channel-summary";
+    const profileDetail = document.createElement("div"); profileDetail.className = "interface-profile-detail control-note";
+    const removeButton = document.createElement("button");
+    removeButton.type = "button";
+    removeButton.className = "secondary-button compact-button interface-remove-button";
+    removeButton.textContent = "删除接口";
+    removeButton.addEventListener("click", () => {
+      const count = controls.interfacePanel?.querySelectorAll(".interface-config-row").length || 0;
+      if (count <= 1) { toast("至少保留一个接口"); return; }
+      row.remove();
+      refreshChannelInterfaceOptions();
+      refreshInterfaceEndpointOptions();
+      markHardwareCheckStale("接口配置已删除");
+    });
+    row.append(addLabel(`接口 ${index + 1} · 启用`, enabled), addLabel("传感器类型", role), addLabel("自动驱动", driver), addLabel("连接地址", endpoint), addLabel("波特率", baud), addLabel("通道映射（仅自定义JSON）", map, "interface-map-label"), profileDetail, summary, removeButton);
+    role.addEventListener("change", () => { applySensorTypeProfile(row, true); refreshChannelInterfaceOptions(); });
+    driver.addEventListener("change", () => {
+      if (controls.acquisitionMode?.value !== "simulation" && driver.value === "simulator") {
+        driver.value = "serial_json";
+        toast("真实接口采集模式不允许使用本地模拟驱动");
+      }
+      refreshInterfaceEndpointOptions();
+      refreshChannelInterfaceOptions();
+    });
+    endpoint.addEventListener("change", () => { refreshInterfaceEndpointOptions(); refreshChannelInterfaceOptions(); });
+    enabled.addEventListener("change", refreshChannelInterfaceOptions);
+    createInterfaceChannelEditor(row, row.dataset.interfaceId);
+    applySensorTypeProfile(row, false);
+    return row;
+  }));
+  hideLegacyInterfaceFields();
+  refreshChannelInterfaceOptions();
+}
+
+async function discoverInterfaces() {
+  if (controls.acquisitionMode?.value === "simulation") {
+    state.availableInterfaces = [];
+    if (controls.interfaceDiscoveryStatus) {
+      controls.interfaceDiscoveryStatus.textContent =
+        "模拟采集不需要识别物理接口；仅使用当前选择的 CSV/文件夹/MySQL 数据源";
+    }
+    return;
+  }
+  try {
+    const result = await fetch("/api/acquisition/discover", {cache: "no-store"}).then((response) => response.json());
+    state.availableInterfaces = recognizedInterfacePortsFrom(result.ports || []);
+    const defaults = result.defaults || [];
+    state.interfaceCatalog = defaults.length ? defaults : [{id: "interface_1", enabled: true, driver: "smrf_hid", role: "thermocouple", endpoint: "SMRFCT08B", channel_types: ["K", "K", "K", "K", "K", "K", "K", "K"], channel_map: {}}];
+    renderInterfacePanel(state.interfaceCatalog);
+    markHardwareCheckStale("接口识别结果已更新");
+    const ports = state.availableInterfaces;
+    if (controls.interfaceDiscoveryStatus) controls.interfaceDiscoveryStatus.textContent = ports.length
+      ? `发现 ${ports.length} 个接口（仅表示接口存在，传感器数据需再检查）：${ports.map((item) => item.endpoint).join(", ")}`
+      : "未发现物理接口；可手动填写 COM/TCP 地址后再检查数据";
+  } catch (error) {
+    if (controls.interfaceDiscoveryStatus) controls.interfaceDiscoveryStatus.textContent = `接口识别失败：${error.message}`;
+  }
+}
+
+function recognizedInterfacePortsFrom(ports) {
+  const seen = new Set();
+  return (Array.isArray(ports) ? ports : []).filter((port) => {
+    const endpoint = String(port.endpoint || port.id || "").trim();
+    const key = endpoint.toUpperCase();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function addInterface() {
+  const ports = recognizedInterfacePorts();
+  const current = interfaceConfigs().interfaces;
+  if (current.length >= 8) {
+    toast("最多配置 8 个传感器接口");
+    return;
+  }
+  const used = new Set(current.map((item) => item.endpoint.toUpperCase()));
+  const nextPort = ports.find((port) => !used.has(String(port.endpoint || port.id).toUpperCase()));
+  current.push({id: `interface_${current.length + 1}`, enabled: true, role: "custom", driver: "serial_json", endpoint: nextPort?.endpoint || "", baudrate: 115200, channel_map: {}});
+  state.interfaceCatalog = current;
+  renderInterfacePanel(current);
+  markHardwareCheckStale("已增加接口配置");
+}
+
+Object.assign(controls, {
+  acquisitionMode: $("acquisitionModeSelect"),
+  simulationSettings: $("simulationSettings"),
+  simulationSourceType: $("simulationSourceTypeSelect"),
+  simulationSourcePath: $("simulationSourcePathInput"),
+  selectSimulationSource: $("selectSimulationSourceButton"),
+  simulationSourcePathLabel: $("simulationSourcePathLabel"),
+  simulationMysqlSettings: $("simulationMysqlSettings"),
+  simulationMysqlHost: $("simulationMysqlHostInput"),
+  simulationMysqlPort: $("simulationMysqlPortInput"),
+  simulationMysqlUser: $("simulationMysqlUserInput"),
+  simulationMysqlPassword: $("simulationMysqlPasswordInput"),
+  simulationMysqlDatabase: $("simulationMysqlDatabaseInput"),
+  simulationMysqlQuery: $("simulationMysqlQueryInput"),
+  integrationSourceType: $("integrationSourceTypeSelect"),
+  integrationFolder: $("integrationFolderInput"),
+  selectIntegrationFolder: $("selectIntegrationFolderButton"),
+  integrationFolderLabel: $("integrationFolderLabel"),
+  integrationMysqlSettings: $("integrationMysqlSettings"),
+  integrationMysqlHost: $("integrationMysqlHostInput"),
+  integrationMysqlPort: $("integrationMysqlPortInput"),
+  integrationMysqlUser: $("integrationMysqlUserInput"),
+  integrationMysqlPassword: $("integrationMysqlPasswordInput"),
+  integrationMysqlDatabase: $("integrationMysqlDatabaseInput"),
+  integrationMysqlQuery: $("integrationMysqlQueryInput"),
+  integrationOutput: $("integrationOutputInput"),
+  runIntegration: $("runIntegrationButton"),
+  integrationStatus: $("integrationStatus"),
+});
+
+function updateRealAcquisitionVisibility() {
+  const liveAcquisition = controls.dataMode?.value === "live";
+  // Neither real nor simulated acquisition selects a historical specimen.
+  // Both modes build evidence from the current acquisition stream.
+  controls.specimen?.closest("label")?.classList.toggle("hidden", liveAcquisition);
+  $("specimenState")?.closest(".status-card")?.classList.toggle("hidden", liveAcquisition);
+  controls.runId?.closest(".compact-input-grid")?.classList.add("hidden");
+}
+
+function updateSimulationSettings() {
+  const simulation = controls.acquisitionMode?.value === "simulation";
+  const saveRuleNote = document.querySelector(".save-rule-note");
+  if (saveRuleNote) {
+    saveRuleNote.textContent =
+      "文件夹按工况与独立重复命名；每层保留分层文件，完整试样始终覆盖为同一份当前数据文件。";
+  }
+  controls.simulationSettings?.classList.toggle("hidden", !simulation);
+  if (controls.interfaceDiscoveryStatus && simulation) {
+    controls.interfaceDiscoveryStatus.textContent =
+      "模拟采集不需要识别物理接口；仅使用当前选择的 CSV/文件夹/MySQL 数据源";
+  }
+  document.querySelector("#sourceFileInput")?.closest("label")?.classList.toggle("hidden", true);
+  if (!simulation) {
+    document.querySelectorAll(".interface-driver").forEach((node) => {
+      if (node.value === "simulator") node.value = "serial_json";
+    });
+  }
+  const mysql = controls.simulationSourceType?.value === "mysql";
+  controls.simulationMysqlSettings?.classList.toggle("hidden", !simulation || !mysql);
+  controls.simulationSourcePathLabel?.classList.toggle("hidden", !simulation || mysql);
+  if (controls.simulationSourcePath) {
+    controls.simulationSourcePath.placeholder = controls.simulationSourceType?.value === "folder_csv"
+      ? "选择采集保存格式的数据文件夹"
+      : "选择单个 CSV 文件";
+  }
+  updateRealAcquisitionVisibility();
+  if (!simulation) discoverInterfaces();
+}
+
+function updateIntegrationSource() {
+  const mysql = controls.integrationSourceType?.value === "mysql";
+  controls.integrationFolderLabel?.classList.toggle("hidden", mysql);
+  controls.integrationMysqlSettings?.classList.toggle("hidden", !mysql);
+}
+
+async function selectIntegrationFolder() {
+  try {
+    const result = await postJson("/api/acquisition/select-folder", {
+      initial_path: controls.integrationFolder?.value.trim() || "",
+    });
+    if (result.selected) {
+      controls.integrationFolder.value = result.path;
+      if (controls.integrationOutput && !controls.integrationOutput.value.trim()) {
+        controls.integrationOutput.placeholder = result.path + "\\整合数据.csv";
+      }
+    }
+  } catch (error) {
+    toast("无法选择整合文件夹：" + error.message);
+  }
+}
+
+async function runIntegration() {
+  const mysql = controls.integrationSourceType?.value === "mysql";
+  const status = controls.integrationStatus;
+  if (!status) return;
+  status.textContent = "正在读取并整合数据……";
+  controls.runIntegration.disabled = true;
+  try {
+    const payload = {
+      source_type: mysql ? "mysql" : "folder_csv",
+      source_path: controls.integrationFolder?.value.trim() || "",
+      output_file: controls.integrationOutput?.value.trim() || "",
+      query: controls.integrationMysqlQuery?.value.trim() || "",
+      mysql_settings: {
+        host: controls.integrationMysqlHost?.value.trim() || "127.0.0.1",
+        port: Number(controls.integrationMysqlPort?.value) || 3306,
+        user: controls.integrationMysqlUser?.value.trim() || "root",
+        password: controls.integrationMysqlPassword?.value ?? "",
+        database: controls.integrationMysqlDatabase?.value.trim() || "afp_state_warning",
+      },
+    };
+    const result = await postJson("/api/acquisition/integrate", payload);
+    status.textContent =
+      "整合完成：" + result.rows + " 行，" + result.specimens + " 个试样，"
+      + result.source_files + " 个来源文件；已保存：" + result.output_file;
+  } catch (error) {
+    status.textContent = "整合失败：" + error.message;
+  } finally {
+    controls.runIntegration.disabled = false;
+  }
+}
+
+async function selectSimulationSource() {
+  const sourceType = controls.simulationSourceType?.value || "single_csv";
+  if (sourceType === "mysql") return;
+  try {
+    const result = await postJson("/api/acquisition/select-source", {
+      source_type: sourceType,
+      initial_path: controls.simulationSourcePath?.value.trim() || "",
+    });
+    if (result.selected) {
+      controls.simulationSourcePath.value = result.path;
+      toast("模拟采集数据源已选择");
+    }
+  } catch (error) { toast(`无法选择模拟数据源：${error.message}`); }
+}
+
+function acquisitionConfig() {
+  const newSchema = controls.datasetSchema.value === "new_collection_v11_3";
+  const interfaceState = interfaceConfigs();
+  const first = interfaceState.interfaces[0] || {};
+  const simulation = controls.acquisitionMode?.value === "simulation";
+  return {
+    processing_mode: controls.processingMode.value,
+    acquisition_mode: simulation ? "simulation" : "real",
+    simulation_source_type: controls.simulationSourceType?.value || "single_csv",
+    simulation_source_path: simulation ? (controls.simulationSourcePath?.value.trim() || "") : "",
+    simulation_mysql_query: controls.simulationMysqlQuery?.value.trim() || "",
+    simulation_mysql_host: controls.simulationMysqlHost?.value.trim() || "127.0.0.1",
+    simulation_mysql_port: Number(controls.simulationMysqlPort?.value) || 3306,
+    simulation_mysql_user: controls.simulationMysqlUser?.value.trim() || "root",
+    simulation_mysql_password: controls.simulationMysqlPassword?.value ?? "",
+    simulation_mysql_database: controls.simulationMysqlDatabase?.value.trim() || "afp_state_warning",
+    dataset_schema: controls.datasetSchema.value || "legacy_original",
+    use_best_prediction_override: controls.bestPredictionOverride.checked,
+    driver: simulation ? "simulator" : (first.driver || controls.driver.value),
+    endpoint: first.endpoint || "",
+    baudrate: Number(first.baudrate || controls.baudrate.value) || 115200,
+    interfaces: interfaceState.interfaces,
+    interface_channel_assignments: interfaceState.assignments,
+    sample_rate_hz: Number(controls.sampleRate.value) || 10,
+    selected_sensors: selectedLiveSensors(),
+    prediction_sensors: selectedPredictionSensors(),
+    model_input_sensors: selectedModelInputSensors(),
+    model_output_sensors: selectedPredictionSensors(),
+    prediction_model_file: controls.predictionModel.value.trim(),
+    prediction_model_type: controls.predictionModelType?.value || "i_T_G",
+    health_indicator: controls.indicator.value || "TC-HI",
+    run_id: controls.runId.value.trim() || "LIVE_RUN",
+    specimen_id: controls.liveSpecimen.value.trim() || "LIVE_SPECIMEN",
+    condition_id: newSchema ? (controls.conditionId.value.trim() || "H06") : "LIVE",
+    layer: Number(newSchema ? controls.newLayer.value : controls.liveLayer.value) || 0,
+    cycle: 1,
+    p: Number(controls.livePower.value) || 0,
+    v: Number(controls.liveSpeed.value) || 0,
+    pr: Number(controls.livePressure.value) || 0,
+    root: "LIVE",
+    source_file: simulation ? (controls.simulationSourcePath?.value.trim() || "") : "",
+    save_root: controls.saveRoot.value.trim(),
+    mysql_enabled: Boolean(controls.mysqlEnabled?.checked),
+    mysql_host: controls.mysqlHost?.value.trim() || "127.0.0.1",
+    mysql_port: Number(controls.mysqlPort?.value) || 3306,
+    mysql_user: controls.mysqlUser?.value.trim() || "root",
+    mysql_password: controls.mysqlPassword?.value ?? "",
+    mysql_database: controls.mysqlDatabase?.value.trim() || "afp_state_warning",
+    mysql_charset: "utf8mb4",
+    mysql_connect_timeout: 5,
+    initial_compaction_force_N: Number(controls.initialForce.value) || 0,
+    placement_speed_mm_s: Number(controls.placementSpeed.value) || 0,
+    pid_angle_deg: Number(controls.pidAngle.value) || 0,
+    temperature_setpoint_C: Number(controls.temperatureSetpoint.value) || 0,
+    replicate: Number(controls.replicate.value) || 1,
+  };
+}
+
+controls.acquisitionMode?.addEventListener("change", () => {
+  updateSimulationSettings();
+  markHardwareCheckStale("采集模式已变化");
+});
+controls.simulationSourceType?.addEventListener("change", updateSimulationSettings);
+controls.selectSimulationSource?.addEventListener("click", selectSimulationSource);
+controls.integrationSourceType?.addEventListener("change", updateIntegrationSource);
+controls.selectIntegrationFolder?.addEventListener("click", selectIntegrationFolder);
+controls.runIntegration?.addEventListener("click", runIntegration);
+updateIntegrationSource();
+updateSimulationSettings();
+
+// Keep the interface-side channel list aligned with the acquisition checklist.
+function selectedAcquisitionChannelsForInterfaces() {
+  const checks = [...document.querySelectorAll("#liveSensorChecklist .save-sensor-checkbox")];
+  if (!checks.length) {
+    const schemaId = controls.datasetSchema?.value || "legacy_original";
+    return state.bootstrap?.acquisition?.schemas?.find((item) => item.id === schemaId)?.sensors || [];
+  }
+  return checks.filter((node) => node.checked).map((node) => node.value);
+}
+
+function isTemperatureChannel(channel) {
+  return /^温度[1-8]$/.test(String(channel || ""));
+}
+
+function interfaceAcceptsChannel(item, channel) {
+  if (!item) return false;
+  const profile = sensorTypeProfile(item.role);
+  return Boolean(profile.editable_driver)
+    || (profile.channels || []).includes(channel);
+}
+
+function preferredInterfaceForChannel(channel, excludeId = "") {
+  const items = currentInterfaceItems().filter((item) => item.id !== excludeId);
+  return items.find((item) => interfaceAcceptsChannel(item, channel)) || null;
+}
+
+function createInterfaceChannelEditor(row, interfaceId) {
+  const editor = document.createElement("div");
+  editor.className = "interface-channel-editor";
+  const role = row.querySelector(".interface-role")?.value || "custom";
+  const profile = sensorTypeProfile(role);
+  const channels = selectedAcquisitionChannelsForInterfaces().filter(
+    (channel) => Boolean(profile.editable_driver)
+      || (profile.channels || []).includes(channel)
+  );
+  channels.forEach((channel) => {
+    const label = document.createElement("label");
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.dataset.channel = channel;
+    input.dataset.interface = interfaceId;
+    input.addEventListener("change", () => {
+      const route = document.querySelector(`.interface-route-select[data-channel="${CSS.escape(channel)}"]`);
+      if (!route) return;
+      if (input.checked) route.value = interfaceId;
+      else if (route.value === interfaceId) route.value = preferredInterfaceForChannel(channel)?.id || "__unassigned__";
+      syncInterfaceSummaries();
+    });
+    label.append(input, document.createTextNode(channel));
+    editor.append(label);
+  });
+  row.append(editor);
+}
+
+function refreshInterfaceEditors() {
+  const assigned = {};
+  document.querySelectorAll(".interface-route-select").forEach((select) => {
+    assigned[select.dataset.channel] = select.value;
+  });
+  document.querySelectorAll(".interface-channel-editor input").forEach((input) => {
+    input.checked = assigned[input.dataset.channel] === input.dataset.interface;
+  });
+}
+
+function rebuildInterfaceEditors() {
+  document.querySelectorAll(".interface-config-row").forEach((row) => {
+    row.querySelector(".interface-channel-editor")?.remove();
+    createInterfaceChannelEditor(row, row.dataset.interfaceId);
+  });
+  refreshInterfaceEditors();
+}
+
+function syncInterfaceSummaries() {
+  const grouped = {};
+  document.querySelectorAll(".interface-route-select").forEach((select) => {
+    if (select.value && select.value !== "__unassigned__") (grouped[select.value] ||= []).push(select.dataset.channel);
+  });
+  document.querySelectorAll(".interface-config-row").forEach((row) => {
+    const summary = row.querySelector(".interface-channel-summary");
+    if (summary) summary.textContent = `通道：${(grouped[row.dataset.interfaceId] || []).join("、") || "未分配"}`;
+  });
+  refreshInterfaceEditors();
+}
+
+function refreshChannelInterfaceOptions() {
+  const items = currentInterfaceItems();
+  document.querySelectorAll(".interface-route-select").forEach((select) => {
+    const previous = select.value;
+    const channel = select.dataset.channel || "";
+    const compatible = items.filter((item) => interfaceAcceptsChannel(item, channel));
+    select.replaceChildren(...[
+      {value: "__unassigned__", text: "未分配"},
+      ...compatible.map((item) => ({
+        value: item.id,
+        text: `${item.endpoint || item.id} · ${sensorTypeProfile(item.role).label}`,
+      })),
+    ].map((item) => {
+      const option = document.createElement("option"); option.value = item.value; option.textContent = item.text; return option;
+    }));
+    const previousItem = compatible.find((item) => item.id === previous);
+    const preferred = compatible[0];
+    select.value = previousItem && interfaceAcceptsChannel(previousItem, channel)
+      ? previous
+      : (preferred?.id || "__unassigned__");
+    select.onchange = syncInterfaceSummaries;
+  });
+  syncInterfaceSummaries();
+  refreshInterfaceEndpointOptions();
+}
+
+function applyRoleChannelDefaults(row) {
+  const id = row?.dataset.interfaceId;
+  const item = currentInterfaceItems().find((candidate) => candidate.id === id);
+  if (!item) return;
+  const selected = new Set(selectedAcquisitionChannelsForInterfaces());
+  document.querySelectorAll(".interface-route-select").forEach((select) => {
+    const channel = select.dataset.channel;
+    if (!selected.has(channel)) return;
+    if (interfaceAcceptsChannel(item, channel)) select.value = id;
+    else if (select.value === id) select.value = preferredInterfaceForChannel(channel, id)?.id || "__unassigned__";
+  });
+}
+
+function refreshInterfaceCardsForSelection() {
+  rebuildInterfaceEditors();
+  refreshChannelInterfaceOptions();
+}
+
+document.querySelector("#liveSensorChecklist")?.addEventListener("change", (event) => {
+  if (event.target?.classList?.contains("save-sensor-checkbox")) refreshInterfaceCardsForSelection();
+  markHardwareCheckStale("传感器通道选择已变化");
+});
+controls.interfacePanel?.addEventListener("change", (event) => {
+  if (event.target?.classList?.contains("interface-role")) {
+    applyRoleChannelDefaults(event.target.closest(".interface-config-row"));
+    rebuildInterfaceEditors();
+    refreshChannelInterfaceOptions();
+  }
+  markHardwareCheckStale("接口或通道映射已变化");
+});
+
+function hardwareConfigFingerprint() {
+  try {
+    const config = acquisitionConfig();
+    return JSON.stringify({
+      acquisition_mode: config.acquisition_mode,
+      dataset_schema: config.dataset_schema,
+      selected_sensors: [...(config.selected_sensors || [])].sort(),
+      interfaces: (config.interfaces || []).map((item) => ({
+        id: item.id, enabled: item.enabled, role: item.role,
+        driver: item.driver, endpoint: item.endpoint, baudrate: item.baudrate,
+      })),
+      assignments: config.interface_channel_assignments || {},
+      source_file: config.source_file || "",
+    });
+  } catch (_error) {
+    return "";
+  }
+}
+
+function hardwareStateLabel(value) {
+  return ({
+    ok: "正常", disabled: "已停用", video_only: "仅视频",
+    no_channels: "无已选通道", waiting: "等待数据",
+    not_connected: "未连接", no_data: "没有采集数据",
+    invalid_data: "采集数据无效", partial: "部分通道异常",
+    stale: "数据已中断", not_selected: "未选择",
+  })[value] || "异常";
+}
+
+function clearHardwareRowStates() {
+  document.querySelectorAll(".interface-config-row, .sensor-checklist-row").forEach((row) => {
+    row.classList.remove("check-ok", "check-error", "check-waiting");
+    row.removeAttribute("data-check-state");
+  });
+}
+
+function renderHardwareCheckResult(result, {automatic = false, live = false} = {}) {
+  const node = controls.hardwareCheckStatus;
+  if (!node) return;
+  clearHardwareRowStates();
+  const interfaces = Array.isArray(result?.interfaces) ? result.interfaces : [];
+  const sensors = (Array.isArray(result?.sensors) ? result.sensors : [])
+    .filter((item) => item.selected);
+  const badInterfaces = interfaces.filter((item) => item.enabled !== false && !item.ok);
+  const badSensors = sensors.filter((item) => !item.ok && item.blocking !== false);
+  const nonBlockingMissingSensors = sensors.filter((item) => !item.ok && item.blocking === false);
+  const waiting = [...interfaces, ...sensors].some((item) => item.state === "waiting");
+  const ok = Boolean(result?.ok ?? (!badInterfaces.length && !badSensors.length && !waiting));
+  node.className = `hardware-check-status ${waiting ? "checking" : ok ? "ok" : "error"}`;
+
+  const title = document.createElement("strong");
+  if (waiting) title.textContent = "正在等待各通道首个数据";
+  else if (ok) title.textContent = `${live ? "持续监控" : automatic ? "自动检查" : "手动检查"}通过`;
+  else title.textContent = `${live ? "持续监控发现异常" : automatic ? "自动检查未通过" : "手动检查未通过"}`;
+  node.replaceChildren(title);
+
+  const summary = document.createElement("div");
+  summary.textContent = `接口 ${interfaces.filter((item) => item.ok).length}/${interfaces.length} 正常；通道 ${sensors.filter((item) => item.ok).length}/${sensors.length} 正常`;
+  node.appendChild(summary);
+
+  const appendDetails = (label, items, formatter) => {
+    if (!items.length) return;
+    const detail = document.createElement("div");
+    detail.className = "hardware-check-detail";
+    detail.textContent = `${label}：${items.map(formatter).join("；")}`;
+    node.appendChild(detail);
+  };
+  appendDetails("异常接口", badInterfaces, (item) => {
+    const profile = sensorTypeProfile(item.role || "custom");
+    return `${profile.label || item.role || "接口"} ${item.endpoint || item.id || "未填写地址"}（${item.message || hardwareStateLabel(item.state)}）`;
+  });
+  appendDetails("异常通道", badSensors, (item) => `${item.name}（${item.message || hardwareStateLabel(item.state)}）`);
+  appendDetails(
+    "未采集通道（不阻止启动）",
+    nonBlockingMissingSensors,
+    (item) => `${item.name}（${item.message || hardwareStateLabel(item.state)}）`,
+  );
+  if (
+    Array.isArray(result?.errors)
+    && result.errors.length
+    && !badInterfaces.length
+    && !badSensors.length
+  ) {
+    appendDetails("检查信息", result.errors, (item) => String(item));
+  }
+  const timeNode = document.createElement("small");
+  timeNode.textContent = `${live ? "实时更新" : `检查用时 ${Number(result?.elapsed_seconds || 0).toFixed(1)} 秒`} · ${new Date().toLocaleTimeString()}`;
+  node.appendChild(timeNode);
+
+  interfaces.forEach((item) => {
+    const row = [...document.querySelectorAll(".interface-config-row")]
+      .find((candidate) => candidate.dataset.interfaceId === String(item.id || ""));
+    if (!row) return;
+    const className = item.state === "waiting" || (!item.ok && item.blocking === false)
+      ? "check-waiting"
+      : item.ok ? "check-ok" : "check-error";
+    row.classList.add(className);
+    row.dataset.checkState = hardwareStateLabel(item.state);
+    row.title = item.message || hardwareStateLabel(item.state);
+  });
+  sensors.forEach((item) => {
+    const row = [...document.querySelectorAll("#liveSensorChecklist .sensor-checklist-row")]
+      .find((candidate) => candidate.querySelector(".save-sensor-checkbox")?.value === item.name);
+    if (!row) return;
+    const className = item.state === "waiting" ? "check-waiting" : item.ok ? "check-ok" : "check-error";
+    row.classList.add(className);
+    row.dataset.checkState = hardwareStateLabel(item.state);
+    row.title = item.message || hardwareStateLabel(item.state);
+  });
+}
+
+function markHardwareCheckStale(reason = "配置已变化") {
+  state.hardwareCheck = null;
+  state.hardwareCheckFingerprint = "";
+  clearHardwareRowStates();
+  const node = controls.hardwareCheckStatus;
+  if (node) {
+    node.className = "hardware-check-status stale";
+    node.textContent = `${reason}，需要重新检查接口和传感器通道。`;
+  }
+  scheduleAutomaticHardwareCheck(700);
+}
+
+function scheduleAutomaticHardwareCheck(delay = 700) {
+  if (!controls.autoHardwareCheck?.checked || state.hardwareCheckInProgress) return;
+  if (state.acquisitionStatus?.running) return;
+  if (state.hardwareCheckTimer) window.clearTimeout(state.hardwareCheckTimer);
+  state.hardwareCheckTimer = window.setTimeout(() => {
+    state.hardwareCheckTimer = null;
+    testSensorConnection({automatic: true});
+  }, Math.max(0, delay));
+}
+
+async function testSensorConnection({automatic = false} = {}) {
+  if (state.hardwareCheckInProgress) return state.hardwareCheck;
+  if (state.acquisitionStatus?.running) {
+    toast("采集运行中正在持续监控，无需另开接口检查");
+    return null;
+  }
+  state.hardwareCheckInProgress = true;
+  const node = controls.hardwareCheckStatus;
+  const button = $("testSensorsButton");
+  const resetButton = controls.resetSensorCheck;
+  if (button) button.disabled = true;
+  if (resetButton) resetButton.disabled = true;
+  if (node) {
+    node.className = "hardware-check-status checking";
+    node.textContent = `${automatic ? "正在自动检查" : "正在检查"}，将逐一读取每个接口的全部已选通道…`;
+  }
+  try {
+    const result = await postJson("/api/acquisition/test", acquisitionConfig());
+    if (controls.processingMode.value !== "capture_only") {
+      applyPredictionModelProfile(result.prediction_model, false);
+    }
+    state.hardwareCheck = result;
+    state.hardwareCheckFingerprint = hardwareConfigFingerprint();
+    renderHardwareCheckResult(result, {automatic});
+    if (!result.ok && !automatic) toast("检查发现接口或传感器通道异常，详情已列出");
+    return result;
+  } catch (error) {
+    state.hardwareCheck = null;
+    state.hardwareCheckFingerprint = "";
+    if (node) {
+      node.className = "hardware-check-status error";
+      node.textContent = `检查失败：${error.message}`;
+    }
+    if (!automatic) toast(error.message);
+    return null;
+  } finally {
+    state.hardwareCheckInProgress = false;
+    if (button) button.disabled = false;
+    if (resetButton) resetButton.disabled = false;
+  }
+}
+
+async function resetAndCheckHardware() {
+  if (state.acquisitionStatus?.running) {
+    toast("请先停止并保存当前采集，再重置检查状态");
+    return;
+  }
+  try {
+    await postJson("/api/acquisition/reset-check", {});
+    state.hardwareCheck = null;
+    state.hardwareCheckFingerprint = "";
+    clearHardwareRowStates();
+    if (controls.hardwareCheckStatus) {
+      controls.hardwareCheckStatus.className = "hardware-check-status checking";
+      controls.hardwareCheckStatus.textContent = "检查状态已重置，正在按当前接口地址重新识别数据…";
+    }
+    await testSensorConnection({automatic: false});
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+function renderLiveHardwareMonitor(status) {
+  const selected = (status.sensors || []).filter((item) => item.selected);
+  const interfaces = status.interfaces || [];
+  const result = {
+    ok: !status.last_error
+      && interfaces.every((item) => item.ok || item.state === "waiting"),
+    sensors: selected,
+    interfaces,
+    errors: status.last_error ? [status.last_error] : [],
+  };
+  renderHardwareCheckResult(result, {live: true});
+}

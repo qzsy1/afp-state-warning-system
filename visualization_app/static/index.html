@@ -34,8 +34,8 @@
           <div class="control-content">
             <label>运行模式
               <select id="dataModeSelect">
-                <option value="replay" selected>历史数据实时回放</option>
-                <option value="live">真实传感器采集</option>
+                <option value="replay">历史数据实时回放</option>
+                <option value="live" selected>真实传感器采集</option>
               </select>
             </label>
             <label>试样<select id="specimenSelect"></select></label>
@@ -53,6 +53,40 @@
               </select>
             </label>
             <label>数据采集方案<select id="datasetSchemaSelect"></select></label>
+            <label>采集来源
+              <select id="acquisitionModeSelect">
+                <option value="real" selected>真实接口采集</option>
+                <option value="simulation">模拟采集</option>
+              </select>
+            </label>
+            <div id="simulationSettings" class="simulation-settings hidden">
+              <label>模拟数据形式
+                <select id="simulationSourceTypeSelect">
+                  <option value="single_csv">单 CSV 文件</option>
+                  <option value="folder_csv">采集数据文件夹</option>
+                  <option value="mysql">MySQL 数据库</option>
+                </select>
+              </label>
+              <label id="simulationSourcePathLabel">模拟数据文件/文件夹
+                <span class="path-picker-row">
+                  <input id="simulationSourcePathInput" type="text" placeholder="选择 CSV 文件或采集数据文件夹">
+                  <button id="selectSimulationSourceButton" class="secondary-button compact-button" type="button">选择</button>
+                </span>
+              </label>
+              <div id="simulationMysqlSettings" class="simulation-mysql-settings hidden">
+                <div class="compact-input-grid">
+                  <label>MySQL 主机<input id="simulationMysqlHostInput" type="text" value="127.0.0.1"></label>
+                  <label>端口<input id="simulationMysqlPortInput" type="number" value="3306" min="1" max="65535"></label>
+                  <label>用户<input id="simulationMysqlUserInput" type="text" value="root"></label>
+                  <label>密码<input id="simulationMysqlPasswordInput" type="password" value="" autocomplete="new-password"></label>
+                  <label>数据库<input id="simulationMysqlDatabaseInput" type="text" value="afp_state_warning"></label>
+                </div>
+                <label>SQL 查询
+                  <textarea id="simulationMysqlQueryInput" rows="2">SELECT * FROM afp_flat_all ORDER BY specimen_key, layer_no, sample_index</textarea>
+                </label>
+              </div>
+              <p class="control-note">模拟模式使用所选文件夹、CSV或MySQL数据逐行回放；真实接口模式不会读取本地文件。</p>
+            </div>
             <label>采集驱动<select id="driverSelect"></select></label>
             <label>模拟采集数据文件<input id="sourceFileInput" type="text" placeholder="模拟驱动的数据 CSV；真实驱动可留空"></label>
             <label>连接地址<input id="endpointInput" type="text" placeholder="串口 COM3 或 TCP 127.0.0.1:9000"></label>
@@ -101,6 +135,9 @@
                 <button id="selectPredictionModelButton" class="secondary-button compact-button" type="button">选择</button>
               </span>
             </label>
+            <label class="prediction-setting">预测算法
+              <select id="predictionModelTypeSelect"></select>
+            </label>
             <div id="predictionModelStatus" class="model-file-status prediction-setting">尚未检查预测模型</div>
             <label class="toggle prediction-setting"><input id="bestPredictionOverrideInput" type="checkbox">使用冻结验证集最佳预测模型覆盖当前选择</label>
             <p id="bestPredictionOverrideNote" class="control-note prediction-setting">未勾选时严格使用手动模型；勾选后只按验证集误差在同一采集方案内选择兼容模型。</p>
@@ -121,10 +158,27 @@
             </div>
             <p class="control-note collection-index-note">采集运行期间层号和独立重复编号锁定；只有停止并成功保存本次采集后，才可递增到下一层或下一独立重复。</p>
             <div class="sensor-selector-title">采集保存、模型输入与模型输出</div>
+            <div class="interface-toolbar">
+              <button id="discoverInterfacesButton" class="secondary-button compact-button" type="button">自动识别接口</button>
+              <button id="addInterfaceButton" class="secondary-button compact-button" type="button">＋ 增加接口</button>
+              <span id="interfaceDiscoveryStatus" class="muted">默认启用热电偶接口和其它传感器接口</span>
+            </div>
+            <div id="interfacePanel" class="interface-panel"></div>
+            <p class="control-note">温度1～温度8均可独立选择。停止采集时可自由勾选、取消或使用全选/清空；采集中为保证同一文件通道定义不变会暂时锁定。接口勾选、角色和通道映射同时作用于显示、CSV和MySQL。</p>
             <div id="liveSensorChecklist" class="sensor-checklist"></div>
             <p class="control-note sensor-prediction-note">仅采集模式只使用“采集保存”；预测模式要求输入通道与模型元数据一致，输出通道决定预测曲线及健康指标数据。</p>
+            <label class="hardware-auto-toggle">
+              <input id="autoHardwareCheckInput" type="checkbox" checked>
+              自动检查接口与传感器通道
+            </label>
+            <div class="transport hardware-check-actions">
+              <button id="testSensorsButton" class="secondary-button" type="button">立即检查</button>
+              <button id="resetSensorCheckButton" class="secondary-button" type="button">重置并重新检查</button>
+            </div>
+            <div id="hardwareCheckStatus" class="hardware-check-status checking">
+              等待自动检查；检查会逐项确认接口、通道和有效数据。
+            </div>
             <div class="transport">
-              <button id="testSensorsButton" class="secondary-button">检查连接</button>
               <button id="startAcquisitionButton" class="primary-button">开始采集</button>
             </div>
             <button id="stopAcquisitionButton" class="secondary-button full-button">停止并保存</button>
@@ -167,11 +221,45 @@
             <div id="recommendationCard" class="recommendation-card">正在读取模型推荐……</div>
             <label><span>异常阈值 <output id="thresholdValue">0.50</output></span><input id="thresholdInput" type="range" min="0.05" max="0.95" step="0.01" value="0.50"></label>
             <label><span>CAP 聚合强度 ρ <output id="rhoValue">0.50</output></span><input id="rhoInput" type="range" min="0" max="1" step="0.05" value="0.50"></label>
-            <label class="checkbox-row"><input id="optimizedWarningInput" type="checkbox" checked>使用优化预警（回放 v13.8 / 实时因果 v13.9）</label>
+            <label class="checkbox-row"><input id="optimizedWarningInput" type="checkbox" checked><span id="optimizedWarningLabel">使用优化预警</span></label>
             <label class="checkbox-row evidence-visibility-setting"><input id="showLayerEvidenceInput" type="checkbox" checked>显示健康指标与铺层证据</label>
             <p id="calculationModeNote" class="control-note">异常分数由所选分类器实时计算；窗口仅在 24 个真实点全部到达后进入聚合。</p>
           </div>
         </details>
+      <details id="dataIntegrationSection" class="control-section">
+        <summary>采集数据整合为 CSV</summary>
+        <div class="control-content">
+          <label>数据来源
+            <select id="integrationSourceTypeSelect">
+              <option value="folder_csv" selected>采集数据文件夹（每个试样一份完整文件）</option>
+              <option value="mysql">MySQL 数据库（afp_flat_all）</option>
+            </select>
+          </label>
+          <label id="integrationFolderLabel">采集数据文件夹
+            <span class="path-picker-row">
+              <input id="integrationFolderInput" type="text" placeholder="选择保存采集数据的根文件夹">
+              <button id="selectIntegrationFolderButton" class="secondary-button compact-button" type="button">选择</button>
+            </span>
+          </label>
+          <div id="integrationMysqlSettings" class="simulation-mysql-settings hidden">
+            <div class="compact-input-grid">
+              <label>MySQL 主机<input id="integrationMysqlHostInput" type="text" value="127.0.0.1"></label>
+              <label>端口<input id="integrationMysqlPortInput" type="number" value="3306" min="1" max="65535"></label>
+              <label>用户<input id="integrationMysqlUserInput" type="text" value="root"></label>
+              <label>密码<input id="integrationMysqlPasswordInput" type="password" value="" autocomplete="new-password"></label>
+              <label>数据库<input id="integrationMysqlDatabaseInput" type="text" value="afp_state_warning"></label>
+            </div>
+            <label>SQL 查询
+              <textarea id="integrationMysqlQueryInput" rows="2">SELECT * FROM afp_flat_all ORDER BY specimen_key, layer_no, sample_index</textarea>
+            </label>
+          </div>
+          <label>整合文件保存位置（留空则保存到来源文件夹）
+            <input id="integrationOutputInput" type="text" placeholder="默认：来源文件夹/整合数据.csv">
+          </label>
+          <button id="runIntegrationButton" class="primary-button full-button" type="button">整合并导出 CSV</button>
+          <p id="integrationStatus" class="control-note">只读取每个试样当前的完整数据文件，不重复导入历史快照和分层文件。</p>
+        </div>
+      </details>
       </aside>
 
       <div id="leftColumnResizer" class="column-resizer left-resizer" role="separator"
@@ -273,6 +361,6 @@
     </div>
   </div>
   <div id="toast" class="toast"></div>
-  <script src="/app.js"></script>
+  <script src="/app.js?v=20260817-capture-integration-3"></script>
 </body>
 </html>

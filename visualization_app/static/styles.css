@@ -320,12 +320,49 @@ output { color: var(--blue); font-weight: 800; }
 .recommendation-card.not-recommended, .model-file-status.error, .acquisition-status.error { color: #a23c45; background: #fff0f1; border-color: #f2c6ca; }
 .model-file-status.ok, .acquisition-status.ok { color: #19704f; background: #eefaf5; border-color: #c2e9d8; }
 .sensor-selector-title { margin-top: 2px; color: var(--navy); font-size: 10px; font-weight: 800; }
-.sensor-checklist { width: 100%; min-width: 0; max-width: 100%; box-sizing: border-box; overflow: auto; max-height: 260px; border: 1px solid var(--line); border-radius: 5px; }
-.sensor-checklist-header, .sensor-checklist-row { display: grid; grid-template-columns: minmax(86px,1fr) repeat(3, minmax(30px, 38px)); align-items: center; min-height: 24px; width: 100%; box-sizing: border-box; padding: 2px 3px; border-bottom: 1px solid #e8eff4; font-size: 8px; text-align: center; }
-.sensor-checklist-header { position: sticky; top: 0; z-index: 1; color: #fff; background: var(--navy); font-weight: 800; }
+.sensor-checklist { width: 100%; min-width: 0; max-width: 100%; box-sizing: border-box; overflow-x: hidden; overflow-y: auto; max-height: 470px; padding-bottom: 4px; scrollbar-gutter: stable; border: 1px solid var(--line); border-radius: 5px; }
+.sensor-capture-toolbar { position: sticky; top: 0; z-index: 3; display: flex; align-items: center; gap: 6px; min-height: 30px; padding: 3px 5px; background: #f5f9fc; border-bottom: 1px solid var(--line); }
+.sensor-capture-count { flex: 1; color: #31536c; font-size: 9px; font-weight: 700; }
+.sensor-capture-toolbar .compact-button { min-height: 22px; padding: 2px 7px; font-size: 9px; }
+.sensor-checklist-header, .sensor-checklist-row { display: grid; grid-template-columns: minmax(74px,1fr) repeat(3, minmax(30px, 36px)) minmax(82px, 1.2fr); align-items: center; min-height: 24px; width: 100%; box-sizing: border-box; padding: 2px 3px; border-bottom: 1px solid #e8eff4; font-size: 8px; text-align: center; }
+.sensor-checklist-header { position: sticky; top: 30px; z-index: 2; color: #fff; background: var(--navy); font-weight: 800; }
 .sensor-checklist-row:last-child { border-bottom: 0; }
 .sensor-checklist-name { min-width: 0; overflow: visible; color: #486175; text-align: left; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; word-break: break-word; line-height: 1.25; }
 .sensor-checklist-row input { width: 13px; height: 13px; margin: auto; accent-color: var(--blue); }
+.sensor-checklist-row select { width: 100%; min-width: 0; font-size: 8px; padding: 2px 1px; }
+.interface-channel-summary { grid-column: 1 / -1; width: 100%; min-width: 0; color: #4a7b9d; font-size: 8px; text-align: left; padding-top: 2px; white-space: normal; overflow-wrap: break-word; word-break: normal; }
+.interface-channel-editor { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 3px 7px; max-height: 58px; overflow: auto; padding: 4px 5px; background: #fff; border: 1px solid #d8e6ef; border-radius: 4px; }
+.interface-channel-editor label { display: inline-flex; align-items: center; gap: 2px; color: #506a7e; font-size: 8px; }
+.interface-channel-editor input { width: 12px !important; height: 12px !important; }
+.first-interface-summary { display: block; margin: 2px 0 5px; padding: 4px 6px; background: #edf7fd; border-radius: 4px; }
+.interface-toolbar { display: flex; align-items: center; gap: 6px; margin: 7px 0 4px; min-width: 0; }
+.interface-panel { display: grid; gap: 5px; max-width: 100%; overflow: auto; }
+.interface-config-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; align-items: end; padding: 6px; border: 1px solid #c9dceb; border-radius: 5px; background: #f7fbfe; font-size: 8px; }
+.interface-config-row label { min-width: 0; }
+.interface-config-row input, .interface-config-row select { width: 100%; box-sizing: border-box; min-height: 24px; font-size: 9px; }
+.interface-config-row .interface-map-label { grid-column: 1 / -1; width: 100%; }
+.interface-config-row .interface-profile-detail { grid-column: 1 / -1; width: 100%; min-width: 0; margin: 0; white-space: normal; overflow-wrap: break-word; word-break: normal; }
+.hardware-auto-toggle { display: flex; align-items: center; gap: 6px; margin: 6px 0 4px; color: #355f7e; font-size: 9px; font-weight: 700; }
+.hardware-auto-toggle input { width: 13px; height: 13px; margin: 0; accent-color: var(--blue); }
+.hardware-check-actions { margin-bottom: 5px; }
+.hardware-check-status { display: grid; gap: 3px; margin: 0 0 6px; padding: 7px 8px; color: #315d7c; background: #edf7fd; border: 1px solid #c7dfef; border-left-width: 4px; border-radius: 5px; font-size: 8.5px; line-height: 1.4; overflow-wrap: anywhere; }
+.hardware-check-status strong { font-size: 9.5px; }
+.hardware-check-status small { color: #6f8798; }
+.hardware-check-status.ok { color: #176646; background: #eefaf5; border-color: #9ed9be; }
+.hardware-check-status.error { color: #8f2f39; background: #fff0f1; border-color: #e8aab0; }
+.hardware-check-status.checking { color: #795610; background: #fff9e8; border-color: #e8cf82; }
+.hardware-check-status.stale { color: #735a26; background: #f8f4e9; border-color: #d9cda9; }
+.hardware-check-detail { max-height: 64px; overflow: auto; padding: 3px 2px 0; border-top: 1px solid currentColor; scrollbar-width: thin; }
+.interface-config-row.check-ok, .sensor-checklist-row.check-ok { background: #eefaf5; border-color: #89cdae; }
+.interface-config-row.check-error, .sensor-checklist-row.check-error { background: #fff0f1; border-color: #dc9098; }
+.interface-config-row.check-waiting, .sensor-checklist-row.check-waiting { background: #fff9e8; border-color: #dfc56b; }
+.legacy-interface-field { display: none !important; }
+.interface-remove-button { min-height: 24px; color: #a52d2d; border-color: #dca6a6; }
+.simulation-settings { margin: 6px 0; padding: 8px; border: 1px solid #b9d5e6; border-radius: 6px; background: #f5fbff; }
+.simulation-settings textarea { width: 100%; box-sizing: border-box; font: inherit; resize: vertical; }
+.simulation-mysql-settings { margin-top: 5px; }
+.interface-enable { align-self: center; white-space: nowrap; }
+.interface-enable input { width: 13px; }
 .forecast-alignment-note { max-width: 204px; }
 
 .panel, .status-card, .rail-block {
