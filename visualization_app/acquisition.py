@@ -27,10 +27,12 @@ from mysql_storage import MySQLCaptureStore, MySQLSettings, validate_database_na
 from smrf_hid import SmrfHidDriver, enumerate_smrf_hid_devices
 
 
-APP_DIR = Path(__file__).resolve().parent
+APP_DIR = Path(os.environ.get("AFP_LEGACY_APP_DIR") or Path(__file__).resolve().parent).resolve()
 WORKSPACE_DIR = APP_DIR.parents[1]
 DEFAULT_CAPTURE_ROOT = Path(WORKSPACE_DIR.anchor) / "AFP_Capture"
-_PACKAGED_SIMULATOR_FILE = APP_DIR / "data" / "原文件.csv"
+_DATA_DIR = Path(os.environ.get("AFP_DATA_DIR") or APP_DIR / "data").resolve()
+_NATIVE_DLL_DIR = Path(os.environ.get("AFP_NATIVE_DLL_DIR") or APP_DIR).resolve()
+_PACKAGED_SIMULATOR_FILE = _DATA_DIR / "原文件.csv"
 DEFAULT_SIMULATOR_FILE = (
     _PACKAGED_SIMULATOR_FILE
     if _PACKAGED_SIMULATOR_FILE.exists()
@@ -1421,6 +1423,7 @@ class UvcThermalDriver(SampleDriver):
         if self.dll_path:
             candidates.append(Path(self.dll_path))
         candidates.extend([
+            _NATIVE_DLL_DIR / BSV_UVC_DLL_NAME,
             APP_DIR / BSV_UVC_DLL_NAME,
             APP_DIR.parent / BSV_UVC_DLL_NAME,
             Path.cwd() / BSV_UVC_DLL_NAME,
@@ -1939,6 +1942,7 @@ class AcquisitionManager:
         uvc_dll_found = any(
             candidate.is_file()
             for candidate in (
+                _NATIVE_DLL_DIR / BSV_UVC_DLL_NAME,
                 APP_DIR / BSV_UVC_DLL_NAME,
                 APP_DIR.parent / BSV_UVC_DLL_NAME,
                 Path.cwd() / BSV_UVC_DLL_NAME,

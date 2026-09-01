@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -9,10 +10,9 @@ import numpy as np
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_ARTIFACT = (
-    APP_DIR
-    / "new_collection_demo_v11_3"
-    / "models"
-    / "new_collection_hi_artifacts.joblib"
+    Path(os.environ.get("AFP_NEW_HEALTH_ARTIFACT")).expanduser().resolve()
+    if os.environ.get("AFP_NEW_HEALTH_ARTIFACT")
+    else APP_DIR / "new_collection_demo_v11_3" / "models" / "new_collection_hi_artifacts.joblib"
 )
 
 SENSOR_COLUMNS = [

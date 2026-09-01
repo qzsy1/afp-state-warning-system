@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import mimetypes
+import os
 import sys
 import threading
 import webbrowser
@@ -49,7 +50,7 @@ from new_collection_health import (
 from web_training import WebTrainingManager
 
 
-APP_DIR = Path(__file__).resolve().parent
+APP_DIR = Path(os.environ.get("AFP_LEGACY_APP_DIR") or Path(__file__).resolve().parent).resolve()
 APP_VERSION = "1.12.0"
 BUILD_ID = "20260823-schema-contract-fix"
 EXECUTABLE_DIR = (
@@ -57,13 +58,16 @@ EXECUTABLE_DIR = (
     if getattr(sys, "frozen", False)
     else APP_DIR
 )
+_ENV_MODEL_DIR = os.environ.get("AFP_MODELS_DIR", "").strip()
 RUNTIME_MODEL_DIR = (
-    EXECUTABLE_DIR / "models"
+    Path(_ENV_MODEL_DIR).expanduser().resolve()
+    if _ENV_MODEL_DIR
+    else EXECUTABLE_DIR / "models"
     if (EXECUTABLE_DIR / "models").exists()
     else APP_DIR / "models"
 )
-STATIC_DIR = APP_DIR / "static"
-DATA_DIR = APP_DIR / "data"
+STATIC_DIR = Path(os.environ.get("AFP_UI_DIR") or APP_DIR / "static").resolve()
+DATA_DIR = Path(os.environ.get("AFP_DATA_DIR") or APP_DIR / "data").resolve()
 _PACKAGED_REPLAY_DIR = DATA_DIR / "legacy_replay"
 OUTPUT_DIR = (
     _PACKAGED_REPLAY_DIR
@@ -112,7 +116,9 @@ LIVE_SENSOR_UNITS = {
     "ABB_Z": "mm",
     **{f"温度{index}": "°C" for index in range(1, 9)},
 }
-NEW_DEMO_ROOT = APP_DIR / "new_collection_demo_v11_3"
+NEW_DEMO_ROOT = Path(
+    os.environ.get("AFP_NEW_DEMO_DIR") or APP_DIR / "new_collection_demo_v11_3"
+).resolve()
 NEW_DEMO_SOURCE = NEW_DEMO_ROOT / "simulator_stream.csv"
 NEW_DEMO_CHECKPOINT = RUNTIME_MODEL_DIR / "new" / "i_T_G" / "checkpoint.pth"
 

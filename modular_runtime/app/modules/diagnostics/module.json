@@ -1,0 +1,10 @@
+{
+  "id": "diagnostics",
+  "name": "系统诊断",
+  "version": "2.0.0",
+  "api_version": "2.0",
+  "entrypoint": "plugin.py",
+  "enabled": true,
+  "dependencies": ["drivers", "acquisition", "storage", "prediction", "health", "warning", "training", "data_integration"],
+  "capabilities": ["module_health", "compatibility_report", "runtime_status"]
+}

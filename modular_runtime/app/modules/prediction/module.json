@@ -1,0 +1,10 @@
+{
+  "id": "prediction",
+  "name": "多模型实时预测",
+  "version": "2.0.0",
+  "api_version": "2.0",
+  "entrypoint": "plugin.py",
+  "enabled": true,
+  "dependencies": [],
+  "capabilities": ["model_catalog", "checkpoint_validation", "causal_forecast", "horizon_1_600"]
+}

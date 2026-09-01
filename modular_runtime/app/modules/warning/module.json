@@ -1,0 +1,10 @@
+{
+  "id": "warning",
+  "name": "三级状态预警",
+  "version": "2.0.0",
+  "api_version": "2.0",
+  "entrypoint": "plugin.py",
+  "enabled": true,
+  "dependencies": ["health"],
+  "capabilities": ["window", "layer", "specimen", "causal_online", "abnormal_type"]
+}

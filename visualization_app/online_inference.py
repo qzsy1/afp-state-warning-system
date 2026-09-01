@@ -14,6 +14,8 @@ import numpy as np
 
 
 APP_DIR = Path(__file__).resolve().parent
+MODULAR_ROOT = Path(os.environ.get("AFP_MODULAR_ROOT") or APP_DIR).resolve()
+EXTERNAL_MODELS_DIR = Path(os.environ.get("AFP_MODELS_DIR") or MODULAR_ROOT / "models").resolve()
 EXECUTABLE_DIR = (
     Path(sys.executable).resolve().parent
     if getattr(sys, "frozen", False)
@@ -63,7 +65,7 @@ _WORKSPACE_DEFAULT_CHECKPOINT = (
     / "checkpoint.pth"
 )
 _PACKAGED_DEFAULT_CHECKPOINT = APP_DIR / "models" / "checkpoint.pth"
-_EXTERNAL_DEFAULT_CHECKPOINT = EXECUTABLE_DIR / "models" / "checkpoint.pth"
+_EXTERNAL_DEFAULT_CHECKPOINT = EXTERNAL_MODELS_DIR / "checkpoint.pth"
 DEFAULT_CHECKPOINT = (
     _EXTERNAL_DEFAULT_CHECKPOINT
     if _EXTERNAL_DEFAULT_CHECKPOINT.exists()
@@ -296,8 +298,9 @@ def _registered_checkpoint(model_type: str, schema_mode: str = "") -> Path | Non
     # beside the EXE.  Search that directory first; the extracted _internal
     # copy remains a fallback for older packages.
     app_roots = list(dict.fromkeys(
-        ([EXECUTABLE_DIR, APP_DIR] if getattr(sys, "frozen", False)
-         else [APP_DIR, EXECUTABLE_DIR])
+        [EXTERNAL_MODELS_DIR.parent, MODULAR_ROOT]
+        + ([EXECUTABLE_DIR, APP_DIR] if getattr(sys, "frozen", False)
+           else [APP_DIR, EXECUTABLE_DIR])
     ))
     trained_roots = [
         root / "trained_models_web" for root in app_roots

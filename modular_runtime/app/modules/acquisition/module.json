@@ -1,0 +1,10 @@
+{
+  "id": "acquisition",
+  "name": "实时采集",
+  "version": "2.0.0",
+  "api_version": "2.0",
+  "entrypoint": "plugin.py",
+  "enabled": true,
+  "dependencies": ["drivers"],
+  "capabilities": ["real_capture", "simulation_replay", "multi_interface", "layer_save"]
+}

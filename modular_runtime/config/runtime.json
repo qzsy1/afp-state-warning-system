@@ -1,0 +1,28 @@
+{
+  "application_version": "2.0.0-dev",
+  "api_version": "2.0",
+  "paths": {
+    "app_dir": "app",
+    "legacy_dir": "../visualization_app",
+    "modules_dir": "app/modules",
+    "ui_dir": "../visualization_app/static",
+    "data_dir": "../visualization_app/data",
+    "models_dir": "../visualization_app/models",
+    "native_dll_dir": "../visualization_app/hardware_dlls",
+    "config_dir": "config",
+    "logs_dir": "logs",
+    "updates_dir": "updates",
+    "rollback_dir": "rollback",
+    "runtime_dir": "runtime"
+  },
+  "module_policy": {
+    "strict_api": true,
+    "fail_on_unhealthy_required_module": true
+  },
+  "ui": {
+    "title": "AFP 实时预测、状态预警与模型训练系统（模块化版）",
+    "width": 1660,
+    "height": 1040
+  }
+}
+
