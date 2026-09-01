@@ -353,6 +353,22 @@ output { color: var(--blue); font-weight: 800; }
 .hardware-check-status.checking { color: #795610; background: #fff9e8; border-color: #e8cf82; }
 .hardware-check-status.stale { color: #735a26; background: #f8f4e9; border-color: #d9cda9; }
 .hardware-check-detail { max-height: 64px; overflow: auto; padding: 3px 2px 0; border-top: 1px solid currentColor; scrollbar-width: thin; }
+.acquisition-parameter-panel {
+  display: grid;
+  gap: 7px;
+  margin-top: 2px;
+  padding: 8px;
+  background: linear-gradient(145deg, #f5faff, #edf6fc);
+  border: 1px solid #b8d5e8;
+  border-left: 4px solid var(--blue);
+  border-radius: 6px;
+}
+.acquisition-parameter-title {
+  margin: 0;
+  color: #174f79;
+  font-size: 11px;
+}
+.acquisition-parameter-panel .collection-index-note { margin-top: 1px; }
 .interface-config-row.check-ok, .sensor-checklist-row.check-ok { background: #eefaf5; border-color: #89cdae; }
 .interface-config-row.check-error, .sensor-checklist-row.check-error { background: #fff0f1; border-color: #dc9098; }
 .interface-config-row.check-waiting, .sensor-checklist-row.check-waiting { background: #fff9e8; border-color: #dfc56b; }

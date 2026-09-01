@@ -141,22 +141,6 @@
             <div id="predictionModelStatus" class="model-file-status prediction-setting">尚未检查预测模型</div>
             <label class="toggle prediction-setting"><input id="bestPredictionOverrideInput" type="checkbox">使用冻结验证集最佳预测模型覆盖当前选择</label>
             <p id="bestPredictionOverrideNote" class="control-note prediction-setting">未勾选时严格使用手动模型；勾选后只按验证集误差在同一采集方案内选择兼容模型。</p>
-            <div id="legacyParameterGrid" class="compact-input-grid">
-              <label>功率 p<input id="livePowerInput" type="number" value="600"></label>
-              <label>速度 v<input id="liveSpeedInput" type="number" value="100"></label>
-              <label>压实力 pr<input id="livePressureInput" type="number" value="600"></label>
-              <label>层号（从0开始，每次递增1）<input id="liveLayerInput" class="step-one-input" type="number" value="0" min="0" step="1" inputmode="numeric"></label>
-            </div>
-            <div id="newParameterGrid" class="compact-input-grid hidden">
-              <label>初始压实力/N<input id="initialForceInput" type="number" value="400"></label>
-              <label>铺放速度/mm·s⁻¹<input id="placementSpeedInput" type="number" value="80"></label>
-              <label>PID 角度/°<input id="pidAngleInput" type="number" value="5"></label>
-              <label>设定温度/°C<input id="temperatureSetpointInput" type="number" value="360"></label>
-              <label>工况编号<input id="conditionIdInput" type="text" value="H06"></label>
-              <label>独立重复（每次递增1）<input id="replicateInput" class="step-one-input" type="number" value="1" min="1" step="1" inputmode="numeric"></label>
-              <label>层号（从0开始，每次递增1）<input id="newLayerInput" class="step-one-input" type="number" value="0" min="0" step="1" inputmode="numeric"></label>
-            </div>
-            <p class="control-note collection-index-note">采集运行期间层号和独立重复编号锁定；只有停止并成功保存本次采集后，才可递增到下一层或下一独立重复。</p>
             <div class="sensor-selector-title">采集保存、模型输入与模型输出</div>
             <div class="interface-toolbar">
               <button id="discoverInterfacesButton" class="secondary-button compact-button" type="button">自动识别接口</button>
@@ -178,6 +162,25 @@
             <div id="hardwareCheckStatus" class="hardware-check-status checking">
               等待自动检查；检查会逐项确认接口、通道和有效数据。
             </div>
+            <section id="acquisitionParameterPanel" class="acquisition-parameter-panel" aria-labelledby="acquisitionParameterTitle">
+              <div id="acquisitionParameterTitle" class="sensor-selector-title acquisition-parameter-title">采集前参数调整</div>
+              <div id="legacyParameterGrid" class="compact-input-grid">
+                <label>功率 p<input id="livePowerInput" type="number" value="600"></label>
+                <label>速度 v<input id="liveSpeedInput" type="number" value="100"></label>
+                <label>压实力 pr<input id="livePressureInput" type="number" value="600"></label>
+                <label>层号（从0开始，每次递增1）<input id="liveLayerInput" class="step-one-input" type="number" value="0" min="0" step="1" inputmode="numeric"></label>
+              </div>
+              <div id="newParameterGrid" class="compact-input-grid hidden">
+                <label>初始压实力/N<input id="initialForceInput" type="number" value="400"></label>
+                <label>铺放速度/mm·s⁻¹<input id="placementSpeedInput" type="number" value="80"></label>
+                <label>PID 角度/°<input id="pidAngleInput" type="number" value="5"></label>
+                <label>设定温度/°C<input id="temperatureSetpointInput" type="number" value="360"></label>
+                <label>工况编号<input id="conditionIdInput" type="text" value="H06"></label>
+                <label>独立重复（每次递增1）<input id="replicateInput" class="step-one-input" type="number" value="1" min="1" step="1" inputmode="numeric"></label>
+                <label>层号（从0开始，每次递增1）<input id="newLayerInput" class="step-one-input" type="number" value="0" min="0" step="1" inputmode="numeric"></label>
+              </div>
+              <p class="control-note collection-index-note">采集运行期间层号和独立重复编号锁定；只有停止并成功保存本次采集后，才可递增到下一层或下一独立重复。</p>
+            </section>
             <div class="transport">
               <button id="startAcquisitionButton" class="primary-button">开始采集</button>
             </div>
@@ -361,6 +364,6 @@
     </div>
   </div>
   <div id="toast" class="toast"></div>
-  <script src="/app.js?v=20260817-capture-integration-3"></script>
+  <script src="/app.js?v=20260901-parameter-before-start-1"></script>
 </body>
 </html>
