@@ -897,10 +897,6 @@ async function stopAcquisition() {
 function buildSensorChecklist(sensorNames) {
   const sensorHeader = document.createElement("div");
   sensorHeader.className = "sensor-checklist-header";
-  sensorHeader.innerHTML =
-    "<span>通道</span><span>采集</span><span>输入</span><span>输出</span>";
-  sensorHeader.innerHTML =
-    '<span title="传感器通道">通道</span><span title="采集并保存">采</span><span title="模型输入">入</span><span title="模型输出/预测">出</span>';
   sensorHeader.innerHTML = "<span>通道</span><span>采集</span><span>输入</span><span>输出</span><span>接口</span>";
   const sensorRows = sensorNames.map((name) => {
     const row = document.createElement("div");
@@ -2381,8 +2377,78 @@ function initializeVerticalPanelResizer() {
   }
 }
 
+const SENSOR_CHECKLIST_HEIGHT_STORAGE_KEY = "afp-state-monitor-sensor-list-height-v1";
+
+function initializeSensorChecklistResizer() {
+  const checklist = $("liveSensorChecklist");
+  const handle = $("sensorChecklistResizer");
+  if (!checklist || !handle) return;
+
+  const minimum = 260;
+  const maximum = 1200;
+  const defaultHeight = 760;
+
+  function applyHeight(value, persist = true) {
+    const safe = Math.max(minimum, Math.min(maximum, Number(value) || defaultHeight));
+    checklist.style.height = `${Math.round(safe)}px`;
+    handle.setAttribute("aria-valuemin", String(minimum));
+    handle.setAttribute("aria-valuemax", String(maximum));
+    handle.setAttribute("aria-valuenow", String(Math.round(safe)));
+    if (persist) {
+      try { localStorage.setItem(SENSOR_CHECKLIST_HEIGHT_STORAGE_KEY, String(safe)); } catch (_error) {}
+    }
+  }
+
+  function resetHeight() {
+    try { localStorage.removeItem(SENSOR_CHECKLIST_HEIGHT_STORAGE_KEY); } catch (_error) {}
+    applyHeight(defaultHeight, false);
+  }
+
+  handle.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    const startY = event.clientY;
+    const startHeight = checklist.getBoundingClientRect().height;
+    handle.classList.add("dragging");
+    document.body.classList.add("resizing-sensor-list");
+
+    function move(pointerEvent) {
+      applyHeight(startHeight + pointerEvent.clientY - startY, false);
+    }
+
+    function end() {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", end);
+      window.removeEventListener("pointercancel", end);
+      handle.classList.remove("dragging");
+      document.body.classList.remove("resizing-sensor-list");
+      applyHeight(checklist.getBoundingClientRect().height, true);
+    }
+
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", end, { once: true });
+    window.addEventListener("pointercancel", end, { once: true });
+  });
+
+  handle.addEventListener("dblclick", resetHeight);
+  handle.addEventListener("keydown", (event) => {
+    if (!["ArrowUp", "ArrowDown"].includes(event.key)) return;
+    event.preventDefault();
+    const delta = event.key === "ArrowDown" ? 24 : -24;
+    applyHeight(checklist.getBoundingClientRect().height + delta, true);
+  });
+
+  try {
+    const saved = Number(localStorage.getItem(SENSOR_CHECKLIST_HEIGHT_STORAGE_KEY));
+    if (Number.isFinite(saved) && saved >= minimum) applyHeight(saved, false);
+    else resetHeight();
+  } catch (_error) {
+    resetHeight();
+  }
+}
+
 initializeColumnResizers();
 initializeVerticalPanelResizer();
+initializeSensorChecklistResizer();
 initialize();
 
 // Unified sensor-interface cards.  The legacy driver/endpoint fields remain

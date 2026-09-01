@@ -327,20 +327,57 @@ output { color: var(--blue); font-weight: 800; }
   box-sizing: border-box;
   overflow-x: hidden;
   overflow-y: auto;
-  /* 16-channel schemes wrap the 采/入/出 labels in a narrow sidebar.
-     The former 470 px cap therefore clipped the final rows. */
-  max-height: 760px;
+  /* The explicit height is controlled by the drag handle below. */
+  height: 760px;
+  min-height: 260px;
+  max-height: 1200px;
   padding-bottom: 12px;
   scroll-padding-bottom: 12px;
   scrollbar-gutter: stable;
   border: 1px solid var(--line);
   border-radius: 5px;
 }
+.sensor-checklist-resizer {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 14px;
+  margin-top: -1px;
+  box-sizing: border-box;
+  cursor: ns-resize;
+  color: #4d86ae;
+  background: #edf6fc;
+  border: 1px solid #b8d5e8;
+  border-radius: 0 0 5px 5px;
+  user-select: none;
+}
+.sensor-checklist-resizer::before {
+  content: "";
+  position: absolute;
+  left: 12%;
+  right: 12%;
+  top: 6px;
+  height: 2px;
+  border-radius: 2px;
+  background: #8bb7d3;
+}
+.sensor-checklist-resizer span { position: relative; z-index: 1; padding: 0 5px; background: #edf6fc; font-size: 9px; line-height: 1; }
+.sensor-checklist-resizer:hover,
+.sensor-checklist-resizer:focus-visible,
+.sensor-checklist-resizer.dragging { color: #fff; background: var(--blue); border-color: var(--blue); outline: none; }
+.sensor-checklist-resizer:hover::before,
+.sensor-checklist-resizer:focus-visible::before,
+.sensor-checklist-resizer.dragging::before { background: #d8effc; }
+.sensor-checklist-resizer:hover span,
+.sensor-checklist-resizer:focus-visible span,
+.sensor-checklist-resizer.dragging span { background: var(--blue); }
+body.resizing-sensor-list { cursor: ns-resize; user-select: none; }
 .sensor-capture-toolbar { position: sticky; top: 0; z-index: 3; display: flex; align-items: center; gap: 6px; min-height: 30px; padding: 3px 5px; background: #f5f9fc; border-bottom: 1px solid var(--line); }
 .sensor-capture-count { flex: 1; color: #31536c; font-size: 9px; font-weight: 700; }
 .sensor-capture-toolbar .compact-button { min-height: 22px; padding: 2px 7px; font-size: 9px; }
 .sensor-checklist-header, .sensor-checklist-row { display: grid; grid-template-columns: minmax(74px,1fr) repeat(3, minmax(30px, 36px)) minmax(82px, 1.2fr); align-items: center; min-height: 24px; width: 100%; box-sizing: border-box; padding: 2px 3px; border-bottom: 1px solid #e8eff4; font-size: 8px; text-align: center; }
-.sensor-checklist-header { position: sticky; top: 30px; z-index: 2; color: #fff; background: var(--navy); font-weight: 800; }
+.sensor-checklist-header { position: sticky; top: 0; z-index: 3; color: #fff; background: var(--navy); font-weight: 800; }
 .sensor-checklist-row:last-child { border-bottom: 0; }
 .sensor-checklist-name { min-width: 0; overflow: visible; color: #486175; text-align: left; text-overflow: clip; white-space: normal; overflow-wrap: anywhere; word-break: break-word; line-height: 1.25; }
 .sensor-checklist-row input { width: 13px; height: 13px; margin: auto; accent-color: var(--blue); }

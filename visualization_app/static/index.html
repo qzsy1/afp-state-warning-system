@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AFP 实时预测与状态预警系统</title>
-  <link rel="stylesheet" href="/styles.css?v=20260901-channel-height-1">
+  <link rel="stylesheet" href="/styles.css?v=20260901-channel-resize-1">
 </head>
 <body>
   <div class="app-shell">
@@ -150,6 +150,11 @@
             <div id="interfacePanel" class="interface-panel"></div>
             <p class="control-note">温度1～温度8均可独立选择。停止采集时可自由勾选、取消或使用全选/清空；采集中为保证同一文件通道定义不变会暂时锁定。接口勾选、角色和通道映射同时作用于显示、CSV和MySQL。</p>
             <div id="liveSensorChecklist" class="sensor-checklist"></div>
+            <div id="sensorChecklistResizer" class="sensor-checklist-resizer" role="separator"
+                 aria-label="调整传感器通道区域高度" aria-orientation="horizontal" tabindex="0"
+                 title="上下拖动调整传感器通道区域高度；双击恢复默认高度">
+              <span aria-hidden="true">•••</span>
+            </div>
             <p class="control-note sensor-prediction-note">仅采集模式只使用“采集保存”；预测模式要求输入通道与模型元数据一致，输出通道决定预测曲线及健康指标数据。</p>
             <label class="hardware-auto-toggle">
               <input id="autoHardwareCheckInput" type="checkbox" checked>
@@ -364,6 +369,6 @@
     </div>
   </div>
   <div id="toast" class="toast"></div>
-  <script src="/app.js?v=20260901-parameter-before-start-1"></script>
+  <script src="/app.js?v=20260901-channel-resize-1"></script>
 </body>
 </html>
