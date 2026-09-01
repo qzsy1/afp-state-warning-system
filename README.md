@@ -1,64 +1,56 @@
-﻿# AFP 瀹炴椂棰勬祴涓庣姸鎬侀璀︾郴缁?
+# AFP 实时预测、三级状态预警与模型训练系统
 
-## 当前公开版本：包含模型训练过程
+本项目面向自动铺丝（AFP）过程，集成多接口传感器采集、模拟回放、时序预测、在线健康指标、窗口级—铺层级—试样级状态预警、CSV/MySQL 保存、数据整合以及预测/预警模型训练。
 
-本仓库当前版本已包含完整的模型训练链路，不仅是采集、I-ModernTCN 预测和三级状态预警演示。训练中心支持导入采集格式的 CSV 文件夹或 MySQL 数据，统一整理数据，配置训练参数，实时显示 epoch/patience 进度，停止训练并将预测模型和预警模型保存到指定位置。原生 Windows 软件也已将训练中心与实时采集、预测和预警界面合并，启动软件后可从顶部的“模型训练中心”进入。
+当前开发分支 `feature/modular-runtime-v2` 已完成模块化改造：桌面 EXE 作为稳定启动器，采集、驱动、存储、预测、健康指标、预警、训练、数据整合、界面和配置均保留为外部模块。普通业务修改不再需要重新生成整个 EXE。
 
-Windows 发布包请从仓库 Releases 下载，软件包名称为 `AFP_Integrated_Native_System_Windows_20260814_0020.zip`。解压后保持 `AFP_Integrated_System.exe` 与 `_internal` 文件夹在同一目录。
+## 主要功能
 
-源码入口：
+- 旧数据、新数据（16 个传感器）和自定义数据模式；
+- 真实采集与模拟采集严格分离，支持多接口、接口角色和通道双向映射；
+- CSV 单文件、采集文件夹和采集格式 MySQL 数据源；
+- 多算法预测模型与权重匹配，支持预测步长 1–600；
+- TC-HI、T-HI、C-HI、RFHI、PR-HI、MPRF-HI、PCA-SPE-HI、KECA-SPE-HI；
+- 窗口级、铺层级和按实际铺层数形成的试样级状态证据；
+- 本地文件优先保存、MySQL 关系表/外键/索引/平面视图及数据整合；
+- 预测模型训练和预测—预警联合训练，支持 epoch、patience、继续训练、停止并保存；
+- 模块健康检查、文件完整性校验、独立更新和回滚。
 
-- `visualization_app/native_frontend_launcher.py`：原生窗口入口，嵌入原三栏监测前端；
-- `visualization_app/static/training.html`、`training.js`：模型训练页面；
-- `visualization_app/web_training.py`、`web_training_pipeline.py`：数据导入、整理、预测训练和预警训练链路；
-- `visualization_app/build_native_integrated_app.ps1`：包含训练过程的原生 Windows 打包脚本。
+## 模块化源码入口
 
-璇ヤ粨搴撳寘鍚嚜鍔ㄩ摵涓濓紙AFP锛夌郴缁熺殑瀹炴椂閲囬泦銆両-ModernTCN 澶氬彉閲忛娴嬨€佸湪绾垮仴搴锋寚鏍囪绠楋紝浠ュ強鈥滅獥鍙ｇ骇 鈫?閾哄眰绾?鈫?瀹為檯閾哄眰鏁拌瘯鏍风骇鈥濈殑鐘舵€侀璀︾晫闈㈡簮鐮併€?
+- `modular_runtime/launcher_entry.py`：稳定启动器入口；
+- `modular_runtime/app/bootstrap.py`：外部业务启动和诊断入口；
+- `modular_runtime/app/core`：模块契约、装载、事件和更新回滚；
+- `modular_runtime/app/modules`：九个可独立维护的业务模块；
+- `visualization_app`：已经验证的原有业务兼容实现与前端；
+- `modular_runtime/build_modular_app.ps1`：Windows 自包含软件构建；
+- `modular_runtime/scripts/create_module_patch.py`：按 Git 差异制作模块补丁。
 
-## 浣跨敤鏂瑰紡
+详细方案见 [模块化 Git 开发维护与发布方案](docs/模块化Git开发维护与发布方案.md)，当前复测见 [模块化 v2 验证报告](docs/模块化v2验证报告.md)。
 
-鏅€?Windows 浣跨敤鑰呭簲浠庨」鐩殑 **Releases** 涓嬭浇 `AFP_State_Warning_System_Windows.zip`锛岃В鍘嬪悗杩愯 `AFP_State_Warning_System.exe`銆傝杞欢鍖呭寘鍚繍琛屾椂銆侀粯璁ら娴嬫ā鍨嬪拰婕旂ず鏁版嵁锛屾棤闇€瀹夎 Python锛屼篃涓嶄緷璧栧紑鍙戠數鑴戜笂鐨勫伐绋嬭矾寰勩€?
-
-婧愮爜寮€鍙戝彲鍦?Python 3.11 鐜涓墽琛岋細
-
-```powershell
-cd visualization_app
-python -m pip install -r requirements.txt
-python app.py
-```
-
-闅忓悗鎵撳紑 `http://127.0.0.1:8765/`銆傛墽琛?`python test_app.py` 鍙繘琛屽熀鏈姛鑳芥祴璇曘€?
-
-## 鍔熻兘鑼冨洿
-
-- 鏄剧ず鍏ㄩ儴宸查€夋嫨浼犳劅鍣ㄧ殑閲囬泦鍊笺€佹湭鏉ラ娴嬪€间笌棰勬祴/鐪熷疄瀵归綈缁撴灉锛?
-- 鏀寔浠呴噰闆嗐€佹紨绀哄洖鏀惧拰瀹炴椂棰勬祴锛?
-- 鏀寔閫夋嫨杈撳叆浼犳劅鍣ㄣ€侀娴嬭緭鍑恒€佹湭鏉ユ闀垮強鍋ュ悍鎸囨爣/寮傚父鍒嗘暟妯″瀷锛?
-- 閲囩敤 TC-HI銆乀-HI銆丆-HI銆丷FHI銆丳R-HI 绛夊仴搴锋寚鏍囷紝骞剁粰鍑烘帹鑽愭ā鍨嬶紱
-- 浠ョ獥鍙ｃ€侀摵灞傚拰璇曟牱涓夌骇灞曠ず棰勮璇佹嵁锛岃瘯鏍风骇鎸夊疄闄呭凡缁忛噰闆嗙殑閾哄眰鏁板姩鎬佽仛鍚堬紱
-- 閲囬泦鏁版嵁鎸夆€滀繚瀛樹綅缃?璇曟牱鍚?宸ヨ壓鍙傛暟/璇曟牱鍚?宸ヨ壓鍙傛暟缁勫悎+閾哄眰鏁扳€濅繚瀛橈紝鍚屾椂淇濈暀瀹屾暣璇曟牱涓庡崟灞傛枃浠讹紱
-- 瀵规帴 JSON Lines 浼犳劅鍣ㄦ祦锛屽苟鏄剧ず杩炴帴鍜屾暟鎹帴鏀剁姸鎬侊紱
-- 鏈湴鏂囦欢淇濆瓨鎴愬姛鍚庯紝鍙寜灞備簨鍔″悓姝ヨ嚦鎸囧畾 MySQL 鏁版嵁搴擄紝骞堕€氳繃鍏崇郴瑙嗗浘鏌ョ湅宸ュ喌鈥旇瘯鏍封€旂嫭绔嬮噸澶嶁€旈摵灞傚叧绯汇€?
-
-## 鏁版嵁鍜屾ā鍨嬭竟鐣?
-
-鍘熷閲囬泦鏁版嵁銆佸疄楠岀粨鏋溿€佽缁冩鏌ョ偣鍜屼釜浜轰繚瀛樿矾寰勪笉闅忔簮鐮佷粨搴撳叕寮€銆傚彂甯冨寘涓粎鍖呭惈杩愯婕旂ず鎵€闇€鐨勮繍琛屾椂鍓湰銆傚疄闄呯敓浜ч儴缃插墠搴斾互宸叉牎鍑嗙殑浼犳劅鍣ㄣ€佺粡楠岃瘉鐨勬ā鍨嬪拰鐪熷疄缂洪櫡/鎬ц兘璇佹嵁閲嶆柊纭闃堝€间笌閫傜敤鑼冨洿銆?
-
-## 鎵撳寘
-
-鍦ㄥ叿澶囪繍琛岃祫浜х殑寮€鍙戝伐浣滃尯涓墽琛岋細
+## 开发验证
 
 ```powershell
-cd visualization_app
-powershell -ExecutionPolicy Bypass -File .\build_desktop_app.ps1
+python modular_runtime/launcher_entry.py --module-status
+python modular_runtime/launcher_entry.py --self-test
+python -m unittest discover -s modular_runtime/tests -v
 ```
 
-杈撳嚭浣嶄簬 `visualization_app/release/AFP_State_Warning_System`銆傛墦鍖呰剼鏈細澶嶅埗鐢ㄤ簬 I-ModernTCN 鎺ㄧ悊鐨勮繍琛屼唬鐮併€佹鏌ョ偣銆佸仴搴锋寚鏍囧伐浠跺拰婕旂ず鏁版嵁锛涙簮鐮佷粨搴撶殑 `.gitignore` 浼氭帓闄よ繖浜涘ぇ浣撶Н杩愯璧勪骇銆?
+Windows 发布软件还支持：
 
-## 绯荤粺浠嬬粛鏂囨。
+```powershell
+AFP_Integrated_System_Modular.exe --self-test
+AFP_Integrated_System_Modular.exe --verify-files
+AFP_Integrated_System_Modular.exe --integration-smoke
+AFP_Integrated_System_Modular.exe --functional-smoke
+```
 
-涓巚1.11.0瀹炵幇瀵瑰簲鐨勮鏂囧熀纭€绔犺妭浣嶄簬锛?
+无控制台软件会把命令结果写入 `runtime/*_result.json`。
 
-`thesis_draft/AFP瀹炴椂棰勬祴涓庝笁绾х姸鎬侀璀︾郴缁熸牳蹇冩祦绋嬭鏄巁杞欢鏁版嵁搴撻泦鎴愭洿鏂扮増_v5.docx`
+## 使用与发布边界
 
-鍏朵腑璇存槑浜?6涓疄闄呴噰闆嗛€氶亾銆佺洰鏍囨椂鍒荤粦瀹氶娴嬨€佺獥鍙ｂ€旈摵灞傗€斿疄闄呴摵灞傛暟璇曟牱涓夌骇CAP銆佷换鎰忛摵灞?鐙珛閲嶅銆佹湰鍦版枃浠朵紭鍏堜繚瀛樸€丮ySQL澶栭敭/绱㈠紩/鍏崇郴瑙嗗浘鍜岃蒋浠堕獙璇佽竟鐣屻€?
+完整 Windows 软件文件夹可直接复制到其它 Windows 电脑，目标电脑不需要另装 Python、PyTorch 或 Git，但必须保持 EXE、`_internal`、`app`、`config`、`models` 和 `native_dll` 的相对位置。使用 MySQL 时需要可访问的 MySQL Server；使用真实传感器时需要相应设备、驱动、通信参数与权限。
+
+原始采集数据、正式实验数据库、个人路径、训练权重和生成软件包不直接放入源码提交历史。大型软件包与权重应通过 GitHub Releases 发布。
+
+模拟/OOD/弱标签预警只表示模型证据，不等同于独立确认的真实缺陷。生产部署和论文结论应使用真实传感器、独立缺陷检测或力学性能证据重新确认阈值、精度和适用范围。
