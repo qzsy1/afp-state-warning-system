@@ -320,7 +320,22 @@ output { color: var(--blue); font-weight: 800; }
 .recommendation-card.not-recommended, .model-file-status.error, .acquisition-status.error { color: #a23c45; background: #fff0f1; border-color: #f2c6ca; }
 .model-file-status.ok, .acquisition-status.ok { color: #19704f; background: #eefaf5; border-color: #c2e9d8; }
 .sensor-selector-title { margin-top: 2px; color: var(--navy); font-size: 10px; font-weight: 800; }
-.sensor-checklist { width: 100%; min-width: 0; max-width: 100%; box-sizing: border-box; overflow-x: hidden; overflow-y: auto; max-height: 470px; padding-bottom: 4px; scrollbar-gutter: stable; border: 1px solid var(--line); border-radius: 5px; }
+.sensor-checklist {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow-x: hidden;
+  overflow-y: auto;
+  /* 16-channel schemes wrap the 采/入/出 labels in a narrow sidebar.
+     The former 470 px cap therefore clipped the final rows. */
+  max-height: 760px;
+  padding-bottom: 12px;
+  scroll-padding-bottom: 12px;
+  scrollbar-gutter: stable;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+}
 .sensor-capture-toolbar { position: sticky; top: 0; z-index: 3; display: flex; align-items: center; gap: 6px; min-height: 30px; padding: 3px 5px; background: #f5f9fc; border-bottom: 1px solid var(--line); }
 .sensor-capture-count { flex: 1; color: #31536c; font-size: 9px; font-weight: 700; }
 .sensor-capture-toolbar .compact-button { min-height: 22px; padding: 2px 7px; font-size: 9px; }
