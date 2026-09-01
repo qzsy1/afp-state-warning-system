@@ -25,6 +25,7 @@ const state = {
   hardwareCheckInProgress: false,
   hardwareCheckTimer: null,
   autoCheckInterval: null,
+  mysqlConnectionTest: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -661,6 +662,7 @@ async function testMysqlConnection() {
       mysql_database: controls.mysqlDatabase.value.trim() || "afp_state_warning",
       mysql_charset: "utf8mb4",
     });
+    state.mysqlConnectionTest = result;
     status.classList.toggle("ok", Boolean(result.ok));
     status.classList.toggle("error", !result.ok);
     const errorText = String(result.error || "未知错误");
@@ -671,6 +673,7 @@ async function testMysqlConnection() {
       ? `MySQL 已连接：${result.database}（${result.driver}）`
       : `MySQL 连接失败：${friendlyError}`;
   } catch (error) {
+    state.mysqlConnectionTest = {ok: false, error: error.message};
     status.classList.remove("ok");
     status.classList.add("error");
     status.textContent = `MySQL 连接失败：${error.message}`;
@@ -755,6 +758,21 @@ async function refreshRelationMap() {
 function renderMysqlStatus(mysql) {
   const status = $("mysqlStatus");
   if (!status || !mysql) return;
+  const selectedInUi = Boolean(controls.mysqlEnabled?.checked);
+  if (!mysql.enabled && selectedInUi) {
+    const tested = state.mysqlConnectionTest;
+    status.classList.toggle("ok", Boolean(tested?.ok));
+    status.classList.toggle("error", Boolean(tested && tested.ok === false));
+    if (tested?.ok) {
+      status.textContent =
+        `MySQL 已连接：${tested.database}（${tested.driver}）；采集完成后将批量写入。`;
+    } else if (tested?.error) {
+      status.textContent = `MySQL 连接失败：${tested.error}`;
+    } else {
+      status.textContent = "MySQL 保存已勾选；请点击“检查 MySQL”确认连接，采集完成后批量写入。";
+    }
+    return;
+  }
   status.classList.toggle("ok", Boolean(mysql.ok));
   status.classList.toggle(
     "error",
@@ -1983,6 +2001,19 @@ controls.discoverInterfaces?.addEventListener("click", discoverInterfaces);
 controls.addInterface?.addEventListener("click", addInterface);
 $("testMysqlButton")?.addEventListener("click", testMysqlConnection);
 $("refreshRelationMapButton")?.addEventListener("click", refreshRelationMap);
+controls.mysqlEnabled?.addEventListener("change", () => {
+  if (!controls.mysqlEnabled.checked) state.mysqlConnectionTest = null;
+  renderMysqlStatus({enabled: false, ok: false, saved_rows: 0});
+});
+[controls.mysqlHost, controls.mysqlPort, controls.mysqlUser,
+ controls.mysqlPassword, controls.mysqlDatabase].forEach((control) => {
+  control?.addEventListener("input", () => {
+    state.mysqlConnectionTest = null;
+    if (controls.mysqlEnabled?.checked) {
+      renderMysqlStatus({enabled: false, ok: false, saved_rows: 0});
+    }
+  });
+});
 controls.mysqlDatabase?.addEventListener("change", () => {
   const status = $("mysqlStatus");
   if (status) {

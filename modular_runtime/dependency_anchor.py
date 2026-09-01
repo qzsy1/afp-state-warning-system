@@ -10,9 +10,11 @@ if getattr(sys, "frozen", False) and os.environ.get("AFP_FORCE_DEPENDENCY_IMPORT
     import joblib  # noqa: F401
     import mysql.connector  # noqa: F401
     import numpy  # noqa: F401
+    import openpyxl  # noqa: F401
     import pandas  # noqa: F401
     import serial  # noqa: F401
     import sklearn  # noqa: F401
     import torch  # noqa: F401
     import torch_geometric  # noqa: F401
     import webview  # noqa: F401
+    import xlrd  # noqa: F401

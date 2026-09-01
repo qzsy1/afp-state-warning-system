@@ -1,7 +1,7 @@
 param(
     [string]$PythonExecutable = "",
     [string]$ReferenceRelease = "F:\AFP_Integrated_Native_InterfaceMapped\AFP_Integrated_System_SMRF_HID_Restored_20260824_v1.12.1\AFP_Integrated_System",
-    [string]$TargetDir = "F:\AFP_Integrated_Modular_v2\delivery\AFP_Integrated_System_Modular_v2.0.0",
+    [string]$TargetDir = "F:\AFP_Integrated_Modular_v2\delivery\AFP_Integrated_System_Modular_v2.0.1",
     [switch]$SkipExecutableBuild
 )
 
@@ -52,8 +52,11 @@ if (-not $SkipExecutableBuild) {
         "-m", "PyInstaller", "--noconfirm", "--clean", "--onedir", "--noconsole",
         "--name", "AFP_Integrated_System_Modular",
         "--collect-all", "torch_geometric",
+        "--collect-all", "openpyxl", "--collect-all", "xlrd",
         "--collect-submodules", "mysql.connector",
         "--collect-submodules", "serial",
+        "--hidden-import", "tkinter", "--hidden-import", "tkinter.filedialog",
+        "--hidden-import", "tkinter.messagebox", "--hidden-import", "tkinter.ttk",
         "--hidden-import", "webview", "--hidden-import", "webview.platforms.winforms",
         "--hidden-import", "sklearn.ensemble._forest",
         "--hidden-import", "sklearn.ensemble._iforest",
@@ -104,12 +107,12 @@ Copy-Item -LiteralPath (Join-Path $ScriptDir "app\bootstrap.py") -Destination $a
 Copy-Item -LiteralPath (Join-Path $ScriptDir "app\core") -Destination $appTarget -Recurse
 Copy-Item -LiteralPath (Join-Path $ScriptDir "app\modules") -Destination $appTarget -Recurse
 Copy-Item -LiteralPath (Join-Path $ScriptDir "config\runtime.delivery.json") -Destination (Join-Path $configTarget "runtime.json") -Force
-foreach ($name in @("模块化Git开发维护与发布方案.md", "模块化v2验证报告.md")) {
-    $source = Join-Path (Join-Path $RepoRoot "docs") $name
-    if (-not (Test-Path -LiteralPath $source)) {
-        throw "Modular documentation missing: $source"
-    }
-    Copy-Item -LiteralPath $source -Destination $docsTarget -Force
+$documentation = Get-ChildItem -LiteralPath (Join-Path $RepoRoot "docs") -Filter "*.md" -File
+if (-not $documentation) {
+    throw "Modular documentation directory does not contain Markdown files."
+}
+$documentation | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination $docsTarget -Force
 }
 
 $legacyFiles = @(
@@ -151,21 +154,22 @@ foreach ($directory in @("logs", "runtime", "rollback", "updates", "verification
 }
 
 @{
-    application_version = "2.0.0"
-    launcher_version = "2.0.0"
+    application_version = "2.0.1"
+    launcher_version = "2.0.1"
     module_api_version = "2.0"
     baseline = "v1.12.1-r3"
     built_at = (Get-Date).ToString("o")
 } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $TargetDir "VERSION.json") -Encoding UTF8
 
 @(
-    "AFP Integrated System Modular v2.0.0",
+    "AFP Integrated System Modular v2.0.1",
     "====================================",
     "Start: AFP_Integrated_System_Modular.exe",
     "Application logic is stored in app/modules and app/legacy and can be updated without rebuilding the EXE.",
     "UI files are in app/ui; configuration is in config/runtime.json; prediction weights are in models.",
     "Keep the complete directory together.  Another PC does not need Python, PyTorch or Git.",
     "Use --module-status or --self-test for diagnostics; use --verify-files for SHA-256 integrity verification.",
+    "Use --mysql-smoke and --spreadsheet-smoke to verify database and Excel runtime dependencies.",
     "Use verified patch ZIP files for module updates. Mutable logs, runtime data and verification outputs are not in SHA256SUMS.txt."
 ) | Set-Content -LiteralPath (Join-Path $TargetDir "README.txt") -Encoding UTF8
 

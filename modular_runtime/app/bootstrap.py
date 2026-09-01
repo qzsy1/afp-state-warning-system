@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
+import os
 import sys
 import threading
 import time
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 
-APP_VERSION = "2.0.0-dev"
+APP_VERSION = "2.0.1-dev"
 API_VERSION = "2.0"
 
 
@@ -82,11 +85,40 @@ def self_test(context: Any, manager: Any) -> dict[str, Any]:
         context.paths.native_dll_dir / "libusb-1.0.dll",
     ]
     missing = [str(path) for path in required if not path.exists()]
+    dependency_status: dict[str, dict[str, Any]] = {}
+    for name in ("tkinter", "mysql.connector", "openpyxl", "xlrd"):
+        try:
+            module = importlib.import_module(name)
+            if name == "tkinter":
+                # Importing _tkinter alone is not sufficient in a frozen build:
+                # Tcl/Tk data files can still be absent.  Creating a hidden root
+                # verifies the same runtime path used by the file/folder pickers.
+                root = module.Tk()
+                root.withdraw()
+                root.update_idletasks()
+                root.destroy()
+            dependency_status[name] = {
+                "ok": True,
+                "version": str(
+                    getattr(module, "__version__", "")
+                    or getattr(module, "TkVersion", "")
+                ),
+            }
+        except Exception as exc:
+            dependency_status[name] = {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
     status = manager.status()
     result = {
-        "ok": not missing and bool(status["all_healthy"]),
+        "ok": (
+            not missing
+            and bool(status["all_healthy"])
+            and all(item["ok"] for item in dependency_status.values())
+        ),
         "version": str(context.config.get("application_version", APP_VERSION)),
         "missing": missing,
+        "dependencies": dependency_status,
         "modules": status,
     }
     if not result["ok"]:
@@ -155,6 +187,116 @@ def integration_smoke(context: Any, manager: Any) -> dict[str, Any]:
     finally:
         server.shutdown()
         server.server_close()
+
+
+def mysql_smoke(
+    context: Any,
+    *,
+    host: str,
+    port: int,
+    user: str,
+    password: str,
+    database: str,
+) -> dict[str, Any]:
+    """Create schema, write one layer and read its relation row using packaged dependencies."""
+    mysql_storage = _legacy_module("mysql_storage", context)
+    settings = mysql_storage.MySQLSettings(
+        enabled=True,
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        database=database,
+        charset="utf8mb4",
+        connect_timeout=5,
+    )
+    store = mysql_storage.MySQLCaptureStore(settings)
+    connection = store.test_connection()
+    if not connection.get("ok"):
+        raise RuntimeError(str(connection.get("error") or "MySQL connection test failed"))
+    config = SimpleNamespace(
+        p=600.0,
+        v=100.0,
+        pr=600.0,
+        initial_compaction_force_N=600.0,
+        placement_speed_mm_s=100.0,
+        pid_angle_deg=0.0,
+        temperature_setpoint_C=360.0,
+        layer=0,
+        specimen_id="MODULAR_MYSQL_SMOKE",
+        replicate=1,
+        dataset_schema="new_collection_v11_3",
+        run_id="MODULAR_MYSQL_SMOKE_RUN",
+        schema_sensors=["温度1", "压力"],
+        process_columns=["p", "v", "pr"],
+    )
+    rows = [
+        {
+            "时间": "2026-09-01T00:00:00.000",
+            "timestamp_unix": 0.0,
+            "温度1": 235.5,
+            "压力": 600.0,
+            "p": 600.0,
+            "v": 100.0,
+            "pr": 600.0,
+        },
+        {
+            "时间": "2026-09-01T00:00:00.010",
+            "timestamp_unix": 0.01,
+            "温度1": 236.0,
+            "压力": 601.0,
+            "p": 600.0,
+            "v": 100.0,
+            "pr": 600.0,
+        },
+    ]
+    saved = store.save_layer(
+        config,
+        rows=rows,
+        layer_file="mysql_smoke_layer.csv",
+        full_specimen_file="mysql_smoke_complete.csv",
+        timestamp_file="mysql_smoke_timestamp.csv",
+        folder_path=str(context.paths.runtime_dir / "mysql_smoke"),
+        summary={"completed_layers": [1], "diagnostic": True},
+    )
+    if not saved.get("ok"):
+        raise RuntimeError(str(saved.get("error") or "MySQL write test failed"))
+    relation = store.relation_map(limit=10)
+    if not relation.get("ok") or not relation.get("rows"):
+        raise RuntimeError(str(relation.get("error") or "MySQL read-back test failed"))
+    return {
+        "ok": True,
+        "database": database,
+        "driver": connection.get("driver"),
+        "saved_rows": saved.get("saved_rows"),
+        "relation_rows": relation.get("count"),
+        "specimen_key": saved.get("specimen_key"),
+    }
+
+
+def spreadsheet_smoke(context: Any) -> dict[str, Any]:
+    """Verify packaged Excel engines by writing and reading a small workbook."""
+    pandas = importlib.import_module("pandas")
+    output_dir = context.root / "verification" / "spreadsheet_smoke"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    workbook = output_dir / "excel_roundtrip.xlsx"
+    expected = pandas.DataFrame(
+        {
+            "工况": ["p600_v100_pr600", "p700_v100_pr600"],
+            "铺层": [1, 2],
+            "温度1": [235.5, 241.0],
+        }
+    )
+    expected.to_excel(workbook, index=False, engine="openpyxl")
+    actual = pandas.read_excel(workbook, engine="openpyxl")
+    if list(actual.columns) != list(expected.columns) or len(actual) != len(expected):
+        raise RuntimeError("Excel round-trip columns or row count did not match")
+    return {
+        "ok": True,
+        "file": str(workbook),
+        "rows": int(len(actual)),
+        "columns": list(actual.columns),
+    }
 
 
 def functional_smoke(context: Any, manager: Any) -> dict[str, Any]:
@@ -290,6 +432,13 @@ def main(root: Path, arguments: list[str] | None = None) -> None:
     parser.add_argument("--verify-files", action="store_true")
     parser.add_argument("--integration-smoke", action="store_true")
     parser.add_argument("--functional-smoke", action="store_true")
+    parser.add_argument("--mysql-smoke", action="store_true")
+    parser.add_argument("--spreadsheet-smoke", action="store_true")
+    parser.add_argument("--mysql-host", default="127.0.0.1")
+    parser.add_argument("--mysql-port", type=int, default=3306)
+    parser.add_argument("--mysql-user", default="root")
+    parser.add_argument("--mysql-password", default=os.environ.get("AFP_MYSQL_PASSWORD", ""))
+    parser.add_argument("--mysql-database", default="afp_modular_smoke")
     parser.add_argument("--module-status", action="store_true")
     parser.add_argument("--reload-module", default="")
     parser.add_argument("--install-patch", default="")
@@ -319,6 +468,23 @@ def main(root: Path, arguments: list[str] | None = None) -> None:
         return
     if args.functional_smoke:
         _emit_command_result(context, "functional-smoke", functional_smoke(context, manager))
+        return
+    if args.mysql_smoke:
+        _emit_command_result(
+            context,
+            "mysql-smoke",
+            mysql_smoke(
+                context,
+                host=args.mysql_host,
+                port=args.mysql_port,
+                user=args.mysql_user,
+                password=args.mysql_password,
+                database=args.mysql_database,
+            ),
+        )
+        return
+    if args.spreadsheet_smoke:
+        _emit_command_result(context, "spreadsheet-smoke", spreadsheet_smoke(context))
         return
     if args.module_status:
         _emit_command_result(context, "module-status", manager.status())
