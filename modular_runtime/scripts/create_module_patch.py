@@ -29,6 +29,10 @@ def target_path(source: str) -> str | None:
             return target
         if source.startswith(prefix):
             relative = source[len(prefix):]
+            if prefix == "visualization_app/" and (
+                relative.startswith("test_") or relative.endswith("_test.py")
+            ):
+                return None
             if prefix == "visualization_app/" and "/" in relative:
                 return None
             return target + relative
@@ -73,4 +77,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

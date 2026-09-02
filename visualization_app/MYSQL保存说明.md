@@ -4,7 +4,7 @@
 
 系统先将当前铺层完整写入本地 CSV、时间戳文件和采集摘要；停止并保存成功后，才执行一次 MySQL 事务写入。数据库异常不会中断采集。
 
-同一试样使用 `specimen_id + condition_id + replicate + dataset_schema` 作为稳定标识。再次保存同一层时使用主键幂等更新，不会产生重复采样点。后续层会更新试样的层数和完整试样文件路径。
+同一物理试样使用系统生成的`capture_uuid`，再结合工艺参数条件和独立重复构造稳定主键。相同试样的各层共用同一个`capture_uuid`；从第1层开始采集新试样时自动生成新编号。再次保存同一层时使用主键幂等更新，不会产生重复采样点。后续层会更新试样的层数和完整试样文件路径。
 
 ## 界面设置
 
@@ -63,4 +63,4 @@ afp_sample_all / afp_sensor_sample
 
 ## 依赖
 
-安装 `requirements.txt` 中的 `mysql-connector-python`。如果数据库暂时不可用，系统会在采集记录目录生成 `mysql_pending.json`，同时保留全部本地数据。
+安装 `requirements.txt` 中的 `mysql-connector-python`。如果数据库暂时不可用，系统会在采集记录目录生成`mysql_pending.json`，同时保留全部本地数据。以后同一主机、端口、用户和数据库恢复且完成新一层保存时，程序自动补传最多20条历史待同步记录；补传成功后改为`mysql_synced.json`，其中保留补传时间和写入结果。

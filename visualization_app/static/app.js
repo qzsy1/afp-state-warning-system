@@ -443,11 +443,22 @@ function renderAcquisitionStatus(status) {
       && (captureOnly || !rowCollect?.checked)
     );
   });
+  const captureUuid = status.capture_uuid
+    ? String(status.capture_uuid)
+    : "";
+  const quality = status.data_quality || {};
+  const qualityText = !status.running && Number(quality.sample_count) > 1
+    ? ` · 实际采样 ${Number(quality.effective_sample_rate_hz || 0).toFixed(2)} Hz` +
+      ` · 最大间隔 ${Number(quality.maximum_gap_ms || 0).toFixed(1)} ms`
+    : "";
   node.textContent =
     `${status.running ? "采集中" : "已停止"} · ${status.sample_count || 0}点 · ` +
     `${captureOnly
       ? `采集通道 ${healthy.length}/${selected.length} 正常`
       : `模型输入 ${expectedInputCount}通道 · 模型输出 ${predictionCount}通道`} · ${readiness}` +
+    `${captureUuid ? ` · 试样会话：${captureUuid}` : ""}` +
+    qualityText +
+    `${status.archived_previous_session ? " · 已自动归档上一试样，避免混层" : ""}` +
     `${status.layer_file ? ` · 分层文件：${status.layer_file}` : ""}` +
     `${status.full_specimen_file ? ` · 完整试样：${status.full_specimen_file}` : ""}` +
     `${status.last_error ? ` · 错误：${status.last_error}` : ""}`;
@@ -783,7 +794,9 @@ function renderMysqlStatus(mysql) {
   } else if (mysql.state === "pending" || mysql.ok === null || mysql.ok === undefined) {
     status.textContent = "MySQL 已启用；等待本次采集完成后批量写入。";
   } else if (mysql.ok) {
-    status.textContent = `第${mysql.layer || ""}层已写入 MySQL：${mysql.database}，${mysql.saved_rows || 0} 行`;
+    const retried = Number(mysql.pending_retry?.succeeded || 0);
+    status.textContent = `第${mysql.layer || ""}层已写入 MySQL：${mysql.database}，${mysql.saved_rows || 0} 行` +
+      `${retried > 0 ? `；同时自动补传 ${retried} 条历史待同步记录` : ""}`;
   } else if (mysql.error) {
     const errorText = String(mysql.error);
     const friendlyError = errorText.includes("1045") || errorText.toLowerCase().includes("access denied")

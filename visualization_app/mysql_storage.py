@@ -534,10 +534,14 @@ class MySQLCaptureStore:
     @staticmethod
     def specimen_key(config: Any) -> str:
         condition_key = process_condition_key(config)
+        capture_uuid = str(getattr(config, "capture_uuid", "") or "").strip()
+        specimen_identity = capture_uuid or str(
+            getattr(config, "specimen_id", "LIVE_SPECIMEN")
+        )
         return "|".join(
             [
                 condition_key,
-                str(getattr(config, "specimen_id", "LIVE_SPECIMEN")),
+                specimen_identity,
                 f"R{int(getattr(config, 'replicate', 1))}",
             ]
         )[:320]
