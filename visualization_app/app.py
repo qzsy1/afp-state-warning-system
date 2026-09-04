@@ -1118,7 +1118,7 @@ class DashboardData:
                 )
                 if not np.isfinite(cached).all():
                     raise ValueError(
-                        "所选预测模型未覆盖历史回放状态预警所需的全部传感器输出"
+                        "所选预测模型未覆盖历史数据状态预警所需的全部传感器输出"
                     )
                 self.replay_prediction_cache[cache_key] = cached
             outputs.append(cached)
@@ -1352,7 +1352,7 @@ class DashboardData:
         prediction_model_type: str = "i_T_G",
     ) -> dict:
         if dataset_schema != "legacy_original":
-            raise ValueError("历史回放数据仅支持旧数据12传感器方案")
+            raise ValueError("历史数据流仅支持旧数据12传感器方案")
         selected_model_type = normalize_model_type(prediction_model_type)
         active_profile = self.online_predictor.profile
         if realtime_prediction and (
@@ -1767,7 +1767,7 @@ class DashboardData:
             "forecast": {
                 "requested_horizon": prediction_horizon,
                 "forecast_lead": forecast_lead,
-                "lead_semantics": "历史曲线使用已冻结的因果提前量；回放数据使用窗口起点对齐预测",
+                "lead_semantics": "历史曲线使用已冻结的因果提前量；历史数据使用窗口起点对齐预测",
                 "returned_horizon": int(len(future_prediction_matrix)),
                 "native_horizon": int(self.actual.shape[1]),
                 "mode": forecast_mode,
@@ -2050,7 +2050,7 @@ class DashboardData:
         for model_sensor in profile["input_sensors"]:
             display_sensor = "压实力" if model_sensor == "压力" else model_sensor
             if display_sensor not in sensor_names:
-                raise ValueError(f"历史回放缺少模型输入传感器：{model_sensor}")
+                raise ValueError(f"历史数据缺少模型输入传感器：{model_sensor}")
             physical[:, model_columns.index(model_sensor)] = specimen_actual[
                 :, sensor_names.index(display_sensor)
             ]
@@ -3615,7 +3615,7 @@ class AppHandler(BaseHTTPRequestHandler):
     dashboard: DashboardData
 
     def log_message(self, fmt: str, *args) -> None:
-        # 实时回放可达到10 Hz；逐请求打印会淹没终端并影响长时间运行。
+        # 实时数据流可达到10 Hz；逐请求打印会淹没终端并影响长时间运行。
         return
 
     def _send_json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:

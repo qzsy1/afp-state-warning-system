@@ -471,7 +471,7 @@ function renderRuntimeStatus(payload = state.payload) {
 
   const liveMode = controls.dataMode.value === "live";
   if (!liveMode) {
-    node.textContent = state.playing ? "实时回放运行中" : "实时回放已暂停";
+    node.textContent = state.playing ? "实时数据运行中" : "实时数据已暂停";
     dot.classList.toggle("active", state.playing);
     return;
   }
@@ -547,7 +547,7 @@ function updateDatasetMeta() {
   if (!node) return;
   if (controls.dataMode.value !== "live") {
     node.textContent =
-      `实时回放源：${state.bootstrap.manifest.specimen_count} 个试样 · ` +
+      `历史数据源：${state.bootstrap.manifest.specimen_count} 个试样 · ` +
       `12个通道 · 24点预测窗口 · ${state.bootstrap.manifest.sampling_hz} Hz`;
     return;
   }
@@ -1153,7 +1153,7 @@ function configureDatasetSchema(useDefaults = true) {
   if (optimizedLabel) {
     optimizedLabel.textContent = isNew
       ? "使用验证集校准的 CAP 在线优化（16传感器方案）"
-      : "使用优化预警（回放 v13.8 / 实时因果 v13.9）";
+      : "使用优化预警（历史数据 v13.8 / 实时因果 v13.9）";
   }
   configureProcessingMode();
   configureAutomaticIndicator(true);
@@ -1270,13 +1270,13 @@ function playbackInterval() {
 
 function startPlayback() {
   if (controls.dataMode.value === "live") {
-    toast("真实采集模式由传感器数据自动推进，无需启动回放");
+    toast("真实采集模式由传感器数据自动推进，无需启动数据流");
     return;
   }
   if (state.playing) return;
   state.playing = true;
   $("playButton").textContent = "❚❚ 暂停";
-  $("streamStatus").textContent = "实时回放运行中";
+  $("streamStatus").textContent = "实时数据运行中";
   document.querySelector(".live-dot").classList.add("active");
   state.timer = window.setInterval(async () => {
     if (state.busy) return;
@@ -1299,7 +1299,7 @@ function stopPlayback() {
   window.clearInterval(state.timer);
   state.timer = null;
   $("playButton").textContent = "▶ 开始";
-  $("streamStatus").textContent = "实时回放已暂停";
+  $("streamStatus").textContent = "实时数据已暂停";
   document.querySelector(".live-dot").classList.remove("active");
 }
 
@@ -1526,7 +1526,7 @@ function render(payload) {
       payload.feature_generation?.mode === "realtime_from_actual_and_live_prediction"
         ? "由本次实测与实时预测现场生成"
         : payload.feature_generation?.mode === "realtime_from_current_replay_window"
-          ? "由当前回放实测/预测窗口重新生成"
+          ? "由当前历史数据实测/预测窗口重新生成"
           : "等待完整窗口"
     }；最终预警：${
       windowData.optimized_warning_applied

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AFP 实时预测与状态预警系统</title>
-  <link rel="stylesheet" href="/styles.css?v=20260902-integrity-1">
+  <link rel="stylesheet" href="/styles.css?v=20260904-ui-1">
 </head>
 <body>
   <div class="app-shell">
@@ -19,7 +19,7 @@
       <div class="system-statuses">
         <a class="system-training-link" href="/training.html" title="打开模型训练中心">模型训练中心</a>
         <div class="system-status-item"><span class="status-dot"></span><div><small>数据连接</small><b id="connectionStatus">正在连接本地数据服务</b></div></div>
-        <div class="system-status-item"><span class="live-dot"></span><div><small>运行状态</small><b id="streamStatus">实时回放已暂停</b></div></div>
+        <div class="system-status-item"><span class="live-dot"></span><div><small>运行状态</small><b id="streamStatus">实时数据已暂停</b></div></div>
         <div class="system-status-item wide"><div><small>数据位置</small><b id="streamPosition">等待开始</b></div></div>
         <div class="system-status-item meta"><div><small>数据集 / 模型信息</small><b id="datasetMeta">正在加载数据流信息……</b></div></div>
       </div>
@@ -34,7 +34,7 @@
           <div class="control-content">
             <label>运行模式
               <select id="dataModeSelect">
-                <option value="replay">历史数据实时回放</option>
+                <option value="replay">历史数据流</option>
                 <option value="live" selected>真实传感器采集</option>
               </select>
             </label>
@@ -85,7 +85,7 @@
                   <textarea id="simulationMysqlQueryInput" rows="2">SELECT * FROM afp_flat_all ORDER BY specimen_key, layer_no, sample_index</textarea>
                 </label>
               </div>
-              <p class="control-note">模拟模式使用所选文件夹、CSV或MySQL数据逐行回放；真实接口模式不会读取本地文件。</p>
+              <p class="control-note">模拟模式使用所选文件夹、CSV或MySQL数据逐行读取；真实接口模式不会读取本地文件。</p>
             </div>
             <label>采集驱动<select id="driverSelect"></select></label>
             <label>模拟采集数据文件<input id="sourceFileInput" type="text" placeholder="模拟驱动的数据 CSV；真实驱动可留空"></label>
@@ -197,7 +197,7 @@
         <div class="section-heading compact-heading"><span>02</span><div><b>预测与预警设置</b><small>时间步、指标与模型</small></div></div>
 
         <details class="control-section" open>
-          <summary>回放与预测控制</summary>
+          <summary>数据流与预测控制</summary>
           <div class="control-content">
             <div class="transport">
               <button id="playButton" class="primary-button">▶ 开始</button>
@@ -205,7 +205,7 @@
             </div>
             <label><span>采集进度 <output id="progressValue">0 / 0</output></span><input id="cursorInput" type="range" min="1" max="100" value="24"></label>
             <div class="compact-input-grid">
-              <label>回放倍速<select id="speedSelect"><option value="0.5">0.5×</option><option value="1" selected>1×（10 Hz）</option><option value="2">2×</option><option value="5">5×</option><option value="10">10×</option></select></label>
+              <label>数据推进速度<select id="speedSelect"><option value="0.5">0.5×</option><option value="1" selected>1×（10 Hz）</option><option value="2">2×</option><option value="5">5×</option><option value="10">10×</option></select></label>
               <label>每次推进<select id="streamStepSelect"><option value="1" selected>1 点</option><option value="2">2 点</option><option value="4">4 点</option><option value="8">8 点</option><option value="24">24 点 / 1窗口</option></select></label>
               <label>历史长度<select id="lengthSelect"><option value="120">120 点 / 12 s</option><option value="240" selected>240 点 / 24 s</option><option value="480">480 点 / 48 s</option><option value="768">768 点 / 76.8 s</option><option value="1200">1200 点 / 120 s</option></select></label>
               <label>绘图抽样<select id="stepSelect"><option value="1">1（全部点）</option><option value="2">2</option><option value="4">4</option><option value="6">6</option><option value="12">12</option></select></label>
@@ -302,7 +302,7 @@
         <details class="panel explanation-panel">
           <summary>系统功能与判定边界说明</summary>
           <div class="guide-grid">
-            <div><b>1</b><h3>实时数据流</h3><p>历史数据按采样率逐点回放；接入设备后沿用相同数据接口。</p></div>
+            <div><b>1</b><h3>实时数据流</h3><p>历史数据按采样率逐点读取；接入设备后沿用相同数据接口。</p></div>
             <div><b>2</b><h3>同步预测</h3><p>实时推理或归档预测可切换，超过训练步长时采用滚动预测。</p></div>
             <div><b>3</b><h3>窗口更新</h3><p>24 个实测点完整到达后才确认窗口，未来值不提前参与健康指标。</p></div>
             <div><b>4</b><h3>三级状态</h3><p>窗口证据依次聚合为铺层和实际层数试样状态，并随新证据更新。</p></div>
@@ -369,6 +369,6 @@
     </div>
   </div>
   <div id="toast" class="toast"></div>
-  <script src="/app.js?v=20260902-integrity-1"></script>
+  <script src="/app.js?v=20260904-ui-1"></script>
 </body>
 </html>
