@@ -170,14 +170,18 @@ foreach ($directory in @("logs", "runtime", "rollback", "updates", "verification
     "Keep the complete directory together.  Another PC does not need Python, PyTorch or Git.",
     "Use --module-status or --self-test for diagnostics; use --verify-files for SHA-256 integrity verification.",
     "Use --mysql-smoke and --spreadsheet-smoke to verify database and Excel runtime dependencies.",
-    "Use verified patch ZIP files for module updates. Mutable logs, runtime data and verification outputs are not in SHA256SUMS.txt."
+    "Use verified patch ZIP files for module updates. Mutable logs, runtime data, update packages, verification outputs and Python caches are not in SHA256SUMS.txt."
 ) | Set-Content -LiteralPath (Join-Path $TargetDir "README.txt") -Encoding UTF8
 
 $mutableDirectories = @("logs", "runtime", "rollback", "updates", "verification")
 $hashes = Get-ChildItem -LiteralPath $TargetDir -Recurse -File | Where-Object {
     $relative = $_.FullName.Substring($TargetDir.Length).TrimStart('\')
     $topDirectory = ($relative -split '[\\/]')[0]
-    $_.Name -ne "SHA256SUMS.txt" -and $topDirectory -notin $mutableDirectories
+    $segments = $relative -split '[\\/]'
+    $_.Name -ne "SHA256SUMS.txt" -and
+        $topDirectory -notin $mutableDirectories -and
+        $_.Extension -ne ".pyc" -and
+        "__pycache__" -notin $segments
 } | Get-FileHash -Algorithm SHA256
 $hashes | ForEach-Object {
     $relative = $_.Path.Substring($TargetDir.Length).TrimStart('\')

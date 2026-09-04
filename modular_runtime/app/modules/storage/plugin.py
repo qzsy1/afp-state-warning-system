@@ -34,7 +34,7 @@ class StorageService:
 
 def register(context: Any) -> ModuleRegistration:
     return ModuleRegistration(
-        "storage", "2.1.0", "2.0",
+        "storage", "2.1.1", "2.0",
         ("csv", "mysql", "foreign_keys", "flat_views", "pending_retry", "sha256_audit"),
         StorageService(context),
     )

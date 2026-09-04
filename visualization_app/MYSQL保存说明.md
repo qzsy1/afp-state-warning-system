@@ -63,4 +63,4 @@ afp_sample_all / afp_sensor_sample
 
 ## 依赖
 
-安装 `requirements.txt` 中的 `mysql-connector-python`。如果数据库暂时不可用，系统会在采集记录目录生成`mysql_pending.json`，同时保留全部本地数据。以后同一主机、端口、用户和数据库恢复且完成新一层保存时，程序自动补传最多20条历史待同步记录；补传成功后改为`mysql_synced.json`，其中保留补传时间和写入结果。
+安装 `requirements.txt` 中的 `mysql-connector-python`。如果数据库暂时不可用，系统会在采集记录目录生成`mysql_pending.json`，同时保留全部本地数据。以后同一主机、端口、用户和数据库恢复且完成新一层保存时，程序先排除其他目标数据库的待同步文件，再补传最多20条属于当前数据库的记录；补传成功后改为`mysql_synced.json`，其中保留补传时间和写入结果。0点或没有有效传感器数据的采集不会生成待同步记录。

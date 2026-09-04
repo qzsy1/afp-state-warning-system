@@ -1875,6 +1875,13 @@ class AcquisitionManager:
         self.session_metadata_path: Path | None = None
         self.archived_previous_session: str | None = None
         self.replaced_layer_archive: str | None = None
+        self.failed_capture_archive: str | None = None
+        self.pending_previous_archive = False
+        self.previous_session_metadata: dict[str, Any] = {}
+        self.pending_session_metadata: dict[str, Any] = {}
+        self.specimen_folder_name = ""
+        self.capture_saved = False
+        self.finalization_complete = False
         self.last_data_quality: dict[str, Any] | None = None
         self.last_file_integrity: dict[str, Any] | None = None
         self.mysql_status: dict[str, Any] = {
@@ -2214,7 +2221,10 @@ class AcquisitionManager:
         )
 
     def _archive_previous_specimen(
-        self, specimen_folder_name: str, previous_metadata: dict[str, Any]
+        self,
+        specimen_folder_name: str,
+        previous_metadata: dict[str, Any],
+        exclude: set[Path] | None = None,
     ) -> str | None:
         """Move the active specimen aside before a new layer-1 capture.
 
@@ -2246,7 +2256,10 @@ class AcquisitionManager:
             / f"试样会话_{self.session_stamp}_{old_capture}"
         )
         archive_dir.mkdir(parents=True, exist_ok=True)
+        excluded = {path.resolve() for path in (exclude or set())}
         for source in dict.fromkeys(candidates):
+            if source.resolve() in excluded:
+                continue
             target = archive_dir / source.name
             counter = 2
             while target.exists():
@@ -2256,6 +2269,17 @@ class AcquisitionManager:
         if previous_metadata:
             _atomic_write_json(archive_dir / "试样会话.json", previous_metadata)
         return str(archive_dir)
+
+    def _archive_failed_working_files(self) -> str | None:
+        archived: list[Path] = []
+        for path in (self.raw_work_path, self.timestamp_work_path):
+            if path is not None and path.exists():
+                target = self._archive_existing(path, "无有效数据")
+                if target is not None:
+                    archived.append(target)
+        if not archived:
+            return None
+        return str(archived[0].parent)
 
     def _infer_existing_specimen_id(
         self, specimen_folder_name: str
@@ -2283,6 +2307,7 @@ class AcquisitionManager:
             if self.session_metadata_path.exists()
             else {}
         )
+        self.previous_session_metadata = dict(previous)
         signature = {
             "dataset_schema": config.dataset_schema,
             "condition_id": str(config.condition_id),
@@ -2290,17 +2315,16 @@ class AcquisitionManager:
             "parameter_token": specimen_folder_name,
         }
         active_layers = self._layer_files(specimen_folder_name)
-        if config.layer == 0 and active_layers:
-            self.archived_previous_session = self._archive_previous_specimen(
-                specimen_folder_name, previous
-            )
-            previous = {}
-            active_layers = []
+        combined = self.session_dir / f"{specimen_folder_name}_完整试样.CSV"
+        self.pending_previous_archive = bool(
+            config.layer == 0 and (active_layers or combined.exists())
+        )
+        identity_previous = {} if self.pending_previous_archive else previous
 
-        previous_signature = previous.get("identity")
+        previous_signature = identity_previous.get("identity")
         capture_uuid = ""
         if previous_signature == signature:
-            capture_uuid = str(previous.get("capture_uuid") or "").strip()
+            capture_uuid = str(identity_previous.get("capture_uuid") or "").strip()
         if not capture_uuid and config.layer > 0 and active_layers:
             # Backward-compatible continuation of data written before this
             # identity feature existed.
@@ -2324,18 +2348,31 @@ class AcquisitionManager:
             "capture_uuid": capture_uuid,
             "operator_specimen_id": self.operator_specimen_id,
             "identity": signature,
-            "created_at": previous.get("created_at")
+            "created_at": identity_previous.get("created_at")
             or datetime.now().isoformat(timespec="milliseconds"),
             "last_started_at": datetime.now().isoformat(timespec="milliseconds"),
-            "completed_layers": previous.get("completed_layers", []),
+            "completed_layers": identity_previous.get("completed_layers", []),
         }
-        _atomic_write_json(self.session_metadata_path, metadata)
+        # Commit this identity only after at least one valid sample has been
+        # finalized.  Until then, the previous specimen remains authoritative.
+        self.pending_session_metadata = metadata
         return capture_uuid
 
     def _archive_orphan_partial(self, path: Path | None) -> None:
         if path is None or not path.exists():
             return
         self._archive_existing(path, "中断采集")
+
+    def _archive_orphan_timestamp_partials(
+        self, specimen_folder_name: str
+    ) -> None:
+        if self.capture_record_dir is None:
+            return
+        for path in self.capture_record_dir.glob(
+            f"{specimen_folder_name}_第*层_*_时间戳.csv.partial"
+        ):
+            if path != self.timestamp_work_path:
+                self._archive_orphan_partial(path)
 
     def _finalize_working_files(self) -> None:
         for working, final in (
@@ -2344,6 +2381,8 @@ class AcquisitionManager:
         ):
             if working is None or final is None or not working.exists():
                 continue
+            with working.open("r+b") as handle:
+                os.fsync(handle.fileno())
             os.replace(working, final)
 
     @staticmethod
@@ -2427,6 +2466,14 @@ class AcquisitionManager:
         with self.lock:
             if self.thread is not None and self.thread.is_alive():
                 raise RuntimeError("采集已经在运行")
+            if (
+                self.thread is not None
+                and self.config is not None
+                and not self.finalization_complete
+            ):
+                # A hardware driver may stop itself after a read error.  Commit
+                # any rows already received before a new session resets state.
+                self.stop()
             self.config = config
             self.mysql_status = {
                 "enabled": bool(config.mysql_enabled),
@@ -2452,6 +2499,13 @@ class AcquisitionManager:
             self.last_error = ""
             self.archived_previous_session = None
             self.replaced_layer_archive = None
+            self.failed_capture_archive = None
+            self.pending_previous_archive = False
+            self.previous_session_metadata = {}
+            self.pending_session_metadata = {}
+            self.specimen_folder_name = ""
+            self.capture_saved = False
+            self.finalization_complete = False
             self.full_specimen_path = None
             self.completed_layers = []
             self.last_data_quality = None
@@ -2475,6 +2529,7 @@ class AcquisitionManager:
             parameter_token = _parameter_token(config)
             # Storage names intentionally exclude specimen/run identifiers.
             specimen_folder_name = parameter_token
+            self.specimen_folder_name = specimen_folder_name
             self.session_dir = selected_root / specimen_folder_name
             self.capture_record_dir = self.session_dir / "采集记录"
             self.capture_record_dir.mkdir(parents=True, exist_ok=True)
@@ -2497,8 +2552,8 @@ class AcquisitionManager:
                     "保存路径过长。请改选更短的保存根目录，或缩短试样名。"
                 )
             self.driver = build_driver(config)
-            self.driver.open()
             try:
+                self.driver.open()
                 self._prepare_capture_identity(config, specimen_folder_name)
                 self.raw_work_path = self.raw_path.with_name(
                     f"{self.raw_path.name}.partial"
@@ -2507,15 +2562,8 @@ class AcquisitionManager:
                     f"{self.timestamp_path.name}.partial"
                 )
                 self._archive_orphan_partial(self.raw_work_path)
+                self._archive_orphan_timestamp_partials(specimen_folder_name)
                 self._archive_orphan_partial(self.timestamp_work_path)
-                if self.raw_path.exists():
-                    self._archive_existing(self.raw_path, "重采铺层")
-                    self.replaced_layer_archive = "重采铺层"
-                    combined = self.session_dir / (
-                        f"{specimen_folder_name}_完整试样.CSV"
-                    )
-                    if combined.exists():
-                        self._archive_existing(combined, "完整试样快照")
                 _atomic_write_json(
                     manifest_path,
                     {
@@ -2537,11 +2585,14 @@ class AcquisitionManager:
                         ),
                     },
                 )
-            except Exception:
+            except Exception as exc:
+                self.last_error = str(exc)
                 try:
                     self.driver.close()
                 finally:
                     self.driver = None
+                    self.thread = None
+                    self.finalization_complete = True
                 raise
             self.stop_event.clear()
             self.thread = threading.Thread(
@@ -2552,9 +2603,9 @@ class AcquisitionManager:
             self.thread.start()
         return self.status()
 
-    def _archive_existing(self, path: Path, category: str) -> None:
+    def _archive_existing(self, path: Path, category: str) -> Path | None:
         if not path.exists():
-            return
+            return None
         history_dir = self.session_dir / "历史版本" / category
         history_dir.mkdir(parents=True, exist_ok=True)
         archived = history_dir / (
@@ -2567,6 +2618,7 @@ class AcquisitionManager:
             )
             counter += 1
         path.replace(archived)
+        return archived
 
     def _rebuild_whole_specimen(self) -> Path | None:
         """Rebuild one canonical complete specimen CSV in-place.
@@ -2774,15 +2826,13 @@ class AcquisitionManager:
         pending_files = sorted(
             root.rglob("*_mysql_pending.json"),
             key=lambda path: path.stat().st_mtime,
-        )[: max(0, int(limit))]
+        )
         if not pending_files:
             return result
-        store = MySQLCaptureStore(settings)
-        connection = store.test_connection()
-        if not connection.get("ok"):
-            result["connection_error"] = connection.get("error")
+        retry_limit = max(0, int(limit))
+        if retry_limit == 0:
             return result
-        allowed_fields = set(AcquisitionConfig.__dataclass_fields__)
+        selected_pending: list[tuple[Path, dict[str, Any]]] = []
         for pending_path in pending_files:
             payload = self._read_json(pending_path)
             saved_config = payload.get("config")
@@ -2791,6 +2841,19 @@ class AcquisitionManager:
             ):
                 result["skipped"] += 1
                 continue
+            selected_pending.append((pending_path, payload))
+            if len(selected_pending) >= retry_limit:
+                break
+        if not selected_pending:
+            return result
+        store = MySQLCaptureStore(settings)
+        connection = store.test_connection()
+        if not connection.get("ok"):
+            result["connection_error"] = connection.get("error")
+            return result
+        allowed_fields = set(AcquisitionConfig.__dataclass_fields__)
+        for pending_path, payload in selected_pending:
+            saved_config = payload.get("config")
             layer_file = Path(str(payload.get("layer_file") or ""))
             if not layer_file.is_file():
                 result["failed"] += 1
@@ -2882,18 +2945,97 @@ class AcquisitionManager:
                 )
                 return self.status()
         with self.lock:
+            if self.finalization_complete:
+                return self.status()
             if self.session_dir is not None and self.config is not None:
-                self._finalize_working_files()
-                full_specimen_path = (
-                    self._rebuild_whole_specimen()
-                    if self.raw_path is not None and self.raw_path.is_file()
-                    else None
+                intended_raw_path = self.raw_path
+                specimen_folder_name = (
+                    self.specimen_folder_name or _parameter_token(self.config)
                 )
+                has_valid_data = bool(
+                    self.total_sample_count > 0
+                    and self.raw_work_path is not None
+                    and self.raw_work_path.is_file()
+                )
+                full_specimen_path: Path | None = None
+                if has_valid_data:
+                    if self.pending_previous_archive:
+                        excluded = {
+                            path
+                            for path in (
+                                self.raw_work_path,
+                                self.timestamp_work_path,
+                            )
+                            if path is not None
+                        }
+                        self.archived_previous_session = (
+                            self._archive_previous_specimen(
+                                specimen_folder_name,
+                                self.previous_session_metadata,
+                                exclude=excluded,
+                            )
+                        )
+                    elif self.raw_path is not None and self.raw_path.exists():
+                        archived_layer = self._archive_existing(
+                            self.raw_path, "重采铺层"
+                        )
+                        self.replaced_layer_archive = (
+                            str(archived_layer)
+                            if archived_layer is not None
+                            else None
+                        )
+                        combined = self.session_dir / (
+                            f"{specimen_folder_name}_完整试样.CSV"
+                        )
+                        if combined.exists():
+                            self._archive_existing(
+                                combined, "完整试样快照"
+                            )
+                    self._finalize_working_files()
+                    full_specimen_path = (
+                        self._rebuild_whole_specimen()
+                        if self.raw_path is not None and self.raw_path.is_file()
+                        else None
+                    )
+                    self.capture_saved = bool(
+                        self.raw_path is not None and self.raw_path.is_file()
+                    )
+                else:
+                    self.capture_saved = False
+                    self.failed_capture_archive = (
+                        self._archive_failed_working_files()
+                    )
+                    if not self.last_error:
+                        self.last_error = (
+                            "未采集到有效数据，本次未生成铺层文件；"
+                            "上一份有效数据（如有）保持不变"
+                        )
+                    if not self.pending_previous_archive:
+                        previous_layers = self.previous_session_metadata.get(
+                            "completed_layers", []
+                        )
+                        self.completed_layers = [
+                            int(layer) - 1
+                            for layer in previous_layers
+                            if str(layer).isdigit() and int(layer) > 0
+                        ]
                 data_quality = self._data_quality_summary()
                 integrity = {
-                    "layer_file": _file_integrity(self.raw_path),
-                    "timestamp_file": _file_integrity(self.timestamp_path),
-                    "whole_specimen_file": _file_integrity(full_specimen_path),
+                    "layer_file": (
+                        _file_integrity(self.raw_path)
+                        if self.capture_saved
+                        else None
+                    ),
+                    "timestamp_file": (
+                        _file_integrity(self.timestamp_path)
+                        if self.capture_saved
+                        else None
+                    ),
+                    "whole_specimen_file": (
+                        _file_integrity(full_specimen_path)
+                        if self.capture_saved
+                        else None
+                    ),
                 }
                 self.last_data_quality = data_quality
                 self.last_file_integrity = integrity
@@ -2902,11 +3044,19 @@ class AcquisitionManager:
                     "operator_specimen_id": self.operator_specimen_id,
                     "stopped_at": datetime.now().isoformat(timespec="milliseconds"),
                     "sample_count": int(self.total_sample_count),
+                    "capture_saved": self.capture_saved,
                     "last_error": self.last_error,
-                    "layer_file": str(self.raw_path),
+                    "layer_file": (
+                        str(self.raw_path) if self.capture_saved else None
+                    ),
+                    "intended_layer_file": (
+                        str(intended_raw_path)
+                        if intended_raw_path is not None
+                        else None
+                    ),
                     "whole_specimen_file": (
                         str(full_specimen_path)
-                        if full_specimen_path is not None
+                        if self.capture_saved and full_specimen_path is not None
                         else None
                     ),
                     "completed_layers": [
@@ -2918,13 +3068,14 @@ class AcquisitionManager:
                     "file_integrity": integrity,
                     "archived_previous_session": self.archived_previous_session,
                     "replaced_layer_archive": self.replaced_layer_archive,
+                    "failed_capture_archive": self.failed_capture_archive,
                 }
                 summary_path = self.capture_record_dir / (
-                    f"{self.raw_path.stem}_{self.session_stamp}_采集摘要.json"
+                    f"{intended_raw_path.stem}_{self.session_stamp}_采集摘要.json"
                 )
                 _atomic_write_json(summary_path, summary)
-                if self.session_metadata_path is not None:
-                    metadata = self._read_json(self.session_metadata_path)
+                if self.capture_saved and self.session_metadata_path is not None:
+                    metadata = dict(self.pending_session_metadata)
                     metadata.update(
                         {
                             "capture_uuid": self.capture_uuid,
@@ -2936,7 +3087,11 @@ class AcquisitionManager:
                         }
                     )
                     _atomic_write_json(self.session_metadata_path, metadata)
-                if self.config.mysql_enabled and self.raw_path is not None:
+                if (
+                    self.capture_saved
+                    and self.config.mysql_enabled
+                    and self.raw_path is not None
+                ):
                     settings = MySQLSettings(
                         enabled=True,
                         host=self.config.mysql_host,
@@ -2999,12 +3154,23 @@ class AcquisitionManager:
                                 "folder_path": str(self.session_dir),
                             },
                         )
+                elif self.config.mysql_enabled and not self.capture_saved:
+                    self.mysql_status = {
+                        "enabled": True,
+                        "ok": False,
+                        "state": "not_saved",
+                        "saved_rows": 0,
+                        "error": "未采集到有效数据，未写入MySQL",
+                    }
+                    summary["mysql"] = self.mysql_status
+                    _atomic_write_json(summary_path, summary)
                 elif not self.config.mysql_enabled:
                     self.mysql_status = {
                         "enabled": False,
                         "ok": False,
                         "saved_rows": 0,
                     }
+                self.finalization_complete = True
         return self.status()
 
     def status(self) -> dict:
@@ -3117,6 +3283,7 @@ class AcquisitionManager:
                 "sample_count": int(self.total_sample_count),
                 "online_buffer_rows": len(self.rows),
                 "capture_uuid": self.capture_uuid or None,
+                "capture_saved": self.capture_saved,
                 "started_at": self.started_at,
                 "stopped_at": self.stopped_at,
                 "last_error": self.last_error,
@@ -3126,17 +3293,27 @@ class AcquisitionManager:
                     if self.session_dir is not None
                     else None
                 ),
-                "raw_file": str(self.raw_path) if self.raw_path else None,
-                "layer_file": str(self.raw_path) if self.raw_path else None,
+                "raw_file": (
+                    str(self.raw_path)
+                    if (running or self.capture_saved) and self.raw_path
+                    else None
+                ),
+                "layer_file": (
+                    str(self.raw_path)
+                    if (running or self.capture_saved) and self.raw_path
+                    else None
+                ),
                 "full_specimen_file": (
                     str(self.full_specimen_path)
-                    if self.full_specimen_path
+                    if self.capture_saved and self.full_specimen_path
                     else None
                 ),
                 "completed_layers": [
                     layer + 1 for layer in self.completed_layers
                 ],
                 "archived_previous_session": self.archived_previous_session,
+                "replaced_layer_archive": self.replaced_layer_archive,
+                "failed_capture_archive": self.failed_capture_archive,
                 "data_quality": self.last_data_quality,
                 "file_integrity": self.last_file_integrity,
                 "timestamp_file": (

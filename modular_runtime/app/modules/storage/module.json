@@ -1,7 +1,7 @@
 {
   "id": "storage",
   "name": "文件与MySQL存储",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "api_version": "2.0",
   "entrypoint": "plugin.py",
   "enabled": true,

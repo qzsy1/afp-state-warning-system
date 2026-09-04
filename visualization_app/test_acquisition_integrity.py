@@ -16,6 +16,7 @@ from acquisition import (  # noqa: E402
     AcquisitionManager,
     MySQLSettings,
     NEW_COLLECTION_SENSOR_COLUMNS,
+    SimulatorDriver,
 )
 from training_data import read_excel_or_folder  # noqa: E402
 
@@ -185,6 +186,274 @@ class AcquisitionIntegrityTests(unittest.TestCase):
             self.assertEqual(result["succeeded"], 1, result)
             self.assertFalse(pending.exists())
             self.assertTrue((root / "x_mysql_synced.json").is_file())
+
+    def test_empty_capture_does_not_replace_last_valid_specimen(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self._source(root)
+            previous = self._capture(root, source, 0)
+            active_layer = Path(previous["raw_file"])
+            previous_bytes = active_layer.read_bytes()
+            metadata_path = (
+                Path(previous["session_dir"]) / "采集记录" / "当前试样会话.json"
+            )
+            previous_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+            empty = root / "empty.csv"
+            with empty.open("w", encoding="utf-8-sig", newline="") as handle:
+                csv.DictWriter(
+                    handle, fieldnames=NEW_COLLECTION_SENSOR_COLUMNS
+                ).writeheader()
+            manager = AcquisitionManager(root / "unused")
+            config = AcquisitionConfig(
+                processing_mode="capture_only",
+                dataset_schema="new_collection_v11_3",
+                driver="simulator",
+                source_file=str(empty),
+                simulation_source_path=str(empty),
+                selected_sensors=NEW_COLLECTION_SENSOR_COLUMNS.copy(),
+                sample_rate_hz=1000.0,
+                save_root=str(root / "capture"),
+                condition_id="H06",
+                replicate=1,
+                layer=0,
+                mysql_enabled=True,
+                mysql_database="unused",
+            )
+            manager.start(config)
+            time.sleep(0.05)
+            failed = manager.stop()
+
+            self.assertFalse(failed["capture_saved"])
+            self.assertIsNone(failed["raw_file"])
+            self.assertTrue(failed["failed_capture_archive"])
+            self.assertTrue(active_layer.is_file())
+            self.assertEqual(active_layer.read_bytes(), previous_bytes)
+            current_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                current_metadata["capture_uuid"],
+                previous_metadata["capture_uuid"],
+            )
+            self.assertFalse(list(root.rglob("*_mysql_pending.json")))
+            self.assertEqual(failed["mysql"]["state"], "not_saved")
+
+    def test_orphan_timestamp_partial_is_archived_on_next_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self._source(root)
+            first = self._capture(root, source, 0)
+            session_dir = Path(first["session_dir"])
+            orphan = session_dir / "采集记录" / (
+                f"{session_dir.name}_第9层_20000101_000000_时间戳.csv.partial"
+            )
+            orphan.write_text("row_index,timestamp_iso,timestamp_unix\n", encoding="utf-8")
+
+            second = self._capture(root, source, 1)
+            self.assertTrue(second["capture_saved"])
+            self.assertFalse(orphan.exists())
+            self.assertTrue(
+                list(
+                    session_dir.joinpath("历史版本", "中断采集").glob(
+                        "*时间戳*.partial"
+                    )
+                )
+            )
+
+    def test_pending_retry_limit_is_applied_after_database_filter(self) -> None:
+        class FakeStore:
+            def __init__(self, settings):
+                self.settings = settings
+
+            def test_connection(self):
+                return {"ok": True}
+
+            def save_layer(self, config, **kwargs):
+                return {"ok": True, "saved_rows": len(kwargs["rows"])}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self._source(root, rows=3)
+            for index in range(25):
+                config = AcquisitionConfig(
+                    capture_uuid=f"wrong-{index}",
+                    mysql_enabled=True,
+                    mysql_database="another_database",
+                )
+                (root / f"{index:02d}_mysql_pending.json").write_text(
+                    json.dumps(
+                        {
+                            "config": AcquisitionManager._public_config(config),
+                            "layer_file": str(source),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+            target_config = AcquisitionConfig(
+                capture_uuid="target",
+                mysql_enabled=True,
+                mysql_database="afp_test",
+            )
+            target = root / "99_mysql_pending.json"
+            target.write_text(
+                json.dumps(
+                    {
+                        "config": AcquisitionManager._public_config(target_config),
+                        "layer_file": str(source),
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            manager = AcquisitionManager(root / "capture")
+            settings = MySQLSettings(enabled=True, database="afp_test")
+            with patch("acquisition.MySQLCaptureStore", FakeStore):
+                result = manager._retry_pending_mysql(settings, root, limit=20)
+            self.assertEqual(result["succeeded"], 1, result)
+            self.assertEqual(result["skipped"], 25, result)
+            self.assertFalse(target.exists())
+
+    def test_stop_is_idempotent_and_does_not_upload_twice(self) -> None:
+        class FakeStore:
+            save_calls = 0
+
+            def __init__(self, settings):
+                self.settings = settings
+
+            def test_connection(self):
+                return {"ok": True}
+
+            def save_layer(self, config, **kwargs):
+                type(self).save_calls += 1
+                return {
+                    "ok": True,
+                    "database": self.settings.database,
+                    "layer": config.layer + 1,
+                    "saved_rows": len(kwargs["rows"]),
+                }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self._source(root)
+            manager = AcquisitionManager(root / "unused")
+            config = AcquisitionConfig(
+                processing_mode="capture_only",
+                dataset_schema="new_collection_v11_3",
+                driver="simulator",
+                source_file=str(source),
+                simulation_source_path=str(source),
+                selected_sensors=NEW_COLLECTION_SENSOR_COLUMNS.copy(),
+                sample_rate_hz=1000.0,
+                save_root=str(root / "capture"),
+                condition_id="H06",
+                replicate=1,
+                layer=0,
+                mysql_enabled=True,
+                mysql_database="afp_test",
+            )
+            with patch("acquisition.MySQLCaptureStore", FakeStore):
+                manager.start(config)
+                deadline = time.time() + 5.0
+                while manager.status()["sample_count"] < 20 and time.time() < deadline:
+                    time.sleep(0.01)
+                first = manager.stop()
+                second = manager.stop()
+            self.assertTrue(first["capture_saved"])
+            self.assertEqual(first["raw_file"], second["raw_file"])
+            self.assertEqual(FakeStore.save_calls, 1)
+
+    def test_driver_open_failure_is_closed_and_does_not_leave_active_session(self) -> None:
+        class FailingDriver:
+            def __init__(self):
+                self.closed = False
+
+            def open(self):
+                raise RuntimeError("device-open-failed")
+
+            def close(self):
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            driver = FailingDriver()
+            manager = AcquisitionManager(root / "capture")
+            config = AcquisitionConfig(save_root=str(root / "saved"))
+            with patch("acquisition.build_driver", return_value=driver):
+                with self.assertRaisesRegex(RuntimeError, "device-open-failed"):
+                    manager.start(config)
+            self.assertTrue(driver.closed)
+            self.assertIsNone(manager.thread)
+            self.assertTrue(manager.finalization_complete)
+
+    def test_new_start_auto_finalizes_rows_after_driver_read_error(self) -> None:
+        class OneRowThenError:
+            def __init__(self):
+                self.reads = 0
+
+            def open(self):
+                return None
+
+            def read_sample(self):
+                self.reads += 1
+                if self.reads == 1:
+                    return {
+                        name: 10.0 + index
+                        for index, name in enumerate(
+                            NEW_COLLECTION_SENSOR_COLUMNS
+                        )
+                    }
+                raise RuntimeError("simulated-read-error")
+
+            def close(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self._source(root)
+            manager = AcquisitionManager(root / "unused")
+            first = AcquisitionConfig(
+                processing_mode="capture_only",
+                dataset_schema="new_collection_v11_3",
+                driver="simulator",
+                source_file=str(source),
+                simulation_source_path=str(source),
+                selected_sensors=NEW_COLLECTION_SENSOR_COLUMNS.copy(),
+                sample_rate_hz=1000.0,
+                save_root=str(root / "capture"),
+                condition_id="FIRST",
+                layer=0,
+            )
+            second = AcquisitionConfig(
+                processing_mode="capture_only",
+                dataset_schema="new_collection_v11_3",
+                driver="simulator",
+                source_file=str(source),
+                simulation_source_path=str(source),
+                selected_sensors=NEW_COLLECTION_SENSOR_COLUMNS.copy(),
+                sample_rate_hz=1000.0,
+                save_root=str(root / "capture"),
+                condition_id="SECOND",
+                layer=0,
+            )
+            drivers = [
+                OneRowThenError(),
+                SimulatorDriver(source, NEW_COLLECTION_SENSOR_COLUMNS.copy()),
+            ]
+            with patch("acquisition.build_driver", side_effect=drivers):
+                manager.start(first)
+                deadline = time.time() + 3.0
+                while manager.status()["running"] and time.time() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(manager.status()["sample_count"], 1)
+                manager.start(second)
+                first_layers = list(
+                    (root / "capture").rglob("CFIRST_R1_*_第1层.CSV")
+                )
+                self.assertEqual(len(first_layers), 1)
+                deadline = time.time() + 3.0
+                while manager.status()["sample_count"] < 5 and time.time() < deadline:
+                    time.sleep(0.01)
+                manager.stop()
 
 
 if __name__ == "__main__":
