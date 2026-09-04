@@ -670,12 +670,12 @@ class DashboardData:
                 "prediction_horizon": 24,
                 "prediction_model_type": "i_T_G",
                 "forecast_lead": 1,
-                # Replay defaults to the causal checkpoint path so the
-                # displayed historical curve uses the selected forecast lead
-                # instead of the fixed archived target sequence.
+                # Real-time acquisition is the only visible run mode.  Local
+                # CSV/folder/MySQL playback is configured as a simulated
+                # acquisition source under the acquisition panel.
                 "realtime_prediction": True,
                 "use_optimized_warning": True,
-                "data_mode": "replay",
+                "data_mode": "live",
             },
             "acquisition": {
                 "drivers": self.acquisition.available_drivers(),

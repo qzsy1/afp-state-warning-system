@@ -1888,7 +1888,7 @@ async function initialize() {
     ) ? "new_collection_v11_3" : "legacy_original";
     configureDatasetSchema(true);
     state.liveScopeKey = liveEvidenceScopeKey();
-    controls.dataMode.value = payload.defaults.data_mode || "replay";
+    controls.dataMode.value = payload.defaults.data_mode || "live";
     controls.specimen.value = payload.defaults.specimen;
     controls.sensor.value = String(payload.defaults.sensor);
     controls.cursor.value = payload.defaults.cursor;

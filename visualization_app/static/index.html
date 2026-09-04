@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AFP 实时预测与状态预警系统</title>
-  <link rel="stylesheet" href="/styles.css?v=20260904-ui-1">
+  <link rel="stylesheet" href="/styles.css?v=20260904-ui-2">
 </head>
 <body>
   <div class="app-shell">
@@ -34,8 +34,7 @@
           <div class="control-content">
             <label>运行模式
               <select id="dataModeSelect">
-                <option value="replay">历史数据流</option>
-                <option value="live" selected>真实传感器采集</option>
+                <option value="live" selected>实时采集（真实或模拟）</option>
               </select>
             </label>
             <label>试样<select id="specimenSelect"></select></label>
@@ -369,6 +368,6 @@
     </div>
   </div>
   <div id="toast" class="toast"></div>
-  <script src="/app.js?v=20260904-ui-1"></script>
+  <script src="/app.js?v=20260904-ui-2"></script>
 </body>
 </html>
