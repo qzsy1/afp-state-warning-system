@@ -696,6 +696,18 @@ class AcquisitionConfig:
                 raise ValueError(
                     "模拟采集没有可用通道：请在通道映射中把至少一个通道分配给已启用接口"
                 )
+        # The acquisition checklist is the source of truth for the channels
+        # that are actually collected.  Drop stale interface assignments for
+        # unchecked channels so real and simulated capture use the same
+        # effective mapping and cannot save/route an unselected sensor.
+        selected_set = set(self.selected_sensors)
+        self.interface_channel_assignments = {
+            interface_id: [
+                name for name in channels if name in selected_set
+            ]
+            for interface_id, channels in self.interface_channel_assignments.items()
+            if any(name in selected_set for name in channels)
+        }
         if self.model_input_sensors is None:
             self.model_input_sensors = self.selected_sensors.copy()
         self.model_input_sensors = [

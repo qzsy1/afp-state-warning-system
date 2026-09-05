@@ -22,6 +22,33 @@ from training_data import read_excel_or_folder  # noqa: E402
 
 
 class AcquisitionIntegrityTests(unittest.TestCase):
+    def test_unchecked_channels_are_removed_from_interface_assignments(self) -> None:
+        config = AcquisitionConfig(
+            processing_mode="capture_only",
+            acquisition_mode="simulation",
+            dataset_schema="new_collection_v11_3",
+            driver="simulator",
+            simulation_source_path="simulation.csv",
+            selected_sensors=["温度1", "压力"],
+            interfaces=[
+                {
+                    "id": "interface_1",
+                    "enabled": True,
+                    "driver": "simulator",
+                    "role": "custom",
+                    "endpoint": "",
+                }
+            ],
+            interface_channel_assignments={
+                "interface_1": ["温度1", "压力", "张力"]
+            },
+        )
+        self.assertEqual(config.selected_sensors, ["温度1", "压力"])
+        self.assertEqual(
+            config.interface_channel_assignments,
+            {"interface_1": ["温度1", "压力"]},
+        )
+
     def _source(self, root: Path, rows: int = 200) -> Path:
         path = root / "simulation.csv"
         with path.open("w", encoding="utf-8-sig", newline="") as handle:

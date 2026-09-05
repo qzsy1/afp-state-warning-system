@@ -961,6 +961,11 @@ function buildSensorChecklist(sensorNames) {
         modelInput.checked = false;
         outputInput.checked = false;
       }
+      // Rebuild the interface-side routing before refreshing live data.  The
+      // checklist change event bubbles afterwards, but loadRealtime() starts
+      // its request immediately; doing it here prevents one request from
+      // carrying the just-unchecked channel.
+      refreshInterfaceCardsForSelection();
       if (controls.dataMode.value === "live") loadRealtime();
     });
     modelInput.addEventListener("change", () => {
@@ -2508,10 +2513,15 @@ function interfaceConfigs() {
     if (controls.baudrate) controls.baudrate.value = String(first.baudrate || 115200);
   }
   const assignments = {};
+  const selectedChannels = new Set(selectedAcquisitionChannelsForInterfaces());
   document.querySelectorAll(".interface-route-select").forEach((select) => {
     const id = select.value;
     const channel = select.dataset.channel;
-    if (id && id !== "__unassigned__" && channel) {
+    // A channel that is not selected for acquisition must never remain in the
+    // interface mapping submitted to the backend.  Keeping this guard here
+    // makes the submitted configuration authoritative even if a stale DOM
+    // node survives a checklist refresh.
+    if (selectedChannels.has(channel) && id && id !== "__unassigned__" && channel) {
       (assignments[id] ||= []).push(channel);
     }
   });
@@ -2983,9 +2993,22 @@ function syncInterfaceSummaries() {
 
 function refreshChannelInterfaceOptions() {
   const items = currentInterfaceItems();
+  const selectedChannels = new Set(selectedAcquisitionChannelsForInterfaces());
   document.querySelectorAll(".interface-route-select").forEach((select) => {
     const previous = select.value;
     const channel = select.dataset.channel || "";
+    if (!selectedChannels.has(channel)) {
+      // Keep the row visible for editing, but make the state explicit: this
+      // channel is not acquired and cannot be routed to an interface.
+      const option = document.createElement("option");
+      option.value = "__unassigned__";
+      option.textContent = "未采集";
+      select.replaceChildren(option);
+      select.value = "__unassigned__";
+      select.disabled = true;
+      return;
+    }
+    select.disabled = false;
     const compatible = items.filter((item) => interfaceAcceptsChannel(item, channel));
     select.replaceChildren(...[
       {value: "__unassigned__", text: "未分配"},
