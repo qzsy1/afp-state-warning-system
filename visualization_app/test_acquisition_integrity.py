@@ -92,6 +92,44 @@ class AcquisitionIntegrityTests(unittest.TestCase):
                 summary["data_quality"]["effective_sample_rate_hz"], 0
             )
 
+    def test_saved_schema_contains_only_selected_sensor_channels(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self._source(root)
+            manager = AcquisitionManager(root / "unused")
+            selected = ["温度", "压力"]
+            config = AcquisitionConfig(
+                processing_mode="capture_only",
+                dataset_schema="new_collection_v11_3",
+                driver="simulator",
+                source_file=str(source),
+                simulation_source_path=str(source),
+                selected_sensors=selected,
+                sample_rate_hz=1000.0,
+                save_root=str(root / "capture"),
+                condition_id="H06",
+            )
+            manager.start(config)
+            deadline = time.time() + 5.0
+            while manager.status()["sample_count"] < 8 and time.time() < deadline:
+                time.sleep(0.01)
+            stopped = manager.stop()
+
+            with Path(stopped["raw_file"]).open(
+                "r", encoding="gb18030", newline=""
+            ) as handle:
+                fieldnames = next(csv.reader(handle))
+            self.assertTrue(all(name in fieldnames for name in selected))
+            self.assertFalse(
+                any(
+                    name in fieldnames
+                    for name in NEW_COLLECTION_SENSOR_COLUMNS
+                    if name not in selected
+                )
+            )
+            self.assertIn("condition_id", fieldnames)
+            self.assertIn("layer_id", fieldnames)
+
     def test_new_layer_one_archives_previous_specimen_without_mixing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

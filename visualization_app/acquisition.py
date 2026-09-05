@@ -758,7 +758,15 @@ class AcquisitionConfig:
 
     @property
     def raw_columns(self) -> list[str]:
-        return list(ACQUISITION_SCHEMAS[self.dataset_schema]["raw_columns"])
+        """Return only selected sensor columns plus identity/process fields."""
+        definition = ACQUISITION_SCHEMAS[self.dataset_schema]
+        selected = set(self.selected_sensors or [])
+        sensor_names = set(definition["sensors"])
+        return [
+            name
+            for name in definition["raw_columns"]
+            if name not in sensor_names or name in selected
+        ]
 
     @property
     def process_columns(self) -> list[str]:
@@ -2316,6 +2324,18 @@ class AcquisitionManager:
         }
         active_layers = self._layer_files(specimen_folder_name)
         combined = self.session_dir / f"{specimen_folder_name}_完整试样.CSV"
+        if config.layer > 0 and active_layers:
+            expected_columns = config.raw_columns
+            mismatched = [
+                path.name
+                for path in active_layers
+                if self._layer_columns(path) != expected_columns
+            ]
+            if mismatched:
+                raise ValueError(
+                    "同一试样的后续铺层必须使用与已保存铺层相同的采集通道；"
+                    "请将铺层数设为1开始新的试样，或恢复原采集通道。"
+                )
         self.pending_previous_archive = bool(
             config.layer == 0 and (active_layers or combined.exists())
         )
@@ -2391,6 +2411,18 @@ class AcquisitionManager:
             try:
                 with path.open("r", encoding=encoding, newline="") as handle:
                     return list(csv.DictReader(handle))
+            except UnicodeDecodeError:
+                continue
+        raise ValueError(f"无法识别层文件编码：{path}")
+
+    @staticmethod
+    def _layer_columns(path: Path) -> list[str]:
+        """Read only a layer header for schema-consistency checks."""
+        for encoding in ("gb18030", "utf-8-sig", "utf-8"):
+            try:
+                with path.open("r", encoding=encoding, newline="") as handle:
+                    reader = csv.reader(handle)
+                    return next(reader, [])
             except UnicodeDecodeError:
                 continue
         raise ValueError(f"无法识别层文件编码：{path}")
@@ -2716,12 +2748,8 @@ class AcquisitionManager:
                         now = time.time()
                         row_index = int(self.total_sample_count)
                         row = {
-                            name: (
-                                sample.get(name, "")
-                                if name in selected
-                                else ""
-                            )
-                            for name in config.schema_sensors
+                            name: sample.get(name, "")
+                            for name in config.selected_sensors
                         }
                         if config.dataset_schema == "new_collection_v11_3":
                             row.update(
