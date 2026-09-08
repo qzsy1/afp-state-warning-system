@@ -73,7 +73,8 @@
                 </span>
               </label>
               <div id="simulationMysqlSettings" class="simulation-mysql-settings hidden">
-                <div class="compact-input-grid">
+                <p class="control-note shared-mysql-note">使用“真实采集与保存”中的统一 MySQL 连接信息。</p>
+                <div class="compact-input-grid shared-mysql-legacy-fields hidden" aria-hidden="true">
                   <label>MySQL 主机<input id="simulationMysqlHostInput" type="text" value="127.0.0.1"></label>
                   <label>端口<input id="simulationMysqlPortInput" type="number" value="3306" min="1" max="65535"></label>
                   <label>用户<input id="simulationMysqlUserInput" type="text" value="root"></label>
@@ -105,19 +106,19 @@
             </label>
             <p class="control-note save-rule-note">自动建立“试样名_p功率_v速度_pr压实力”文件夹，同时保存每层文件、完整试样快照和采集记录。</p>
             <div class="mysql-settings">
-              <label class="toggle"><input id="mysqlEnabledInput" type="checkbox"> 采集完成后同步保存到 MySQL</label>
+              <label class="toggle"><input id="mysqlEnabledInput" type="checkbox"> 采集完成后同步保存到 MySQL（支持远程数据库）</label>
               <div class="compact-input-grid">
-                <label>MySQL 主机<input id="mysqlHostInput" type="text" value="127.0.0.1"></label>
+                <label>数据库电脑 IP / 域名<input id="mysqlHostInput" type="text" value="127.0.0.1"></label>
                 <label>端口<input id="mysqlPortInput" type="number" min="1" max="65535" step="1" value="3306"></label>
                 <label>用户名<input id="mysqlUserInput" type="text" value="root"></label>
                 <label>密码<input id="mysqlPasswordInput" type="password" value="" autocomplete="new-password"></label>
                 <label>数据库名称<input id="mysqlDatabaseInput" type="text" value="afp_state_warning" pattern="[A-Za-z][A-Za-z0-9_]{0,63}"></label>
               </div>
               <div class="transport">
-                <button id="testMysqlButton" class="secondary-button" type="button">检查 MySQL</button>
+                <button id="testMysqlButton" class="secondary-button" type="button">检查已有数据库</button>
                 <button id="refreshRelationMapButton" class="secondary-button" type="button">刷新关系表</button>
               </div>
-              <p id="mysqlStatus" class="control-note">默认关闭；每次停止并保存一层后进行一次批量事务写入。</p>
+              <p id="mysqlStatus" class="control-note">填写本机或另一台电脑的 MySQL 地址；勾选后每层停止保存时批量写入。</p>
               <div class="relation-map-panel">
                 <div class="sensor-selector-title">工况—试样—独立重复—铺层关系</div>
                 <div class="relation-map-scroll">
@@ -127,6 +128,26 @@
                   </table>
                 </div>
               </div>
+              <details class="remote-mysql-panel">
+                <summary>远程数据查看与下载</summary>
+                <div class="remote-mysql-content">
+                  <label>只读 SQL（仅允许 SELECT / WITH ... SELECT）
+                    <textarea id="remoteMysqlQueryInput" rows="3">SELECT * FROM afp_flat_all ORDER BY specimen_key, layer_no, sample_index</textarea>
+                  </label>
+                  <label>预览行数<input id="remoteMysqlLimitInput" type="number" min="1" max="1000" step="1" value="200"></label>
+                  <div class="remote-mysql-actions">
+                    <button id="previewMysqlDataButton" class="secondary-button" type="button">预览数据</button>
+                    <button id="copyMysqlPreviewButton" class="secondary-button" type="button">复制预览</button>
+                    <button id="downloadMysqlCsvButton" class="primary-button" type="button">下载 CSV</button>
+                  </div>
+                  <p id="remoteMysqlStatus" class="control-note">使用上方同一套连接信息；查看和下载不会修改数据库。</p>
+                  <div class="remote-mysql-preview-scroll">
+                    <table id="remoteMysqlPreviewTable" class="relation-map-table">
+                      <tbody><tr><td>点击“预览数据”读取远程数据</td></tr></tbody>
+                    </table>
+                  </div>
+                </div>
+              </details>
             </div>
             <label class="prediction-setting">已训练预测模型文件
               <span class="path-picker-row">
@@ -249,7 +270,8 @@
             </span>
           </label>
           <div id="integrationMysqlSettings" class="simulation-mysql-settings hidden">
-            <div class="compact-input-grid">
+            <p class="control-note shared-mysql-note">使用“真实采集与保存”中的统一 MySQL 连接信息。</p>
+            <div class="compact-input-grid shared-mysql-legacy-fields hidden" aria-hidden="true">
               <label>MySQL 主机<input id="integrationMysqlHostInput" type="text" value="127.0.0.1"></label>
               <label>端口<input id="integrationMysqlPortInput" type="number" value="3306" min="1" max="65535"></label>
               <label>用户<input id="integrationMysqlUserInput" type="text" value="root"></label>

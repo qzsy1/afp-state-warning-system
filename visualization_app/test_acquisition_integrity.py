@@ -378,6 +378,60 @@ class AcquisitionIntegrityTests(unittest.TestCase):
             self.assertEqual(result["skipped"], 25, result)
             self.assertFalse(target.exists())
 
+    def test_public_pending_retry_uses_remote_profile_without_active_capture(self) -> None:
+        class FakeStore:
+            def __init__(self, settings):
+                self.settings = settings
+
+            def test_connection(self):
+                return {"ok": True}
+
+            def save_layer(self, config, **kwargs):
+                return {
+                    "ok": True,
+                    "host": self.settings.host,
+                    "saved_rows": len(kwargs["rows"]),
+                }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self._source(root, rows=2)
+            config = AcquisitionConfig(
+                capture_uuid="remote-retry",
+                mysql_enabled=True,
+                mysql_host="10.20.30.40",
+                mysql_user="afp_app",
+                mysql_database="afp_remote",
+            )
+            pending = root / "remote_mysql_pending.json"
+            pending.write_text(
+                json.dumps(
+                    {
+                        "config": AcquisitionManager._public_config(config),
+                        "layer_file": str(source),
+                        "folder_path": str(root),
+                        "summary": {"completed_layers": [1]},
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            manager = AcquisitionManager(root / "capture")
+            with patch("acquisition.MySQLCaptureStore", FakeStore):
+                result = manager.retry_pending_mysql(
+                    {
+                        "enabled": True,
+                        "host": "10.20.30.40",
+                        "user": "afp_app",
+                        "database": "afp_remote",
+                    },
+                    root,
+                )
+            self.assertEqual(result["succeeded"], 1, result)
+            self.assertFalse(pending.exists())
+            self.assertEqual(manager.mysql_status["host"], "10.20.30.40")
+            self.assertEqual(manager.mysql_status["state"], "synced")
+
     def test_stop_is_idempotent_and_does_not_upload_twice(self) -> None:
         class FakeStore:
             save_calls = 0

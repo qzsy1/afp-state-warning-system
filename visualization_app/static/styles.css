@@ -306,12 +306,21 @@ output { color: var(--blue); font-weight: 800; }
 .mysql-settings { margin-top: 8px; padding: 8px; border: 1px solid #c9dceb; border-radius: 5px; background: #f7fbfe; }
 .mysql-settings .compact-input-grid { margin-top: 6px; }
 .mysql-settings input[type="password"], .mysql-settings input[type="text"], .mysql-settings input[type="number"] { width: 100%; box-sizing: border-box; }
+.mysql-settings textarea { width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box; resize: vertical; font: inherit; }
 .relation-map-panel { margin-top: 8px; }
 .relation-map-scroll { max-height: 190px; overflow: auto; border: 1px solid #c9dceb; border-radius: 4px; background: #fff; }
 .relation-map-table { width: 100%; border-collapse: collapse; font-size: 9px; white-space: nowrap; }
 .relation-map-table th { position: sticky; top: 0; z-index: 1; background: #184878; color: #fff; font-weight: 700; padding: 5px 6px; }
 .relation-map-table td { border-bottom: 1px solid #e2edf4; padding: 5px 6px; color: #35566e; }
 .relation-map-table tr:nth-child(even) td { background: #f5f9fc; }
+.remote-mysql-panel { max-width: 100%; min-width: 0; margin-top: 8px; border-top: 1px solid #d5e4ee; }
+.remote-mysql-panel > summary { padding: 8px 1px 4px; color: var(--navy); cursor: pointer; font-size: 10px; font-weight: 800; }
+.remote-mysql-content { display: grid; grid-template-columns: minmax(0,1fr); gap: 6px; min-width: 0; padding-top: 4px; }
+.remote-mysql-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(76px, 1fr)); gap: 5px; min-width: 0; }
+.remote-mysql-actions button { width: 100%; min-width: 0; white-space: normal; }
+.remote-mysql-preview-scroll { width: 100%; max-width: 100%; max-height: 220px; overflow: auto; border: 1px solid #c9dceb; border-radius: 4px; background: #fff; }
+.remote-mysql-preview-scroll table { width: max-content; min-width: 100%; }
+.shared-mysql-note { margin: 4px 0 6px; }
 .recommendation-card, .model-file-status, .acquisition-status { min-width: 0; overflow-wrap: anywhere; word-break: break-word; padding: 7px 8px; color: #28638d; background: #edf7fd; border: 1px solid #cbe4f3; border-radius: 5px; font-size: 9px; line-height: 1.45; }
 .indicator-auto-status { padding: 7px 8px; color: #235f87; background: #edf7fd; border: 1px solid #cbe4f3; border-radius: 5px; font-size: 9px; line-height: 1.5; }
 .indicator-auto-status strong { color: var(--navy); }

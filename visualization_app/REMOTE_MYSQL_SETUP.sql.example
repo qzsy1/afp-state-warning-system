@@ -1,0 +1,22 @@
+-- AFP 统一 MySQL 服务器初始化示例。
+-- 请只在数据库服务器上由管理员执行，并先替换：
+--   YOUR_CLIENT_IP：采集电脑 IP，或受控 VPN 网段写法
+--   CHANGE_TO_A_STRONG_PASSWORD：强密码
+
+CREATE DATABASE IF NOT EXISTS afp_state_warning
+  CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+-- 第一次建表：先在 AFP 软件中使用管理员账号点击“初始化表结构”。
+-- 表结构完成后，再创建日常最小权限账号。
+
+CREATE USER IF NOT EXISTS 'afp_app'@'YOUR_CLIENT_IP'
+  IDENTIFIED BY 'CHANGE_TO_A_STRONG_PASSWORD';
+GRANT SELECT, INSERT, UPDATE, DELETE
+  ON afp_state_warning.* TO 'afp_app'@'YOUR_CLIENT_IP';
+
+CREATE USER IF NOT EXISTS 'afp_reader'@'YOUR_CLIENT_IP'
+  IDENTIFIED BY 'CHANGE_TO_A_STRONG_PASSWORD';
+GRANT SELECT
+  ON afp_state_warning.* TO 'afp_reader'@'YOUR_CLIENT_IP';
+
+FLUSH PRIVILEGES;

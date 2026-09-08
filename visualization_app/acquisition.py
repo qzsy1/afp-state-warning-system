@@ -2887,7 +2887,12 @@ class AcquisitionManager:
         if not selected_pending:
             return result
         store = MySQLCaptureStore(settings)
-        connection = store.test_connection()
+        verifier = getattr(store, "verify_connection", None)
+        connection = (
+            verifier(require_schema=True)
+            if callable(verifier)
+            else store.test_connection()
+        )
         if not connection.get("ok"):
             result["connection_error"] = connection.get("error")
             return result
@@ -2965,6 +2970,65 @@ class AcquisitionManager:
             except Exception as exc:
                 result["failed"] += 1
                 result["errors"].append(f"{pending_path.name}：{exc}")
+        return result
+
+    def retry_pending_mysql(
+        self,
+        settings: MySQLSettings | dict[str, Any] | None = None,
+        root: str | Path | None = None,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Retry completed local layers that have not reached MySQL yet.
+
+        This is the operator-facing counterpart of ``_retry_pending_mysql``.
+        It deliberately processes only finalized local layer files, so a slow
+        or unreachable remote database can never block the acquisition loop.
+        """
+        active_config = self.config
+        if settings is None:
+            if active_config is None:
+                raise ValueError("尚未配置 MySQL 连接")
+            settings = MySQLSettings(
+                enabled=True,
+                host=active_config.mysql_host,
+                port=active_config.mysql_port,
+                user=active_config.mysql_user,
+                password=active_config.mysql_password,
+                database=active_config.mysql_database,
+                charset=active_config.mysql_charset,
+                connect_timeout=active_config.mysql_connect_timeout,
+            )
+        elif isinstance(settings, dict):
+            settings = MySQLSettings.from_mapping(settings)
+        if not settings.enabled:
+            settings = MySQLSettings(
+                **{
+                    **settings.__dict__,
+                    "enabled": True,
+                }
+            )
+        retry_root = Path(
+            root
+            or (active_config.save_root if active_config is not None else "")
+            or self.capture_root
+        ).expanduser()
+        result = self._retry_pending_mysql(
+            settings, retry_root, limit=max(1, min(int(limit), 1000))
+        )
+        with self.lock:
+            self.mysql_status = {
+                **self.mysql_status,
+                "enabled": True,
+                "database": settings.database,
+                "host": settings.host,
+                "pending_retry": result,
+                "state": (
+                    "synced"
+                    if result.get("failed", 0) == 0
+                    and not result.get("connection_error")
+                    else "pending"
+                ),
+            }
         return result
 
     def stop(self) -> dict:

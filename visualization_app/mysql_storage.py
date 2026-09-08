@@ -21,6 +21,22 @@ from typing import Any, Iterable
 DATABASE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 
 
+def _as_bool(value: Any, default: bool = False) -> bool:
+    """Parse UI/configuration booleans without treating ``"false"`` as true."""
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    token = str(value).strip().lower()
+    if token in {"1", "true", "yes", "on", "y", "是", "启用"}:
+        return True
+    if token in {"0", "false", "no", "off", "n", "否", "禁用", ""}:
+        return False
+    return bool(default)
+
+
 def validate_database_name(value: str) -> str:
     name = str(value or "").strip()
     if not DATABASE_NAME_RE.fullmatch(name):
@@ -73,20 +89,50 @@ class MySQLSettings:
     database: str = "afp_state_warning"
     charset: str = "utf8mb4"
     connect_timeout: int = 5
+    ssl_enabled: bool = False
+    ssl_verify_cert: bool = True
+    ssl_verify_identity: bool = True
+    ssl_ca: str = ""
+    ssl_cert: str = ""
+    ssl_key: str = ""
 
     @classmethod
     def from_mapping(cls, values: dict[str, Any]) -> "MySQLSettings":
         return cls(
-            enabled=bool(values.get("mysql_enabled", values.get("enabled", False))),
-            host=str(values.get("mysql_host", values.get("host", "127.0.0.1"))),
+            enabled=_as_bool(
+                values.get("mysql_enabled", values.get("enabled", False))
+            ),
+            host=str(
+                values.get("mysql_host", values.get("host", "127.0.0.1"))
+            ).strip()
+            or "127.0.0.1",
             port=int(values.get("mysql_port", values.get("port", 3306))),
-            user=str(values.get("mysql_user", values.get("user", "root"))),
+            user=str(values.get("mysql_user", values.get("user", "root"))).strip(),
             password=str(values.get("mysql_password", values.get("password", ""))),
             database=validate_database_name(
                 str(values.get("mysql_database", values.get("database", "afp_state_warning")))
             ),
             charset=str(values.get("mysql_charset", values.get("charset", "utf8mb4"))),
             connect_timeout=max(1, min(int(values.get("mysql_connect_timeout", 5)), 60)),
+            ssl_enabled=_as_bool(
+                values.get("mysql_ssl_enabled", values.get("ssl_enabled", False))
+            ),
+            ssl_verify_cert=_as_bool(
+                values.get("mysql_ssl_verify_cert", values.get("ssl_verify_cert", True)),
+                True,
+            ),
+            ssl_verify_identity=_as_bool(
+                values.get(
+                    "mysql_ssl_verify_identity",
+                    values.get("ssl_verify_identity", True),
+                ),
+                True,
+            ),
+            ssl_ca=str(values.get("mysql_ssl_ca", values.get("ssl_ca", ""))).strip(),
+            ssl_cert=str(
+                values.get("mysql_ssl_cert", values.get("ssl_cert", ""))
+            ).strip(),
+            ssl_key=str(values.get("mysql_ssl_key", values.get("ssl_key", ""))).strip(),
         )
 
     def public_dict(self) -> dict[str, Any]:
@@ -99,6 +145,12 @@ class MySQLSettings:
             "charset": self.charset,
             "connect_timeout": self.connect_timeout,
             "password_configured": bool(self.password),
+            "ssl_enabled": self.ssl_enabled,
+            "ssl_verify_cert": self.ssl_verify_cert,
+            "ssl_verify_identity": self.ssl_verify_identity,
+            "ssl_ca_configured": bool(self.ssl_ca),
+            "ssl_client_cert_configured": bool(self.ssl_cert),
+            "ssl_client_key_configured": bool(self.ssl_key),
         }
 
 
@@ -338,6 +390,52 @@ FOREIGN_KEY_DEFINITIONS = (
     ),
 )
 
+REQUIRED_SCHEMA_OBJECTS = frozenset(
+    {
+        "afp_condition",
+        "afp_specimen",
+        "afp_layer",
+        "afp_sensor_sample",
+        "afp_sample_all",
+        "afp_mysql_upload_log",
+        "afp_relation_map",
+        "afp_flat_all",
+    }
+)
+
+RELATION_COLUMNS = (
+    "condition_id",
+    "schema_id",
+    "specimen_id",
+    "replicate_no",
+    "specimen_key",
+    "layer_no",
+    "sample_count",
+    "layer_file",
+    "timestamp_file",
+    "saved_at",
+)
+
+FLAT_EXPORT_COLUMNS = (
+    "condition_id",
+    "schema_id",
+    "specimen_key",
+    "specimen_id",
+    "replicate_no",
+    "run_id",
+    "layer_no",
+    "sample_index",
+    "timestamp_iso",
+    "timestamp_unix",
+    "sensor_json",
+    "process_json",
+    "saved_at",
+)
+
+FILTER_COLUMNS = frozenset(
+    {"schema_id", "condition_id", "specimen_id", "replicate_no", "layer_no"}
+)
+
 
 def _now_sql() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -358,24 +456,90 @@ def _find_value(row: dict[str, Any], names: Iterable[str]) -> Any:
     return None
 
 
+def _json_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    if value in (None, ""):
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _csv_value(value: Any) -> Any:
+    if value is None:
+        return ""
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat(sep=" ")
+        except TypeError:
+            return value.isoformat()
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=False)
+    return value
+
+
 class MySQLCaptureStore:
     def __init__(self, settings: MySQLSettings) -> None:
         self.settings = settings
+
+    def _connection_kwargs(self, driver: str, database: str | None = None) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "host": self.settings.host,
+            "port": self.settings.port,
+            "user": self.settings.user,
+            "password": self.settings.password,
+            "charset": self.settings.charset,
+        }
+        if driver == "mysql.connector":
+            kwargs["connection_timeout"] = self.settings.connect_timeout
+        elif driver == "pymysql":
+            kwargs["connect_timeout"] = self.settings.connect_timeout
+            kwargs["autocommit"] = False
+        else:
+            raise ValueError(f"不支持的MySQL驱动：{driver}")
+        if database:
+            kwargs["database"] = validate_database_name(database)
+
+        if self.settings.ssl_enabled:
+            if driver == "mysql.connector":
+                kwargs.update(
+                    {
+                        "ssl_disabled": False,
+                        "ssl_verify_cert": self.settings.ssl_verify_cert,
+                        "ssl_verify_identity": self.settings.ssl_verify_identity,
+                    }
+                )
+            else:
+                kwargs.update(
+                    {
+                        "ssl_verify_cert": self.settings.ssl_verify_cert,
+                        "ssl_verify_identity": self.settings.ssl_verify_identity,
+                    }
+                )
+            for setting_name, argument_name in (
+                ("ssl_ca", "ssl_ca"),
+                ("ssl_cert", "ssl_cert"),
+                ("ssl_key", "ssl_key"),
+            ):
+                value = str(getattr(self.settings, setting_name, "") or "").strip()
+                if value:
+                    kwargs[argument_name] = value
+        elif driver == "mysql.connector":
+            # Make an explicitly disabled TLS setting deterministic.  PyMySQL
+            # simply omits all ssl_* arguments when encryption is disabled.
+            kwargs["ssl_disabled"] = True
+        return kwargs
 
     def _connect(self, database: str | None = None):
         try:
             import mysql.connector  # type: ignore
 
-            kwargs = {
-                "host": self.settings.host,
-                "port": self.settings.port,
-                "user": self.settings.user,
-                "password": self.settings.password,
-                "connection_timeout": self.settings.connect_timeout,
-                "charset": self.settings.charset,
-            }
-            if database:
-                kwargs["database"] = database
+            kwargs = self._connection_kwargs("mysql.connector", database)
             return "mysql.connector", mysql.connector.connect(**kwargs)
         except ImportError:
             try:
@@ -384,37 +548,32 @@ class MySQLCaptureStore:
                 raise RuntimeError(
                     "未安装 MySQL 驱动，请安装 mysql-connector-python 或 PyMySQL"
                 ) from exc
-            kwargs = {
-                "host": self.settings.host,
-                "port": self.settings.port,
-                "user": self.settings.user,
-                "password": self.settings.password,
-                "connect_timeout": self.settings.connect_timeout,
-                "charset": self.settings.charset,
-                "autocommit": False,
-            }
-            if database:
-                kwargs["database"] = database
+            kwargs = self._connection_kwargs("pymysql", database)
             return "pymysql", pymysql.connect(**kwargs)
 
     @staticmethod
     def _cursor(connection):
         return connection.cursor()
 
-    def _ensure_schema(self) -> str:
+    def _initialize_schema_impl(self, *, create_database: bool) -> str:
         database = validate_database_name(self.settings.database)
-        driver, connection = self._connect()
-        try:
-            cursor = self._cursor(connection)
-            cursor.execute(
-                f"CREATE DATABASE IF NOT EXISTS `{database}` "
-                "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
-            )
-            connection.commit()
-            cursor.close()
-        finally:
-            connection.close()
+        driver = ""
+        if create_database:
+            driver, connection = self._connect()
+            cursor = None
+            try:
+                cursor = self._cursor(connection)
+                cursor.execute(
+                    f"CREATE DATABASE IF NOT EXISTS `{database}` "
+                    "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                )
+                connection.commit()
+            finally:
+                if cursor is not None:
+                    cursor.close()
+                connection.close()
         driver, connection = self._connect(database)
+        cursor = None
         try:
             cursor = self._cursor(connection)
             for statement in SCHEMA_STATEMENTS:
@@ -463,22 +622,33 @@ class MySQLCaptureStore:
                         f"FOREIGN KEY {reference_sql}"
                     )
             connection.commit()
-            cursor.close()
         finally:
+            if cursor is not None:
+                cursor.close()
             connection.close()
         return driver
 
-    def test_connection(self) -> dict[str, Any]:
+    def initialize_schema(self, *, create_database: bool = True) -> dict[str, Any]:
+        """Perform the one-time database/table/view initialization.
+
+        ``create_database=False`` is intended for a remotely administered
+        server where the AFP application account may create tables but is not
+        allowed to create databases.  Ordinary saves and reads never call this
+        method; they connect directly to the already initialized database.
+        """
         started = time.time()
         if not self.settings.enabled:
             return {"ok": False, "enabled": False, "error": "MySQL保存未启用"}
         try:
-            driver = self._ensure_schema()
+            driver = self._initialize_schema_impl(create_database=create_database)
             return {
                 "ok": True,
                 "enabled": True,
                 "database": self.settings.database,
                 "driver": driver,
+                "initialized": True,
+                "database_creation_requested": bool(create_database),
+                "tls_requested": self.settings.ssl_enabled,
                 "elapsed_seconds": round(time.time() - started, 3),
             }
         except Exception as exc:
@@ -486,32 +656,162 @@ class MySQLCaptureStore:
                 "ok": False,
                 "enabled": True,
                 "database": self.settings.database,
+                "initialized": False,
+                "database_creation_requested": bool(create_database),
+                "tls_requested": self.settings.ssl_enabled,
                 "error": str(exc),
                 "elapsed_seconds": round(time.time() - started, 3),
             }
 
-    def relation_map(self, limit: int = 1000) -> dict[str, Any]:
-        """Return the compact condition/specimen/replicate/layer overview."""
+    def _ensure_schema(self) -> str:
+        """Compatibility wrapper retained for older callers and patches."""
+        return self._initialize_schema_impl(create_database=True)
+
+    def verify_connection(self, *, require_schema: bool = True) -> dict[str, Any]:
+        """Check connectivity and the existing schema without executing DDL."""
+        started = time.time()
         if not self.settings.enabled:
-            return {"ok": False, "enabled": False, "rows": [], "error": "MySQL保存未启用"}
+            return {"ok": False, "enabled": False, "error": "MySQL保存未启用"}
         connection = None
         cursor = None
         try:
-            self._ensure_schema()
+            driver, connection = self._connect(self.settings.database)
+            cursor = self._cursor(connection)
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+            missing: list[str] = []
+            if require_schema:
+                names = sorted(REQUIRED_SCHEMA_OBJECTS)
+                placeholders = ",".join(["%s"] * len(names))
+                cursor.execute(
+                    "SELECT TABLE_NAME FROM information_schema.TABLES "
+                    f"WHERE TABLE_SCHEMA=%s AND TABLE_NAME IN ({placeholders})",
+                    (self.settings.database, *names),
+                )
+                existing = {str(row[0]).lower() for row in cursor.fetchall()}
+                missing = [name for name in names if name.lower() not in existing]
+            return {
+                "ok": True,
+                "enabled": True,
+                "database": self.settings.database,
+                "driver": driver,
+                "schema_verified": bool(require_schema),
+                "schema_ready": not missing,
+                "missing_objects": missing,
+                "tls_requested": self.settings.ssl_enabled,
+                "elapsed_seconds": round(time.time() - started, 3),
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "enabled": True,
+                "database": self.settings.database,
+                "schema_verified": False,
+                "tls_requested": self.settings.ssl_enabled,
+                "error": str(exc),
+                "elapsed_seconds": round(time.time() - started, 3),
+            }
+        finally:
+            if cursor is not None:
+                cursor.close()
+            if connection is not None:
+                connection.close()
+
+    def test_connection(self) -> dict[str, Any]:
+        """Compatibility entry point: verify first, initialize only if needed."""
+        if not self.settings.enabled:
+            return {"ok": False, "enabled": False, "error": "MySQL保存未启用"}
+        verified = self.verify_connection(require_schema=True)
+        if verified.get("ok") and verified.get("schema_ready", True):
+            return {**verified, "initialized": False}
+        initialized = self.initialize_schema(create_database=True)
+        if initialized.get("ok"):
+            return initialized
+        # Preserve the non-DDL verification error as context.  This is useful
+        # for remote accounts whose permissions intentionally exclude CREATE.
+        initialized["verification_error"] = verified.get("error", "")
+        return initialized
+
+    @staticmethod
+    def _filter_sql(
+        *,
+        schema_id: str | None = None,
+        condition_id: str | None = None,
+        specimen_id: str | None = None,
+        replicate_no: int | None = None,
+        layer_no: int | None = None,
+    ) -> tuple[str, tuple[Any, ...]]:
+        values = {
+            "schema_id": schema_id,
+            "condition_id": condition_id,
+            "specimen_id": specimen_id,
+            "replicate_no": replicate_no,
+            "layer_no": layer_no,
+        }
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        for column, value in values.items():
+            if column not in FILTER_COLUMNS or value is None or value == "":
+                continue
+            clauses.append(f"`{column}`=%s")
+            parameters.append(int(value) if column in {"replicate_no", "layer_no"} else str(value))
+        return (" WHERE " + " AND ".join(clauses) if clauses else "", tuple(parameters))
+
+    def relation_map(
+        self,
+        limit: int = 1000,
+        *,
+        offset: int = 0,
+        schema_id: str | None = None,
+        condition_id: str | None = None,
+        specimen_id: str | None = None,
+        replicate_no: int | None = None,
+        layer_no: int | None = None,
+    ) -> dict[str, Any]:
+        """Return the compact condition/specimen/replicate/layer overview."""
+        columns = list(RELATION_COLUMNS)
+        if not self.settings.enabled:
+            return {
+                "ok": False,
+                "enabled": False,
+                "columns": columns,
+                "rows": [],
+                "error": "MySQL保存未启用",
+            }
+        connection = None
+        cursor = None
+        try:
             _, connection = self._connect(self.settings.database)
             cursor = self._cursor(connection)
+            page_limit = max(1, min(int(limit), 10000))
+            page_offset = max(0, int(offset))
+            where_sql, parameters = self._filter_sql(
+                schema_id=schema_id,
+                condition_id=condition_id,
+                specimen_id=specimen_id,
+                replicate_no=replicate_no,
+                layer_no=layer_no,
+            )
+            cursor.execute(
+                "SELECT COUNT(*) FROM afp_relation_map" + where_sql,
+                parameters,
+            )
+            count_row = cursor.fetchone()
+            total_count = int(count_row[0]) if count_row else 0
             cursor.execute(
                 """
                 SELECT condition_id, schema_id, specimen_id, replicate_no,
                        specimen_key, layer_no, sample_count, layer_file,
                        timestamp_file, saved_at
                 FROM afp_relation_map
+                """
+                + where_sql
+                + """
                 ORDER BY condition_id, replicate_no, specimen_id, layer_no
-                LIMIT %s
+                LIMIT %s OFFSET %s
                 """,
-                (max(1, min(int(limit), 10000)),),
+                (*parameters, page_limit, page_offset),
             )
-            columns = [item[0] for item in cursor.description]
             rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
             for row in rows:
                 if hasattr(row.get("saved_at"), "isoformat"):
@@ -520,11 +820,200 @@ class MySQLCaptureStore:
                 "ok": True,
                 "enabled": True,
                 "database": self.settings.database,
+                "columns": columns,
                 "rows": rows,
                 "count": len(rows),
+                "total_count": total_count,
+                "limit": page_limit,
+                "offset": page_offset,
+                "has_more": page_offset + len(rows) < total_count,
             }
         except Exception as exc:
-            return {"ok": False, "enabled": True, "rows": [], "error": str(exc)}
+            return {
+                "ok": False,
+                "enabled": True,
+                "database": self.settings.database,
+                "columns": columns,
+                "rows": [],
+                "error": str(exc),
+            }
+        finally:
+            if cursor is not None:
+                cursor.close()
+            if connection is not None:
+                connection.close()
+
+    def export_flat_csv(
+        self,
+        output_file: str | Path,
+        *,
+        schema_id: str | None = None,
+        condition_id: str | None = None,
+        specimen_id: str | None = None,
+        replicate_no: int | None = None,
+        layer_no: int | None = None,
+        batch_size: int = 2000,
+        expand_json: bool = True,
+    ) -> dict[str, Any]:
+        """Export selected AFP samples with a fixed, parameterized query.
+
+        No caller-provided SQL is accepted.  Rows are fetched in bounded
+        batches and written through a ``.partial`` file before atomically
+        replacing the destination.  With ``expand_json=True`` the process and
+        sensor JSON objects are expanded into training-friendly CSV columns.
+        """
+        if not self.settings.enabled:
+            return {
+                "ok": False,
+                "enabled": False,
+                "saved_rows": 0,
+                "error": "MySQL保存未启用",
+            }
+        started = time.time()
+        output_path = Path(output_file).expanduser()
+        partial_path = output_path.with_name(output_path.name + ".partial")
+        connection = None
+        cursor = None
+        saved_rows = 0
+        export_columns: list[str] = []
+        chunk_size = max(1, min(int(batch_size), 10000))
+        where_sql, parameters = self._filter_sql(
+            schema_id=schema_id,
+            condition_id=condition_id,
+            specimen_id=specimen_id,
+            replicate_no=replicate_no,
+            layer_no=layer_no,
+        )
+        select_sql = (
+            "SELECT condition_id, schema_id, specimen_key, specimen_id, "
+            "replicate_no, run_id, layer_no, sample_index, timestamp_iso, "
+            "timestamp_unix, sensor_json, process_json, saved_at "
+            "FROM afp_flat_all"
+            + where_sql
+            + " ORDER BY condition_id, replicate_no, specimen_id, "
+            "layer_no, sample_index"
+        )
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            if output_path.exists() and output_path.is_dir():
+                raise IsADirectoryError(f"导出目标是文件夹而不是CSV文件：{output_path}")
+            driver, connection = self._connect(self.settings.database)
+            cursor = self._cursor(connection)
+
+            process_keys: set[str] = set()
+            sensor_keys: set[str] = set()
+            if expand_json:
+                # A key-only pass keeps RAM bounded and fixes the header before
+                # the CSV is opened.  The same transaction provides a stable
+                # view while the subsequent export pass is running.
+                cursor.execute(
+                    "SELECT process_json, sensor_json FROM afp_flat_all"
+                    + where_sql
+                    + " ORDER BY condition_id, replicate_no, specimen_id, "
+                    "layer_no, sample_index",
+                    parameters,
+                )
+                while True:
+                    batch = cursor.fetchmany(chunk_size)
+                    if not batch:
+                        break
+                    for process_json, sensor_json in batch:
+                        process_keys.update(str(key) for key in _json_object(process_json))
+                        sensor_keys.update(str(key) for key in _json_object(sensor_json))
+
+            metadata_columns = [
+                column
+                for column in FLAT_EXPORT_COLUMNS
+                if column not in {"sensor_json", "process_json", "saved_at"}
+            ]
+            if expand_json:
+                used = set(metadata_columns) | {"saved_at"}
+                process_map: dict[str, str] = {}
+                sensor_map: dict[str, str] = {}
+                for prefix, keys, target in (
+                    ("process__", sorted(process_keys), process_map),
+                    ("sensor__", sorted(sensor_keys), sensor_map),
+                ):
+                    for key in keys:
+                        column = key
+                        if column in used:
+                            column = prefix + key
+                        suffix = 2
+                        base = column
+                        while column in used:
+                            column = f"{base}_{suffix}"
+                            suffix += 1
+                        target[key] = column
+                        used.add(column)
+                export_columns = (
+                    metadata_columns
+                    + list(process_map.values())
+                    + list(sensor_map.values())
+                    + ["saved_at"]
+                )
+            else:
+                process_map = {}
+                sensor_map = {}
+                export_columns = list(FLAT_EXPORT_COLUMNS)
+
+            cursor.execute(select_sql, parameters)
+            with partial_path.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=export_columns)
+                writer.writeheader()
+                while True:
+                    batch = cursor.fetchmany(chunk_size)
+                    if not batch:
+                        break
+                    for values in batch:
+                        source = dict(zip(FLAT_EXPORT_COLUMNS, values))
+                        if expand_json:
+                            process_values = _json_object(source.get("process_json"))
+                            sensor_values = _json_object(source.get("sensor_json"))
+                            output_row = {
+                                column: _csv_value(source.get(column))
+                                for column in metadata_columns
+                            }
+                            for key, column in process_map.items():
+                                output_row[column] = _csv_value(process_values.get(key))
+                            for key, column in sensor_map.items():
+                                output_row[column] = _csv_value(sensor_values.get(key))
+                            output_row["saved_at"] = _csv_value(source.get("saved_at"))
+                        else:
+                            output_row = {
+                                column: _csv_value(source.get(column))
+                                for column in export_columns
+                            }
+                        writer.writerow(output_row)
+                        saved_rows += 1
+            partial_path.replace(output_path)
+            return {
+                "ok": True,
+                "enabled": True,
+                "database": self.settings.database,
+                "driver": driver,
+                "output_file": str(output_path.resolve()),
+                "saved_rows": saved_rows,
+                "columns": export_columns,
+                "batch_size": chunk_size,
+                "expanded_json": bool(expand_json),
+                "elapsed_seconds": round(time.time() - started, 3),
+            }
+        except Exception as exc:
+            try:
+                if partial_path.exists() and partial_path.is_file():
+                    partial_path.unlink()
+            except OSError:
+                pass
+            return {
+                "ok": False,
+                "enabled": True,
+                "database": self.settings.database,
+                "output_file": str(output_path),
+                "saved_rows": saved_rows,
+                "columns": export_columns,
+                "error": str(exc),
+                "elapsed_seconds": round(time.time() - started, 3),
+            }
         finally:
             if cursor is not None:
                 cursor.close()
@@ -563,9 +1052,10 @@ class MySQLCaptureStore:
         started = time.time()
         specimen_key = self.specimen_key(config)
         layer_no = int(getattr(config, "layer", 0)) + 1
+        connection = None
+        cursor = None
         try:
-            driver = self._ensure_schema()
-            _, connection = self._connect(self.settings.database)
+            driver, connection = self._connect(self.settings.database)
             saved_at = _now_sql()
             parameter_values = {
                 key: getattr(config, key, None)
@@ -717,8 +1207,6 @@ class MySQLCaptureStore:
                 (specimen_key, layer_no, len(sample_values), saved_at),
             )
             connection.commit()
-            cursor.close()
-            connection.close()
             return {
                 "ok": True,
                 "enabled": True,
@@ -730,6 +1218,11 @@ class MySQLCaptureStore:
                 "elapsed_seconds": round(time.time() - started, 3),
             }
         except Exception as exc:
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
             return {
                 "ok": False,
                 "enabled": True,
@@ -740,6 +1233,17 @@ class MySQLCaptureStore:
                 "error": str(exc),
                 "elapsed_seconds": round(time.time() - started, 3),
             }
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
 
 
 def mysql_settings_from_mapping(values: dict[str, Any]) -> MySQLSettings:

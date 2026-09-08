@@ -96,6 +96,10 @@ const controls = {
   mysqlPassword: $("mysqlPasswordInput"),
   mysqlDatabase: $("mysqlDatabaseInput"),
   testMysql: $("testMysqlButton"),
+  remoteMysqlQuery: $("remoteMysqlQueryInput"),
+  remoteMysqlLimit: $("remoteMysqlLimitInput"),
+  remoteMysqlStatus: $("remoteMysqlStatus"),
+  remoteMysqlPreview: $("remoteMysqlPreviewTable"),
   predictionModel: $("predictionModelInput"),
   predictionModelType: $("predictionModelTypeSelect"),
   livePower: $("livePowerInput"),
@@ -114,6 +118,19 @@ const controls = {
   resetSensorCheck: $("resetSensorCheckButton"),
   hardwareCheckStatus: $("hardwareCheckStatus"),
 };
+
+function unifiedMysqlSettings(extra = {}) {
+  return {
+    mysql_enabled: true,
+    mysql_host: controls.mysqlHost?.value.trim() || "127.0.0.1",
+    mysql_port: Number(controls.mysqlPort?.value) || 3306,
+    mysql_user: controls.mysqlUser?.value.trim() || "root",
+    mysql_password: controls.mysqlPassword?.value ?? "",
+    mysql_database: controls.mysqlDatabase?.value.trim() || "afp_state_warning",
+    mysql_charset: "utf8mb4",
+    ...extra,
+  };
+}
 
 const LAYER_EVIDENCE_VISIBILITY_KEY = "afp-show-layer-evidence-v1";
 
@@ -658,21 +675,8 @@ async function selectSaveRoot() {
 async function testMysqlConnection() {
   const status = $("mysqlStatus");
   try {
-    if (!controls.mysqlEnabled.checked) {
-      status.textContent = "请先勾选 MySQL 保存选项。";
-      status.classList.remove("ok", "error");
-      return;
-    }
-    status.textContent = "正在检查 MySQL 连接并准备数据库表……";
-    const result = await postJson("/api/mysql/test", {
-      mysql_enabled: true,
-      mysql_host: controls.mysqlHost.value.trim() || "127.0.0.1",
-      mysql_port: Number(controls.mysqlPort.value) || 3306,
-      mysql_user: controls.mysqlUser.value.trim() || "root",
-      mysql_password: controls.mysqlPassword.value ?? "",
-      mysql_database: controls.mysqlDatabase.value.trim() || "afp_state_warning",
-      mysql_charset: "utf8mb4",
-    });
+    status.textContent = "正在检查已有 MySQL 数据库（不会创建或修改表）……";
+    const result = await postJson("/api/mysql/test", unifiedMysqlSettings({read_only: true}));
     state.mysqlConnectionTest = result;
     status.classList.toggle("ok", Boolean(result.ok));
     status.classList.toggle("error", !result.ok);
@@ -681,7 +685,7 @@ async function testMysqlConnection() {
       ? "账号或密码错误：请确认 MySQL 用户名和密码设置正确"
       : errorText;
     status.textContent = result.ok
-      ? `MySQL 已连接：${result.database}（${result.driver}）`
+      ? `MySQL 已连接：${result.database}（${result.driver}）${result.schema_ready === false ? "，但AFP表结构不完整" : ""}`
       : `MySQL 连接失败：${friendlyError}`;
   } catch (error) {
     state.mysqlConnectionTest = {ok: false, error: error.message};
@@ -698,27 +702,8 @@ async function refreshRelationMap() {
   const database = controls.mysqlDatabase.value.trim() || "afp_state_warning";
   const status = $("mysqlStatus");
   try {
-    if (!controls.mysqlEnabled.checked) {
-      body.replaceChildren();
-      const row = document.createElement("tr");
-      const cell = document.createElement("td");
-      cell.colSpan = 6;
-      cell.textContent = "请先勾选 MySQL 保存选项";
-      row.appendChild(cell);
-      body.appendChild(row);
-      return;
-    }
     if (status) status.textContent = `正在读取数据库 ${database} 的关系表……`;
-    const result = await postJson("/api/mysql/relation-map", {
-      mysql_enabled: true,
-      mysql_host: controls.mysqlHost.value.trim() || "127.0.0.1",
-      mysql_port: Number(controls.mysqlPort.value) || 3306,
-      mysql_user: controls.mysqlUser.value.trim() || "root",
-      mysql_password: controls.mysqlPassword.value ?? "",
-      mysql_database: database,
-      mysql_charset: "utf8mb4",
-      limit: 1000,
-    });
+    const result = await postJson("/api/mysql/relation-map", unifiedMysqlSettings({limit: 1000}));
     body.replaceChildren();
     if (!result.ok || !result.rows?.length) {
       const row = document.createElement("tr");
@@ -763,6 +748,106 @@ async function refreshRelationMap() {
     cell.textContent = `数据库 ${database} 关系表读取失败：${error.message}`;
     row.appendChild(cell);
     body.appendChild(row);
+  }
+}
+
+function renderRemoteMysqlPreview(columns, rows) {
+  const table = controls.remoteMysqlPreview;
+  if (!table) return;
+  table.replaceChildren();
+  const head = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  columns.forEach((name) => {
+    const cell = document.createElement("th");
+    cell.textContent = name;
+    headRow.appendChild(cell);
+  });
+  head.appendChild(headRow);
+  const body = document.createElement("tbody");
+  rows.forEach((item) => {
+    const row = document.createElement("tr");
+    columns.forEach((name) => {
+      const cell = document.createElement("td");
+      cell.textContent = String(item?.[name] ?? "");
+      row.appendChild(cell);
+    });
+    body.appendChild(row);
+  });
+  if (!rows.length) {
+    const row = document.createElement("tr");
+    const cell = document.createElement("td");
+    cell.colSpan = Math.max(1, columns.length);
+    cell.textContent = "查询成功，当前没有匹配数据";
+    row.appendChild(cell);
+    body.appendChild(row);
+  }
+  table.append(head, body);
+}
+
+async function previewRemoteMysqlData() {
+  const status = controls.remoteMysqlStatus;
+  try {
+    if (status) status.textContent = "正在从统一 MySQL 数据库读取预览……";
+    const result = await postJson("/api/mysql/query", unifiedMysqlSettings({
+      query: controls.remoteMysqlQuery?.value.trim() || "",
+      limit: Number(controls.remoteMysqlLimit?.value) || 200,
+    }));
+    renderRemoteMysqlPreview(result.columns || [], result.rows || []);
+    state.remoteMysqlPreview = result;
+    if (status) status.textContent = `已读取 ${result.count || 0} 行${result.truncated ? "（结果已截断）" : ""}。`;
+  } catch (error) {
+    if (status) status.textContent = `读取失败：${error.message}`;
+  }
+}
+
+async function copyRemoteMysqlPreview() {
+  const result = state.remoteMysqlPreview;
+  if (!result?.columns?.length) {
+    toast("请先预览远程数据");
+    return;
+  }
+  const escapeCell = (value) => {
+    const text = String(value ?? "");
+    return /[\t\r\n]/.test(text) ? JSON.stringify(text) : text;
+  };
+  const lines = [result.columns.join("\t")];
+  (result.rows || []).forEach((row) => lines.push(result.columns.map((name) => escapeCell(row[name])).join("\t")));
+  try {
+    await navigator.clipboard.writeText(lines.join("\n"));
+    toast("预览数据已复制，可直接粘贴到 Excel");
+  } catch (error) {
+    toast(`复制失败：${error.message}`);
+  }
+}
+
+async function downloadRemoteMysqlCsv() {
+  const status = controls.remoteMysqlStatus;
+  try {
+    if (status) status.textContent = "正在生成远程数据库 CSV……";
+    const response = await fetch("/api/mysql/export-csv", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(unifiedMysqlSettings({
+        query: controls.remoteMysqlQuery?.value.trim() || "",
+        limit: 200000,
+      })),
+    });
+    if (!response.ok) {
+      let message = `请求失败（${response.status}）`;
+      try { message = (await response.json()).error || message; } catch (_) {}
+      throw new Error(message);
+    }
+    const blob = await response.blob();
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `afp_${controls.mysqlDatabase?.value.trim() || "database"}_export.csv`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(link.href);
+    if (status) status.textContent = "CSV 已生成并开始下载。";
+  } catch (error) {
+    if (status) status.textContent = `下载失败：${error.message}`;
   }
 }
 
@@ -2015,6 +2100,9 @@ controls.discoverInterfaces?.addEventListener("click", discoverInterfaces);
 controls.addInterface?.addEventListener("click", addInterface);
 $("testMysqlButton")?.addEventListener("click", testMysqlConnection);
 $("refreshRelationMapButton")?.addEventListener("click", refreshRelationMap);
+$("previewMysqlDataButton")?.addEventListener("click", previewRemoteMysqlData);
+$("copyMysqlPreviewButton")?.addEventListener("click", copyRemoteMysqlPreview);
+$("downloadMysqlCsvButton")?.addEventListener("click", downloadRemoteMysqlCsv);
 controls.mysqlEnabled?.addEventListener("change", () => {
   if (!controls.mysqlEnabled.checked) state.mysqlConnectionTest = null;
   renderMysqlStatus({enabled: false, ok: false, saved_rows: 0});
@@ -2803,13 +2891,7 @@ async function runIntegration() {
       source_path: controls.integrationFolder?.value.trim() || "",
       output_file: controls.integrationOutput?.value.trim() || "",
       query: controls.integrationMysqlQuery?.value.trim() || "",
-      mysql_settings: {
-        host: controls.integrationMysqlHost?.value.trim() || "127.0.0.1",
-        port: Number(controls.integrationMysqlPort?.value) || 3306,
-        user: controls.integrationMysqlUser?.value.trim() || "root",
-        password: controls.integrationMysqlPassword?.value ?? "",
-        database: controls.integrationMysqlDatabase?.value.trim() || "afp_state_warning",
-      },
+      mysql_settings: unifiedMysqlSettings(),
     };
     const result = await postJson("/api/acquisition/integrate", payload);
     status.textContent =
@@ -2848,11 +2930,11 @@ function acquisitionConfig() {
     simulation_source_type: controls.simulationSourceType?.value || "single_csv",
     simulation_source_path: simulation ? (controls.simulationSourcePath?.value.trim() || "") : "",
     simulation_mysql_query: controls.simulationMysqlQuery?.value.trim() || "",
-    simulation_mysql_host: controls.simulationMysqlHost?.value.trim() || "127.0.0.1",
-    simulation_mysql_port: Number(controls.simulationMysqlPort?.value) || 3306,
-    simulation_mysql_user: controls.simulationMysqlUser?.value.trim() || "root",
-    simulation_mysql_password: controls.simulationMysqlPassword?.value ?? "",
-    simulation_mysql_database: controls.simulationMysqlDatabase?.value.trim() || "afp_state_warning",
+    simulation_mysql_host: controls.mysqlHost?.value.trim() || "127.0.0.1",
+    simulation_mysql_port: Number(controls.mysqlPort?.value) || 3306,
+    simulation_mysql_user: controls.mysqlUser?.value.trim() || "root",
+    simulation_mysql_password: controls.mysqlPassword?.value ?? "",
+    simulation_mysql_database: controls.mysqlDatabase?.value.trim() || "afp_state_warning",
     dataset_schema: controls.datasetSchema.value || "legacy_original",
     use_best_prediction_override: controls.bestPredictionOverride.checked,
     driver: simulation ? "simulator" : (first.driver || controls.driver.value),

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import inspect
+import io
 import json
 import math
 import mimetypes
 import os
+import re
 import sys
 import threading
 import webbrowser
@@ -75,6 +79,222 @@ OUTPUT_DIR = (
     else APP_DIR.parent / "outputs_tc_hi_soft_consistency_v13_8"
 )
 CAUSAL_OUTPUT_DIR = APP_DIR.parent / "outputs_causal_online_consistency_v13_9"
+
+DEFAULT_MYSQL_FLAT_QUERY = (
+    "SELECT * FROM afp_flat_all "
+    "ORDER BY specimen_key, layer_no, sample_index"
+)
+MYSQL_PREVIEW_LIMIT = 200
+MYSQL_EXPORT_LIMIT = 200_000
+_MYSQL_FORBIDDEN_TOKENS = {
+    "ALTER", "ANALYZE", "CALL", "CREATE", "DELETE", "DO", "DROP",
+    "GRANT", "HANDLER", "INSERT", "LOAD", "LOCK", "OPTIMIZE",
+    "RENAME", "REPAIR", "REPLACE", "REVOKE", "SET", "TRUNCATE",
+    "UNLOCK", "UPDATE",
+}
+
+
+def _mysql_sql_tokens(sql: str) -> list[str]:
+    """Return SQL words outside quoted strings/identifiers.
+
+    This is intentionally conservative.  The browser is a data-view/export
+    surface, not a general SQL console, so comments and stacked statements are
+    rejected by :func:`validate_read_only_mysql_query` before tokenization.
+    """
+    scrubbed = re.sub(r"'(?:''|\\.|[^'])*'", " ", sql, flags=re.S)
+    scrubbed = re.sub(r'"(?:""|\\.|[^"])*"', " ", scrubbed, flags=re.S)
+    scrubbed = re.sub(r"`(?:``|[^`])*`", " ", scrubbed, flags=re.S)
+    return re.findall(r"[A-Za-z_]+", scrubbed.upper())
+
+
+def validate_read_only_mysql_query(
+    query: str,
+    default: str = DEFAULT_MYSQL_FLAT_QUERY,
+) -> str:
+    """Validate one browser-supplied MySQL SELECT/CTE statement.
+
+    Prefix checking alone is unsafe because ``WITH ... DELETE`` and
+    ``SELECT ... INTO OUTFILE`` can change server state.  We therefore reject
+    comments, statement separators and every data/schema/privilege mutation
+    token.  Database permissions remain the final security boundary; this
+    validation is an additional application-level guard.
+    """
+    sql = str(query or "").strip() or default
+    if len(sql) > 20_000:
+        raise ValueError("SQL 查询过长；只允许不超过 20000 个字符的只读查询")
+    if "\x00" in sql or ";" in sql:
+        raise ValueError("只允许一条 SELECT/WITH 查询，不能包含分号或多条语句")
+    if re.search(r"(?:--|#|/\*|\*/)", sql):
+        raise ValueError("只读查询不允许包含 SQL 注释")
+    tokens = _mysql_sql_tokens(sql)
+    if not tokens or tokens[0] not in {"SELECT", "WITH"}:
+        raise ValueError("只允许 SELECT 或 WITH ... SELECT 只读查询")
+    forbidden = sorted(set(tokens) & _MYSQL_FORBIDDEN_TOKENS)
+    if forbidden:
+        raise ValueError(f"只读查询包含禁止关键字：{', '.join(forbidden)}")
+    if "SELECT" not in tokens:
+        raise ValueError("WITH 查询必须以 SELECT 返回数据")
+    for unsafe_phrase in (r"\bINTO\s+(?:OUTFILE|DUMPFILE)\b", r"\bFOR\s+UPDATE\b"):
+        if re.search(unsafe_phrase, sql, flags=re.I):
+            raise ValueError("只读查询不能写文件或锁定数据")
+    return sql
+
+
+def _json_safe_mysql_value(value):
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).decode("utf-8", errors="replace")
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat(sep=" ")
+        except TypeError:
+            return value.isoformat()
+    return str(value)
+
+
+def _normalise_mysql_rows(result) -> tuple[list[str], list[dict]]:
+    if isinstance(result, dict):
+        rows = result.get("rows", [])
+        columns = list(result.get("columns", []) or [])
+    else:
+        rows = result or []
+        columns = []
+    normalised: list[dict] = []
+    for raw in rows:
+        if isinstance(raw, dict):
+            item = {str(key): _json_safe_mysql_value(value) for key, value in raw.items()}
+        else:
+            if not columns:
+                raise ValueError("MySQL 查询结果缺少列名")
+            item = {
+                str(key): _json_safe_mysql_value(value)
+                for key, value in zip(columns, raw)
+            }
+        normalised.append(item)
+    if not columns and normalised:
+        columns = list(normalised[0])
+    return columns, normalised
+
+
+def _call_compatible_mysql_rows(store, query: str, limit: int):
+    """Use a newer store query API when available, otherwise connect directly."""
+    for name in ("read_only_query", "query_readonly", "export_flat_rows"):
+        method = getattr(store, name, None)
+        if not callable(method):
+            continue
+        signature = inspect.signature(method)
+        parameters = signature.parameters
+        # A flat-export helper without a query argument is safe only for the
+        # canonical flat view; custom SELECTs use the compatibility fallback.
+        if "query" not in parameters and query != DEFAULT_MYSQL_FLAT_QUERY:
+            continue
+        kwargs = {}
+        if "query" in parameters:
+            kwargs["query"] = query
+        if "limit" in parameters:
+            kwargs["limit"] = limit
+        return method(**kwargs)
+
+    _, connection = store._connect(store.settings.database)
+    cursor = None
+    try:
+        cursor = connection.cursor()
+        cursor.execute(query)
+        columns = [str(item[0]) for item in (cursor.description or [])]
+        rows = cursor.fetchmany(limit + 1)
+        return {
+            "columns": columns,
+            "rows": [dict(zip(columns, row)) for row in rows[:limit]],
+            "truncated": len(rows) > limit,
+        }
+    finally:
+        if cursor is not None:
+            cursor.close()
+        connection.close()
+
+
+def mysql_read_only_rows(store, query: str, limit: int) -> dict:
+    sql = validate_read_only_mysql_query(query)
+    capped_limit = max(1, min(int(limit), MYSQL_EXPORT_LIMIT))
+    raw = _call_compatible_mysql_rows(store, sql, capped_limit)
+    columns, rows = _normalise_mysql_rows(raw)
+    truncated = bool(raw.get("truncated", False)) if isinstance(raw, dict) else False
+    return {
+        "ok": True,
+        "database": store.settings.database,
+        "host": store.settings.host,
+        "columns": columns,
+        "rows": rows[:capped_limit],
+        "count": min(len(rows), capped_limit),
+        "truncated": truncated or len(rows) > capped_limit,
+        "limit": capped_limit,
+        "query": sql,
+    }
+
+
+def mysql_rows_to_csv(columns: list[str], rows: list[dict]) -> bytes:
+    stream = io.StringIO(newline="")
+    writer = csv.DictWriter(stream, fieldnames=columns, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({name: row.get(name, "") for name in columns})
+    return ("\ufeff" + stream.getvalue()).encode("utf-8")
+
+
+def mysql_test_existing_database(store) -> dict:
+    """Test an already-initialized database without creating or altering it."""
+    verifier = getattr(store, "verify_connection", None)
+    if callable(verifier):
+        return verifier(require_schema=True)
+    for name in ("test_existing_database", "test_read_only_connection"):
+        method = getattr(store, name, None)
+        if callable(method):
+            return method()
+    connection = None
+    cursor = None
+    try:
+        driver, connection = store._connect(store.settings.database)
+        cursor = connection.cursor()
+        cursor.execute("SELECT 1")
+        cursor.fetchone()
+        cursor.execute(
+            "SELECT TABLE_NAME FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA=%s AND TABLE_NAME IN "
+            "('afp_condition','afp_specimen','afp_layer','afp_sensor_sample',"
+            "'afp_sample_all','afp_flat_all','afp_relation_map')",
+            (store.settings.database,),
+        )
+        existing = {str(row[0]) for row in cursor.fetchall()}
+        required = {
+            "afp_condition", "afp_specimen", "afp_layer", "afp_sample_all",
+            "afp_flat_all", "afp_relation_map",
+        }
+        missing = sorted(required - existing)
+        return {
+            "ok": True,
+            "enabled": True,
+            "database": store.settings.database,
+            "host": store.settings.host,
+            "driver": driver,
+            "schema_ready": not missing,
+            "missing_objects": missing,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "enabled": True,
+            "database": store.settings.database,
+            "host": store.settings.host,
+            "error": str(exc),
+        }
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if connection is not None:
+            connection.close()
 
 LEGACY_STATE_LABELS = {
     "normal": "正常",
@@ -3639,6 +3859,22 @@ class AppHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _send_download(
+        self,
+        raw: bytes,
+        filename: str,
+        content_type: str = "application/octet-stream",
+    ) -> None:
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", filename).strip("._")
+        safe_name = safe_name or "download.bin"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{safe_name}"')
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(raw)
+
     @staticmethod
     def _one(query: dict[str, list[str]], key: str, default: str) -> str:
         return query.get(key, [default])[0]
@@ -3792,6 +4028,10 @@ class AppHandler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise ValueError("请求体必须是JSON对象")
             if parsed.path == "/api/acquisition/test":
+                if str(payload.get("simulation_source_type", "")).lower() == "mysql":
+                    payload["simulation_mysql_query"] = validate_read_only_mysql_query(
+                        str(payload.get("simulation_mysql_query", ""))
+                    )
                 config = AcquisitionConfig(**payload)
                 model_validation = self.dashboard.validate_prediction_setup(
                     config, load_model=False
@@ -3804,6 +4044,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._send_json(self.dashboard.acquisition.reset_check_state())
                 return
             if parsed.path == "/api/training/import":
+                if str(payload.get("source", "")).lower() == "mysql":
+                    payload["query"] = validate_read_only_mysql_query(
+                        str(payload.get("query", ""))
+                    )
                 self._send_json(self.dashboard.web_training.import_source(payload))
                 return
             if parsed.path == "/api/training/start":
@@ -3821,7 +4065,13 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/mysql/test":
                 settings = mysql_settings_from_mapping(payload)
-                self._send_json(MySQLCaptureStore(settings).test_connection())
+                store = MySQLCaptureStore(settings)
+                result = (
+                    mysql_test_existing_database(store)
+                    if bool(payload.get("read_only", False))
+                    else store.test_connection()
+                )
+                self._send_json(result)
                 return
             if parsed.path == "/api/mysql/relation-map":
                 settings = mysql_settings_from_mapping(payload)
@@ -3829,6 +4079,34 @@ class AppHandler(BaseHTTPRequestHandler):
                     int(payload.get("limit", 1000))
                 )
                 self._send_json(result)
+                return
+            if parsed.path == "/api/mysql/query":
+                settings = mysql_settings_from_mapping(payload)
+                result = mysql_read_only_rows(
+                    MySQLCaptureStore(settings),
+                    str(payload.get("query", "")),
+                    max(1, min(int(payload.get("limit", MYSQL_PREVIEW_LIMIT)), 1000)),
+                )
+                self._send_json(result)
+                return
+            if parsed.path == "/api/mysql/export-csv":
+                settings = mysql_settings_from_mapping(payload)
+                result = mysql_read_only_rows(
+                    MySQLCaptureStore(settings),
+                    str(payload.get("query", "")),
+                    max(
+                        1,
+                        min(
+                            int(payload.get("limit", MYSQL_EXPORT_LIMIT)),
+                            MYSQL_EXPORT_LIMIT,
+                        ),
+                    ),
+                )
+                self._send_download(
+                    mysql_rows_to_csv(result["columns"], result["rows"]),
+                    f"afp_{settings.database}_export.csv",
+                    "text/csv; charset=utf-8",
+                )
                 return
             if parsed.path == "/api/prediction-model/select-file":
                 selected = select_prediction_model_file(
@@ -3877,6 +4155,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._send_json({"selected": bool(selected), "path": selected})
                 return
             if parsed.path == "/api/acquisition/integrate":
+                if str(payload.get("source_type", "")).lower() == "mysql":
+                    payload["query"] = validate_read_only_mysql_query(
+                        str(payload.get("query", ""))
+                    )
                 result = integrate_capture_sources(
                     str(payload.get("source_type", "folder_csv")),
                     str(payload.get("source_path", "")),
@@ -3889,6 +4171,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._send_json(result)
                 return
             if parsed.path == "/api/acquisition/start":
+                if str(payload.get("simulation_source_type", "")).lower() == "mysql":
+                    payload["simulation_mysql_query"] = validate_read_only_mysql_query(
+                        str(payload.get("simulation_mysql_query", ""))
+                    )
                 config = AcquisitionConfig(**payload)
                 model_validation = self.dashboard.validate_prediction_setup(
                     config, load_model=True

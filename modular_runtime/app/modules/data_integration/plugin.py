@@ -19,5 +19,4 @@ class DataIntegrationService:
 
 
 def register(context: Any) -> ModuleRegistration:
-    return ModuleRegistration("data_integration", "2.0.0", "2.0", ("capture_folder_to_csv", "mysql_to_csv", "schema_normalization"), DataIntegrationService(context))
-
+    return ModuleRegistration("data_integration", "2.1.0", "2.0", ("capture_folder_to_csv", "mysql_to_csv", "remote_mysql_to_csv", "schema_normalization"), DataIntegrationService(context))
