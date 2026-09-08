@@ -47,11 +47,19 @@ def main() -> None:
     parser.add_argument("--version", required=True)
     args = parser.parse_args()
     repo = Path(args.repo).resolve()
-    names = subprocess.check_output(
-        ["git", "-C", str(repo), "diff", "--name-only", "--diff-filter=AM", args.base, "HEAD"],
-        text=True,
-        encoding="utf-8",
-    ).splitlines()
+    # NUL-delimited output preserves spaces and non-ASCII Windows filenames;
+    # ordinary line output may quote Chinese paths as octal escape sequences.
+    raw_names = subprocess.check_output(
+        [
+            "git", "-C", str(repo), "diff", "--name-only", "-z",
+            "--diff-filter=AM", args.base, "HEAD",
+        ]
+    )
+    names = [
+        item.decode("utf-8", errors="strict")
+        for item in raw_names.split(b"\0")
+        if item
+    ]
     files: list[tuple[Path, str]] = []
     for name in names:
         destination = target_path(name.replace("\\", "/"))
