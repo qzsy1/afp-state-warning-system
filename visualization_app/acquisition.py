@@ -515,12 +515,21 @@ class AcquisitionConfig:
     simulation_mysql_database: str = "afp_state_warning"
     # MySQL is deliberately opt-in.  Local CSV/JSON files remain the primary
     # raw-data archive and MySQL receives a transaction after each saved layer.
+    # ``mysql_enabled`` remains the target/remote destination switch for API
+    # compatibility.  A second, independent local destination can be enabled
+    # at the same time; both receive the same finalized layer transaction.
     mysql_enabled: bool = False
     mysql_host: str = "127.0.0.1"
     mysql_port: int = 3306
     mysql_user: str = "root"
     mysql_password: str = ""
     mysql_database: str = "afp_state_warning"
+    mysql_local_enabled: bool = False
+    mysql_local_host: str = "127.0.0.1"
+    mysql_local_port: int = 3306
+    mysql_local_user: str = "root"
+    mysql_local_password: str = ""
+    mysql_local_database: str = "afp_state_warning"
     mysql_charset: str = "utf8mb4"
     mysql_connect_timeout: int = 5
 
@@ -748,6 +757,14 @@ class AcquisitionConfig:
         self.mysql_password = str(self.mysql_password or "")
         self.mysql_database = validate_database_name(
             self.mysql_database or "afp_state_warning"
+        )
+        self.mysql_local_enabled = bool(self.mysql_local_enabled)
+        self.mysql_local_host = str(self.mysql_local_host or "127.0.0.1").strip()
+        self.mysql_local_port = max(1, min(int(self.mysql_local_port), 65535))
+        self.mysql_local_user = str(self.mysql_local_user or "root")
+        self.mysql_local_password = str(self.mysql_local_password or "")
+        self.mysql_local_database = validate_database_name(
+            self.mysql_local_database or "afp_state_warning"
         )
         self.mysql_charset = str(self.mysql_charset or "utf8mb4")
         self.mysql_connect_timeout = max(
@@ -1915,6 +1932,9 @@ class AcquisitionManager:
         payload = asdict(config)
         # Never expose or write the database password to a browser or manifest.
         payload["mysql_password"] = "***" if config.mysql_password else ""
+        payload["mysql_local_password"] = (
+            "***" if config.mysql_local_password else ""
+        )
         payload["simulation_mysql_password"] = (
             "***" if config.simulation_mysql_password else ""
         )
@@ -2520,9 +2540,13 @@ class AcquisitionManager:
                 self.stop()
             self.config = config
             self.mysql_status = {
-                "enabled": bool(config.mysql_enabled),
+                "enabled": bool(config.mysql_enabled or config.mysql_local_enabled),
                 "ok": None,
-                "state": "pending" if config.mysql_enabled else "disabled",
+                "state": (
+                    "pending"
+                    if config.mysql_enabled or config.mysql_local_enabled
+                    else "disabled"
+                ),
                 "saved_rows": 0,
             }
             self.rows.clear()
@@ -2864,7 +2888,7 @@ class AcquisitionManager:
             "errors": [],
         }
         pending_files = sorted(
-            root.rglob("*_mysql_pending.json"),
+            root.rglob("*_mysql*_pending.json"),
             key=lambda path: path.stat().st_mtime,
         )
         if not pending_files:
@@ -2946,9 +2970,7 @@ class AcquisitionManager:
                 )
                 if uploaded.get("ok"):
                     synced_path = pending_path.with_name(
-                        pending_path.name.replace(
-                            "_mysql_pending.json", "_mysql_synced.json"
-                        )
+                        pending_path.name.replace("_pending.json", "_synced.json")
                     )
                     _atomic_write_json(
                         synced_path,
@@ -3030,6 +3052,46 @@ class AcquisitionManager:
                 ),
             }
         return result
+
+    @staticmethod
+    def _mysql_destinations(
+        config: AcquisitionConfig,
+    ) -> list[tuple[str, MySQLSettings]]:
+        """Return enabled local and target stores in deterministic order."""
+        destinations: list[tuple[str, MySQLSettings]] = []
+        if config.mysql_local_enabled:
+            destinations.append(
+                (
+                    "local",
+                    MySQLSettings(
+                        enabled=True,
+                        host=config.mysql_local_host,
+                        port=config.mysql_local_port,
+                        user=config.mysql_local_user,
+                        password=config.mysql_local_password,
+                        database=config.mysql_local_database,
+                        charset=config.mysql_charset,
+                        connect_timeout=config.mysql_connect_timeout,
+                    ),
+                )
+            )
+        if config.mysql_enabled:
+            destinations.append(
+                (
+                    "target",
+                    MySQLSettings(
+                        enabled=True,
+                        host=config.mysql_host,
+                        port=config.mysql_port,
+                        user=config.mysql_user,
+                        password=config.mysql_password,
+                        database=config.mysql_database,
+                        charset=config.mysql_charset,
+                        connect_timeout=config.mysql_connect_timeout,
+                    ),
+                )
+            )
+        return destinations
 
     def stop(self) -> dict:
         self.stop_event.set()
@@ -3191,74 +3253,94 @@ class AcquisitionManager:
                         }
                     )
                     _atomic_write_json(self.session_metadata_path, metadata)
-                if (
-                    self.capture_saved
-                    and self.config.mysql_enabled
-                    and self.raw_path is not None
-                ):
-                    settings = MySQLSettings(
-                        enabled=True,
-                        host=self.config.mysql_host,
-                        port=self.config.mysql_port,
-                        user=self.config.mysql_user,
-                        password=self.config.mysql_password,
-                        database=self.config.mysql_database,
-                        charset=self.config.mysql_charset,
-                        connect_timeout=self.config.mysql_connect_timeout,
-                    )
-                    retry_status = self._retry_pending_mysql(
-                        settings, self.session_dir.parent
-                    )
+                mysql_destinations = self._mysql_destinations(self.config)
+                if self.capture_saved and mysql_destinations and self.raw_path is not None:
                     mysql_rows = (
                         self._read_layer_rows(self.raw_path)
                         if self.raw_path.is_file()
                         else []
                     )
-                    self.mysql_status = MySQLCaptureStore(settings).save_layer(
-                        self.config,
-                        rows=mysql_rows,
-                        layer_file=str(self.raw_path),
-                        full_specimen_file=(
-                            str(full_specimen_path)
-                            if full_specimen_path is not None
-                            else None
+                    destination_results: dict[str, Any] = {}
+                    for destination_name, settings in mysql_destinations:
+                        retry_status = self._retry_pending_mysql(
+                            settings, self.session_dir.parent
+                        )
+                        saved = MySQLCaptureStore(settings).save_layer(
+                            self.config,
+                            rows=mysql_rows,
+                            layer_file=str(self.raw_path),
+                            full_specimen_file=(
+                                str(full_specimen_path)
+                                if full_specimen_path is not None
+                                else None
+                            ),
+                            timestamp_file=(
+                                str(self.timestamp_path)
+                                if self.timestamp_path is not None
+                                else None
+                            ),
+                            folder_path=(
+                                str(self.session_dir)
+                                if self.session_dir is not None
+                                else None
+                            ),
+                            summary=summary,
+                        )
+                        saved["destination"] = destination_name
+                        saved["pending_retry"] = retry_status
+                        destination_results[destination_name] = saved
+                        if not saved.get("ok"):
+                            pending_path = self.capture_record_dir / (
+                                f"{self.raw_path.stem}_{self.session_stamp}_"
+                                f"mysql_{destination_name}_pending.json"
+                            )
+                            pending_config = self._public_config(self.config)
+                            pending_config.update(
+                                {
+                                    "mysql_enabled": True,
+                                    "mysql_local_enabled": False,
+                                    "mysql_host": settings.host,
+                                    "mysql_port": settings.port,
+                                    "mysql_user": settings.user,
+                                    "mysql_password": "***" if settings.password else "",
+                                    "mysql_database": settings.database,
+                                }
+                            )
+                            _atomic_write_json(
+                                pending_path,
+                                {
+                                    "mysql": saved,
+                                    "config": pending_config,
+                                    "summary": summary,
+                                    "layer_file": str(self.raw_path),
+                                    "full_specimen_file": str(full_specimen_path)
+                                    if full_specimen_path is not None
+                                    else None,
+                                    "timestamp_file": str(self.timestamp_path)
+                                    if self.timestamp_path is not None
+                                    else None,
+                                    "folder_path": str(self.session_dir),
+                                },
+                            )
+                    successful = [item for item in destination_results.values() if item.get("ok")]
+                    failed = [item for item in destination_results.values() if not item.get("ok")]
+                    self.mysql_status = {
+                        "enabled": True,
+                        "ok": not failed,
+                        "state": "synced" if not failed else "pending",
+                        "saved_rows": sum(int(item.get("saved_rows", 0)) for item in successful),
+                        "destination_count": len(destination_results),
+                        "successful_destinations": len(successful),
+                        "failed_destinations": len(failed),
+                        "destinations": destination_results,
+                        "error": "; ".join(
+                            f"{item.get('destination')}: {item.get('error', '未知错误')}"
+                            for item in failed
                         ),
-                        timestamp_file=(
-                            str(self.timestamp_path)
-                            if self.timestamp_path is not None
-                            else None
-                        ),
-                        folder_path=(
-                            str(self.session_dir)
-                            if self.session_dir is not None
-                            else None
-                        ),
-                        summary=summary,
-                    )
-                    self.mysql_status["pending_retry"] = retry_status
+                    }
                     summary["mysql"] = self.mysql_status
                     _atomic_write_json(summary_path, summary)
-                    if not self.mysql_status.get("ok"):
-                        pending_path = self.capture_record_dir / (
-                            f"{self.raw_path.stem}_{self.session_stamp}_mysql_pending.json"
-                        )
-                        _atomic_write_json(
-                            pending_path,
-                            {
-                                "mysql": self.mysql_status,
-                                "config": self._public_config(self.config),
-                                "summary": summary,
-                                "layer_file": str(self.raw_path),
-                                "full_specimen_file": str(full_specimen_path)
-                                if full_specimen_path is not None
-                                else None,
-                                "timestamp_file": str(self.timestamp_path)
-                                if self.timestamp_path is not None
-                                else None,
-                                "folder_path": str(self.session_dir),
-                            },
-                        )
-                elif self.config.mysql_enabled and not self.capture_saved:
+                elif mysql_destinations and not self.capture_saved:
                     self.mysql_status = {
                         "enabled": True,
                         "ok": False,
@@ -3268,7 +3350,7 @@ class AcquisitionManager:
                     }
                     summary["mysql"] = self.mysql_status
                     _atomic_write_json(summary_path, summary)
-                elif not self.config.mysql_enabled:
+                elif not mysql_destinations:
                     self.mysql_status = {
                         "enabled": False,
                         "ok": False,

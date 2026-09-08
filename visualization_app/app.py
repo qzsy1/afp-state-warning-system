@@ -55,6 +55,44 @@ from web_training import WebTrainingManager
 
 
 APP_DIR = Path(os.environ.get("AFP_LEGACY_APP_DIR") or Path(__file__).resolve().parent).resolve()
+
+
+def local_mysql_profile() -> dict:
+    """Load machine-local defaults without embedding credentials in source."""
+    candidates: list[Path] = []
+    configured = str(os.environ.get("AFP_MYSQL_PROFILE_FILE") or "").strip()
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    candidates.extend(
+        [
+            APP_DIR.parent / "runtime" / "mysql.local.json",
+            APP_DIR.parent.parent / "runtime" / "mysql.local.json",
+        ]
+    )
+    for path in candidates:
+        try:
+            if path.is_file():
+                payload = json.loads(path.read_text(encoding="utf-8-sig"))
+                if isinstance(payload, dict):
+                    return payload
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+    return {
+        "target": {
+            "host": "192.168.101.31",
+            "port": 3306,
+            "user": "afp_app",
+            "password": "",
+            "database": "afp_state_warning",
+        },
+        "local": {
+            "host": "127.0.0.1",
+            "port": 3306,
+            "user": "root",
+            "password": "",
+            "database": "afp_state_warning",
+        },
+    }
 APP_VERSION = "1.12.0"
 BUILD_ID = "20260823-schema-contract-fix"
 EXECUTABLE_DIR = (
@@ -3896,6 +3934,9 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/bootstrap":
             self._send_json(self.dashboard.bootstrap())
+            return
+        if parsed.path == "/api/mysql/defaults":
+            self._send_json(local_mysql_profile())
             return
         if parsed.path == "/api/acquisition/status":
             self._send_json(self.dashboard.acquisition.status())

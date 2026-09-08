@@ -32,11 +32,11 @@ class AcquisitionService:
 
 def register(context: Any) -> ModuleRegistration:
     return ModuleRegistration(
-        "acquisition", "2.1.1", "2.0",
+        "acquisition", "2.2.0", "2.0",
         (
             "real_capture", "simulation_replay", "multi_interface", "layer_save",
             "capture_identity", "atomic_save", "quality_summary",
-            "transactional_replace",
+            "transactional_replace", "dual_mysql_destinations",
         ),
         AcquisitionService(context),
     )

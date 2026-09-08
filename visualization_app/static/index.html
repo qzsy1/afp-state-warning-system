@@ -106,19 +106,28 @@
             </label>
             <p class="control-note save-rule-note">自动建立“试样名_p功率_v速度_pr压实力”文件夹，同时保存每层文件、完整试样快照和采集记录。</p>
             <div class="mysql-settings">
-              <label class="toggle"><input id="mysqlEnabledInput" type="checkbox"> 采集完成后同步保存到 MySQL（支持远程数据库）</label>
+              <label class="toggle"><input id="mysqlLocalEnabledInput" type="checkbox"> 保存到打开软件这台电脑的 MySQL</label>
               <div class="compact-input-grid">
-                <label>数据库电脑 IP / 域名<input id="mysqlHostInput" type="text" value="127.0.0.1"></label>
+                <label>本机地址<input id="mysqlLocalHostInput" type="text" value="127.0.0.1"></label>
+                <label>本机端口<input id="mysqlLocalPortInput" type="number" min="1" max="65535" step="1" value="3306"></label>
+                <label>本机用户名<input id="mysqlLocalUserInput" type="text" value="root"></label>
+                <label>本机密码<input id="mysqlLocalPasswordInput" type="password" value="" autocomplete="new-password"></label>
+                <label>本机数据库<input id="mysqlLocalDatabaseInput" type="text" value="afp_state_warning" pattern="[A-Za-z][A-Za-z0-9_]{0,63}"></label>
+              </div>
+              <label class="toggle"><input id="mysqlEnabledInput" type="checkbox"> 保存到目标电脑 MySQL</label>
+              <div class="compact-input-grid">
+                <label>目标电脑 IP / 域名<input id="mysqlHostInput" type="text" value="192.168.101.31"></label>
                 <label>端口<input id="mysqlPortInput" type="number" min="1" max="65535" step="1" value="3306"></label>
-                <label>用户名<input id="mysqlUserInput" type="text" value="root"></label>
+                <label>用户名<input id="mysqlUserInput" type="text" value="afp_app"></label>
                 <label>密码<input id="mysqlPasswordInput" type="password" value="" autocomplete="new-password"></label>
                 <label>数据库名称<input id="mysqlDatabaseInput" type="text" value="afp_state_warning" pattern="[A-Za-z][A-Za-z0-9_]{0,63}"></label>
               </div>
               <div class="transport">
-                <button id="testMysqlButton" class="secondary-button" type="button">检查已有数据库</button>
+                <button id="testLocalMysqlButton" class="secondary-button" type="button">检查本机数据库</button>
+                <button id="testMysqlButton" class="secondary-button" type="button">检查目标数据库</button>
                 <button id="refreshRelationMapButton" class="secondary-button" type="button">刷新关系表</button>
               </div>
-              <p id="mysqlStatus" class="control-note">填写本机或另一台电脑的 MySQL 地址；勾选后每层停止保存时批量写入。</p>
+              <p id="mysqlStatus" class="control-note">可只选本机、只选目标电脑或同时选择；本地 CSV 始终优先保存。</p>
               <div class="relation-map-panel">
                 <div class="sensor-selector-title">工况—试样—独立重复—铺层关系</div>
                 <div class="relation-map-scroll">

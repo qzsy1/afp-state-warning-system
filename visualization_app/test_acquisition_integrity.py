@@ -182,11 +182,30 @@ class AcquisitionIntegrityTests(unittest.TestCase):
     def test_public_manifest_masks_both_mysql_passwords(self) -> None:
         config = AcquisitionConfig(
             mysql_password="secret",
+            mysql_local_password="local-secret",
             simulation_mysql_password="other-secret",
         )
         public = AcquisitionManager._public_config(config)
         self.assertEqual(public["mysql_password"], "***")
+        self.assertEqual(public["mysql_local_password"], "***")
         self.assertEqual(public["simulation_mysql_password"], "***")
+
+    def test_local_and_target_mysql_destinations_can_be_enabled_together(self) -> None:
+        config = AcquisitionConfig(
+            mysql_local_enabled=True,
+            mysql_local_host="127.0.0.1",
+            mysql_local_database="afp_local",
+            mysql_enabled=True,
+            mysql_host="192.168.101.31",
+            mysql_user="afp_app",
+            mysql_password="remote-secret",
+            mysql_database="afp_remote",
+        )
+        destinations = AcquisitionManager._mysql_destinations(config)
+        self.assertEqual([name for name, _ in destinations], ["local", "target"])
+        self.assertEqual(destinations[0][1].database, "afp_local")
+        self.assertEqual(destinations[1][1].host, "192.168.101.31")
+        self.assertEqual(destinations[1][1].password, "remote-secret")
 
     def test_training_import_ignores_archived_specimen_layers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -480,6 +499,54 @@ class AcquisitionIntegrityTests(unittest.TestCase):
             self.assertTrue(first["capture_saved"])
             self.assertEqual(first["raw_file"], second["raw_file"])
             self.assertEqual(FakeStore.save_calls, 1)
+
+    def test_completed_layer_is_saved_to_local_and_target_mysql(self) -> None:
+        class FakeStore:
+            calls: list[str] = []
+
+            def __init__(self, settings):
+                self.settings = settings
+
+            def test_connection(self):
+                return {"ok": True}
+
+            def save_layer(self, config, **kwargs):
+                type(self).calls.append(self.settings.host)
+                return {
+                    "ok": True,
+                    "host": self.settings.host,
+                    "saved_rows": len(kwargs["rows"]),
+                }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self._source(root)
+            manager = AcquisitionManager(root / "unused")
+            config = AcquisitionConfig(
+                processing_mode="capture_only",
+                dataset_schema="new_collection_v11_3",
+                driver="simulator",
+                source_file=str(source),
+                simulation_source_path=str(source),
+                selected_sensors=NEW_COLLECTION_SENSOR_COLUMNS.copy(),
+                sample_rate_hz=1000.0,
+                save_root=str(root / "capture"),
+                mysql_local_enabled=True,
+                mysql_local_host="127.0.0.1",
+                mysql_enabled=True,
+                mysql_host="192.168.101.31",
+            )
+            with patch("acquisition.MySQLCaptureStore", FakeStore):
+                manager.start(config)
+                deadline = time.time() + 5.0
+                while manager.status()["sample_count"] < 20 and time.time() < deadline:
+                    time.sleep(0.01)
+                result = manager.stop()
+            mysql = result["mysql"]
+            self.assertTrue(mysql["ok"], mysql)
+            self.assertEqual(mysql["destination_count"], 2)
+            self.assertEqual(mysql["successful_destinations"], 2)
+            self.assertEqual(FakeStore.calls, ["127.0.0.1", "192.168.101.31"])
 
     def test_driver_open_failure_is_closed_and_does_not_leave_active_session(self) -> None:
         class FailingDriver:

@@ -90,6 +90,12 @@ const controls = {
   liveSpecimen: $("liveSpecimenInput"),
   saveRoot: $("saveRootInput"),
   mysqlEnabled: $("mysqlEnabledInput"),
+  mysqlLocalEnabled: $("mysqlLocalEnabledInput"),
+  mysqlLocalHost: $("mysqlLocalHostInput"),
+  mysqlLocalPort: $("mysqlLocalPortInput"),
+  mysqlLocalUser: $("mysqlLocalUserInput"),
+  mysqlLocalPassword: $("mysqlLocalPasswordInput"),
+  mysqlLocalDatabase: $("mysqlLocalDatabaseInput"),
   mysqlHost: $("mysqlHostInput"),
   mysqlPort: $("mysqlPortInput"),
   mysqlUser: $("mysqlUserInput"),
@@ -122,14 +128,52 @@ const controls = {
 function unifiedMysqlSettings(extra = {}) {
   return {
     mysql_enabled: true,
-    mysql_host: controls.mysqlHost?.value.trim() || "127.0.0.1",
+    mysql_host: controls.mysqlHost?.value.trim() || "192.168.101.31",
     mysql_port: Number(controls.mysqlPort?.value) || 3306,
-    mysql_user: controls.mysqlUser?.value.trim() || "root",
+    mysql_user: controls.mysqlUser?.value.trim() || "afp_app",
     mysql_password: controls.mysqlPassword?.value ?? "",
     mysql_database: controls.mysqlDatabase?.value.trim() || "afp_state_warning",
     mysql_charset: "utf8mb4",
     ...extra,
   };
+}
+
+function unifiedLocalMysqlSettings(extra = {}) {
+  return {
+    mysql_enabled: true,
+    mysql_host: controls.mysqlLocalHost?.value.trim() || "127.0.0.1",
+    mysql_port: Number(controls.mysqlLocalPort?.value) || 3306,
+    mysql_user: controls.mysqlLocalUser?.value.trim() || "root",
+    mysql_password: controls.mysqlLocalPassword?.value ?? "",
+    mysql_database: controls.mysqlLocalDatabase?.value.trim() || "afp_state_warning",
+    mysql_charset: "utf8mb4",
+    ...extra,
+  };
+}
+
+async function loadMysqlDefaults() {
+  try {
+    const response = await fetch("/api/mysql/defaults", {cache: "no-store"});
+    const profile = await response.json();
+    if (!response.ok) return;
+    const target = profile.target || {};
+    const local = profile.local || {};
+    const assign = (control, value) => {
+      if (control && value !== undefined && value !== null) control.value = String(value);
+    };
+    assign(controls.mysqlHost, target.host);
+    assign(controls.mysqlPort, target.port);
+    assign(controls.mysqlUser, target.user);
+    assign(controls.mysqlPassword, target.password);
+    assign(controls.mysqlDatabase, target.database);
+    assign(controls.mysqlLocalHost, local.host);
+    assign(controls.mysqlLocalPort, local.port);
+    assign(controls.mysqlLocalUser, local.user);
+    assign(controls.mysqlLocalPassword, local.password);
+    assign(controls.mysqlLocalDatabase, local.database);
+  } catch (_) {
+    // Static defaults remain usable when a legacy backend lacks this endpoint.
+  }
 }
 
 const LAYER_EVIDENCE_VISIBILITY_KEY = "afp-show-layer-evidence-v1";
@@ -672,11 +716,12 @@ async function selectSaveRoot() {
   }
 }
 
-async function testMysqlConnection() {
+async function testMysqlConnection(local = false) {
   const status = $("mysqlStatus");
   try {
     status.textContent = "正在检查已有 MySQL 数据库（不会创建或修改表）……";
-    const result = await postJson("/api/mysql/test", unifiedMysqlSettings({read_only: true}));
+    const settings = local ? unifiedLocalMysqlSettings() : unifiedMysqlSettings();
+    const result = await postJson("/api/mysql/test", {...settings, read_only: true});
     state.mysqlConnectionTest = result;
     status.classList.toggle("ok", Boolean(result.ok));
     status.classList.toggle("error", !result.ok);
@@ -685,8 +730,8 @@ async function testMysqlConnection() {
       ? "账号或密码错误：请确认 MySQL 用户名和密码设置正确"
       : errorText;
     status.textContent = result.ok
-      ? `MySQL 已连接：${result.database}（${result.driver}）${result.schema_ready === false ? "，但AFP表结构不完整" : ""}`
-      : `MySQL 连接失败：${friendlyError}`;
+      ? `${local ? "本机" : "目标"} MySQL 已连接：${result.database}（${result.driver}）${result.schema_ready === false ? "，但AFP表结构不完整" : ""}`
+      : `${local ? "本机" : "目标"} MySQL 连接失败：${friendlyError}`;
   } catch (error) {
     state.mysqlConnectionTest = {ok: false, error: error.message};
     status.classList.remove("ok");
@@ -854,7 +899,9 @@ async function downloadRemoteMysqlCsv() {
 function renderMysqlStatus(mysql) {
   const status = $("mysqlStatus");
   if (!status || !mysql) return;
-  const selectedInUi = Boolean(controls.mysqlEnabled?.checked);
+  const selectedInUi = Boolean(
+    controls.mysqlEnabled?.checked || controls.mysqlLocalEnabled?.checked
+  );
   if (!mysql.enabled && selectedInUi) {
     const tested = state.mysqlConnectionTest;
     status.classList.toggle("ok", Boolean(tested?.ok));
@@ -880,7 +927,10 @@ function renderMysqlStatus(mysql) {
     status.textContent = "MySQL 已启用；等待本次采集完成后批量写入。";
   } else if (mysql.ok) {
     const retried = Number(mysql.pending_retry?.succeeded || 0);
-    status.textContent = `第${mysql.layer || ""}层已写入 MySQL：${mysql.database}，${mysql.saved_rows || 0} 行` +
+    const destinationText = mysql.destination_count
+      ? `${mysql.successful_destinations || 0}/${mysql.destination_count} 个数据库目标`
+      : (mysql.database || "MySQL");
+    status.textContent = `第${mysql.layer || ""}层已写入 ${destinationText}，共 ${mysql.saved_rows || 0} 行` +
       `${retried > 0 ? `；同时自动补传 ${retried} 条历史待同步记录` : ""}`;
   } else if (mysql.error) {
     const errorText = String(mysql.error);
@@ -1944,6 +1994,7 @@ function renderLayerProgress(layers) {
 
 async function initialize() {
   try {
+    await loadMysqlDefaults();
     const response = await fetch("/api/bootstrap", { cache: "no-store" });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || "初始化失败");
@@ -2098,7 +2149,8 @@ controls.autoHardwareCheck?.addEventListener("change", () => {
 });
 controls.discoverInterfaces?.addEventListener("click", discoverInterfaces);
 controls.addInterface?.addEventListener("click", addInterface);
-$("testMysqlButton")?.addEventListener("click", testMysqlConnection);
+$("testMysqlButton")?.addEventListener("click", () => testMysqlConnection(false));
+$("testLocalMysqlButton")?.addEventListener("click", () => testMysqlConnection(true));
 $("refreshRelationMapButton")?.addEventListener("click", refreshRelationMap);
 $("previewMysqlDataButton")?.addEventListener("click", previewRemoteMysqlData);
 $("copyMysqlPreviewButton")?.addEventListener("click", copyRemoteMysqlPreview);
@@ -2107,8 +2159,13 @@ controls.mysqlEnabled?.addEventListener("change", () => {
   if (!controls.mysqlEnabled.checked) state.mysqlConnectionTest = null;
   renderMysqlStatus({enabled: false, ok: false, saved_rows: 0});
 });
+controls.mysqlLocalEnabled?.addEventListener("change", () => {
+  renderMysqlStatus({enabled: false, ok: false, saved_rows: 0});
+});
 [controls.mysqlHost, controls.mysqlPort, controls.mysqlUser,
- controls.mysqlPassword, controls.mysqlDatabase].forEach((control) => {
+  controls.mysqlPassword, controls.mysqlDatabase, controls.mysqlLocalHost,
+  controls.mysqlLocalPort, controls.mysqlLocalUser, controls.mysqlLocalPassword,
+  controls.mysqlLocalDatabase].forEach((control) => {
   control?.addEventListener("input", () => {
     state.mysqlConnectionTest = null;
     if (controls.mysqlEnabled?.checked) {
@@ -2930,9 +2987,9 @@ function acquisitionConfig() {
     simulation_source_type: controls.simulationSourceType?.value || "single_csv",
     simulation_source_path: simulation ? (controls.simulationSourcePath?.value.trim() || "") : "",
     simulation_mysql_query: controls.simulationMysqlQuery?.value.trim() || "",
-    simulation_mysql_host: controls.mysqlHost?.value.trim() || "127.0.0.1",
+    simulation_mysql_host: controls.mysqlHost?.value.trim() || "192.168.101.31",
     simulation_mysql_port: Number(controls.mysqlPort?.value) || 3306,
-    simulation_mysql_user: controls.mysqlUser?.value.trim() || "root",
+    simulation_mysql_user: controls.mysqlUser?.value.trim() || "afp_app",
     simulation_mysql_password: controls.mysqlPassword?.value ?? "",
     simulation_mysql_database: controls.mysqlDatabase?.value.trim() || "afp_state_warning",
     dataset_schema: controls.datasetSchema.value || "legacy_original",
@@ -2962,11 +3019,17 @@ function acquisitionConfig() {
     source_file: simulation ? (controls.simulationSourcePath?.value.trim() || "") : "",
     save_root: controls.saveRoot.value.trim(),
     mysql_enabled: Boolean(controls.mysqlEnabled?.checked),
-    mysql_host: controls.mysqlHost?.value.trim() || "127.0.0.1",
+    mysql_host: controls.mysqlHost?.value.trim() || "192.168.101.31",
     mysql_port: Number(controls.mysqlPort?.value) || 3306,
-    mysql_user: controls.mysqlUser?.value.trim() || "root",
+    mysql_user: controls.mysqlUser?.value.trim() || "afp_app",
     mysql_password: controls.mysqlPassword?.value ?? "",
     mysql_database: controls.mysqlDatabase?.value.trim() || "afp_state_warning",
+    mysql_local_enabled: Boolean(controls.mysqlLocalEnabled?.checked),
+    mysql_local_host: controls.mysqlLocalHost?.value.trim() || "127.0.0.1",
+    mysql_local_port: Number(controls.mysqlLocalPort?.value) || 3306,
+    mysql_local_user: controls.mysqlLocalUser?.value.trim() || "root",
+    mysql_local_password: controls.mysqlLocalPassword?.value ?? "",
+    mysql_local_database: controls.mysqlLocalDatabase?.value.trim() || "afp_state_warning",
     mysql_charset: "utf8mb4",
     mysql_connect_timeout: 5,
     initial_compaction_force_N: Number(controls.initialForce.value) || 0,

@@ -40,6 +40,7 @@ visualization_app/test_training_request.json
 
 # Modular runtime: generated delivery, user data, models and local state
 /delivery/
+/runtime/
 modular_runtime/dist/
 modular_runtime/build/
 modular_runtime/runtime/
