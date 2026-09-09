@@ -121,7 +121,8 @@ $legacyFiles = @(
     "causal_online_runtime.py", "runtime_scaler.py", "new_collection_health.py",
     "runtime_health_primitives.py", "web_training.py", "web_training_pipeline.py",
     "training_data.py", "training_center.py", "training_center_cli.py",
-    "native_integrated_app.py", "fit_new_collection_health.py"
+    "native_integrated_app.py", "fit_new_collection_health.py",
+    "remote_mysql_setup.py"
 )
 foreach ($name in $legacyFiles) {
     $source = Join-Path $LegacySource $name

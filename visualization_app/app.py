@@ -41,6 +41,7 @@ from acquisition import (
     select_simulation_source,
 )
 from mysql_storage import MySQLCaptureStore, mysql_settings_from_mapping
+from remote_mysql_setup import classify_mysql_error
 from online_health_features import OnlineWindowFeatureEngine
 from causal_online_runtime import CausalOnlineConsistency
 from runtime_scaler import FeatureScaler
@@ -4112,6 +4113,8 @@ class AppHandler(BaseHTTPRequestHandler):
                     if bool(payload.get("read_only", False))
                     else store.test_connection()
                 )
+                if not result.get("ok"):
+                    result["error_detail"] = classify_mysql_error(result.get("error"))
                 self._send_json(result)
                 return
             if parsed.path == "/api/mysql/relation-map":
@@ -4120,6 +4123,8 @@ class AppHandler(BaseHTTPRequestHandler):
                     int(payload.get("limit", 1000)),
                     auto_initialize=True,
                 )
+                if not result.get("ok"):
+                    result["error_detail"] = classify_mysql_error(result.get("error"))
                 self._send_json(result)
                 return
             if parsed.path == "/api/mysql/query":

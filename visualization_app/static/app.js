@@ -744,9 +744,12 @@ async function testMysqlConnection(local = false) {
     status.classList.toggle("ok", Boolean(result.ok));
     status.classList.toggle("error", !result.ok);
     const errorText = String(result.error || "未知错误");
-    const friendlyError = errorText.includes("1045") || errorText.toLowerCase().includes("access denied")
-      ? "账号或密码错误：请确认 MySQL 用户名和密码设置正确"
-      : errorText;
+    const detail = result.error_detail || {};
+    const friendlyError = detail.message
+      ? `[${detail.code || detail.category}] ${detail.message}`
+      : (errorText.includes("1045") || errorText.toLowerCase().includes("access denied")
+        ? "账号或密码错误：请确认 MySQL 用户名和密码设置正确"
+        : errorText);
     status.textContent = result.ok
       ? `${label} MySQL 已连接：${settings.mysql_host}:${settings.mysql_port}/${result.database}（${result.driver}）${result.schema_ready === false ? "，但AFP表结构不完整" : ""}`
       : `${label} MySQL 连接失败：${friendlyError}`;
@@ -775,8 +778,12 @@ async function refreshRelationMap(scope) {
       const row = document.createElement("tr");
       const cell = document.createElement("td");
       cell.colSpan = 6;
-      cell.textContent = result.error
-        ? `${label}数据库 ${database} 读取失败：${result.error}`
+      const detail = result.error_detail || {};
+      const errorMessage = detail.message
+        ? `[${detail.code || detail.category}] ${detail.message}`
+        : result.error;
+      cell.textContent = errorMessage
+        ? `${label}数据库 ${database} 读取失败：${errorMessage}`
         : `${label}数据库 ${database} 已连接，但当前没有已保存的工况—试样—铺层关系`;
       row.appendChild(cell);
       body.appendChild(row);

@@ -37,6 +37,7 @@ from acquisition import (  # noqa: E402
     integrate_capture_sources,
 )
 from mysql_storage import MySQLCaptureStore, MySQLSettings  # noqa: E402
+from remote_mysql_setup import build_remote_setup_sql, classify_mysql_error  # noqa: E402
 from web_training import WebTrainingManager  # noqa: E402
 from web_training_pipeline import (  # noqa: E402
     default_columns,
@@ -441,14 +442,15 @@ class AcquisitionPanel(ttk.Frame):
         self._entry(saving, "目标用户", "mysql_user", "afp_app", 7, 0)
         self._entry(saving, "目标密码", "mysql_password", "", 7, 2, show="*")
         self._entry(saving, "目标数据库", "mysql_database", "afp_state_warning", 8, 0, width=20)
+        self._entry(saving, "允许客户端主机", "mysql_allowed_host", "192.168.101.%", 9, 0, width=20)
         ttk.Label(
             saving,
-            text="本机与目标电脑是两套独立连接；请使用对应列的测试、关系查看与导出按钮。",
+            text="服务器管理员执行授权脚本后，另一台电脑使用目标账号上传；本机与目标电脑是两套独立连接。",
             foreground=COLORS["muted"],
             wraplength=345,
-        ).grid(row=9, column=0, columnspan=4, sticky="ew", pady=(3, 4))
+        ).grid(row=10, column=0, columnspan=4, sticky="ew", pady=(3, 4))
         mysql_actions = ttk.Frame(saving)
-        mysql_actions.grid(row=10, column=0, columnspan=4, sticky="ew")
+        mysql_actions.grid(row=11, column=0, columnspan=4, sticky="ew")
         mysql_actions.columnconfigure(0, weight=1); mysql_actions.columnconfigure(1, weight=1)
         ttk.Button(mysql_actions, text="测试本机连接", command=lambda: self._test_mysql_connection(local=True)).grid(row=0, column=0, sticky="ew", padx=(0, 2), pady=2)
         ttk.Button(mysql_actions, text="测试目标连接", command=self._test_mysql_connection).grid(row=0, column=1, sticky="ew", padx=(2, 0), pady=2)
@@ -458,14 +460,15 @@ class AcquisitionPanel(ttk.Frame):
         ttk.Button(mysql_actions, text="导出目标数据 CSV", command=self._export_mysql_csv).grid(row=2, column=1, sticky="ew", padx=(2, 0), pady=2)
         ttk.Button(mysql_actions, text="初始化本机表结构", command=lambda: self._initialize_mysql_schema(local=True)).grid(row=3, column=0, sticky="ew", padx=(0, 2), pady=2)
         ttk.Button(mysql_actions, text="初始化目标表结构", command=self._initialize_mysql_schema).grid(row=3, column=1, sticky="ew", padx=(2, 0), pady=2)
+        ttk.Button(mysql_actions, text="生成目标授权 SQL", command=self._export_remote_mysql_setup_sql).grid(row=4, column=0, sticky="ew", padx=(0, 2), pady=2)
         self.mysql_retry_button = ttk.Button(mysql_actions, text="立即补传待同步数据", command=self._retry_pending_mysql, state="disabled")
-        self.mysql_retry_button.grid(row=4, column=0, columnspan=2, sticky="ew", pady=2)
+        self.mysql_retry_button.grid(row=4, column=1, sticky="ew", padx=(2, 0), pady=2)
         self.mysql_local_status_text = tk.StringVar(value="本机数据库：尚未检查。")
         self.mysql_target_status_text = tk.StringVar(value="目标电脑数据库：尚未检查。")
         self.mysql_status_text = tk.StringVar(value="保存状态：本地 CSV 始终优先保存。")
-        ttk.Label(saving, textvariable=self.mysql_local_status_text, foreground=COLORS["muted"], wraplength=345).grid(row=11, column=0, columnspan=4, sticky="ew", pady=(3, 0))
-        ttk.Label(saving, textvariable=self.mysql_target_status_text, foreground=COLORS["muted"], wraplength=345).grid(row=12, column=0, columnspan=4, sticky="ew")
-        ttk.Label(saving, textvariable=self.mysql_status_text, foreground=COLORS["muted"], wraplength=345).grid(row=13, column=0, columnspan=4, sticky="ew")
+        ttk.Label(saving, textvariable=self.mysql_local_status_text, foreground=COLORS["muted"], wraplength=345).grid(row=12, column=0, columnspan=4, sticky="ew", pady=(3, 0))
+        ttk.Label(saving, textvariable=self.mysql_target_status_text, foreground=COLORS["muted"], wraplength=345).grid(row=13, column=0, columnspan=4, sticky="ew")
+        ttk.Label(saving, textvariable=self.mysql_status_text, foreground=COLORS["muted"], wraplength=345).grid(row=14, column=0, columnspan=4, sticky="ew")
 
         actions = ttk.Frame(parent)
         actions.grid(row=6, column=0, sticky="ew", pady=8)
@@ -724,7 +727,12 @@ class AcquisitionPanel(ttk.Frame):
                 if result.get("schema_ready") is False:
                     message += "；连接已建立，但AFP表结构不完整，请先初始化表结构"
             else:
-                message = f"{'本机' if local else '目标'}数据库连接失败：" + str(result.get("error") or "未知错误")
+                detail = classify_mysql_error(result.get("error"))
+                message = (
+                    f"{'本机' if local else '目标'}数据库连接失败"
+                    f"[{detail.get('code') or detail.get('category')}]："
+                    f"{detail.get('message') or result.get('error') or '未知错误'}"
+                )
             status_variable.set(message)
             self.status_text.set(message)
 
@@ -752,11 +760,44 @@ class AcquisitionPanel(ttk.Frame):
             if result.get("ok"):
                 message = f"表结构已就绪：{settings.host}/{settings.database}"
             else:
-                message = "表结构初始化失败：" + str(result.get("error") or "未知错误")
+                detail = classify_mysql_error(result.get("error"))
+                message = (
+                    f"表结构初始化失败[{detail.get('code') or detail.get('category')}]："
+                    f"{detail.get('message') or result.get('error') or '未知错误'}"
+                )
             (self.mysql_local_status_text if local else self.mysql_target_status_text).set(message)
             self.status_text.set(message)
 
         self._background(f"正在初始化{label} MySQL 表结构……", work, done)
+
+    def _export_remote_mysql_setup_sql(self) -> None:
+        """Generate the server-admin SQL needed by a second acquisition PC."""
+        try:
+            sql = build_remote_setup_sql(
+                database=str(self.vars["mysql_database"].get()).strip(),
+                user=str(self.vars["mysql_user"].get()).strip(),
+                password=str(self.vars["mysql_password"].get()),
+                allowed_host=str(self.vars["mysql_allowed_host"].get()).strip(),
+            )
+            database = str(self.vars["mysql_database"].get()).strip() or "afp_state_warning"
+            selected = filedialog.asksaveasfilename(
+                title="保存目标数据库授权脚本",
+                defaultextension=".sql",
+                initialfile=f"AFP_{database}_remote_setup.sql",
+                filetypes=[("MySQL SQL", "*.sql"), ("所有文件", "*.*")],
+            )
+            if not selected:
+                return
+            Path(selected).write_text(sql, encoding="utf-8-sig")
+            messagebox.showinfo(
+                "目标数据库脚本已生成",
+                "请把该 SQL 文件交给目标数据库电脑的管理员执行。\n"
+                "执行完成后，在本软件中点击“测试目标连接”和“刷新目标关系表”。",
+            )
+            self.mysql_target_status_text.set(f"授权脚本已保存：{selected}")
+        except Exception as exc:
+            messagebox.showerror("生成授权脚本失败", str(exc))
+            self.mysql_target_status_text.set(f"授权脚本生成失败：{exc}")
 
     def _update_mysql_retry_capability(self) -> None:
         manager = getattr(self.dashboard, "acquisition", None) if self.dashboard else None
