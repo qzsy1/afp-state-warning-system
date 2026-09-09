@@ -4117,7 +4117,8 @@ class AppHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/mysql/relation-map":
                 settings = mysql_settings_from_mapping(payload)
                 result = MySQLCaptureStore(settings).relation_map(
-                    int(payload.get("limit", 1000))
+                    int(payload.get("limit", 1000)),
+                    auto_initialize=True,
                 )
                 self._send_json(result)
                 return

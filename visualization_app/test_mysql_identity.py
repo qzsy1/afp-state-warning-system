@@ -90,6 +90,39 @@ class MySQLIdentityTests(unittest.TestCase):
         self.assertNotIn("CREATE ", statements)
         self.assertNotIn("ALTER ", statements)
 
+    def test_relation_refresh_can_initialize_missing_database(self) -> None:
+        settings = MySQLSettings(enabled=True, database="afp_empty")
+        store = MySQLCaptureStore(settings)
+        initialized = {
+            "ok": True,
+            "initialized": True,
+            "database": "afp_empty",
+        }
+        ready = {
+            "ok": True,
+            "enabled": True,
+            "database": "afp_empty",
+            "rows": [],
+            "count": 0,
+            "total_count": 0,
+        }
+        calls: list[bool] = []
+
+        def relation_once(*args, **kwargs):
+            calls.append(True)
+            return (
+                {"ok": False, "enabled": True, "database": "afp_empty",
+                 "rows": [], "error": "1049 Unknown database 'afp_empty'"}
+                if len(calls) == 1 else ready
+            )
+
+        with mock.patch.object(store, "_relation_map_once", side_effect=relation_once), \
+             mock.patch.object(store, "initialize_schema", return_value=initialized) as init:
+            result = store.relation_map(1000, auto_initialize=True)
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(calls), 2)
+        init.assert_called_once_with(create_database=True)
+
     def test_browser_mysql_query_rejects_mutation(self) -> None:
         self.assertEqual(
             validate_read_only_mysql_query("SELECT * FROM afp_flat_all"),

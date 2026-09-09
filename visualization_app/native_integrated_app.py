@@ -1047,6 +1047,7 @@ class AcquisitionPanel(ttk.Frame):
             status_var.set(
                 f"当前显示 {len(rows)} 条；符合筛选条件共 {total} 条。"
                 + (" 数据较多，仅显示前 10000 条。" if result.get("has_more") else "")
+                + (" 已自动创建/补齐 AFP 数据库关系结构。" if result.get("auto_initialized") else "")
             )
             schedule_next()
 
@@ -1067,7 +1068,9 @@ class AcquisitionPanel(ttk.Frame):
                 try:
                     store = MySQLCaptureStore(settings)
                     try:
-                        result = store.relation_map(10000, **filters)
+                        result = store.relation_map(
+                            10000, auto_initialize=True, **filters
+                        )
                     except TypeError:
                         # Older packages did not yet expose server-side
                         # filters. Keep the relationship viewer functional and

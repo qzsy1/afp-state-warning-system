@@ -768,6 +768,65 @@ class MySQLCaptureStore:
         specimen_id: str | None = None,
         replicate_no: int | None = None,
         layer_no: int | None = None,
+        auto_initialize: bool = False,
+    ) -> dict[str, Any]:
+        """Read the relation view, optionally creating a missing AFP schema.
+
+        Automatic DDL is deliberately limited to missing-database/schema
+        errors. Authentication, network, and permission errors are returned
+        unchanged so a refresh cannot hide a bad connection configuration.
+        """
+        result = self._relation_map_once(
+            limit,
+            offset=offset,
+            schema_id=schema_id,
+            condition_id=condition_id,
+            specimen_id=specimen_id,
+            replicate_no=replicate_no,
+            layer_no=layer_no,
+        )
+        if not auto_initialize or result.get("ok"):
+            return result
+        error_text = str(result.get("error") or "").lower()
+        missing_schema = (
+            "1049" in error_text
+            or "unknown database" in error_text
+            or "1146" in error_text
+            or "doesn't exist" in error_text
+            or "does not exist" in error_text
+        )
+        if not missing_schema:
+            return result
+        initialized = self.initialize_schema(create_database=True)
+        if not initialized.get("ok"):
+            result["initialization"] = initialized
+            result["error"] = (
+                f"关系结构不存在，自动创建失败：{initialized.get('error') or '未知错误'}"
+            )
+            return result
+        retry = self._relation_map_once(
+            limit,
+            offset=offset,
+            schema_id=schema_id,
+            condition_id=condition_id,
+            specimen_id=specimen_id,
+            replicate_no=replicate_no,
+            layer_no=layer_no,
+        )
+        retry["auto_initialized"] = True
+        retry["initialization"] = initialized
+        return retry
+
+    def _relation_map_once(
+        self,
+        limit: int = 1000,
+        *,
+        offset: int = 0,
+        schema_id: str | None = None,
+        condition_id: str | None = None,
+        specimen_id: str | None = None,
+        replicate_no: int | None = None,
+        layer_no: int | None = None,
     ) -> dict[str, Any]:
         """Return the compact condition/specimen/replicate/layer overview."""
         columns = list(RELATION_COLUMNS)

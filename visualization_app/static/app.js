@@ -781,7 +781,10 @@ async function refreshRelationMap(scope) {
       row.appendChild(cell);
       body.appendChild(row);
       if (status && result.ok) {
-        status.textContent = `${label}数据库 ${settings.mysql_host}/${database} 已连接，关系表当前为 0 行。`;
+        const initializedNote = result.auto_initialized
+          ? " 已自动创建/补齐 AFP 数据库关系结构。"
+          : "";
+        status.textContent = `${label}数据库 ${settings.mysql_host}/${database} 已连接，关系表当前为 0 行。${initializedNote}`;
         status.classList.remove("error");
       }
       return;
@@ -803,7 +806,10 @@ async function refreshRelationMap(scope) {
       body.appendChild(row);
     });
     if (status) {
-      status.textContent = `${label}数据库 ${settings.mysql_host}/${database} 已刷新：${result.count} 条铺层关系`;
+      const initializedNote = result.auto_initialized
+        ? "（已自动创建/补齐 AFP 数据库关系结构）"
+        : "";
+      status.textContent = `${label}数据库 ${settings.mysql_host}/${database} 已刷新：${result.count} 条铺层关系${initializedNote}`;
       status.classList.add("ok");
       status.classList.remove("error");
     }
