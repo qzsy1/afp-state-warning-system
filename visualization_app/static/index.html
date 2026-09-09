@@ -107,6 +107,7 @@
             <p class="control-note save-rule-note">自动建立“试样名_p功率_v速度_pr压实力”文件夹，同时保存每层文件、完整试样快照和采集记录。</p>
             <div class="mysql-settings">
               <label class="toggle"><input id="mysqlLocalEnabledInput" type="checkbox"> 保存到打开软件这台电脑的 MySQL</label>
+              <div id="mysqlLocalDetails" hidden aria-hidden="true">
               <div class="compact-input-grid">
                 <label>本机地址<input id="mysqlLocalHostInput" type="text" value="127.0.0.1"></label>
                 <label>本机端口<input id="mysqlLocalPortInput" type="number" min="1" max="65535" step="1" value="3306"></label>
@@ -127,6 +128,7 @@
                     <tbody><tr><td colspan="6">点击“刷新本机关系表”查看本机 MySQL 数据</td></tr></tbody>
                   </table>
                 </div>
+              </div>
               </div>
               <label class="toggle"><input id="mysqlEnabledInput" type="checkbox"> 保存到目标电脑 MySQL</label>
               <div id="mysqlTargetDetails" hidden aria-hidden="true">
@@ -415,7 +417,7 @@
     </div>
   </div>
   <div id="toast" class="toast"></div>
-  <script src="/mysql_visibility.js?v=20260909-target-toggle-1"></script>
-  <script src="/app.js?v=20260909-target-toggle-1"></script>
+  <script src="/mysql_visibility.js?v=20260909-mysql-toggle-2"></script>
+  <script src="/app.js?v=20260909-mysql-toggle-2"></script>
 </body>
 </html>

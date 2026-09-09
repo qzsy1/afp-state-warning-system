@@ -90,6 +90,7 @@ const controls = {
   liveSpecimen: $("liveSpecimenInput"),
   saveRoot: $("saveRootInput"),
   mysqlEnabled: $("mysqlEnabledInput"),
+  mysqlLocalDetails: $("mysqlLocalDetails"),
   mysqlTargetDetails: $("mysqlTargetDetails"),
   mysqlLocalEnabled: $("mysqlLocalEnabledInput"),
   mysqlLocalHost: $("mysqlLocalHostInput"),
@@ -130,6 +131,13 @@ function syncTargetMysqlSection() {
   return window.MysqlVisibility?.syncTargetMysqlVisibility(
     controls.mysqlEnabled,
     controls.mysqlTargetDetails,
+  );
+}
+
+function syncLocalMysqlSection() {
+  return window.MysqlVisibility?.syncLocalMysqlVisibility(
+    controls.mysqlLocalEnabled,
+    controls.mysqlLocalDetails,
   );
 }
 
@@ -2008,6 +2016,7 @@ function renderLayerProgress(layers) {
 
 async function initialize() {
   try {
+    syncLocalMysqlSection();
     syncTargetMysqlSection();
     await loadMysqlDefaults();
     const response = await fetch("/api/bootstrap", { cache: "no-store" });
@@ -2177,6 +2186,7 @@ controls.mysqlEnabled?.addEventListener("change", () => {
   renderMysqlStatus({enabled: false, ok: false, saved_rows: 0});
 });
 controls.mysqlLocalEnabled?.addEventListener("change", () => {
+  syncLocalMysqlSection();
   if (!controls.mysqlLocalEnabled.checked) state.mysqlConnectionTests.local = null;
   renderMysqlStatus({enabled: false, ok: false, saved_rows: 0});
 });

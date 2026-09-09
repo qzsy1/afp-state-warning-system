@@ -5,7 +5,7 @@
 }(typeof globalThis !== "undefined" ? globalThis : this, function () {
   "use strict";
 
-  function syncTargetMysqlVisibility(checkbox, details) {
+  function syncMysqlVisibility(checkbox, details) {
     if (!details) return false;
     const visible = Boolean(checkbox && checkbox.checked);
     details.hidden = !visible;
@@ -13,5 +13,8 @@
     return visible;
   }
 
-  return {syncTargetMysqlVisibility};
+  return {
+    syncTargetMysqlVisibility: syncMysqlVisibility,
+    syncLocalMysqlVisibility: syncMysqlVisibility,
+  };
 }));
