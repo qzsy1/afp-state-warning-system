@@ -529,10 +529,11 @@ class MySQLCaptureStore:
                 value = str(getattr(self.settings, setting_name, "") or "").strip()
                 if value:
                     kwargs[argument_name] = value
-        elif driver == "mysql.connector":
-            # Make an explicitly disabled TLS setting deterministic.  PyMySQL
-            # simply omits all ssl_* arguments when encryption is disabled.
-            kwargs["ssl_disabled"] = True
+        # When TLS is not explicitly configured, leave the connector's
+        # transport negotiation at its safe default.  In particular,
+        # ``caching_sha2_password`` may require the connector to negotiate TLS
+        # or retrieve the server RSA key during the first LAN login.  Forcing
+        # ``ssl_disabled=True`` makes that first authentication fail with 2061.
         return kwargs
 
     def _connect(self, database: str | None = None):

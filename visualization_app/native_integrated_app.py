@@ -443,7 +443,7 @@ class AcquisitionPanel(ttk.Frame):
         self._entry(saving, "目标数据库", "mysql_database", "afp_state_warning", 8, 0, width=20)
         ttk.Label(
             saving,
-            text="两项可单独或同时勾选；关系查看、远程查询、导出和训练默认使用目标电脑参数。",
+            text="本机与目标电脑是两套独立连接；请使用对应列的测试、关系查看与导出按钮。",
             foreground=COLORS["muted"],
             wraplength=345,
         ).grid(row=9, column=0, columnspan=4, sticky="ew", pady=(3, 4))
@@ -452,13 +452,20 @@ class AcquisitionPanel(ttk.Frame):
         mysql_actions.columnconfigure(0, weight=1); mysql_actions.columnconfigure(1, weight=1)
         ttk.Button(mysql_actions, text="测试本机连接", command=lambda: self._test_mysql_connection(local=True)).grid(row=0, column=0, sticky="ew", padx=(0, 2), pady=2)
         ttk.Button(mysql_actions, text="测试目标连接", command=self._test_mysql_connection).grid(row=0, column=1, sticky="ew", padx=(2, 0), pady=2)
-        ttk.Button(mysql_actions, text="初始化目标表结构", command=self._initialize_mysql_schema).grid(row=1, column=0, sticky="ew", padx=(0, 2), pady=2)
-        ttk.Button(mysql_actions, text="查看工况—试样—铺层", command=self._show_mysql_relations).grid(row=1, column=1, sticky="ew", padx=(2, 0), pady=2)
-        ttk.Button(mysql_actions, text="导出目标数据 CSV", command=self._export_mysql_csv).grid(row=2, column=0, sticky="ew", padx=(0, 2), pady=2)
+        ttk.Button(mysql_actions, text="查看本机关系", command=lambda: self._show_mysql_relations(local=True)).grid(row=1, column=0, sticky="ew", padx=(0, 2), pady=2)
+        ttk.Button(mysql_actions, text="查看目标关系", command=self._show_mysql_relations).grid(row=1, column=1, sticky="ew", padx=(2, 0), pady=2)
+        ttk.Button(mysql_actions, text="导出本机数据 CSV", command=lambda: self._export_mysql_csv(local=True)).grid(row=2, column=0, sticky="ew", padx=(0, 2), pady=2)
+        ttk.Button(mysql_actions, text="导出目标数据 CSV", command=self._export_mysql_csv).grid(row=2, column=1, sticky="ew", padx=(2, 0), pady=2)
+        ttk.Button(mysql_actions, text="初始化本机表结构", command=lambda: self._initialize_mysql_schema(local=True)).grid(row=3, column=0, sticky="ew", padx=(0, 2), pady=2)
+        ttk.Button(mysql_actions, text="初始化目标表结构", command=self._initialize_mysql_schema).grid(row=3, column=1, sticky="ew", padx=(2, 0), pady=2)
         self.mysql_retry_button = ttk.Button(mysql_actions, text="立即补传待同步数据", command=self._retry_pending_mysql, state="disabled")
-        self.mysql_retry_button.grid(row=2, column=1, sticky="ew", padx=(2, 0), pady=2)
-        self.mysql_status_text = tk.StringVar(value="数据库操作使用上方统一连接参数；待后台加载后检查补传能力。")
-        ttk.Label(saving, textvariable=self.mysql_status_text, foreground=COLORS["muted"], wraplength=345).grid(row=11, column=0, columnspan=4, sticky="ew", pady=(3, 0))
+        self.mysql_retry_button.grid(row=4, column=0, columnspan=2, sticky="ew", pady=2)
+        self.mysql_local_status_text = tk.StringVar(value="本机数据库：尚未检查。")
+        self.mysql_target_status_text = tk.StringVar(value="目标电脑数据库：尚未检查。")
+        self.mysql_status_text = tk.StringVar(value="保存状态：本地 CSV 始终优先保存。")
+        ttk.Label(saving, textvariable=self.mysql_local_status_text, foreground=COLORS["muted"], wraplength=345).grid(row=11, column=0, columnspan=4, sticky="ew", pady=(3, 0))
+        ttk.Label(saving, textvariable=self.mysql_target_status_text, foreground=COLORS["muted"], wraplength=345).grid(row=12, column=0, columnspan=4, sticky="ew")
+        ttk.Label(saving, textvariable=self.mysql_status_text, foreground=COLORS["muted"], wraplength=345).grid(row=13, column=0, columnspan=4, sticky="ew")
 
         actions = ttk.Frame(parent)
         actions.grid(row=6, column=0, sticky="ew", pady=8)
@@ -699,6 +706,7 @@ class AcquisitionPanel(ttk.Frame):
 
     def _test_mysql_connection(self, local: bool = False) -> None:
         settings = self._local_mysql_settings() if local else self._mysql_settings()
+        status_variable = self.mysql_local_status_text if local else self.mysql_target_status_text
 
         def work() -> dict[str, Any]:
             store = MySQLCaptureStore(settings)
@@ -717,16 +725,17 @@ class AcquisitionPanel(ttk.Frame):
                     message += "；连接已建立，但AFP表结构不完整，请先初始化表结构"
             else:
                 message = f"{'本机' if local else '目标'}数据库连接失败：" + str(result.get("error") or "未知错误")
-            self.mysql_status_text.set(message)
+            status_variable.set(message)
             self.status_text.set(message)
 
-        self._background("正在测试统一 MySQL 连接……", work, done)
+        self._background(f"正在测试{'本机' if local else '目标电脑'} MySQL 连接……", work, done)
 
-    def _initialize_mysql_schema(self) -> None:
-        settings = self._mysql_settings()
+    def _initialize_mysql_schema(self, local: bool = False) -> None:
+        settings = self._local_mysql_settings() if local else self._mysql_settings()
+        label = "本机" if local else "目标电脑"
         if not messagebox.askyesno(
             "初始化 MySQL",
-            "将使用当前连接在目标服务器上创建数据库（如不存在）、数据表、索引和外键。是否继续？",
+            f"将使用{label}连接创建数据库（如不存在）、数据表、索引和外键。是否继续？",
         ):
             return
 
@@ -744,10 +753,10 @@ class AcquisitionPanel(ttk.Frame):
                 message = f"表结构已就绪：{settings.host}/{settings.database}"
             else:
                 message = "表结构初始化失败：" + str(result.get("error") or "未知错误")
-            self.mysql_status_text.set(message)
+            (self.mysql_local_status_text if local else self.mysql_target_status_text).set(message)
             self.status_text.set(message)
 
-        self._background("正在初始化目标 MySQL 表结构……", work, done)
+        self._background(f"正在初始化{label} MySQL 表结构……", work, done)
 
     def _update_mysql_retry_capability(self) -> None:
         manager = getattr(self.dashboard, "acquisition", None) if self.dashboard else None
@@ -809,6 +818,7 @@ class AcquisitionPanel(ttk.Frame):
         self,
         filters: dict[str, Any] | None = None,
         parent: tk.Misc | None = None,
+        local: bool = False,
     ) -> None:
         active_filters = {
             key: value for key, value in (filters or {}).items()
@@ -816,15 +826,15 @@ class AcquisitionPanel(ttk.Frame):
         }
         destination = filedialog.asksaveasfilename(
             parent=parent or self,
-            title="导出远程 MySQL 数据",
+            title=f"导出{'本机' if local else '目标电脑'} MySQL 数据",
             initialdir=str(self.vars["save_root"].get() or r"F:\AFP_Capture"),
-            initialfile=time.strftime("AFP远程数据库导出_%Y%m%d_%H%M%S.csv"),
+            initialfile=time.strftime(f"AFP{'本机' if local else '目标'}数据库导出_%Y%m%d_%H%M%S.csv"),
             defaultextension=".csv",
             filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
         )
         if not destination:
             return
-        settings = self._mysql_settings()
+        settings = self._local_mysql_settings() if local else self._mysql_settings()
         settings_mapping = {
             "enabled": True,
             "host": settings.host,
@@ -853,10 +863,10 @@ class AcquisitionPanel(ttk.Frame):
 
         def done(result: dict[str, Any]) -> None:
             message = (
-                f"远程数据已导出：{result.get('saved_rows', result.get('rows', 0))} 行，"
+                f"{'本机' if local else '目标电脑'}数据已导出：{result.get('saved_rows', result.get('rows', 0))} 行，"
                 f"保存到 {result.get('output_file') or destination}"
             )
-            self.mysql_status_text.set(message)
+            (self.mysql_local_status_text if local else self.mysql_target_status_text).set(message)
             self.status_text.set(message)
             owner: tk.Misc = self
             if parent is not None:
@@ -867,7 +877,7 @@ class AcquisitionPanel(ttk.Frame):
                     pass
             messagebox.showinfo("导出完成", message, parent=owner)
 
-        self._background("正在分批读取远程数据库并导出 CSV……", work, done)
+        self._background(f"正在分批读取{'本机' if local else '目标电脑'}数据库并导出 CSV……", work, done)
 
     def test_connection(self) -> None:
         config = self._config()
@@ -914,9 +924,11 @@ class AcquisitionPanel(ttk.Frame):
         path.mkdir(parents=True, exist_ok=True)
         os.startfile(path)
 
-    def _show_mysql_relations(self) -> None:
+    def _show_mysql_relations(self, local: bool = False) -> None:
+        settings = self._local_mysql_settings() if local else self._mysql_settings()
+        scope_label = "本机" if local else "目标电脑"
         window = tk.Toplevel(self)
-        window.title("远程 MySQL｜工况—试样—铺层关系")
+        window.title(f"{scope_label} MySQL｜工况—试样—铺层关系")
         window.geometry("1240x680")
         window.minsize(860, 480)
         window.columnconfigure(0, weight=1)
@@ -931,8 +943,8 @@ class AcquisitionPanel(ttk.Frame):
         auto_var = tk.BooleanVar(value=False)
         status_var = tk.StringVar(
             value=(
-                f"数据库：{self.vars['mysql_host'].get()}:"
-                f"{self.vars['mysql_port'].get()}/{self.vars['mysql_database'].get()}"
+                f"{scope_label}数据库：{settings.host}:"
+                f"{settings.port}/{settings.database}"
             )
         )
         ttk.Label(header, text="工况编号").grid(row=0, column=0, padx=(0, 3))
@@ -1049,8 +1061,7 @@ class AcquisitionPanel(ttk.Frame):
                 return
             state["busy"] = True
             refresh_button.config(state="disabled")
-            status_var.set("正在读取远程数据库……")
-            settings = self._mysql_settings()
+            status_var.set(f"正在读取{scope_label}数据库……")
 
             def worker() -> None:
                 try:
@@ -1087,7 +1098,7 @@ class AcquisitionPanel(ttk.Frame):
             except ValueError as exc:
                 status_var.set(str(exc))
                 return
-            self._export_mysql_csv(filters, parent=window)
+            self._export_mysql_csv(filters, parent=window, local=local)
 
         def auto_changed() -> None:
             schedule_next()

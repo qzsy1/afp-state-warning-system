@@ -50,6 +50,19 @@ class _FakeConnection:
 
 
 class MySQLIdentityTests(unittest.TestCase):
+    def test_non_tls_profile_keeps_connector_security_negotiation_available(self) -> None:
+        """caching_sha2_password must be able to negotiate TLS/RSA itself."""
+        settings = MySQLSettings(
+            enabled=True,
+            host="192.168.101.31",
+            user="afp_app",
+            password="secret",
+        )
+        kwargs = MySQLCaptureStore(settings)._connection_kwargs(
+            "mysql.connector", settings.database
+        )
+        self.assertNotIn("ssl_disabled", kwargs)
+
     def test_remote_settings_accept_host_and_mask_secret(self) -> None:
         settings = MySQLSettings.from_mapping({
             "mysql_enabled": "true",

@@ -25,7 +25,7 @@ const state = {
   hardwareCheckInProgress: false,
   hardwareCheckTimer: null,
   autoCheckInterval: null,
-  mysqlConnectionTest: null,
+  mysqlConnectionTests: {local: null, target: null},
 };
 
 const $ = (id) => document.getElementById(id);
@@ -717,12 +717,14 @@ async function selectSaveRoot() {
 }
 
 async function testMysqlConnection(local = false) {
-  const status = $("mysqlStatus");
+  const scope = local ? "local" : "target";
+  const label = local ? "本机" : "目标电脑";
+  const status = local ? $("mysqlLocalStatus") : $("mysqlTargetStatus");
   try {
-    status.textContent = "正在检查已有 MySQL 数据库（不会创建或修改表）……";
+    status.textContent = `正在检查${label} MySQL 数据库（不会创建或修改表）……`;
     const settings = local ? unifiedLocalMysqlSettings() : unifiedMysqlSettings();
     const result = await postJson("/api/mysql/test", {...settings, read_only: true});
-    state.mysqlConnectionTest = result;
+    state.mysqlConnectionTests[scope] = result;
     status.classList.toggle("ok", Boolean(result.ok));
     status.classList.toggle("error", !result.ok);
     const errorText = String(result.error || "未知错误");
@@ -730,37 +732,40 @@ async function testMysqlConnection(local = false) {
       ? "账号或密码错误：请确认 MySQL 用户名和密码设置正确"
       : errorText;
     status.textContent = result.ok
-      ? `${local ? "本机" : "目标"} MySQL 已连接：${result.database}（${result.driver}）${result.schema_ready === false ? "，但AFP表结构不完整" : ""}`
-      : `${local ? "本机" : "目标"} MySQL 连接失败：${friendlyError}`;
+      ? `${label} MySQL 已连接：${settings.mysql_host}:${settings.mysql_port}/${result.database}（${result.driver}）${result.schema_ready === false ? "，但AFP表结构不完整" : ""}`
+      : `${label} MySQL 连接失败：${friendlyError}`;
   } catch (error) {
-    state.mysqlConnectionTest = {ok: false, error: error.message};
+    state.mysqlConnectionTests[scope] = {ok: false, error: error.message};
     status.classList.remove("ok");
     status.classList.add("error");
-    status.textContent = `MySQL 连接失败：${error.message}`;
+    status.textContent = `${label} MySQL 连接失败：${error.message}`;
   }
 }
 
-async function refreshRelationMap() {
-  const table = $("relationMapTable");
+async function refreshRelationMap(scope) {
+  const local = scope === "local";
+  const label = local ? "本机" : "目标电脑";
+  const table = $(local ? "localRelationMapTable" : "targetRelationMapTable");
   const body = table?.querySelector("tbody");
   if (!body) return;
-  const database = controls.mysqlDatabase.value.trim() || "afp_state_warning";
-  const status = $("mysqlStatus");
+  const settings = local ? unifiedLocalMysqlSettings() : unifiedMysqlSettings();
+  const database = settings.mysql_database;
+  const status = local ? $("mysqlLocalStatus") : $("mysqlTargetStatus");
   try {
-    if (status) status.textContent = `正在读取数据库 ${database} 的关系表……`;
-    const result = await postJson("/api/mysql/relation-map", unifiedMysqlSettings({limit: 1000}));
+    if (status) status.textContent = `正在读取${label}数据库 ${settings.mysql_host}/${database} 的关系表……`;
+    const result = await postJson("/api/mysql/relation-map", {...settings, limit: 1000});
     body.replaceChildren();
     if (!result.ok || !result.rows?.length) {
       const row = document.createElement("tr");
       const cell = document.createElement("td");
       cell.colSpan = 6;
       cell.textContent = result.error
-        ? `数据库 ${database} 读取失败：${result.error}`
-        : `数据库 ${database} 已连接，但当前没有已保存的工况—试样—铺层关系`;
+        ? `${label}数据库 ${database} 读取失败：${result.error}`
+        : `${label}数据库 ${database} 已连接，但当前没有已保存的工况—试样—铺层关系`;
       row.appendChild(cell);
       body.appendChild(row);
       if (status && result.ok) {
-        status.textContent = `数据库 ${database} 已连接，关系表当前为 0 行。`;
+        status.textContent = `${label}数据库 ${settings.mysql_host}/${database} 已连接，关系表当前为 0 行。`;
         status.classList.remove("error");
       }
       return;
@@ -782,7 +787,8 @@ async function refreshRelationMap() {
       body.appendChild(row);
     });
     if (status) {
-      status.textContent = `数据库 ${database} 关系表已刷新：${result.count} 条铺层关系`;
+      status.textContent = `${label}数据库 ${settings.mysql_host}/${database} 已刷新：${result.count} 条铺层关系`;
+      status.classList.add("ok");
       status.classList.remove("error");
     }
   } catch (error) {
@@ -790,7 +796,7 @@ async function refreshRelationMap() {
     const row = document.createElement("tr");
     const cell = document.createElement("td");
     cell.colSpan = 6;
-    cell.textContent = `数据库 ${database} 关系表读取失败：${error.message}`;
+    cell.textContent = `${label}数据库 ${settings.mysql_host}/${database} 关系表读取失败：${error.message}`;
     row.appendChild(cell);
     body.appendChild(row);
   }
@@ -903,7 +909,7 @@ function renderMysqlStatus(mysql) {
     controls.mysqlEnabled?.checked || controls.mysqlLocalEnabled?.checked
   );
   if (!mysql.enabled && selectedInUi) {
-    const tested = state.mysqlConnectionTest;
+    const tested = state.mysqlConnectionTests.target || state.mysqlConnectionTests.local;
     status.classList.toggle("ok", Boolean(tested?.ok));
     status.classList.toggle("error", Boolean(tested && tested.ok === false));
     if (tested?.ok) {
@@ -2151,15 +2157,17 @@ controls.discoverInterfaces?.addEventListener("click", discoverInterfaces);
 controls.addInterface?.addEventListener("click", addInterface);
 $("testMysqlButton")?.addEventListener("click", () => testMysqlConnection(false));
 $("testLocalMysqlButton")?.addEventListener("click", () => testMysqlConnection(true));
-$("refreshRelationMapButton")?.addEventListener("click", refreshRelationMap);
+$("refreshLocalRelationMapButton")?.addEventListener("click", () => refreshRelationMap("local"));
+$("refreshTargetRelationMapButton")?.addEventListener("click", () => refreshRelationMap("target"));
 $("previewMysqlDataButton")?.addEventListener("click", previewRemoteMysqlData);
 $("copyMysqlPreviewButton")?.addEventListener("click", copyRemoteMysqlPreview);
 $("downloadMysqlCsvButton")?.addEventListener("click", downloadRemoteMysqlCsv);
 controls.mysqlEnabled?.addEventListener("change", () => {
-  if (!controls.mysqlEnabled.checked) state.mysqlConnectionTest = null;
+  if (!controls.mysqlEnabled.checked) state.mysqlConnectionTests.target = null;
   renderMysqlStatus({enabled: false, ok: false, saved_rows: 0});
 });
 controls.mysqlLocalEnabled?.addEventListener("change", () => {
+  if (!controls.mysqlLocalEnabled.checked) state.mysqlConnectionTests.local = null;
   renderMysqlStatus({enabled: false, ok: false, saved_rows: 0});
 });
 [controls.mysqlHost, controls.mysqlPort, controls.mysqlUser,
@@ -2167,7 +2175,12 @@ controls.mysqlLocalEnabled?.addEventListener("change", () => {
   controls.mysqlLocalPort, controls.mysqlLocalUser, controls.mysqlLocalPassword,
   controls.mysqlLocalDatabase].forEach((control) => {
   control?.addEventListener("input", () => {
-    state.mysqlConnectionTest = null;
+    if ([controls.mysqlLocalHost, controls.mysqlLocalPort, controls.mysqlLocalUser,
+      controls.mysqlLocalPassword, controls.mysqlLocalDatabase].includes(control)) {
+      state.mysqlConnectionTests.local = null;
+    } else {
+      state.mysqlConnectionTests.target = null;
+    }
     if (controls.mysqlEnabled?.checked) {
       renderMysqlStatus({enabled: false, ok: false, saved_rows: 0});
     }

@@ -114,6 +114,20 @@
                 <label>本机密码<input id="mysqlLocalPasswordInput" type="password" value="" autocomplete="new-password"></label>
                 <label>本机数据库<input id="mysqlLocalDatabaseInput" type="text" value="afp_state_warning" pattern="[A-Za-z][A-Za-z0-9_]{0,63}"></label>
               </div>
+              <div class="transport">
+                <button id="testLocalMysqlButton" class="secondary-button" type="button">检查本机数据库</button>
+                <button id="refreshLocalRelationMapButton" class="secondary-button" type="button">刷新本机关系表</button>
+              </div>
+              <p id="mysqlLocalStatus" class="control-note">本机数据库：尚未检查。</p>
+              <div class="relation-map-panel">
+                <div class="sensor-selector-title">本机数据库｜工况—试样—独立重复—铺层关系</div>
+                <div class="relation-map-scroll">
+                  <table id="localRelationMapTable" class="relation-map-table">
+                    <thead><tr><th>工况</th><th>试样</th><th>独立重复</th><th>铺层</th><th>采样点数</th><th>最后保存</th></tr></thead>
+                    <tbody><tr><td colspan="6">点击“刷新本机关系表”查看本机 MySQL 数据</td></tr></tbody>
+                  </table>
+                </div>
+              </div>
               <label class="toggle"><input id="mysqlEnabledInput" type="checkbox"> 保存到目标电脑 MySQL</label>
               <div class="compact-input-grid">
                 <label>目标电脑 IP / 域名<input id="mysqlHostInput" type="text" value="192.168.101.31"></label>
@@ -123,22 +137,22 @@
                 <label>数据库名称<input id="mysqlDatabaseInput" type="text" value="afp_state_warning" pattern="[A-Za-z][A-Za-z0-9_]{0,63}"></label>
               </div>
               <div class="transport">
-                <button id="testLocalMysqlButton" class="secondary-button" type="button">检查本机数据库</button>
                 <button id="testMysqlButton" class="secondary-button" type="button">检查目标数据库</button>
-                <button id="refreshRelationMapButton" class="secondary-button" type="button">刷新关系表</button>
+                <button id="refreshTargetRelationMapButton" class="secondary-button" type="button">刷新目标关系表</button>
               </div>
-              <p id="mysqlStatus" class="control-note">可只选本机、只选目标电脑或同时选择；本地 CSV 始终优先保存。</p>
+              <p id="mysqlTargetStatus" class="control-note">目标数据库：尚未检查。</p>
               <div class="relation-map-panel">
-                <div class="sensor-selector-title">工况—试样—独立重复—铺层关系</div>
+                <div class="sensor-selector-title">目标电脑数据库｜工况—试样—独立重复—铺层关系</div>
                 <div class="relation-map-scroll">
-                  <table id="relationMapTable" class="relation-map-table">
+                  <table id="targetRelationMapTable" class="relation-map-table">
                     <thead><tr><th>工况</th><th>试样</th><th>独立重复</th><th>铺层</th><th>采样点数</th><th>最后保存</th></tr></thead>
-                    <tbody><tr><td colspan="6">点击“刷新关系表”查看 MySQL 中已保存的关系</td></tr></tbody>
+                    <tbody><tr><td colspan="6">点击“刷新目标关系表”查看目标电脑 MySQL 数据</td></tr></tbody>
                   </table>
                 </div>
               </div>
+              <p id="mysqlStatus" class="control-note">保存状态：本地 CSV 始终优先保存；可单独或同时启用两套 MySQL。</p>
               <details class="remote-mysql-panel">
-                <summary>远程数据查看与下载</summary>
+                <summary>目标电脑数据查看与下载</summary>
                 <div class="remote-mysql-content">
                   <label>只读 SQL（仅允许 SELECT / WITH ... SELECT）
                     <textarea id="remoteMysqlQueryInput" rows="3">SELECT * FROM afp_flat_all ORDER BY specimen_key, layer_no, sample_index</textarea>
@@ -399,6 +413,6 @@
     </div>
   </div>
   <div id="toast" class="toast"></div>
-  <script src="/app.js?v=20260904-ui-2"></script>
+  <script src="/app.js?v=20260909-mysql-scope-1"></script>
 </body>
 </html>
