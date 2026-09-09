@@ -93,7 +93,7 @@ def classify_mysql_error(error: Any) -> dict[str, str]:
     match = re.search(r"\b(10(?:44|45|49)|1130|1146|2003|2005|2061)\b", text)
     if match:
         code = match.group(1)
-    if code == "1045" or "access denied" in lowered and "database" not in lowered:
+    if code == "1045":
         return {
             "category": "authentication",
             "code": code or "1045",
@@ -104,6 +104,12 @@ def classify_mysql_error(error: Any) -> dict[str, str]:
             "category": "authorization",
             "code": code or "1044",
             "message": "账号已登录，但没有该数据库的权限",
+        }
+    if "access denied" in lowered:
+        return {
+            "category": "authentication",
+            "code": code or "1045",
+            "message": "用户名/密码错误，或该用户没有从当前客户端主机登录的账号记录",
         }
     if code in {"1049", "1146"} or "unknown database" in lowered or "doesn't exist" in lowered:
         return {
@@ -130,4 +136,3 @@ def classify_mysql_error(error: Any) -> dict[str, str]:
             "message": "MySQL认证插件需要TLS或RSA公钥协商，请检查服务器认证配置",
         }
     return {"category": "unknown", "code": code, "message": text}
-
