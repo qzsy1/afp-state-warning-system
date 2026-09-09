@@ -129,6 +129,7 @@
                 </div>
               </div>
               <label class="toggle"><input id="mysqlEnabledInput" type="checkbox"> 保存到目标电脑 MySQL</label>
+              <div id="mysqlTargetDetails" hidden aria-hidden="true">
               <div class="compact-input-grid">
                 <label>目标电脑 IP / 域名<input id="mysqlHostInput" type="text" value="192.168.101.31"></label>
                 <label>端口<input id="mysqlPortInput" type="number" min="1" max="65535" step="1" value="3306"></label>
@@ -150,7 +151,6 @@
                   </table>
                 </div>
               </div>
-              <p id="mysqlStatus" class="control-note">保存状态：本地 CSV 始终优先保存；可单独或同时启用两套 MySQL。</p>
               <details class="remote-mysql-panel">
                 <summary>目标电脑数据查看与下载</summary>
                 <div class="remote-mysql-content">
@@ -171,6 +171,8 @@
                   </div>
                 </div>
               </details>
+              </div>
+              <p id="mysqlStatus" class="control-note">保存状态：本地 CSV 始终优先保存；可单独或同时启用两套 MySQL。</p>
             </div>
             <label class="prediction-setting">已训练预测模型文件
               <span class="path-picker-row">
@@ -413,6 +415,7 @@
     </div>
   </div>
   <div id="toast" class="toast"></div>
-  <script src="/app.js?v=20260909-mysql-scope-1"></script>
+  <script src="/mysql_visibility.js?v=20260909-target-toggle-1"></script>
+  <script src="/app.js?v=20260909-target-toggle-1"></script>
 </body>
 </html>

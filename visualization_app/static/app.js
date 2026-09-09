@@ -90,6 +90,7 @@ const controls = {
   liveSpecimen: $("liveSpecimenInput"),
   saveRoot: $("saveRootInput"),
   mysqlEnabled: $("mysqlEnabledInput"),
+  mysqlTargetDetails: $("mysqlTargetDetails"),
   mysqlLocalEnabled: $("mysqlLocalEnabledInput"),
   mysqlLocalHost: $("mysqlLocalHostInput"),
   mysqlLocalPort: $("mysqlLocalPortInput"),
@@ -124,6 +125,13 @@ const controls = {
   resetSensorCheck: $("resetSensorCheckButton"),
   hardwareCheckStatus: $("hardwareCheckStatus"),
 };
+
+function syncTargetMysqlSection() {
+  return window.MysqlVisibility?.syncTargetMysqlVisibility(
+    controls.mysqlEnabled,
+    controls.mysqlTargetDetails,
+  );
+}
 
 function unifiedMysqlSettings(extra = {}) {
   return {
@@ -2000,6 +2008,7 @@ function renderLayerProgress(layers) {
 
 async function initialize() {
   try {
+    syncTargetMysqlSection();
     await loadMysqlDefaults();
     const response = await fetch("/api/bootstrap", { cache: "no-store" });
     const payload = await response.json();
@@ -2163,6 +2172,7 @@ $("previewMysqlDataButton")?.addEventListener("click", previewRemoteMysqlData);
 $("copyMysqlPreviewButton")?.addEventListener("click", copyRemoteMysqlPreview);
 $("downloadMysqlCsvButton")?.addEventListener("click", downloadRemoteMysqlCsv);
 controls.mysqlEnabled?.addEventListener("change", () => {
+  syncTargetMysqlSection();
   if (!controls.mysqlEnabled.checked) state.mysqlConnectionTests.target = null;
   renderMysqlStatus({enabled: false, ok: false, saved_rows: 0});
 });
