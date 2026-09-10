@@ -174,7 +174,11 @@ BSV_UVC_TEMP_FORMULA_SCALE = 64.0
 BSV_UVC_TEMP_FORMULA_OFFSET = -50.0
 BSV_UVC_DLL_NAME = "BsvUvcNative.dll"
 DEFAULT_RTSP_URL = "rtsp://192.168.125.2:554/"
-M3232_BAUDRATE = 230400
+# The vendor operation manual specifies 115200 baud.  The vendor packet
+# framing is not documented, so the driver accepts JSON matrix frames for the
+# simulator/probe path and still needs one raw hardware capture for final
+# protocol validation.
+M3232_BAUDRATE = 115200
 
 # The 16-channel collection plan remains authoritative.  This metadata only
 # restores the verified physical source, unit and decoder contract used by the
@@ -245,7 +249,7 @@ SENSOR_INTERFACE_PROFILES: dict[str, dict[str, Any]] = {
         "endpoint": "COM8",
         "baudrate": M3232_BAUDRATE,
         "channels": ["压力"],
-        "processing": "32×32矩阵→有效像素合计→空载调零→中值滤波（N）",
+        "processing": "串口矩阵（行列自动识别）→有效像素合计→中值滤波（N）；坐标/零点按设备校准",
     },
     "custom": {
         "label": "自定义JSON传感器",
@@ -1651,15 +1655,34 @@ class RtspThermalDriver(SampleDriver):
 
 
 class M3232PressureDriver(SampleDriver):
-    """M3232 32×32 serial pressure reader with transport freshness checks."""
+    """Serial pressure reader with variable-size JSON matrix compatibility.
 
-    def __init__(self, endpoint: str = "COM8", baudrate: int = M3232_BAUDRATE) -> None:
+    The supplied vendor manual confirms 115200 baud and automatic X/Y/zero
+    calibration, but does not publish the packet framing.  JSON arrays and
+    ``{"matrix": ...}`` frames are therefore supported as a documented
+    simulator/probe interchange format; hardware framing remains configurable
+    after a raw serial capture.
+    """
+
+    def __init__(
+        self,
+        endpoint: str = "COM8",
+        baudrate: int = M3232_BAUDRATE,
+        matrix_rows: int = 0,
+        matrix_cols: int = 0,
+    ) -> None:
         self.endpoint = str(endpoint or "COM8").strip()
         self.baudrate = int(baudrate or M3232_BAUDRATE)
+        self.matrix_rows = max(0, int(matrix_rows or 0))
+        self.matrix_cols = max(0, int(matrix_cols or 0))
+        self.matrix_shape: tuple[int, int] = (0, 0)
         self.serial = None
         self.rx_buffer = ""
         self.last_data_time: float | None = None
         self.latest_pressure = 0.0
+        self.latest_pressure_peak = 0.0
+        self.latest_contact_area = 0
+        self.latest_valid_fraction = 0.0
         self.median_window: list[float] = []
 
     def open(self) -> None:
@@ -1673,10 +1696,12 @@ class M3232PressureDriver(SampleDriver):
         self.serial.write(b"begin\n")
 
     def _extract_frames(self) -> list[list[list[float]]]:
+        """Extract complete rectangular JSON matrices from a fragmented stream."""
         frames: list[list[list[float]]] = []
         decoder = json.JSONDecoder()
         while True:
-            start = self.rx_buffer.find("[")
+            starts = [index for index in (self.rx_buffer.find("["), self.rx_buffer.find("{")) if index >= 0]
+            start = min(starts) if starts else -1
             if start < 0:
                 self.rx_buffer = self.rx_buffer[-1024:]
                 break
@@ -1686,24 +1711,57 @@ class M3232PressureDriver(SampleDriver):
                 self.rx_buffer = self.rx_buffer[start:]
                 break
             self.rx_buffer = self.rx_buffer[start + end:]
-            if isinstance(payload, list) and len(payload) == 32 and all(
-                isinstance(row, list) and len(row) == 32 for row in payload
-            ):
-                try:
-                    frames.append([[float(value) for value in row] for row in payload])
-                except (TypeError, ValueError):
-                    pass
+            if isinstance(payload, dict):
+                for key in ("matrix", "data", "values"):
+                    if key in payload:
+                        payload = payload[key]
+                        break
+            if not isinstance(payload, list) or not payload or not all(isinstance(row, list) for row in payload):
+                continue
+            width = len(payload[0])
+            if width <= 0 or not all(len(row) == width for row in payload):
+                continue
+            if self.matrix_rows and len(payload) != self.matrix_rows:
+                continue
+            if self.matrix_cols and width != self.matrix_cols:
+                continue
+            try:
+                matrix = [[float(value) for value in row] for row in payload]
+            except (TypeError, ValueError):
+                continue
+            self.matrix_shape = (len(matrix), width)
+            frames.append(matrix)
         return frames
 
     @staticmethod
+    def _frame_metrics(matrix: list[list[float]]) -> dict[str, float | int]:
+        values = [float(value) for row in matrix for value in row]
+        finite = [value for value in values if math.isfinite(value)]
+        # Zero is the device's no-signal/background value.  Keep it in the
+        # matrix for shape/peak calculations but exclude it from the quality
+        # ratio so a disconnected matrix is distinguishable from valid data.
+        valid = [value for value in finite if value > 0.0]
+        active = sorted(value for value in finite if value > 5.0)
+        trim_count = max(1, int(len(active) * 0.9)) if active else 0
+        return {
+            "pressure_total": round(sum(active[:trim_count]), 2) if active else 0.0,
+            "pressure_peak": round(max(finite), 2) if finite else 0.0,
+            "contact_area": int(len(active)),
+            "valid_fraction": round(len(valid) / len(values), 6) if values else 0.0,
+        }
+
+    @staticmethod
     def _frame_pressure(matrix: list[list[float]]) -> float:
-        active = sorted(
-            value for row in matrix for value in row
-            if math.isfinite(value) and value > 5.0
-        )
-        if not active:
-            return 0.0
-        return round(sum(active[:max(1, int(len(active) * 0.9))]), 2)
+        """Backward-compatible scalar pressure helper."""
+        return float(M3232PressureDriver._frame_metrics(matrix)["pressure_total"])
+
+    def _update_matrix_metrics(self, matrix: list[list[float]]) -> float:
+        metrics = self._frame_metrics(matrix)
+        value = float(metrics["pressure_total"])
+        self.latest_pressure_peak = float(metrics["pressure_peak"])
+        self.latest_contact_area = int(metrics["contact_area"])
+        self.latest_valid_fraction = float(metrics["valid_fraction"])
+        return value
 
     def read_sample(self) -> dict[str, float] | None:
         if self.serial is None:
@@ -1715,14 +1773,19 @@ class M3232PressureDriver(SampleDriver):
                 self.last_data_time = time.time()
                 self.rx_buffer += chunk.decode("utf-8", errors="ignore")
         for matrix in self._extract_frames():
-            value = self._frame_pressure(matrix)
+            value = self._update_matrix_metrics(matrix)
             self.median_window.append(value)
             self.median_window = self.median_window[-9:]
             ordered = sorted(self.median_window)
             self.latest_pressure = ordered[len(ordered) // 2]
         if self.last_data_time is None or time.time() - self.last_data_time > 2.0:
             return None
-        return {"压力": round(float(self.latest_pressure), 2)}
+        return {
+            "压力": round(float(self.latest_pressure), 2),
+            "压力峰值": round(float(self.latest_pressure_peak), 2),
+            "压力接触面积": int(self.latest_contact_area),
+            "压力有效像素比例": round(float(self.latest_valid_fraction), 6),
+        }
 
     def close(self) -> None:
         if self.serial is None:
@@ -1795,6 +1858,8 @@ class MultiInterfaceDriver(SampleDriver):
                     driver = M3232PressureDriver(
                         str(item.get("endpoint") or "COM8"),
                         int(item.get("baudrate") or M3232_BAUDRATE),
+                        int(item.get("matrix_rows") or 0),
+                        int(item.get("matrix_cols") or 0),
                     )
                 elif driver_name == "simulator":
                     driver = SimulatorDriver(Path(self.source_file or DEFAULT_SIMULATOR_FILE), self.selected_sensors)
@@ -1875,7 +1940,12 @@ def build_driver(config: AcquisitionConfig) -> SampleDriver:
     if config.driver == "rtsp_thermal":
         return RtspThermalDriver(config.endpoint or DEFAULT_RTSP_URL)
     if config.driver == "m3232_pressure":
-        return M3232PressureDriver(config.endpoint or "COM8", config.baudrate or M3232_BAUDRATE)
+        return M3232PressureDriver(
+            config.endpoint or "COM8",
+            config.baudrate or M3232_BAUDRATE,
+            int(getattr(config, "matrix_rows", 0) or 0),
+            int(getattr(config, "matrix_cols", 0) or 0),
+        )
     raise ValueError(f"不支持的采集驱动：{config.driver}")
 
 
@@ -1951,7 +2021,7 @@ class AcquisitionManager:
             {"id": "abb_robot", "label": "ABB机器人 RWS"},
             {"id": "uvc_thermal", "label": "BSV UVC热像仪（ROI温度）"},
             {"id": "rtsp_thermal", "label": "IP热像仪 RTSP"},
-            {"id": "m3232_pressure", "label": "M3232薄膜压力（230400）"},
+            {"id": "m3232_pressure", "label": "M3232薄膜压力（115200，矩阵自动识别）"},
         ]
 
     @staticmethod
