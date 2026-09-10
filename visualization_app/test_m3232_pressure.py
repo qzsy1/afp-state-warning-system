@@ -10,6 +10,7 @@ from acquisition import (
     NEW_COLLECTION_SENSOR_COLUMNS,
     SimulatorDriver,
     default_capture_interfaces,
+    _resolve_interface_channel_assignments,
 )
 
 
@@ -53,7 +54,17 @@ class M3232PressureDriverTests(unittest.TestCase):
         self.assertEqual(pressure["id"], "m3232_pressure")
         self.assertEqual(pressure["role"], "pressure")
         self.assertEqual(pressure["driver"], "m3232_pressure")
-        self.assertEqual(pressure["channels"], ["压力"])
+        self.assertEqual(pressure["channels"], ["薄膜压力"])
+
+    def test_process_pressure_and_film_pressure_route_to_different_interfaces(self) -> None:
+        interfaces = default_capture_interfaces()
+        assignments = _resolve_interface_channel_assignments(
+            interfaces,
+            requested=None,
+            capture_sensors=["压力", "薄膜压力"],
+        )
+        self.assertEqual(assignments["plc_process"], ["压力"])
+        self.assertEqual(assignments["m3232_pressure"], ["薄膜压力"])
 
 
 if __name__ == "__main__":

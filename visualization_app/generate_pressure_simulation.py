@@ -14,7 +14,7 @@ import pandas as pd
 
 
 SENSOR_COLUMNS = [
-    "温度", "压力", "ROI平均温度", "张力", "线速度", "ABB_X", "ABB_Y", "ABB_Z",
+    "温度", "压力", "薄膜压力", "ROI平均温度", "张力", "线速度", "ABB_X", "ABB_Y", "ABB_Z",
     *[f"温度{i}" for i in range(1, 9)],
 ]
 PROCESS_COLUMNS = [
@@ -57,6 +57,10 @@ def generate(output: Path, rows: int = 240, seed: int = 20260910) -> Path:
     abb_y = 2.5 * np.sin(np.linspace(0, np.pi, rows))
     abb_z = (layer - 1) * 0.18
     matrices = [_pressure_matrix(float(value), int(layer[idx]), rng) for idx, value in enumerate(t)]
+    film_pressure = []
+    for matrix in matrices:
+        active = sorted(value for row in matrix for value in row if value > 5.0)
+        film_pressure.append(sum(active[:max(1, int(len(active) * 0.9))]) if active else 0.0)
     peaks = [max(v for row in m for v in row) for m in matrices]
     areas = [sum(v > 5.0 for row in m for v in row) for m in matrices]
     valid = [sum(v > 0.0 for row in m for v in row) / 1024.0 for m in matrices]
@@ -64,6 +68,7 @@ def generate(output: Path, rows: int = 240, seed: int = 20260910) -> Path:
         "时间": t,
         "温度": temperature,
         "压力": pressure,
+        "薄膜压力": film_pressure,
         "ROI平均温度": roi,
         "张力": tension,
         "线速度": speed_series,

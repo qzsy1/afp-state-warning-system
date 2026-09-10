@@ -58,6 +58,7 @@ SENSOR_COLUMNS = LEGACY_SENSOR_COLUMNS
 NEW_CORE_SENSOR_COLUMNS = [
     "温度",
     "压力",
+    "薄膜压力",
     "ROI平均温度",
     "张力",
     "线速度",
@@ -123,7 +124,7 @@ ACQUISITION_SCHEMAS = {
         "raw_columns": ORIGINAL_COLUMNS,
     },
     "new_collection_v11_3": {
-        "label": "新数据集采集方案（16传感器＋4工艺参数）",
+        "label": "新数据集采集方案（17采集通道＋4工艺参数；含PLC压力和薄膜压力）",
         "sensors": NEW_COLLECTION_SENSOR_COLUMNS,
         "raw_columns": NEW_COLLECTION_COLUMNS,
     },
@@ -136,6 +137,9 @@ ALIASES = {
     "displacement": "位移",
     "pressure": "压力",
     "compaction": "压力",
+    "film_pressure": "薄膜压力",
+    "thin_film_pressure": "薄膜压力",
+    "m3232_pressure": "薄膜压力",
     "vibration": "振动",
     "temperature": "温度",
     "roi_temperature": "ROI平均温度",
@@ -185,7 +189,8 @@ M3232_BAUDRATE = 115200
 # 2026-08-18 interface-mapped build.
 SENSOR_CHANNEL_METADATA: dict[str, dict[str, str]] = {
     "温度": {"unit": "°C", "dtype": "float32", "source": "松下PLC DT28/DT29"},
-    "压力": {"unit": "N", "dtype": "float32", "source": "松下PLC DT37/DT38或M3232薄膜压力"},
+    "压力": {"unit": "N", "dtype": "float32", "source": "松下PLC DT37/DT38（过程压力）"},
+    "薄膜压力": {"unit": "N", "dtype": "float32", "source": "M3232薄膜压力传感器（独立接口）"},
     "ROI平均温度": {"unit": "°C", "dtype": "float32", "source": "BSV UVC温度矩阵ROI均值"},
     "张力": {"unit": "N", "dtype": "float32", "source": "松下PLC DT23/DT24"},
     "线速度": {"unit": "mm/s", "dtype": "float32", "source": "ABB相邻位置/时间差"},
@@ -248,7 +253,7 @@ SENSOR_INTERFACE_PROFILES: dict[str, dict[str, Any]] = {
         "driver": "m3232_pressure",
         "endpoint": "COM8",
         "baudrate": M3232_BAUDRATE,
-        "channels": ["压力"],
+        "channels": ["薄膜压力"],
         "processing": "串口矩阵（行列自动识别）→有效像素合计→中值滤波（N）；坐标/零点按设备校准",
     },
     "custom": {
@@ -300,7 +305,7 @@ def default_capture_interfaces() -> list[dict[str, Any]]:
             "role": "pressure", "driver": "m3232_pressure",
             "endpoint": "COM8", "baudrate": M3232_BAUDRATE,
             "matrix_rows": 0, "matrix_cols": 0,
-            "channels": ["压力"], "channel_map": {},
+            "channels": ["薄膜压力"], "channel_map": {},
         },
     ]
 
@@ -367,7 +372,6 @@ def _resolve_interface_channel_assignments(
     capture_set = set(capture_sensors)
     resolved: dict[str, list[str]] = {}
     enabled = [item for item in interfaces if item.get("enabled", True)]
-    dedicated_pressure = any(item.get("role") == "pressure" for item in enabled)
     for item in interfaces:
         interface_id = str(item.get("id") or "")
         if not item.get("enabled", True):
@@ -390,8 +394,6 @@ def _resolve_interface_channel_assignments(
                     str(name) for name in requested[interface_id]
                     if str(name) in capture_set
                 )
-        if role == "plc" and dedicated_pressure:
-            allowed.discard("压力")
         chosen = allowed
         if interface_id in requested:
             chosen &= {str(name) for name in requested[interface_id]}

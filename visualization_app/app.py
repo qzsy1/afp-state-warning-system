@@ -365,6 +365,7 @@ LIVE_SENSOR_UNITS = {
     "转速": "device unit",
     "位移": "mm",
     "压力": "N / device unit",
+    "薄膜压力": "N",
     "振动": "device unit",
     "温度": "°C",
     "ROI平均温度": "°C",
@@ -484,8 +485,8 @@ INDICATOR_VARIANTS = {
 INDICATOR_VARIANTS["new_collection_v11_3"]["TC-HI"].update(
     {
         "variant_id": "TC-HI-New-16S4P",
-        "label": "新数据热－压实耦合指标（16路传感器＋4工艺参数）",
-        "construction": "16路实际传感器响应与4项工艺参数的耦合特征",
+        "label": "新数据热－压实耦合指标（模型16路＋独立薄膜压力通道＋4工艺参数）",
+        "construction": "模型保持原16路实际传感器响应；独立薄膜压力通道单独采集保存，可在后续重训时纳入耦合特征",
     }
 )
 
