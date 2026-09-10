@@ -4,7 +4,13 @@ import json
 from pathlib import Path
 import unittest
 
-from acquisition import M3232PressureDriver, M3232_BAUDRATE, NEW_COLLECTION_SENSOR_COLUMNS, SimulatorDriver
+from acquisition import (
+    M3232PressureDriver,
+    M3232_BAUDRATE,
+    NEW_COLLECTION_SENSOR_COLUMNS,
+    SimulatorDriver,
+    default_capture_interfaces,
+)
 
 
 class M3232PressureDriverTests(unittest.TestCase):
@@ -39,6 +45,15 @@ class M3232PressureDriverTests(unittest.TestCase):
         sample = driver.read_sample()
         self.assertIsNotNone(sample)
         self.assertEqual(set(NEW_COLLECTION_SENSOR_COLUMNS), set(sample))
+
+    def test_m3232_is_default_interface_five(self) -> None:
+        interfaces = default_capture_interfaces()
+        self.assertEqual(len(interfaces), 5)
+        pressure = interfaces[4]
+        self.assertEqual(pressure["id"], "m3232_pressure")
+        self.assertEqual(pressure["role"], "pressure")
+        self.assertEqual(pressure["driver"], "m3232_pressure")
+        self.assertEqual(pressure["channels"], ["压力"])
 
 
 if __name__ == "__main__":

@@ -2761,14 +2761,24 @@ function refreshInterfaceEndpointOptions() {
     });
 }
 
+function defaultInterfaceCatalog() {
+  return [
+    {
+      id: "thermocouple_8ch", enabled: true, role: "thermocouple", driver: "smrf_hid",
+      endpoint: "SMRFCT08B", channel_types: ["K", "K", "K", "K", "K", "K", "K", "K"], channel_map: {},
+    },
+    { id: "plc_process", enabled: true, role: "plc", driver: "modbus_tcp", endpoint: "192.168.125.5:502", channel_map: {} },
+    { id: "uvc_temperature", enabled: true, role: "thermal_uvc", driver: "uvc_thermal", endpoint: "BSV UVC (WinUSB)", channel_map: {} },
+    { id: "abb_motion", enabled: true, role: "robot", driver: "abb_robot", endpoint: "192.168.125.1", channel_map: {} },
+    { id: "m3232_pressure", enabled: true, role: "pressure", driver: "m3232_pressure", endpoint: "COM8", baudrate: 115200, channel_map: {} },
+  ];
+}
+
 function renderInterfacePanel(configs) {
   if (!controls.interfacePanel) return;
   const ports = recognizedInterfacePorts();
   const defaults = Array.isArray(configs) ? configs : [];
-  const initial = defaults.length ? defaults : [{
-    id: "interface_1", enabled: true, role: "thermocouple", driver: "smrf_hid",
-    endpoint: "SMRFCT08B", channel_types: ["K", "K", "K", "K", "K", "K", "K", "K"], channel_map: {},
-  }];
+  const initial = defaults.length ? defaults : defaultInterfaceCatalog();
   const unique = [];
   const usedEndpoints = new Set();
   initial.forEach((item, index) => {
@@ -2853,7 +2863,7 @@ async function discoverInterfaces() {
     const result = await fetch("/api/acquisition/discover", {cache: "no-store"}).then((response) => response.json());
     state.availableInterfaces = recognizedInterfacePortsFrom(result.ports || []);
     const defaults = result.defaults || [];
-    state.interfaceCatalog = defaults.length ? defaults : [{id: "interface_1", enabled: true, driver: "smrf_hid", role: "thermocouple", endpoint: "SMRFCT08B", channel_types: ["K", "K", "K", "K", "K", "K", "K", "K"], channel_map: {}}];
+    state.interfaceCatalog = defaults.length ? defaults : defaultInterfaceCatalog();
     renderInterfacePanel(state.interfaceCatalog);
     markHardwareCheckStale("接口识别结果已更新");
     const ports = state.availableInterfaces;

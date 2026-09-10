@@ -264,7 +264,12 @@ SENSOR_INTERFACE_PROFILES: dict[str, dict[str, Any]] = {
 
 
 def default_capture_interfaces() -> list[dict[str, Any]]:
-    """Restore the four verified interfaces used by the 16-channel plan."""
+    """Restore the five interfaces used by the 16-channel plan.
+
+    Interface 5 is the dedicated M3232 thin-film pressure sensor.  Keeping it
+    in the defaults makes the physical sensor visible in the UI and prevents
+    pressure from silently falling back to the PLC interface.
+    """
     return [
         {
             "id": "thermocouple_8ch", "enabled": True,
@@ -289,6 +294,13 @@ def default_capture_interfaces() -> list[dict[str, Any]]:
             "id": "abb_motion", "enabled": True,
             "role": "robot", "driver": "abb_robot",
             "endpoint": DEFAULT_ABB_IP, "channel_map": {},
+        },
+        {
+            "id": "m3232_pressure", "enabled": True,
+            "role": "pressure", "driver": "m3232_pressure",
+            "endpoint": "COM8", "baudrate": M3232_BAUDRATE,
+            "matrix_rows": 0, "matrix_cols": 0,
+            "channels": ["压力"], "channel_map": {},
         },
     ]
 
