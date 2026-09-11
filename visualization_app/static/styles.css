@@ -594,10 +594,6 @@ canvas { display: block; width: 100%; }
 .probability-value { color: #365b77; text-align: right; font-weight: 800; }
 
 .channel-panel { padding-bottom: 10px; }
-.channel-panel:not([open]) .collapsible-panel-summary { padding-top: 8px; padding-bottom: 8px; }
-.channel-panel:not([open]) .collapsible-panel-summary .panel-kicker,
-.channel-panel:not([open]) .collapsible-panel-summary #allChannelHint { display: none; }
-.channel-panel:not([open]) .collapsible-panel-summary h2 { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sensor-grid { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 7px; }
 .sensor-cards-viewport {
   min-width: 0;

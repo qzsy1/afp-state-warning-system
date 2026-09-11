@@ -189,6 +189,8 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertIn("collapsible-panel-summary", html)
         self.assertIn("collapsible-panel-content", html)
         self.assertNotIn("collapsible-status-card", html)
+        self.assertIn('<section class="panel channel-panel">', html)
+        self.assertNotIn('class="panel channel-panel collapsible-panel"', html)
         self.assertGreaterEqual(html.count('class="status-card'), 4)
         self.assertIn("sensorCardsViewport", html)
         self.assertIn("sensorCardsResizer", html)
