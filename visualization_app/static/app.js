@@ -2848,9 +2848,79 @@ function initializeSensorChecklistResizer() {
   }
 }
 
+const SENSOR_CARDS_HEIGHT_STORAGE_KEY = "afp-state-monitor-sensor-cards-height-v1";
+
+function initializeSensorCardsResizer() {
+  const viewport = $("sensorCardsViewport");
+  const handle = $("sensorCardsResizer");
+  if (!viewport || !handle) return;
+
+  const minimum = 120;
+  const maximum = 720;
+  const defaultHeight = 300;
+
+  function applyHeight(value, persist = true) {
+    const safe = Math.max(minimum, Math.min(maximum, Number(value) || defaultHeight));
+    viewport.style.height = `${Math.round(safe)}px`;
+    handle.setAttribute("aria-valuemin", String(minimum));
+    handle.setAttribute("aria-valuemax", String(maximum));
+    handle.setAttribute("aria-valuenow", String(Math.round(safe)));
+    if (persist) {
+      try { localStorage.setItem(SENSOR_CARDS_HEIGHT_STORAGE_KEY, String(safe)); } catch (_error) {}
+    }
+  }
+
+  function resetHeight() {
+    try { localStorage.removeItem(SENSOR_CARDS_HEIGHT_STORAGE_KEY); } catch (_error) {}
+    applyHeight(defaultHeight, false);
+  }
+
+  handle.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    const startY = event.clientY;
+    const startHeight = viewport.getBoundingClientRect().height;
+    handle.classList.add("dragging");
+    document.body.classList.add("resizing-sensor-cards");
+
+    function move(pointerEvent) {
+      applyHeight(startHeight + pointerEvent.clientY - startY, false);
+    }
+
+    function end() {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", end);
+      window.removeEventListener("pointercancel", end);
+      handle.classList.remove("dragging");
+      document.body.classList.remove("resizing-sensor-cards");
+      applyHeight(viewport.getBoundingClientRect().height, true);
+    }
+
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", end, { once: true });
+    window.addEventListener("pointercancel", end, { once: true });
+  });
+
+  handle.addEventListener("dblclick", resetHeight);
+  handle.addEventListener("keydown", (event) => {
+    if (!["ArrowUp", "ArrowDown"].includes(event.key)) return;
+    event.preventDefault();
+    const delta = event.key === "ArrowDown" ? 24 : -24;
+    applyHeight(viewport.getBoundingClientRect().height + delta, true);
+  });
+
+  try {
+    const saved = Number(localStorage.getItem(SENSOR_CARDS_HEIGHT_STORAGE_KEY));
+    if (Number.isFinite(saved) && saved >= minimum) applyHeight(saved, false);
+    else resetHeight();
+  } catch (_error) {
+    resetHeight();
+  }
+}
+
 initializeColumnResizers();
 initializeVerticalPanelResizer();
 initializeSensorChecklistResizer();
+initializeSensorCardsResizer();
 initialize();
 
 // Unified sensor-interface cards.  The legacy driver/endpoint fields remain

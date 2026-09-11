@@ -189,6 +189,9 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertGreaterEqual(html.count('class="control-section'), 5)
         self.assertIn("collapsible-panel-summary", html)
         self.assertIn("collapsible-panel-content", html)
+        self.assertIn("sensorCardsViewport", html)
+        self.assertIn("sensorCardsResizer", html)
+        self.assertNotIn("系统功能与判定边界说明", html)
         self.assertIn('.collapsible-subsection:not([open]) > summary::after', styles)
         self.assertIn('content: "+"', styles)
 

@@ -377,19 +377,14 @@
             <span id="allChannelHint" class="muted">所有通道按统一方式显示</span>
           </summary>
           <div class="collapsible-panel-content">
-            <div id="sensorCards" class="sensor-grid"></div>
-          </div>
-        </details>
-
-        <details class="panel explanation-panel">
-          <summary>系统功能与判定边界说明</summary>
-          <div class="guide-grid">
-            <div><b>1</b><h3>实时数据流</h3><p>历史数据按采样率逐点读取；接入设备后沿用相同数据接口。</p></div>
-            <div><b>2</b><h3>同步预测</h3><p>实时推理或归档预测可切换，超过训练步长时采用滚动预测。</p></div>
-            <div><b>3</b><h3>窗口更新</h3><p>24 个实测点完整到达后才确认窗口，未来值不提前参与健康指标。</p></div>
-            <div><b>4</b><h3>三级状态</h3><p>窗口证据依次聚合为铺层和实际层数试样状态，并随新证据更新。</p></div>
-            <div><b>5</b><h3>指标与模型</h3><p>健康指标和四类异常分数模型可切换，界面给出验证推荐。</p></div>
-            <div><b>!</b><h3>使用边界</h3><p>正式准确率需用真实采集、独立试样划分与外部缺陷证据验证。</p></div>
+            <div id="sensorCardsViewport" class="sensor-cards-viewport">
+              <div id="sensorCards" class="sensor-grid"></div>
+            </div>
+            <div id="sensorCardsResizer" class="sensor-cards-resizer" role="separator"
+                 aria-label="调整多传感器显示区域高度" aria-orientation="horizontal" tabindex="0"
+                 title="上下拖动调整多传感器显示区域高度；双击恢复默认高度">
+              <span aria-hidden="true">•••</span>
+            </div>
           </div>
         </details>
       </main>
