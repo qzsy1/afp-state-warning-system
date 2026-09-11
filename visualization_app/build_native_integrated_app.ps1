@@ -136,6 +136,8 @@ $PyInstallerArgs = @(
     "--collect-all", "torch_geometric",
     "--collect-submodules", "mysql.connector",
     "--collect-submodules", "serial",
+    "--collect-submodules", "langchain_core",
+    "--collect-submodules", "langsmith",
     "--hidden-import", "sklearn.ensemble._forest",
     "--hidden-import", "sklearn.ensemble._iforest",
     "--hidden-import", "sklearn.linear_model._logistic",
@@ -145,7 +147,7 @@ $PyInstallerArgs = @(
     "--hidden-import", "sklearn.preprocessing._data",
     "--hidden-import", "sklearn.decomposition._pca",
     "--hidden-import", "sklearn.metrics.cluster._expected_mutual_info_fast",
-    "--hidden-import", "app", "--hidden-import", "acquisition",
+    "--hidden-import", "app", "--hidden-import", "acquisition", "--hidden-import", "interface_agent",
     "--hidden-import", "mysql_storage", "--hidden-import", "native_integrated_app",
     "--hidden-import", "native_frontend_launcher", "--hidden-import", "webview",
     "--hidden-import", "webview.platforms.winforms",
@@ -188,7 +190,7 @@ $SourceTarget = Join-Path $TargetDir "source\visualization_app"
 New-Item -ItemType Directory -Force -Path $SourceTarget | Out-Null
 $SourceFiles = @(
     "native_frontend_launcher.py", "native_integrated_app.py", "app.py",
-    "acquisition.py", "mysql_storage.py", "online_inference.py", "atavn.py",
+    "acquisition.py", "interface_agent.py", "mysql_storage.py", "online_inference.py", "atavn.py",
     "online_health_features.py", "causal_online_runtime.py", "runtime_scaler.py",
     "new_collection_health.py", "fit_new_collection_health.py", "runtime_health_primitives.py", "web_training.py",
     "web_training_pipeline.py", "training_data.py", "build_native_integrated_app.ps1",

@@ -132,6 +132,37 @@ _MYSQL_FORBIDDEN_TOKENS = {
     "UNLOCK", "UPDATE",
 }
 
+_AGENT_POST_FIELDS = {"api_key_present", "model_name", "event"}
+_AGENT_EVENT_FIELDS = {
+    "event_id", "interface_id", "interface_label", "role", "driver", "endpoint",
+    "sensor_name", "channels", "state", "message", "evidence", "simulated",
+}
+_AGENT_EVIDENCE_FIELDS = {
+    "expected_channels", "detected_channels", "missing_channels", "invalid_channels",
+    "sample_counts", "invalid_sample_counts", "received_samples", "invalid_samples",
+    "last_sample_age_seconds",
+}
+
+
+def _validate_agent_payload(payload: dict) -> dict:
+    unexpected = set(payload) - _AGENT_POST_FIELDS
+    if unexpected:
+        raise ValueError("Agent 请求包含未允许字段；API Key、密码或令牌原文不得发送")
+    event = payload.get("event")
+    if not isinstance(event, dict):
+        raise ValueError("Agent 请求缺少接口异常事件")
+    unexpected_event = set(event) - _AGENT_EVENT_FIELDS
+    if unexpected_event:
+        raise ValueError("Agent 事件包含未允许字段；不得携带凭据或其他秘密")
+    evidence = event.get("evidence")
+    if evidence is not None:
+        if not isinstance(evidence, dict):
+            raise ValueError("Agent 事件证据必须是对象")
+        unexpected_evidence = set(evidence) - _AGENT_EVIDENCE_FIELDS
+        if unexpected_evidence:
+            raise ValueError("Agent 事件证据包含未允许字段")
+    return event
+
 
 def _mysql_sql_tokens(sql: str) -> list[str]:
     """Return SQL words outside quoted strings/identifiers.
@@ -4070,6 +4101,17 @@ class AppHandler(BaseHTTPRequestHandler):
             payload = json.loads(body.decode("utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("请求体必须是JSON对象")
+            if parsed.path == "/api/agent/diagnose":
+                from interface_agent import run_interface_diagnosis
+
+                event = _validate_agent_payload(payload)
+                result = run_interface_diagnosis(
+                    event,
+                    api_key_present=payload.get("api_key_present") is True,
+                    model_name=str(payload.get("model_name", "")),
+                )
+                self._send_json(result)
+                return
             if parsed.path == "/api/acquisition/test":
                 if str(payload.get("simulation_source_type", "")).lower() == "mysql":
                     payload["simulation_mysql_query"] = validate_read_only_mysql_query(

@@ -26,9 +26,17 @@ const state = {
   hardwareCheckTimer: null,
   autoCheckInterval: null,
   mysqlConnectionTests: {local: null, target: null},
+  agentEvent: null,
+  agentResult: null,
+  agentFingerprint: "",
+  agentBusy: false,
 };
 
 const $ = (id) => document.getElementById(id);
+
+const agentApiKeyInput = $("agentApiKeyInput");
+const agentModelNameInput = $("agentModelNameInput");
+const agentDiagnoseButton = $("agentDiagnoseButton");
 
 // Keep the alignment control beside the horizon control even when an older
 // cached index.html is opened by the browser or an older packaged build.
@@ -539,6 +547,9 @@ function renderAcquisitionStatus(status) {
     `${status.layer_file ? ` · 分层文件：${status.layer_file}` : ""}` +
     `${status.full_specimen_file ? ` · 完整试样：${status.full_specimen_file}` : ""}` +
     `${status.last_error ? ` · 错误：${status.last_error}` : ""}`;
+  if (Array.isArray(status.interfaces) && status.interfaces.length) {
+    updateAgentFromHardwareResult(status, {automatic: true});
+  }
 }
 
 function renderRuntimeStatus(payload = state.payload) {
@@ -976,7 +987,176 @@ function renderMysqlStatus(mysql) {
   }
 }
 
-async function testSensorConnection() {
+function agentEscapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function buildAgentEvent(hardwareResult) {
+  const interfaceLabels = {
+    thermocouple_8ch: "SMRF 八通道热电偶",
+    plc_process: "松下 PLC",
+    uvc_temperature: "BSV UVC 热像仪",
+    abb_motion: "ABB 机器人",
+    m3232_pressure: "M3232 薄膜压力",
+  };
+  const badInterfaces = (hardwareResult?.interfaces || [])
+    .filter((item) => item && item.enabled !== false && !item.ok);
+  const badSensors = (hardwareResult?.sensors || [])
+    .filter((item) => item && item.selected && !item.ok);
+  if (!badInterfaces.length && !badSensors.length) return null;
+
+  const sensorByName = new Map(badSensors.map((item) => [String(item.name), item]));
+  const badSensorNames = new Set(badSensors.map((item) => String(item.name)));
+  const interfaceItem = badInterfaces.reduce((best, item) => {
+    const score = (items, weight) => items.map(String)
+      .filter((channel) => badSensorNames.has(channel)).length * weight;
+    const itemScore = score(item.invalid_channels || [], 4)
+      + score(item.missing_channels || [], 2)
+      + score(item.expected_channels || [], 1);
+    return !best || itemScore > best.score ? {item, score: itemScore} : best;
+  }, null)?.item || {};
+  const expected = (interfaceItem.expected_channels || []).map(String);
+  const candidates = [
+    ...(interfaceItem.invalid_channels || []),
+    ...(interfaceItem.missing_channels || []),
+    ...expected,
+  ].map(String);
+  const sensorName = candidates[0] || String(badSensors[0]?.name || "接口");
+  const sensor = sensorByName.get(sensorName) || {};
+  const interfaceId = String(interfaceItem.id || "sensor_channel");
+  return {
+    interface_id: interfaceId,
+    interface_label: String(interfaceItem.label || interfaceLabels[interfaceId] || interfaceId),
+    role: String(interfaceItem.role || "custom"),
+    driver: String(interfaceItem.driver || ""),
+    endpoint: String(interfaceItem.endpoint || "未填写地址"),
+    sensor_name: sensorName,
+    channels: expected.length ? expected : (sensorName === "接口" ? [] : [sensorName]),
+    state: String(interfaceItem.state || sensor.state || "no_data"),
+    message: String(interfaceItem.message || sensor.message || "接口或通道未返回有效数据"),
+    evidence: {
+      expected_channels: expected,
+      detected_channels: (interfaceItem.detected_channels || []).map(String),
+      missing_channels: (interfaceItem.missing_channels || []).map(String),
+      invalid_channels: (interfaceItem.invalid_channels || []).map(String),
+      sample_counts: interfaceItem.sample_counts || {},
+      invalid_sample_counts: interfaceItem.invalid_sample_counts || {},
+      received_samples: sensor.received_samples,
+      invalid_samples: sensor.invalid_samples,
+      last_sample_age_seconds: sensor.last_sample_age_seconds,
+    },
+    simulated: Boolean(hardwareResult?.simulated),
+  };
+}
+
+function renderAgentGate() {
+  const keyPresent = Boolean(agentApiKeyInput?.value.trim());
+  const modelPresent = Boolean(agentModelNameInput?.value.trim());
+  const eventPresent = Boolean(state.agentEvent);
+  const ready = keyPresent && modelPresent && eventPresent && !state.agentBusy;
+  const status = $("agentGateStatus");
+  if (status) {
+    status.className = `agent-gate-status ${ready ? "ready" : ""}`;
+    status.textContent = !keyPresent || !modelPresent
+      ? "未启用"
+      : state.agentBusy ? "诊断中" : eventPresent ? "可以诊断" : "等待异常";
+  }
+  if (agentDiagnoseButton) agentDiagnoseButton.disabled = !ready;
+  return ready;
+}
+
+function renderAgentEvent(event) {
+  const panel = $("agentDiagnosisPanel");
+  if (!panel) return;
+  if (!event) {
+    panel.className = "agent-diagnosis-panel empty";
+    panel.textContent = "当前没有接口或传感器异常；原有接口检查仍按原流程运行。";
+    return;
+  }
+  panel.className = "agent-diagnosis-panel pending";
+  panel.innerHTML = `
+    <div class="agent-event-summary"><strong>待诊断异常</strong><span>${agentEscapeHtml(event.interface_label)} · ${agentEscapeHtml(event.endpoint)}</span></div>
+    <div>传感器/通道：${agentEscapeHtml(event.sensor_name)} · 报错：${agentEscapeHtml(event.message)}</div>`;
+}
+
+function renderAgentResult(result) {
+  const panel = $("agentDiagnosisPanel");
+  if (!panel || !result?.diagnosis) return;
+  const diagnosis = result.diagnosis;
+  const trace = (result.trace || []).map((step, index) => `
+    <li><span>${index + 1}</span><div><strong>${agentEscapeHtml(step.title)}</strong><small>${agentEscapeHtml(step.detail)}</small></div></li>`).join("");
+  const causes = (diagnosis.possible_causes || []).map((item) => `<li>${agentEscapeHtml(item)}</li>`).join("");
+  const actions = (diagnosis.recommended_actions || []).map((item) => `<li>${agentEscapeHtml(item)}</li>`).join("");
+  panel.className = "agent-diagnosis-panel result";
+  panel.innerHTML = `
+    <div class="agent-result-heading"><strong>${agentEscapeHtml(diagnosis.fault_type)}</strong><span>本地规则匹配</span></div>
+    <p class="agent-result-summary">${agentEscapeHtml(diagnosis.summary)}</p>
+    <div class="agent-result-grid">
+      <div><b>定位</b><span>${agentEscapeHtml(diagnosis.interface_label)} / ${agentEscapeHtml(diagnosis.sensor_name)} / ${agentEscapeHtml((diagnosis.channels || []).join("、"))}</span></div>
+      <div><b>证据</b><span>${agentEscapeHtml(JSON.stringify(diagnosis.evidence || {}, null, 0))}</span></div>
+      <div><b>可能原因</b><ul>${causes}</ul></div>
+      <div><b>处理建议</b><ul>${actions}</ul></div>
+    </div>
+    <details class="agent-trace"><summary>LangChain 工具调用轨迹（${(result.trace || []).length} 步）</summary><ol>${trace}</ol></details>
+    <small class="agent-boundary">${agentEscapeHtml(diagnosis.evidence_boundary)} · 模型标签：${agentEscapeHtml(result.model_name)}</small>`;
+}
+
+function handleAgentInputChange() {
+  const ready = renderAgentGate();
+  if (ready && state.agentEvent && !state.agentResult && !state.agentBusy) {
+    runAgentDiagnosis({automatic: true});
+  }
+}
+
+function updateAgentFromHardwareResult(result, {automatic = false} = {}) {
+  const event = buildAgentEvent(result);
+  const fingerprint = event ? JSON.stringify(event) : "";
+  const changed = fingerprint !== state.agentFingerprint;
+  state.agentEvent = event;
+  if (changed) {
+    state.agentFingerprint = fingerprint;
+    state.agentResult = null;
+    renderAgentEvent(event);
+    const autoStatus = $("agentAutoStatus");
+    if (autoStatus) autoStatus.textContent = event
+      ? (automatic ? "发现新异常；已准备本地诊断。" : "发现异常；填写配置后可运行本地诊断。")
+      : "等待接口异常；未填写配置时不执行 Agent。";
+  }
+  renderAgentGate();
+  if (event && changed && !state.agentResult && renderAgentGate()) runAgentDiagnosis({automatic: true});
+}
+
+async function runAgentDiagnosis({automatic = false} = {}) {
+  if (!state.agentEvent || !renderAgentGate()) return null;
+  state.agentBusy = true;
+  renderAgentGate();
+  const autoStatus = $("agentAutoStatus");
+  if (autoStatus) autoStatus.textContent = automatic ? "新异常已触发本地 LangChain 诊断……" : "正在运行本地 LangChain 诊断……";
+  try {
+    const result = await postJson("/api/agent/diagnose", {
+      api_key_present: Boolean(agentApiKeyInput.value.trim()),
+      model_name: agentModelNameInput.value.trim(),
+      event: state.agentEvent,
+    });
+    state.agentResult = result;
+    renderAgentResult(result);
+    if (autoStatus) autoStatus.textContent = "本地 LangChain 诊断已完成；未调用外部模型。";
+    return result;
+  } catch (error) {
+    if (autoStatus) autoStatus.textContent = `诊断未完成：${error.message}`;
+    return null;
+  } finally {
+    state.agentBusy = false;
+    renderAgentGate();
+  }
+}
+
+async function testSensorConnection({automatic = false} = {}) {
   try {
     const result = await postJson("/api/acquisition/test", acquisitionConfig());
     if (controls.processingMode.value !== "capture_only") {
@@ -1002,6 +1182,7 @@ async function testSensorConnection() {
       return String(item.id || item.endpoint || "interface") + ": " + (item.ok ? "ok" : "no data") + " (" + (names || "no channels") + ")";
     }).join("; ");
     if (interfaceSummaryText) node.textContent += " interfaces: " + interfaceSummaryText;
+    updateAgentFromHardwareResult(result, {automatic});
   } catch (error) {
     const status = $("acquisitionStatus");
     if (status) {
@@ -2179,6 +2360,9 @@ controls.bestPredictionOverride.addEventListener(
   "change", configureBestPredictionOverride
 );
 $("testSensorsButton").addEventListener("click", () => testSensorConnection({automatic: false}));
+agentApiKeyInput?.addEventListener("input", handleAgentInputChange);
+agentModelNameInput?.addEventListener("input", handleAgentInputChange);
+agentDiagnoseButton?.addEventListener("click", () => runAgentDiagnosis({automatic: false}));
 controls.resetSensorCheck?.addEventListener("click", resetAndCheckHardware);
 controls.autoHardwareCheck?.addEventListener("change", () => {
   if (controls.autoHardwareCheck.checked) scheduleAutomaticHardwareCheck(200);
@@ -3419,6 +3603,7 @@ async function testSensorConnection({automatic = false} = {}) {
     state.hardwareCheck = result;
     state.hardwareCheckFingerprint = hardwareConfigFingerprint();
     renderHardwareCheckResult(result, {automatic});
+    updateAgentFromHardwareResult(result, {automatic});
     if (!result.ok && !automatic) toast("检查发现接口或传感器通道异常，详情已列出");
     return result;
   } catch (error) {
@@ -3468,4 +3653,5 @@ function renderLiveHardwareMonitor(status) {
     errors: status.last_error ? [status.last_error] : [],
   };
   renderHardwareCheckResult(result, {live: true});
+  updateAgentFromHardwareResult(result, {automatic: true});
 }
