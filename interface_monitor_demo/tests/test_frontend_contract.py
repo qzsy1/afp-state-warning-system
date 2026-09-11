@@ -4,6 +4,8 @@ import threading
 import unittest
 import urllib.request
 from html.parser import HTMLParser
+from pathlib import Path
+import subprocess
 
 from interface_monitor_demo.server import create_server
 
@@ -104,6 +106,31 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn(".thought-flow", stylesheet)
         self.assertIn(".flow-node.active", stylesheet)
         self.assertIn("@media", stylesheet)
+
+    def test_launcher_self_test_loads_langchain_demo(self) -> None:
+        repo_root = Path(__file__).resolve().parents[2]
+        launcher = repo_root / "interface_monitor_demo" / "start_demo.ps1"
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(launcher),
+                "-SelfTest",
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("SELF_TEST_OK", result.stdout)
 
 
 if __name__ == "__main__":

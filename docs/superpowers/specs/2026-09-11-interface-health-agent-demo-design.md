@@ -2,7 +2,7 @@
 
 日期：2026-09-11
 
-状态：已由用户确认方向，等待书面设计复核
+状态：已实现并完成本地验证
 
 目标工程：`F:\AFP_Integrated_Modular_v2`
 功能基线：`delivery\AFP_Integrated_System_M3232_v2.0.6\AFP_Integrated_System_Modular.exe`
@@ -220,3 +220,7 @@ Demo 使用自己的 `.venv`，并由目录内 `.gitignore` 排除。`requiremen
 ## 9. 后续真实集成路径
 
 本 Demo 验收后，如用户另行批准，可把模拟数据源替换为 v2.0.6 的接口状态适配器。真实集成仍保持“确定性监控发现问题，Agent 解释问题”的职责划分；任何设备控制、配置修改或自动恢复动作必须单独设计授权和安全联锁。
+
+## 10. 实现验证记录
+
+2026-09-11 已完成独立可视化 Demo。Demo 自动化测试 25 项通过，原系统 M3232 专项回归测试 6 项通过；浏览器完成 M3232 矩阵解析异常的注入与诊断，显示 7 个 LangChain 本地执行步骤。浏览器诊断请求只包含 `api_key_present`、`model_name`和`event_id`，未传输 API Key 原文。v2.0.6 基线 EXE 的 SHA-256 保持为 `FE42C67E5B38710BE182B8E5898341500EE7CAF2A668CFB619429C7E491DEC0C`。
