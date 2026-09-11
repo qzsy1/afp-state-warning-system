@@ -188,40 +188,46 @@
             <div id="predictionModelStatus" class="model-file-status prediction-setting">尚未检查预测模型</div>
             <label class="toggle prediction-setting"><input id="bestPredictionOverrideInput" type="checkbox">使用冻结验证集最佳预测模型覆盖当前选择</label>
             <p id="bestPredictionOverrideNote" class="control-note prediction-setting">未勾选时严格使用手动模型；勾选后只按验证集误差在同一采集方案内选择兼容模型。</p>
-            <div class="sensor-selector-title">采集保存、模型输入与模型输出</div>
-            <div class="interface-toolbar">
+            <details id="sensorSettingsSection" class="sensor-settings-section collapsible-subsection">
+              <summary class="sensor-settings-summary">传感器设置与接口映射</summary>
+              <div class="collapsible-subsection-content">
+              <div class="sensor-selector-title">采集保存、模型输入与模型输出</div>
+              <div class="interface-toolbar">
               <button id="discoverInterfacesButton" class="secondary-button compact-button" type="button">自动识别接口</button>
               <button id="addInterfaceButton" class="secondary-button compact-button" type="button">＋ 增加接口</button>
               <span id="interfaceDiscoveryStatus" class="muted">默认启用热电偶接口和其它传感器接口</span>
-            </div>
-            <div id="interfacePanel" class="interface-panel"></div>
-            <p class="control-note">温度1～温度8均可独立选择。停止采集时可自由勾选、取消或使用全选/清空；采集中为保证同一文件通道定义不变会暂时锁定。接口勾选、角色和通道映射同时作用于显示、CSV和MySQL。</p>
-            <div id="liveSensorChecklist" class="sensor-checklist"></div>
-            <div id="sensorChecklistResizer" class="sensor-checklist-resizer" role="separator"
+              </div>
+              <div id="interfacePanel" class="interface-panel"></div>
+              <p class="control-note">温度1～温度8均可独立选择。停止采集时可自由勾选、取消或使用全选/清空；采集中为保证同一文件通道定义不变会暂时锁定。接口勾选、角色和通道映射同时作用于显示、CSV和MySQL。</p>
+              <div id="liveSensorChecklist" class="sensor-checklist"></div>
+              <div id="sensorChecklistResizer" class="sensor-checklist-resizer" role="separator"
                  aria-label="调整传感器通道区域高度" aria-orientation="horizontal" tabindex="0"
                  title="上下拖动调整传感器通道区域高度；双击恢复默认高度">
-              <span aria-hidden="true">•••</span>
-            </div>
-            <p class="control-note sensor-prediction-note">仅采集模式只使用“采集保存”；预测模式要求输入通道与模型元数据一致，输出通道决定预测曲线及健康指标数据。</p>
-            <label class="hardware-auto-toggle">
+                <span aria-hidden="true">•••</span>
+              </div>
+              <p class="control-note sensor-prediction-note">仅采集模式只使用“采集保存”；预测模式要求输入通道与模型元数据一致，输出通道决定预测曲线及健康指标数据。</p>
+              <label class="hardware-auto-toggle">
               <input id="autoHardwareCheckInput" type="checkbox" checked>
               自动检查接口与传感器通道
-            </label>
-            <div class="transport hardware-check-actions">
+              </label>
+              <div class="transport hardware-check-actions">
               <button id="testSensorsButton" class="secondary-button" type="button">立即检查</button>
               <button id="resetSensorCheckButton" class="secondary-button" type="button">重置并重新检查</button>
-            </div>
-            <div id="hardwareCheckStatus" class="hardware-check-status checking">
+              </div>
+              <div id="hardwareCheckStatus" class="hardware-check-status checking">
               等待自动检查；检查会逐项确认接口、通道和有效数据。
-            </div>
-            <section id="agentDiagnosisSection" class="agent-diagnosis-section" aria-labelledby="agentDiagnosisTitle">
-              <div class="agent-diagnosis-heading">
+              </div>
+              </div>
+            </details>
+            <details id="agentDiagnosisSection" class="agent-diagnosis-section collapsible-subsection" aria-labelledby="agentDiagnosisTitle">
+              <summary class="agent-diagnosis-heading">
                 <div>
                   <div id="agentDiagnosisTitle" class="sensor-selector-title">LangChain 接口诊断提示</div>
                   <p class="control-note">保留上方原始报错；此处只补充具体接口、传感器、通道和处理建议。</p>
                 </div>
                 <span id="agentGateStatus" class="agent-gate-status">未启用</span>
-              </div>
+              </summary>
+              <div class="collapsible-subsection-content">
               <div class="compact-input-grid agent-input-grid">
                 <label>API Key（仅用于启用）<input id="agentApiKeyInput" type="password" autocomplete="off" placeholder="不会发送或保存"></label>
                 <label>模型名称<input id="agentModelNameInput" type="text" autocomplete="off" placeholder="例如 local-demo-model"></label>
@@ -234,9 +240,11 @@
               <div id="agentDiagnosisPanel" class="agent-diagnosis-panel" aria-live="polite">
                 检测到接口或通道异常后，这里会显示本地 LangChain 诊断提示。
               </div>
-            </section>
-            <section id="acquisitionParameterPanel" class="acquisition-parameter-panel" aria-labelledby="acquisitionParameterTitle">
-              <div id="acquisitionParameterTitle" class="sensor-selector-title acquisition-parameter-title">采集前参数调整</div>
+              </div>
+            </details>
+            <details id="acquisitionParameterPanel" class="acquisition-parameter-panel collapsible-subsection" aria-labelledby="acquisitionParameterTitle">
+              <summary id="acquisitionParameterTitle" class="sensor-selector-title acquisition-parameter-title">采集参数设置</summary>
+              <div class="collapsible-subsection-content">
               <div id="legacyParameterGrid" class="compact-input-grid">
                 <label>功率 p<input id="livePowerInput" type="number" value="600"></label>
                 <label>速度 v<input id="liveSpeedInput" type="number" value="100"></label>
@@ -253,7 +261,8 @@
                 <label>层号（从0开始，每次递增1）<input id="newLayerInput" class="step-one-input" type="number" value="0" min="0" step="1" inputmode="numeric"></label>
               </div>
               <p class="control-note collection-index-note">采集运行期间层号和独立重复编号锁定；只有停止并成功保存本次采集后，才可递增到下一层或下一独立重复。</p>
-            </section>
+              </div>
+            </details>
             <div class="transport">
               <button id="startAcquisitionButton" class="primary-button">开始采集</button>
             </div>

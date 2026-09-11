@@ -179,6 +179,9 @@ class InterfaceAgentTests(unittest.TestCase):
             "collapsible-rail-block",
             "layer-panel",
             "timeline-panel",
+            "sensor-settings-section",
+            "agent-diagnosis-section",
+            "acquisition-parameter-panel",
         ):
             self.assertIn(f"{module_class}", html)
         self.assertGreaterEqual(html.count('class="control-section'), 5)

@@ -253,6 +253,35 @@ body.resizing-rows { cursor: row-resize; user-select: none; }
 .control-content > *, .control-content label { min-width: 0; }
 .control-content label { display: grid; gap: 4px; color: #526b80; font-size: 10px; font-weight: 650; }
 .control-content label > span:first-child { display: flex; justify-content: space-between; }
+.collapsible-subsection {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+}
+.collapsible-subsection > summary {
+  position: relative;
+  list-style: none;
+  cursor: pointer;
+  padding: 8px 30px 8px 8px;
+  color: var(--navy);
+  font-size: 10px;
+  font-weight: 800;
+}
+.collapsible-subsection > summary::-webkit-details-marker { display: none; }
+.collapsible-subsection > summary::after {
+  content: "+";
+  position: absolute;
+  right: 9px;
+  top: 5px;
+  color: var(--blue);
+  font-size: 16px;
+  font-weight: 800;
+}
+.collapsible-subsection[open] > summary::after { content: "−"; }
+.collapsible-subsection[open] > summary { border-bottom: 1px solid var(--line); }
+.collapsible-subsection-content { display: grid; gap: 6px; min-width: 0; padding: 7px 8px 8px; }
+.sensor-settings-section { border: 1px solid #c9dceb; border-radius: 6px; background: #f7fbfe; }
+.sensor-settings-summary { background: #edf7fd; }
 select, input[type="text"], input[type="number"], input[type="password"] {
   width: 100%;
   min-height: 31px;
@@ -414,7 +443,9 @@ body.resizing-sensor-list { cursor: ns-resize; user-select: none; }
 .hardware-check-status.checking { color: #795610; background: #fff9e8; border-color: #e8cf82; }
 .hardware-check-status.stale { color: #735a26; background: #f8f4e9; border-color: #d9cda9; }
 .hardware-check-detail { max-height: 64px; overflow: auto; padding: 3px 2px 0; border-top: 1px solid currentColor; scrollbar-width: thin; }
-.agent-diagnosis-section { display: grid; gap: 6px; margin-top: 7px; padding: 8px; border: 1px solid #c9dceb; border-left: 4px solid #7b61a8; border-radius: 6px; background: linear-gradient(145deg, #fbfaff, #f4f7fc); }
+.agent-diagnosis-section { display: grid; gap: 0; margin-top: 7px; padding: 0; border: 1px solid #c9dceb; border-left: 4px solid #7b61a8; border-radius: 6px; background: linear-gradient(145deg, #fbfaff, #f4f7fc); }
+.agent-diagnosis-section > .agent-diagnosis-heading { padding: 8px 30px 8px 8px; }
+.agent-diagnosis-section > .collapsible-subsection-content { padding: 7px 8px 8px; }
 .agent-diagnosis-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
 .agent-diagnosis-heading .control-note { margin-top: 3px; }
 .agent-gate-status { flex: 0 0 auto; padding: 3px 7px; color: #7b6b8f; background: #f1edf7; border: 1px solid #d7cae6; border-radius: 999px; font-size: 9px; font-weight: 800; }
@@ -442,14 +473,16 @@ body.resizing-sensor-list { cursor: ns-resize; user-select: none; }
 @media (max-width: 520px) { .agent-input-grid, .agent-result-grid { grid-template-columns: minmax(0, 1fr); } .agent-actions { align-items: stretch; flex-direction: column; } .agent-actions button { width: 100%; } }
 .acquisition-parameter-panel {
   display: grid;
-  gap: 7px;
+  gap: 0;
   margin-top: 2px;
-  padding: 8px;
+  padding: 0;
   background: linear-gradient(145deg, #f5faff, #edf6fc);
   border: 1px solid #b8d5e8;
   border-left: 4px solid var(--blue);
   border-radius: 6px;
 }
+.acquisition-parameter-panel > .acquisition-parameter-title { padding: 8px 30px 8px 8px; }
+.acquisition-parameter-panel > .collapsible-subsection-content { padding: 7px 8px 8px; }
 .acquisition-parameter-title {
   margin: 0;
   color: #174f79;
