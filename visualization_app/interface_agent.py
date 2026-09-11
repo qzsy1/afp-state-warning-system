@@ -327,7 +327,6 @@ def _complete(context: dict[str, Any]) -> dict[str, Any]:
     return {
         "model_name": context["model_name"],
         "execution_mode": "langchain_local_runnable_simulation",
-        "trace": context["trace"],
         "diagnosis": context["diagnosis"],
         "simulated": bool(context["event"].get("simulated", False)),
     }

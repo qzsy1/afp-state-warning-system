@@ -438,12 +438,6 @@ body.resizing-sensor-list { cursor: ns-resize; user-select: none; }
 .agent-result-grid b { display: block; color: #66528a; font-size: 8px; }
 .agent-result-grid span { display: block; overflow-wrap: anywhere; }
 .agent-result-grid ul { margin: 2px 0 0; padding-left: 15px; }
-.agent-trace { margin-top: 6px; border-top: 1px solid #e5dff0; padding-top: 4px; }
-.agent-trace summary { cursor: pointer; color: #66528a; font-weight: 750; }
-.agent-trace ol { display: grid; gap: 4px; margin: 5px 0 0; padding-left: 20px; }
-.agent-trace li { padding-left: 2px; }
-.agent-trace li strong, .agent-trace li small { display: block; }
-.agent-trace li small { color: #718397; }
 .agent-boundary { display: block; margin-top: 5px; color: #7b8795; }
 @media (max-width: 520px) { .agent-input-grid, .agent-result-grid { grid-template-columns: minmax(0, 1fr); } .agent-actions { align-items: stretch; flex-direction: column; } .agent-actions button { width: 100%; } }
 .acquisition-parameter-panel {

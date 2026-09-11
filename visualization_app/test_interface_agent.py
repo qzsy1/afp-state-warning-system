@@ -91,25 +91,14 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertEqual(event["endpoint"], "COM8")
         self.assertEqual(event["sensor_name"], "薄膜压力")
 
-    def test_run_diagnosis_returns_auditable_local_langchain_trace(self) -> None:
+    def test_run_diagnosis_returns_diagnosis_without_call_trace(self) -> None:
         result = run_interface_diagnosis(
             build_agent_event(m3232_result()),
             api_key_present=True,
             model_name="local-demo-model",
         )
 
-        self.assertEqual(
-            [item["id"] for item in result["trace"]],
-            [
-                "event_received",
-                "gate_checked",
-                "get_interface_context",
-                "inspect_error_evidence",
-                "lookup_local_rule",
-                "compose_diagnostic_prompt",
-                "complete",
-            ],
-        )
+        self.assertNotIn("trace", result)
         self.assertEqual(result["diagnosis"]["interface_id"], "m3232_pressure")
         self.assertEqual(result["diagnosis"]["sensor_name"], "薄膜压力")
         self.assertNotIn("PLC压力", result["diagnosis"]["summary"])
@@ -174,6 +163,8 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertNotIn("api_key: agentApiKeyInput.value", script)
         self.assertIn("薄膜压力", html)
         self.assertIn("LangChain", html)
+        self.assertNotIn("工具调用轨迹", html)
+        self.assertNotIn("agent-trace", script)
         self.assertIn("/api/agent/diagnose", app_source)
         self.assertIn("run_interface_diagnosis", app_source)
         self.assertIn("langchain-core==1.6.2", requirements)

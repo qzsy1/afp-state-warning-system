@@ -1088,8 +1088,6 @@ function renderAgentResult(result) {
   const panel = $("agentDiagnosisPanel");
   if (!panel || !result?.diagnosis) return;
   const diagnosis = result.diagnosis;
-  const trace = (result.trace || []).map((step, index) => `
-    <li><span>${index + 1}</span><div><strong>${agentEscapeHtml(step.title)}</strong><small>${agentEscapeHtml(step.detail)}</small></div></li>`).join("");
   const causes = (diagnosis.possible_causes || []).map((item) => `<li>${agentEscapeHtml(item)}</li>`).join("");
   const actions = (diagnosis.recommended_actions || []).map((item) => `<li>${agentEscapeHtml(item)}</li>`).join("");
   panel.className = "agent-diagnosis-panel result";
@@ -1102,7 +1100,6 @@ function renderAgentResult(result) {
       <div><b>可能原因</b><ul>${causes}</ul></div>
       <div><b>处理建议</b><ul>${actions}</ul></div>
     </div>
-    <details class="agent-trace"><summary>LangChain 工具调用轨迹（${(result.trace || []).length} 步）</summary><ol>${trace}</ol></details>
     <small class="agent-boundary">${agentEscapeHtml(diagnosis.evidence_boundary)} · 模型标签：${agentEscapeHtml(result.model_name)}</small>`;
 }
 
