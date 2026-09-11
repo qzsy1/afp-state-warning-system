@@ -96,9 +96,11 @@ button, select, input { outline: none; }
   overflow: hidden;
 }
 .sidebar { grid-area: settings; height: 100%; min-height: 0; overflow: auto; scrollbar-width: thin; padding-right: 2px; }
-.main-content { grid-area: main; display: grid; grid-template-rows: auto minmax(0, 1fr); height: 100%; min-width: 0; min-height: 0; overflow: auto; gap: 10px; padding-right: 2px; scrollbar-width: thin; }
+.main-content { grid-area: main; display: grid; grid-template-rows: auto minmax(0, 1fr); height: 100%; min-width: 0; min-height: 0; overflow: auto; gap: 10px; padding-right: 0; scrollbar-width: thin; }
 .warning-rail { grid-area: warning; height: 100%; min-height: 0; overflow: auto; display: grid; gap: 8px; padding: 0 2px 2px 0; scrollbar-width: thin; }
-.evidence-dock { margin-top: -4px; position: relative; z-index: 1; grid-area: evidence; display: grid; grid-template-columns: minmax(500px, 1.2fr) minmax(430px, .8fr); height: 100%; min-width: 0; min-height: 0; overflow: auto; gap: 10px; scrollbar-width: thin; }
+.evidence-dock { margin-top: -5px; position: relative; z-index: 1; grid-area: evidence; display: grid; grid-template-columns: subgrid; height: 100%; min-width: 0; min-height: 0; overflow: auto; column-gap: inherit; row-gap: 0; scrollbar-width: thin; }
+#layerEvidencePanel { grid-column: 1; }
+#timelineEvidencePanel { grid-column: 3; }
 .left-resizer { grid-area: resize-left; }
 .right-resizer { grid-area: resize-right; }
 .column-resizer {
@@ -168,7 +170,7 @@ body.resizing-columns { cursor: col-resize; user-select: none; }
 .vertical-panel-resizer::before {
   content: "";
   position: absolute;
-  top: 0;
+  top: -1px;
   right: 0;
   left: 0;
   height: 1px;
@@ -593,7 +595,7 @@ canvas { display: block; width: 100%; }
 .probability-fill { height: 100%; background: linear-gradient(90deg, #4a9ac9, #e15a61); border-radius: 99px; }
 .probability-value { color: #365b77; text-align: right; font-weight: 800; }
 
-.channel-panel { height: 100%; align-self: stretch; padding-bottom: 10px; }
+.channel-panel { height: 100%; align-self: stretch; padding-bottom: 10px; border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
 .channel-panel-content { min-height: 0; }
 .sensor-grid { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 7px; }
 .sensor-cards-viewport {
@@ -653,7 +655,7 @@ body.resizing-sensor-cards { cursor: ns-resize; user-select: none; }
 .sensor-live-values strong { color: var(--ink); }
 .full-channel-chart, .sensor-card canvas { width: 100%; height: 86px; }
 
-.evidence-dock .panel { min-height: 206px; }
+.evidence-dock .panel { min-height: 206px; border-top-left-radius: 0; border-top-right-radius: 0; }
 .evidence-dock .collapsible-panel { min-height: 0; }
 .evidence-dock .collapsible-panel[open] { min-height: 206px; }
 .layer-progress { display: grid; grid-template-columns: repeat(5, minmax(0,1fr)); gap: 7px; }
@@ -702,6 +704,7 @@ body.resizing-sensor-cards { cursor: ns-resize; user-select: none; }
   .evidence-dock { height: auto; overflow: visible; margin-top: 0; }
   .rail-title, .rail-block { grid-column: 1 / -1; }
   .evidence-dock { grid-template-columns: 1fr; }
+  #layerEvidencePanel, #timelineEvidencePanel { grid-column: auto; }
 }
 
 @media (max-width: 800px) {
