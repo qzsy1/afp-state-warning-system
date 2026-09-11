@@ -173,6 +173,7 @@ class InterfaceAgentTests(unittest.TestCase):
     def test_original_frontend_groups_functional_modules_as_collapsible_sections(self) -> None:
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
         styles = (ROOT / "static" / "styles.css").read_text(encoding="utf-8")
+        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
 
         for module_class in (
             "chart-panel",
@@ -192,10 +193,11 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertIn('<section class="panel channel-panel">', html)
         self.assertNotIn('class="panel channel-panel collapsible-panel"', html)
         self.assertIn("grid-template-rows: auto minmax(0, 1fr)", styles)
-        self.assertIn(".channel-panel { height: 100%", styles)
+        self.assertRegex(styles, r"\.channel-panel\s*\{[^}]*height:\s*100%")
         self.assertGreaterEqual(html.count('class="status-card'), 4)
         self.assertIn("sensorCardsViewport", html)
-        self.assertIn("sensorCardsResizer", html)
+        self.assertNotIn("sensorCardsResizer", html)
+        self.assertIn("verticalPanelResizer", html)
         self.assertNotIn("系统功能与判定边界说明", html)
         self.assertIn("grid-template-rows: minmax(300px, var(--upper-row-height)) 4px", styles)
         self.assertIn("row-gap: 0", styles)
@@ -206,6 +208,10 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertIn("border-bottom-left-radius: 0", styles)
         self.assertIn("border-top-left-radius: 0", styles)
         self.assertRegex(styles, r"\.main-content\s*\{[^}]*padding-right:\s*0")
+        self.assertRegex(styles, r"\.channel-panel\s*\{[^}]*display:\s*grid[^}]*grid-template-rows:\s*auto minmax\(0,\s*1fr\)")
+        self.assertRegex(styles, r"\.channel-panel-content\s*\{[^}]*height:\s*100%")
+        self.assertRegex(styles, r"\.sensor-cards-viewport\s*\{[^}]*height:\s*100%[^}]*max-height:\s*none")
+        self.assertNotIn("SENSOR_CARDS_HEIGHT_STORAGE_KEY", script)
         self.assertIn("vertical-panel-resizer", styles)
         self.assertIn('.collapsible-subsection:not([open]) > summary::after', styles)
         self.assertIn('content: "+"', styles)
