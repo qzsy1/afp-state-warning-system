@@ -12,6 +12,12 @@ $LegacySource = Join-Path $RepoRoot "visualization_app"
 $BuildRoot = Join-Path $env:TEMP "AFP_Modular_Launcher_v2"
 $DistRoot = Join-Path $BuildRoot "dist"
 $WorkRoot = Join-Path $BuildRoot "work"
+$referenceInternal = Join-Path $ReferenceRelease "_internal"
+$referenceLegacy = Join-Path $ReferenceRelease "app\legacy"
+$referenceData = Join-Path $referenceInternal "data"
+if (-not (Test-Path -LiteralPath $referenceData) -and (Test-Path -LiteralPath (Join-Path $referenceLegacy "data"))) {
+    $referenceData = Join-Path $referenceLegacy "data"
+}
 
 if (-not $PythonExecutable) {
     $referenceVersion = Join-Path $ReferenceRelease "VERSION.json"
@@ -26,7 +32,7 @@ foreach ($required in @(
     (Join-Path $ScriptDir "launcher_entry.py"),
     (Join-Path $ScriptDir "app\bootstrap.py"),
     (Join-Path $LegacySource "app.py"),
-    (Join-Path $ReferenceRelease "_internal\data"),
+    $referenceData,
     (Join-Path $ReferenceRelease "models")
 )) {
     if (-not (Test-Path -LiteralPath $required)) {
@@ -55,9 +61,12 @@ if (-not $SkipExecutableBuild) {
         "--collect-all", "openpyxl", "--collect-all", "xlrd",
         "--collect-submodules", "mysql.connector",
         "--collect-submodules", "serial",
+        "--collect-submodules", "langchain_core",
+        "--collect-submodules", "langsmith",
         "--hidden-import", "tkinter", "--hidden-import", "tkinter.filedialog",
         "--hidden-import", "tkinter.messagebox", "--hidden-import", "tkinter.ttk",
         "--hidden-import", "webview", "--hidden-import", "webview.platforms.winforms",
+        "--hidden-import", "interface_agent",
         "--hidden-import", "sklearn.ensemble._forest",
         "--hidden-import", "sklearn.ensemble._iforest",
         "--hidden-import", "sklearn.linear_model._logistic",
@@ -116,7 +125,7 @@ $documentation | ForEach-Object {
 }
 
 $legacyFiles = @(
-    "app.py", "acquisition.py", "smrf_hid.py", "mysql_storage.py",
+    "app.py", "interface_agent.py", "acquisition.py", "smrf_hid.py", "mysql_storage.py",
     "online_inference.py", "atavn.py", "online_health_features.py",
     "causal_online_runtime.py", "runtime_scaler.py", "new_collection_health.py",
     "runtime_health_primitives.py", "web_training.py", "web_training_pipeline.py",
@@ -135,14 +144,19 @@ Get-ChildItem -LiteralPath (Join-Path $LegacySource "static") -Force | ForEach-O
     Copy-Item -LiteralPath $_.FullName -Destination $uiTarget -Recurse -Force
 }
 
-$referenceInternal = Join-Path $ReferenceRelease "_internal"
 Copy-Item -LiteralPath (Join-Path $ReferenceRelease "models") -Destination $TargetDir -Recurse
-Copy-Item -LiteralPath (Join-Path $referenceInternal "data") -Destination $legacyTarget -Recurse
-if (Test-Path -LiteralPath (Join-Path $referenceInternal "new_collection_demo_v11_3")) {
-    Copy-Item -LiteralPath (Join-Path $referenceInternal "new_collection_demo_v11_3") -Destination $legacyTarget -Recurse
+Copy-Item -LiteralPath $referenceData -Destination $legacyTarget -Recurse
+if (Test-Path -LiteralPath (Join-Path $referenceData "new_collection_demo_v11_3")) {
+    Copy-Item -LiteralPath (Join-Path $referenceData "new_collection_demo_v11_3") -Destination $legacyTarget -Recurse
+} elseif (Test-Path -LiteralPath (Join-Path $referenceLegacy "new_collection_demo_v11_3")) {
+    Copy-Item -LiteralPath (Join-Path $referenceLegacy "new_collection_demo_v11_3") -Destination $legacyTarget -Recurse
+} else {
+    Copy-Item -LiteralPath (Join-Path $LegacySource "new_collection_demo_v11_3") -Destination $legacyTarget -Recurse
 }
-if (Test-Path -LiteralPath (Join-Path $referenceInternal "model_runtime")) {
-    Copy-Item -LiteralPath (Join-Path $referenceInternal "model_runtime") -Destination $legacyTarget -Recurse
+if (Test-Path -LiteralPath (Join-Path $referenceData "model_runtime")) {
+    Copy-Item -LiteralPath (Join-Path $referenceData "model_runtime") -Destination $legacyTarget -Recurse
+} elseif (Test-Path -LiteralPath (Join-Path $referenceLegacy "model_runtime")) {
+    Copy-Item -LiteralPath (Join-Path $referenceLegacy "model_runtime") -Destination $legacyTarget -Recurse
 } else {
     Copy-Item -LiteralPath (Join-Path $LegacySource "model_runtime") -Destination $legacyTarget -Recurse
 }

@@ -1,6 +1,7 @@
 param(
     [string]$PythonExecutable = "",
-    [string]$TargetDir = "F:\AFP_Integrated_Native_InterfaceMapped\AFP_Integrated_System_SMRF_HID_Restored_20260824_v1.12.1\AFP_Integrated_System"
+    [string]$TargetDir = "F:\AFP_Integrated_Native_InterfaceMapped\AFP_Integrated_System_SMRF_HID_Restored_20260824_v1.12.1\AFP_Integrated_System",
+    [string]$BasePackageDir = "F:\AFP_Integrated_Native_InterfaceMapped\AFP_Integrated_System_SMRF_HID_Restored_20260824_v1.12.1\AFP_Integrated_System"
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,6 +16,18 @@ $CausalArtifact = Join-Path $StateMonitorDir "outputs_causal_online_consistency_
 $LegacySource = Get-ChildItem -LiteralPath (Split-Path -Parent $StateMonitorDir) -File -Filter "*.csv" |
     Where-Object { $_.Length -eq 22912911 } |
     Select-Object -First 1 -ExpandProperty FullName
+$FallbackDataDir = Join-Path $BasePackageDir "_internal\data"
+if (-not (Test-Path -LiteralPath $LegacyReplayDir) -and (Test-Path -LiteralPath (Join-Path $FallbackDataDir "legacy_replay"))) {
+    $LegacyReplayDir = Join-Path $FallbackDataDir "legacy_replay"
+}
+if (-not (Test-Path -LiteralPath $CausalArtifact) -and (Test-Path -LiteralPath (Join-Path $FallbackDataDir "causal_online_consistency_artifact.joblib"))) {
+    $CausalArtifact = Join-Path $FallbackDataDir "causal_online_consistency_artifact.joblib"
+}
+if (-not $LegacySource) {
+    $LegacySource = Get-ChildItem -LiteralPath $FallbackDataDir -File -Filter "*.csv" |
+        Where-Object { $_.Length -eq 22912911 } |
+        Select-Object -First 1 -ExpandProperty FullName
+}
 
 if (-not $PythonExecutable) {
     throw "Pass -PythonExecutable with the Python environment that contains PyInstaller and pywebview."
