@@ -98,7 +98,7 @@ button, select, input { outline: none; }
 .sidebar { grid-area: settings; height: 100%; min-height: 0; overflow: auto; scrollbar-width: thin; padding-right: 2px; }
 .main-content { grid-area: main; display: grid; grid-template-rows: auto minmax(0, 1fr); height: 100%; min-width: 0; min-height: 0; overflow: auto; gap: 10px; padding-right: 2px; scrollbar-width: thin; }
 .warning-rail { grid-area: warning; height: 100%; min-height: 0; overflow: auto; display: grid; gap: 8px; padding: 0 2px 2px 0; scrollbar-width: thin; }
-.evidence-dock { grid-area: evidence; display: grid; grid-template-columns: minmax(500px, 1.2fr) minmax(430px, .8fr); height: 100%; min-width: 0; min-height: 0; overflow: auto; gap: 10px; scrollbar-width: thin; }
+.evidence-dock { margin-top: -4px; position: relative; z-index: 1; grid-area: evidence; display: grid; grid-template-columns: minmax(500px, 1.2fr) minmax(430px, .8fr); height: 100%; min-width: 0; min-height: 0; overflow: auto; gap: 10px; scrollbar-width: thin; }
 .left-resizer { grid-area: resize-left; }
 .right-resizer { grid-area: resize-right; }
 .column-resizer {
@@ -156,24 +156,24 @@ body.resizing-columns { cursor: col-resize; user-select: none; }
   grid-area: resize-vertical;
   position: relative;
   align-self: stretch;
+  z-index: 2;
   min-width: 0;
   cursor: row-resize;
   touch-action: none;
   user-select: none;
   border-radius: 6px;
-  background: var(--surface);
-  border-top: 1px solid var(--line);
-  border-bottom: 1px solid var(--line);
+  background: transparent;
+  border: 0;
 }
 .vertical-panel-resizer::before {
   content: "";
   position: absolute;
-  top: 50%;
+  top: 0;
   right: 0;
   left: 0;
   height: 1px;
   background: #c9d7e2;
-  transform: translateY(-50%);
+  transform: none;
   transition: height .15s ease, background .15s ease, box-shadow .15s ease;
 }
 .vertical-resizer-grip {
@@ -699,7 +699,7 @@ body.resizing-sensor-cards { cursor: ns-resize; user-select: none; }
   .sidebar { height: auto; max-height: none; }
   .main-content { height: auto; overflow: visible; }
   .warning-rail { position: static; max-height: none; grid-template-columns: repeat(2,1fr); overflow: visible; }
-  .evidence-dock { height: auto; overflow: visible; }
+  .evidence-dock { height: auto; overflow: visible; margin-top: 0; }
   .rail-title, .rail-block { grid-column: 1 / -1; }
   .evidence-dock { grid-template-columns: 1fr; }
 }

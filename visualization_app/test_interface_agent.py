@@ -199,6 +199,7 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertNotIn("系统功能与判定边界说明", html)
         self.assertIn("grid-template-rows: minmax(300px, var(--upper-row-height)) 4px", styles)
         self.assertIn("row-gap: 0", styles)
+        self.assertIn(".evidence-dock { margin-top: -4px", styles)
         self.assertIn("vertical-panel-resizer", styles)
         self.assertIn('.collapsible-subsection:not([open]) > summary::after', styles)
         self.assertIn('content: "+"', styles)
