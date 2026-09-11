@@ -84,13 +84,13 @@ button, select, input { outline: none; }
   height: calc(100vh - 68px);
   grid-template-columns: var(--settings-width) 8px minmax(480px, 1fr) 8px var(--warning-width);
   /* The evidence row may be collapsed completely by the vertical resizer. */
-  grid-template-rows: minmax(300px, var(--upper-row-height)) 8px minmax(0, 1fr);
+  grid-template-rows: minmax(300px, var(--upper-row-height)) 4px minmax(0, 1fr);
   grid-template-areas:
     "settings resize-left main resize-right warning"
     "settings resize-left resize-vertical resize-vertical resize-vertical"
     "settings resize-left evidence evidence evidence";
   column-gap: 5px;
-  row-gap: 5px;
+  row-gap: 0;
   padding: 10px;
   align-items: start;
   overflow: hidden;
@@ -161,6 +161,9 @@ body.resizing-columns { cursor: col-resize; user-select: none; }
   touch-action: none;
   user-select: none;
   border-radius: 6px;
+  background: var(--surface);
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
 }
 .vertical-panel-resizer::before {
   content: "";

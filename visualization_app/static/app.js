@@ -2712,7 +2712,7 @@ function initializeVerticalPanelResizer() {
     const styles = getComputedStyle(workspace);
     const padding = parseFloat(styles.paddingTop) + parseFloat(styles.paddingBottom);
     const gaps = parseFloat(styles.rowGap || styles.gap) * 2;
-    return Math.max(upperMin, workspace.clientHeight - padding - gaps - 8 - lowerMin);
+    return Math.max(upperMin, workspace.clientHeight - padding - gaps - 4 - lowerMin);
   }
 
   function applyHeight(value, persist = true) {
