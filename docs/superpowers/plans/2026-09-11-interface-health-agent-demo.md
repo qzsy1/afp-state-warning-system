@@ -390,7 +390,7 @@ Run:
 
 ```powershell
 Get-FileHash delivery\AFP_Integrated_System_M3232_v2.0.6\AFP_Integrated_System_Modular.exe -Algorithm SHA256
-py -3.11 -m unittest visualization_app.test_m3232_pressure -v
+Push-Location visualization_app; py -3.11 -m unittest test_m3232_pressure -v; Pop-Location
 git diff --check
 git status --short
 ```

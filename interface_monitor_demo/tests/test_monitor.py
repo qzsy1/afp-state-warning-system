@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 from interface_monitor_demo.interface_catalog import build_interface_catalog
 from interface_monitor_demo.monitor import InterfaceMonitor
@@ -53,6 +54,10 @@ class InterfaceMonitorTests(unittest.TestCase):
         self.assertEqual(event["evidence"]["missing_channels"], ["温度7", "温度8"])
         self.assertEqual(event["channels"], [f"温度{index}" for index in range(1, 9)])
 
+    def test_partial_channel_scenario_rejects_single_channel_interface(self) -> None:
+        with self.assertRaisesRegex(ValueError, "多通道"):
+            InterfaceMonitor().apply_scenario("m3232_pressure", "partial_channels")
+
     def test_healthy_scenario_clears_only_that_interface_event(self) -> None:
         monitor = InterfaceMonitor()
         monitor.apply_scenario("plc_process", "timeout")
@@ -81,6 +86,20 @@ class InterfaceMonitorTests(unittest.TestCase):
         self.assertTrue(all(item["state"] == "healthy" for item in snapshot["interfaces"]))
         self.assertEqual(snapshot["events"], [])
         self.assertIsNone(snapshot["active_event"])
+
+    def test_concurrent_scenario_requests_receive_unique_event_ids(self) -> None:
+        monitor = InterfaceMonitor()
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            events = list(
+                executor.map(
+                    lambda _: monitor.apply_scenario("plc_process", "timeout"),
+                    range(40),
+                )
+            )
+
+        event_ids = [event["event_id"] for event in events]
+        self.assertEqual(len(event_ids), len(set(event_ids)))
 
 
 if __name__ == "__main__":

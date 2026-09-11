@@ -1,7 +1,8 @@
 param(
     [int]$Port = 8770,
     [switch]$NoBrowser,
-    [switch]$SelfTest
+    [switch]$SelfTest,
+    [switch]$ReadyTest
 )
 
 $ErrorActionPreference = "Stop"
@@ -39,13 +40,48 @@ try {
     }
 
     $Url = "http://127.0.0.1:$Port"
-    if (-not $NoBrowser) {
-        Start-Process $Url
-    }
     Write-Host "AFP Interface Monitor and LangChain Diagnosis Demo"
     Write-Host "URL: $Url"
     Write-Host "Press Ctrl+C to stop."
-    & $DemoPython -m interface_monitor_demo.server --host 127.0.0.1 --port $Port
+    $ServerProcess = $null
+    try {
+        $ServerProcess = Start-Process -FilePath $DemoPython `
+            -ArgumentList @("-m", "interface_monitor_demo.server", "--host", "127.0.0.1", "--port", "$Port") `
+            -WorkingDirectory $RepoRoot -WindowStyle Hidden -PassThru
+
+        $Ready = $false
+        for ($Attempt = 0; $Attempt -lt 100; $Attempt += 1) {
+            if ($ServerProcess.HasExited) {
+                throw "Demo server exited before becoming ready."
+            }
+            try {
+                $Status = Invoke-RestMethod -Uri "$Url/api/bootstrap" -TimeoutSec 1
+                if ($Status.application.version -eq "demo-1.0") {
+                    $Ready = $true
+                    break
+                }
+            }
+            catch {
+                Start-Sleep -Milliseconds 100
+            }
+        }
+        if (-not $Ready) {
+            throw "Demo server did not become ready within 10 seconds."
+        }
+        if ($ReadyTest) {
+            Write-Host "READY_TEST_OK $Url"
+            return
+        }
+        if (-not $NoBrowser) {
+            Start-Process $Url
+        }
+        Wait-Process -Id $ServerProcess.Id
+    }
+    finally {
+        if ($null -ne $ServerProcess -and -not $ServerProcess.HasExited) {
+            Stop-Process -Id $ServerProcess.Id -Force
+        }
+    }
 }
 finally {
     Pop-Location

@@ -102,6 +102,25 @@ class ServerContractTests(unittest.TestCase):
         self.assertEqual(payload["error"], "请求不得包含 API Key、密码或令牌原文")
         self.assertNotIn("must-not-cross-boundary", json.dumps(payload, ensure_ascii=False))
 
+    def test_diagnosis_rejects_all_fields_outside_allowlist(self) -> None:
+        for field_name in ("openai_api_key", "auth_token", "credentials", "x-api-key"):
+            with self.subTest(field_name=field_name):
+                status, payload = self.post_json(
+                    "/api/diagnose",
+                    {
+                        "api_key_present": True,
+                        "model_name": "local-demo-model",
+                        "event_id": "evt-0001",
+                        field_name: "must-not-cross-boundary",
+                    },
+                )
+
+                self.assertEqual(status, 400)
+                self.assertIn("未允许字段", payload["error"])
+                self.assertNotIn(
+                    "must-not-cross-boundary", json.dumps(payload, ensure_ascii=False)
+                )
+
     def test_unknown_event_is_rejected(self) -> None:
         status, payload = self.post_json(
             "/api/diagnose",

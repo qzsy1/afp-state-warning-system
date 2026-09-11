@@ -5,6 +5,7 @@ from typing import Any
 
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import tool
+from langsmith import tracing_context
 
 
 class AgentGateError(ValueError):
@@ -272,4 +273,7 @@ def run_diagnosis(
         "model_name": model_name.strip(),
         "trace": [],
     }
-    return _LOCAL_DIAGNOSIS_CHAIN.invoke(context)
+    # This Demo is deliberately offline.  Disable inherited LangSmith tracing even
+    # when the host machine has global LANGSMITH/LANGCHAIN tracing variables set.
+    with tracing_context(enabled=False):
+        return _LOCAL_DIAGNOSIS_CHAIN.invoke(context, config={"callbacks": []})

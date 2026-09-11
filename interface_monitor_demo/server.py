@@ -26,6 +26,11 @@ _FORBIDDEN_FIELDS = {
     "authorization",
     "password",
 }
+_POST_FIELD_ALLOWLISTS: dict[str, set[str]] = {
+    "/api/scenario": {"interface_id", "scenario"},
+    "/api/diagnose": {"api_key_present", "model_name", "event_id"},
+    "/api/reset": set(),
+}
 
 
 def _contains_secret_field(value: Any) -> bool:
@@ -39,6 +44,15 @@ def _contains_secret_field(value: Any) -> bool:
     elif isinstance(value, list):
         return any(_contains_secret_field(item) for item in value)
     return False
+
+
+def _validate_post_fields(path: str, payload: dict[str, object]) -> None:
+    allowed = _POST_FIELD_ALLOWLISTS.get(path)
+    if allowed is None:
+        return
+    unexpected = set(payload) - allowed
+    if unexpected:
+        raise ValueError("请求包含未允许字段；API Key、密码或令牌原文不得发送")
 
 
 class DemoRequestHandler(BaseHTTPRequestHandler):
@@ -129,6 +143,7 @@ class DemoRequestHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             payload = self._read_json()
+            _validate_post_fields(path, payload)
             if path == "/api/scenario":
                 result = self.monitor.apply_scenario(
                     str(payload.get("interface_id", "")),

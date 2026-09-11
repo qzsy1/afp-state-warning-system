@@ -37,13 +37,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\interface_monitor_demo
 
 ## 演示步骤
 
-1. 在“故障场景”中选择一个接口和异常类型；
+1. 在“故障场景”中选择一个接口和异常类型；单通道接口不会提供“部分通道缺失”；
 2. 点击“注入异常”，观察对应接口卡从正常变为警告或严重异常；
 3. 在右侧填写任意非空的演示 API Key 和模型名称，例如 `local-demo-model`；
 4. 点击“运行 LangChain 本地诊断”；
 5. 观察流程图依次点亮：确定性监控、标准事件、安全门控、LangChain 编排、结构化诊断；
 6. 查看下方七步执行轨迹、异常证据、可能原因和处理建议；
-7. 点击“全部恢复”清空异常和诊断结果。
+7. 选择“恢复正常”可恢复当前接口，点击“全部恢复”可清空全部异常和诊断结果。
 
 建议重点演示“M3232 薄膜压力 → M3232矩阵帧解析失败”。最终结果应定位到`薄膜压力`，而不是 PLC 的`压力`。
 
@@ -67,9 +67,10 @@ compose_diagnostic_report
 
 - API Key 输入值只存在于当前浏览器输入框；
 - 页面仅向后端发送 `api_key_present: true/false`，不发送 Key 原文；
-- 后端会主动拒绝包含 `api_key`、`token`、`secret`、`authorization`或`password`字段的请求；
+- 后端对每个 POST 接口使用字段白名单，拒绝任何额外字段，包括各种命名形式的 Key、token、凭据或密码；
 - 页面刷新后 Key 清空；
 - 模型名称仅作为演示标签，不加载模型、不访问网络。
+- 诊断代码强制关闭继承自宿主环境的 LangSmith/LangChain tracing，即使机器全局开启 tracing 也不会创建外部追踪器。
 
 ## 真实硬件边界
 

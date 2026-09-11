@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
+from unittest.mock import patch
 
 from interface_monitor_demo.agent_flow import AgentGateError, run_diagnosis
 from interface_monitor_demo.interface_catalog import build_interface_catalog
@@ -93,6 +95,31 @@ class AgentFlowTests(unittest.TestCase):
         self.assertNotIn("api_key", encoded)
         self.assertNotIn("authorization", encoded)
         self.assertNotIn("secret", encoded)
+
+    def test_host_tracing_environment_cannot_create_langsmith_tracer(self) -> None:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "LANGSMITH_TRACING": "true",
+                    "LANGCHAIN_TRACING_V2": "true",
+                    "LANGSMITH_API_KEY": "must-not-be-used",
+                },
+            ),
+            patch(
+                "langchain_core.tracers.langchain.LangChainTracer",
+                side_effect=AssertionError("external tracing must stay disabled"),
+            ) as tracer,
+        ):
+            result = run_diagnosis(
+                self.event,
+                self.catalog,
+                api_key_present=True,
+                model_name="local-demo-model",
+            )
+
+        tracer.assert_not_called()
+        self.assertEqual(result["execution_mode"], "langchain_local_runnable_simulation")
 
 
 if __name__ == "__main__":

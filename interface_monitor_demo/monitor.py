@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timezone
+from threading import RLock
 from typing import Any
 
 from .interface_catalog import build_interface_catalog
@@ -49,6 +50,8 @@ def _scenario_state(
 ) -> tuple[dict[str, object], dict[str, object]]:
     if scenario == "parse_error" and interface["id"] != "m3232_pressure":
         raise ValueError("M3232矩阵帧解析场景只适用于薄膜压力接口")
+    if scenario == "partial_channels" and len(interface["channels"]) <= 1:
+        raise ValueError("部分通道缺失场景只适用于多通道接口")
     if scenario not in _SCENARIO_TEXT:
         raise ValueError(f"未知故障场景：{scenario}")
 
@@ -123,53 +126,58 @@ class InterfaceMonitor:
         }
         self._events: dict[str, dict[str, object]] = {}
         self._event_counter = 0
+        self._lock = RLock()
 
     def snapshot(self) -> dict[str, object]:
-        last_event_id = next(reversed(self._events), None)
-        return deepcopy(
-            {
-                "interfaces": list(self._states.values()),
-                "events": list(self._events.values()),
-                "active_event": self._events.get(last_event_id),
-                "simulated": True,
-            }
-        )
+        with self._lock:
+            last_event_id = next(reversed(self._events), None)
+            return deepcopy(
+                {
+                    "interfaces": list(self._states.values()),
+                    "events": list(self._events.values()),
+                    "active_event": self._events.get(last_event_id),
+                    "simulated": True,
+                }
+            )
 
     def get_event(self, event_id: str) -> dict[str, object] | None:
-        event = self._events.get(event_id)
-        return deepcopy(event) if event is not None else None
+        with self._lock:
+            event = self._events.get(event_id)
+            return deepcopy(event) if event is not None else None
 
     def apply_scenario(self, interface_id: str, scenario: str) -> dict[str, object]:
-        interface = self._by_id.get(interface_id)
-        if interface is None:
-            raise ValueError(f"未知接口：{interface_id}")
-        if scenario == "healthy":
-            self._states[interface_id] = _healthy_state(interface)
+        with self._lock:
+            interface = self._by_id.get(interface_id)
+            if interface is None:
+                raise ValueError(f"未知接口：{interface_id}")
+            if scenario == "healthy":
+                self._states[interface_id] = _healthy_state(interface)
+                self._events = {
+                    key: value
+                    for key, value in self._events.items()
+                    if value["interface_id"] != interface_id
+                }
+                return deepcopy(self._states[interface_id])
+            if scenario not in {item["id"] for item in SCENARIOS}:
+                raise ValueError(f"未知故障场景：{scenario}")
+
+            self._event_counter += 1
+            event_id = f"evt-{self._event_counter:04d}"
+            state, event = _scenario_state(interface, scenario, event_id)
+            self._states[interface_id] = state
             self._events = {
                 key: value
                 for key, value in self._events.items()
                 if value["interface_id"] != interface_id
             }
-            return deepcopy(self._states[interface_id])
-        if scenario not in {item["id"] for item in SCENARIOS}:
-            raise ValueError(f"未知故障场景：{scenario}")
-
-        self._event_counter += 1
-        event_id = f"evt-{self._event_counter:04d}"
-        state, event = _scenario_state(interface, scenario, event_id)
-        self._states[interface_id] = state
-        self._events = {
-            key: value
-            for key, value in self._events.items()
-            if value["interface_id"] != interface_id
-        }
-        self._events[event_id] = event
-        return deepcopy(event)
+            self._events[event_id] = event
+            return deepcopy(event)
 
     def reset(self) -> dict[str, object]:
-        self._states = {
-            interface_id: _healthy_state(item)
-            for interface_id, item in self._by_id.items()
-        }
-        self._events.clear()
-        return self.snapshot()
+        with self._lock:
+            self._states = {
+                interface_id: _healthy_state(item)
+                for interface_id, item in self._by_id.items()
+            }
+            self._events.clear()
+            return self.snapshot()

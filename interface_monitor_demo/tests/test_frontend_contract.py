@@ -5,6 +5,7 @@ import unittest
 import urllib.request
 from html.parser import HTMLParser
 from pathlib import Path
+import socket
 import subprocess
 
 from interface_monitor_demo.server import create_server
@@ -99,6 +100,13 @@ class FrontendContractTests(unittest.TestCase):
         self.assertNotIn("localStorage", javascript)
         self.assertNotIn("sessionStorage", javascript)
 
+    def test_javascript_restores_active_event_and_single_interface_recovery(self) -> None:
+        _, javascript = self.fetch("/app.js")
+
+        self.assertIn("state.activeEvent = state.bootstrap.active_event", javascript)
+        self.assertNotIn('filter((item) => item.id !== "healthy")', javascript)
+        self.assertIn('partialOption.disabled = channelCount <= 1', javascript)
+
     def test_stylesheet_defines_flow_and_responsive_layout(self) -> None:
         content_type, stylesheet = self.fetch("/styles.css")
 
@@ -131,6 +139,36 @@ class FrontendContractTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("SELF_TEST_OK", result.stdout)
+
+    def test_launcher_waits_until_server_is_ready(self) -> None:
+        repo_root = Path(__file__).resolve().parents[2]
+        launcher = repo_root / "interface_monitor_demo" / "start_demo.ps1"
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(launcher),
+                "-ReadyTest",
+                "-Port",
+                str(port),
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("READY_TEST_OK", result.stdout)
 
 
 if __name__ == "__main__":

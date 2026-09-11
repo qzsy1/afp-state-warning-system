@@ -103,6 +103,8 @@ function updateGate() {
 
 function updateScenarioOptions() {
   const selected = $("scenarioInterface").value;
+  const selectedInterface = state.bootstrap?.interfaces.find((item) => item.id === selected);
+  const channelCount = selectedInterface?.channels?.length || 0;
   const parseOption = [...$("scenarioType").options].find((option) => option.value === "parse_error");
   if (parseOption) {
     parseOption.disabled = selected !== "m3232_pressure";
@@ -110,6 +112,15 @@ function updateScenarioOptions() {
       $("scenarioType").value = "timeout";
     }
   }
+  const partialOption = [...$("scenarioType").options].find((option) => option.value === "partial_channels");
+  if (partialOption) {
+    partialOption.disabled = channelCount <= 1;
+    if (partialOption.disabled && $("scenarioType").value === "partial_channels") {
+      $("scenarioType").value = "timeout";
+    }
+  }
+  const isRecovery = $("scenarioType").value === "healthy";
+  $("injectScenarioButton").textContent = isRecovery ? "恢复所选接口" : "注入异常";
 }
 
 function resetFlow() {
@@ -205,6 +216,7 @@ async function injectScenario() {
       markScenarioFlow();
       toast(`已注入：${result.sensor_name} · ${result.summary}`);
     } else {
+      if (state.activeEvent) markScenarioFlow();
       toast("目标接口已恢复正常");
     }
     updateGate();
@@ -251,14 +263,14 @@ async function initialize() {
   modelNameInput.value = "";
   state.bootstrap = await getJson("/api/bootstrap");
   state.snapshot = state.bootstrap;
-  state.activeEvent = null;
+  state.activeEvent = state.bootstrap.active_event;
   $("scenarioInterface").replaceChildren(...state.bootstrap.interfaces.map((item) => {
     const option = document.createElement("option");
     option.value = item.id;
     option.textContent = `${item.label} · ${item.endpoint}`;
     return option;
   }));
-  $("scenarioType").replaceChildren(...state.bootstrap.scenarios.filter((item) => item.id !== "healthy").map((item) => {
+  $("scenarioType").replaceChildren(...state.bootstrap.scenarios.map((item) => {
     const option = document.createElement("option");
     option.value = item.id;
     option.textContent = item.label;
@@ -267,12 +279,14 @@ async function initialize() {
   renderInterfaces(state.bootstrap.interfaces);
   updateScenarioOptions();
   resetFlow();
+  if (state.activeEvent) markScenarioFlow();
   updateGate();
 }
 
 apiKeyInput.addEventListener("input", updateGate);
 modelNameInput.addEventListener("input", updateGate);
 $("scenarioInterface").addEventListener("change", updateScenarioOptions);
+$("scenarioType").addEventListener("change", updateScenarioOptions);
 $("injectScenarioButton").addEventListener("click", injectScenario);
 $("resetButton").addEventListener("click", resetAll);
 diagnoseButton.addEventListener("click", runDiagnosis);
