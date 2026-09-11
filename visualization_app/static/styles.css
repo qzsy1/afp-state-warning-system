@@ -278,6 +278,7 @@ body.resizing-rows { cursor: row-resize; user-select: none; }
   font-weight: 800;
 }
 .collapsible-subsection[open] > summary::after { content: "−"; }
+.control-section[open] .collapsible-subsection:not([open]) > summary::after { content: "+"; }
 .collapsible-subsection[open] > summary { border-bottom: 1px solid var(--line); }
 .collapsible-subsection-content { display: grid; gap: 6px; min-width: 0; padding: 7px 8px 8px; }
 .sensor-settings-section { border: 1px solid #c9dceb; border-radius: 6px; background: #f7fbfe; }

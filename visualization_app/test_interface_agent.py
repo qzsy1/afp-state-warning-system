@@ -146,6 +146,7 @@ class InterfaceAgentTests(unittest.TestCase):
 
     def test_original_frontend_contains_agent_additions(self) -> None:
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        styles = (ROOT / "static" / "styles.css").read_text(encoding="utf-8")
         script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
         app_source = (ROOT / "app.py").read_text(encoding="utf-8")
         requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
@@ -171,6 +172,7 @@ class InterfaceAgentTests(unittest.TestCase):
 
     def test_original_frontend_groups_functional_modules_as_collapsible_sections(self) -> None:
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        styles = (ROOT / "static" / "styles.css").read_text(encoding="utf-8")
 
         for module_class in (
             "chart-panel",
@@ -187,6 +189,8 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertGreaterEqual(html.count('class="control-section'), 5)
         self.assertIn("collapsible-panel-summary", html)
         self.assertIn("collapsible-panel-content", html)
+        self.assertIn('.collapsible-subsection:not([open]) > summary::after', styles)
+        self.assertIn('content: "+"', styles)
 
     def test_app_payload_accepts_only_presence_flag_and_event(self) -> None:
         payload = {
