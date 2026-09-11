@@ -397,26 +397,26 @@
 
       <aside class="warning-rail">
         <div class="rail-title"><span>03</span><div><b>三级状态预警</b><small>窗口 → 铺层 → 实际层数试样</small></div></div>
-        <details class="status-card accent-amber collapsible-status-card">
-          <summary class="card-summary"><div class="card-kicker">窗口级 · 最近完成窗口</div>
-          <div class="state-row"><span id="windowState" class="state-pill">等待窗口</span><strong id="windowScore" class="score-value">—</strong></div></summary>
-          <div class="collapsible-status-content"><div id="windowDetail" class="status-detail">窗口需要 24 个实测点</div></div>
-        </details>
-        <details class="status-card accent-cyan collapsible-status-card">
-          <summary class="card-summary"><div class="card-kicker">层级 · 当前铺层</div>
-          <div class="state-row"><span id="layerState" class="state-pill">等待数据</span><span id="layerScore" class="correctness">—</span></div></summary>
-          <div class="collapsible-status-content"><div id="layerDetail" class="status-detail">尚无完整窗口</div></div>
-        </details>
-        <details class="status-card accent-blue collapsible-status-card">
-          <summary class="card-summary"><div class="card-kicker">试样级 · 实际层数聚合</div>
-          <div class="state-row"><span id="specimenState" class="state-pill">等待数据</span><span id="specimenScore" class="correctness">—</span></div></summary>
-          <div class="collapsible-status-content"><div id="specimenDetail" class="status-detail">尚无层级证据</div></div>
-        </details>
-        <details class="status-card parameter-card accent-violet collapsible-status-card">
-          <summary class="card-summary"><div class="card-kicker">当前工艺参数</div></summary>
-          <div class="collapsible-status-content"><div id="processParameterGrid" class="parameter-grid"><div><span>等待识别</span><strong>—</strong></div></div>
-          <div id="parameterDetail" class="status-detail">—</div></div>
-        </details>
+        <article class="status-card accent-amber">
+          <div class="card-kicker">窗口级 · 最近完成窗口</div>
+          <div class="state-row"><span id="windowState" class="state-pill">等待窗口</span><strong id="windowScore" class="score-value">—</strong></div>
+          <div id="windowDetail" class="status-detail">窗口需要 24 个实测点</div>
+        </article>
+        <article class="status-card accent-cyan">
+          <div class="card-kicker">层级 · 当前铺层</div>
+          <div class="state-row"><span id="layerState" class="state-pill">等待数据</span><span id="layerScore" class="correctness">—</span></div>
+          <div id="layerDetail" class="status-detail">尚无完整窗口</div>
+        </article>
+        <article class="status-card accent-blue">
+          <div class="card-kicker">试样级 · 实际层数聚合</div>
+          <div class="state-row"><span id="specimenState" class="state-pill">等待数据</span><span id="specimenScore" class="correctness">—</span></div>
+          <div id="specimenDetail" class="status-detail">尚无层级证据</div>
+        </article>
+        <article class="status-card parameter-card accent-violet">
+          <div class="card-kicker">当前工艺参数</div>
+          <div id="processParameterGrid" class="parameter-grid"><div><span>等待识别</span><strong>—</strong></div></div>
+          <div id="parameterDetail" class="status-detail">—</div>
+        </article>
         <details class="rail-block collapsible-rail-block">
           <summary class="mini-panel-header"><div><p class="panel-kicker">ANOMALY TYPE</p><h2>异常类型概率</h2></div></summary>
           <div class="collapsible-rail-content"><div id="probabilityBars" class="probability-bars"></div></div>

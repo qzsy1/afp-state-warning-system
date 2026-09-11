@@ -177,7 +177,6 @@ class InterfaceAgentTests(unittest.TestCase):
         for module_class in (
             "chart-panel",
             "channel-panel",
-            "collapsible-status-card",
             "collapsible-rail-block",
             "layer-panel",
             "timeline-panel",
@@ -189,6 +188,8 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertGreaterEqual(html.count('class="control-section'), 5)
         self.assertIn("collapsible-panel-summary", html)
         self.assertIn("collapsible-panel-content", html)
+        self.assertNotIn("collapsible-status-card", html)
+        self.assertGreaterEqual(html.count('class="status-card'), 4)
         self.assertIn("sensorCardsViewport", html)
         self.assertIn("sensorCardsResizer", html)
         self.assertNotIn("系统功能与判定边界说明", html)
