@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AFP 实时预测与状态预警系统</title>
-  <link rel="stylesheet" href="/styles.css?v=20260911-agent-1">
+  <link rel="stylesheet" href="/styles.css?v=20260912-collapse-1">
 </head>
 <body>
   <div class="app-shell">
@@ -29,7 +29,7 @@
       <aside class="sidebar">
         <div class="section-heading"><span>01</span><div><b>采集与试样设置</b><small>数据源、试样和通道</small></div></div>
 
-        <details class="control-section" open>
+        <details class="control-section">
           <summary>数据定位与运行模式</summary>
           <div class="control-content">
             <label>运行模式
@@ -264,7 +264,7 @@
 
         <div class="section-heading compact-heading"><span>02</span><div><b>预测与预警设置</b><small>时间步、指标与模型</small></div></div>
 
-        <details class="control-section" open>
+        <details class="control-section">
           <summary>数据流与预测控制</summary>
           <div class="control-content">
             <div class="transport">
@@ -285,7 +285,7 @@
           </div>
         </details>
 
-        <details id="healthIndicatorSection" class="control-section" open>
+        <details id="healthIndicatorSection" class="control-section">
           <summary>健康指标与异常分数</summary>
           <div class="control-content">
             <label class="checkbox-row auto-indicator-row"><input id="autoIndicatorInput" type="checkbox" checked>根据输入数据方案自动选择健康指标构建形式</label>
@@ -346,8 +346,8 @@
       </div>
 
       <main class="main-content">
-        <section class="panel chart-panel primary-workbench">
-          <div class="panel-header">
+        <details class="panel chart-panel primary-workbench collapsible-panel">
+          <summary class="panel-header collapsible-panel-summary">
             <div><p class="panel-kicker">LIVE I-MODERNTCN FORECAST</p><h1 id="seriesTitle">实测值与未来预测值</h1></div>
             <div class="legend">
               <span><i class="legend-line actual"></i>已采集实测</span>
@@ -355,18 +355,22 @@
               <span id="futurePredictionLegend"><i class="legend-line future"></i>未来步长预测</span>
               <label id="residualToggleLabel" class="toggle"><input id="residualToggle" type="checkbox"><span></span>残差</label>
             </div>
+          </summary>
+          <div class="collapsible-panel-content">
+            <canvas id="seriesChart" height="300"></canvas>
+            <div class="chart-footer"><span>竖线左侧为已采集时刻，右侧为尚未到达的未来预测</span><span id="displayRange">—</span></div>
           </div>
-          <canvas id="seriesChart" height="300"></canvas>
-          <div class="chart-footer"><span>竖线左侧为已采集时刻，右侧为尚未到达的未来预测</span><span id="displayRange">—</span></div>
-        </section>
+        </details>
 
-        <section class="panel channel-panel">
-          <div class="panel-header compact">
+        <details class="panel channel-panel collapsible-panel">
+          <summary class="panel-header compact collapsible-panel-summary">
             <div><p class="panel-kicker">ALL ACQUIRED & PREDICTED CHANNELS</p><h2>全部传感器实时采集与预测</h2></div>
             <span id="allChannelHint" class="muted">所有通道按统一方式显示</span>
+          </summary>
+          <div class="collapsible-panel-content">
+            <div id="sensorCards" class="sensor-grid"></div>
           </div>
-          <div id="sensorCards" class="sensor-grid"></div>
-        </section>
+        </details>
 
         <details class="panel explanation-panel">
           <summary>系统功能与判定边界说明</summary>
@@ -389,30 +393,30 @@
 
       <aside class="warning-rail">
         <div class="rail-title"><span>03</span><div><b>三级状态预警</b><small>窗口 → 铺层 → 实际层数试样</small></div></div>
-        <article class="status-card accent-amber">
-          <div class="card-kicker">窗口级 · 最近完成窗口</div>
-          <div class="state-row"><span id="windowState" class="state-pill">等待窗口</span><strong id="windowScore" class="score-value">—</strong></div>
-          <div id="windowDetail" class="status-detail">窗口需要 24 个实测点</div>
-        </article>
-        <article class="status-card accent-cyan">
-          <div class="card-kicker">层级 · 当前铺层</div>
-          <div class="state-row"><span id="layerState" class="state-pill">等待数据</span><span id="layerScore" class="correctness">—</span></div>
-          <div id="layerDetail" class="status-detail">尚无完整窗口</div>
-        </article>
-        <article class="status-card accent-blue">
-          <div class="card-kicker">试样级 · 实际层数聚合</div>
-          <div class="state-row"><span id="specimenState" class="state-pill">等待数据</span><span id="specimenScore" class="correctness">—</span></div>
-          <div id="specimenDetail" class="status-detail">尚无层级证据</div>
-        </article>
-        <article class="status-card parameter-card accent-violet">
-          <div class="card-kicker">当前工艺参数</div>
-          <div id="processParameterGrid" class="parameter-grid"><div><span>等待识别</span><strong>—</strong></div></div>
-          <div id="parameterDetail" class="status-detail">—</div>
-        </article>
-        <section class="rail-block">
-          <div class="mini-panel-header"><div><p class="panel-kicker">ANOMALY TYPE</p><h2>异常类型概率</h2></div></div>
-          <div id="probabilityBars" class="probability-bars"></div>
-        </section>
+        <details class="status-card accent-amber collapsible-status-card">
+          <summary class="card-summary"><div class="card-kicker">窗口级 · 最近完成窗口</div>
+          <div class="state-row"><span id="windowState" class="state-pill">等待窗口</span><strong id="windowScore" class="score-value">—</strong></div></summary>
+          <div class="collapsible-status-content"><div id="windowDetail" class="status-detail">窗口需要 24 个实测点</div></div>
+        </details>
+        <details class="status-card accent-cyan collapsible-status-card">
+          <summary class="card-summary"><div class="card-kicker">层级 · 当前铺层</div>
+          <div class="state-row"><span id="layerState" class="state-pill">等待数据</span><span id="layerScore" class="correctness">—</span></div></summary>
+          <div class="collapsible-status-content"><div id="layerDetail" class="status-detail">尚无完整窗口</div></div>
+        </details>
+        <details class="status-card accent-blue collapsible-status-card">
+          <summary class="card-summary"><div class="card-kicker">试样级 · 实际层数聚合</div>
+          <div class="state-row"><span id="specimenState" class="state-pill">等待数据</span><span id="specimenScore" class="correctness">—</span></div></summary>
+          <div class="collapsible-status-content"><div id="specimenDetail" class="status-detail">尚无层级证据</div></div>
+        </details>
+        <details class="status-card parameter-card accent-violet collapsible-status-card">
+          <summary class="card-summary"><div class="card-kicker">当前工艺参数</div></summary>
+          <div class="collapsible-status-content"><div id="processParameterGrid" class="parameter-grid"><div><span>等待识别</span><strong>—</strong></div></div>
+          <div id="parameterDetail" class="status-detail">—</div></div>
+        </details>
+        <details class="rail-block collapsible-rail-block">
+          <summary class="mini-panel-header"><div><p class="panel-kicker">ANOMALY TYPE</p><h2>异常类型概率</h2></div></summary>
+          <div class="collapsible-rail-content"><div id="probabilityBars" class="probability-bars"></div></div>
+        </details>
       </aside>
 
       <div id="verticalPanelResizer" class="vertical-panel-resizer" role="separator"
@@ -422,23 +426,25 @@
       </div>
 
       <section id="evidenceDock" class="evidence-dock">
-        <article id="layerEvidencePanel" class="panel layer-panel">
-          <div class="panel-header compact">
+        <details id="layerEvidencePanel" class="panel layer-panel collapsible-panel">
+          <summary class="panel-header compact collapsible-panel-summary">
             <div><p class="panel-kicker">LAYER EVIDENCE</p><h2>铺层证据形成进度</h2></div>
             <span id="layerPreviewBadge" class="preview-badge">等待完整窗口</span>
+          </summary>
+          <div class="collapsible-panel-content"><div id="layerProgress" class="layer-progress"></div></div>
+        </details>
+        <details id="timelineEvidencePanel" class="panel timeline-panel collapsible-panel">
+          <summary class="panel-header compact collapsible-panel-summary"><div><p class="panel-kicker">CAUSAL WINDOW EVIDENCE</p><h2>当前层窗口健康指标</h2></div></summary>
+          <div class="collapsible-panel-content">
+            <canvas id="timelineChart" height="160"></canvas>
+            <div id="poolingSummary" class="inline-summary">只显示已经完成计算的窗口</div>
           </div>
-          <div id="layerProgress" class="layer-progress"></div>
-        </article>
-        <article id="timelineEvidencePanel" class="panel timeline-panel">
-          <div class="panel-header compact"><div><p class="panel-kicker">CAUSAL WINDOW EVIDENCE</p><h2>当前层窗口健康指标</h2></div></div>
-          <canvas id="timelineChart" height="160"></canvas>
-          <div id="poolingSummary" class="inline-summary">只显示已经完成计算的窗口</div>
-        </article>
+        </details>
       </section>
     </div>
   </div>
   <div id="toast" class="toast"></div>
   <script src="/mysql_visibility.js?v=20260909-mysql-toggle-2"></script>
-  <script src="/app.js?v=20260911-agent-1"></script>
+  <script src="/app.js?v=20260912-collapse-1"></script>
 </body>
 </html>

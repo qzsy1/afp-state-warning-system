@@ -169,6 +169,22 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertIn("run_interface_diagnosis", app_source)
         self.assertIn("langchain-core==1.6.2", requirements)
 
+    def test_original_frontend_groups_functional_modules_as_collapsible_sections(self) -> None:
+        html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+
+        for module_class in (
+            "chart-panel",
+            "channel-panel",
+            "collapsible-status-card",
+            "collapsible-rail-block",
+            "layer-panel",
+            "timeline-panel",
+        ):
+            self.assertIn(f"{module_class}", html)
+        self.assertGreaterEqual(html.count('class="control-section'), 5)
+        self.assertIn("collapsible-panel-summary", html)
+        self.assertIn("collapsible-panel-content", html)
+
     def test_app_payload_accepts_only_presence_flag_and_event(self) -> None:
         payload = {
             "api_key_present": True,

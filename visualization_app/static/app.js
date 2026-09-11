@@ -2544,6 +2544,18 @@ window.addEventListener("resize", () => {
   if (!state.showLayerEvidence) renderLayerProgress(state.payload.layers);
 });
 
+// Collapsible modules need a redraw after opening so canvases measure their
+// visible width instead of the zero-width closed state.
+document.querySelectorAll("details.collapsible-panel, details.collapsible-status-card, details.collapsible-rail-block")
+  .forEach((module) => {
+    module.addEventListener("toggle", () => {
+      if (module.open) window.requestAnimationFrame(() => window.dispatchEvent(new Event("resize")));
+    });
+  });
+document.querySelectorAll(".collapsible-panel-summary .legend").forEach((legend) => {
+  legend.addEventListener("click", (event) => event.stopPropagation());
+});
+
 const COLUMN_LAYOUT_STORAGE_KEY = "afp-state-monitor-column-layout-v1";
 
 function redrawChartsAfterColumnResize() {
