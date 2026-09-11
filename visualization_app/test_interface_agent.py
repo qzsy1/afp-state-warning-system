@@ -191,6 +191,8 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertNotIn("collapsible-status-card", html)
         self.assertIn('<section class="panel channel-panel">', html)
         self.assertNotIn('class="panel channel-panel collapsible-panel"', html)
+        self.assertIn("grid-template-rows: auto minmax(0, 1fr)", styles)
+        self.assertIn(".channel-panel { height: 100%", styles)
         self.assertGreaterEqual(html.count('class="status-card'), 4)
         self.assertIn("sensorCardsViewport", html)
         self.assertIn("sensorCardsResizer", html)

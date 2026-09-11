@@ -96,7 +96,7 @@ button, select, input { outline: none; }
   overflow: hidden;
 }
 .sidebar { grid-area: settings; height: 100%; min-height: 0; overflow: auto; scrollbar-width: thin; padding-right: 2px; }
-.main-content { grid-area: main; display: grid; height: 100%; min-width: 0; min-height: 0; overflow: auto; gap: 10px; padding-right: 2px; scrollbar-width: thin; }
+.main-content { grid-area: main; display: grid; grid-template-rows: auto minmax(0, 1fr); height: 100%; min-width: 0; min-height: 0; overflow: auto; gap: 10px; padding-right: 2px; scrollbar-width: thin; }
 .warning-rail { grid-area: warning; height: 100%; min-height: 0; overflow: auto; display: grid; gap: 8px; padding: 0 2px 2px 0; scrollbar-width: thin; }
 .evidence-dock { grid-area: evidence; display: grid; grid-template-columns: minmax(500px, 1.2fr) minmax(430px, .8fr); height: 100%; min-width: 0; min-height: 0; overflow: auto; gap: 10px; scrollbar-width: thin; }
 .left-resizer { grid-area: resize-left; }
@@ -593,7 +593,8 @@ canvas { display: block; width: 100%; }
 .probability-fill { height: 100%; background: linear-gradient(90deg, #4a9ac9, #e15a61); border-radius: 99px; }
 .probability-value { color: #365b77; text-align: right; font-weight: 800; }
 
-.channel-panel { padding-bottom: 10px; }
+.channel-panel { height: 100%; align-self: stretch; padding-bottom: 10px; }
+.channel-panel-content { min-height: 0; }
 .sensor-grid { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 7px; }
 .sensor-cards-viewport {
   min-width: 0;
