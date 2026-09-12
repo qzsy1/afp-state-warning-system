@@ -463,6 +463,8 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertIn("AbortController", script)
         self.assertIn("请求超时", script)
         self.assertIn("timeoutMs: 20000", script)
+        self.assertIn("hardwareCheckController", script)
+        self.assertIn("resetButton) resetButton.disabled = false", script)
 
     def test_original_frontend_groups_functional_modules_as_collapsible_sections(self) -> None:
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")

@@ -23,6 +23,7 @@ const state = {
   hardwareCheck: null,
   hardwareCheckFingerprint: "",
   hardwareCheckInProgress: false,
+  hardwareCheckController: null,
   hardwareCheckTimer: null,
   mysqlConnectionTests: {local: null, target: null},
   agentEvents: [],
@@ -451,22 +452,23 @@ function enforceStepOneInteger(control, minimum) {
   control.addEventListener("blur", normalize);
 }
 
-async function postJson(url, payload = {}, {timeoutMs = 30000} = {}) {
-  const controller = typeof AbortController === "function" ? new AbortController() : null;
-  const timer = window.setTimeout(() => controller?.abort(), Math.max(1000, Number(timeoutMs) || 30000));
+async function postJson(url, payload = {}, {timeoutMs = 30000, controller = null} = {}) {
+  const requestController = controller || (typeof AbortController === "function" ? new AbortController() : null);
+  const effectiveTimeout = Math.max(1000, Number(timeoutMs) || 30000);
+  const timer = window.setTimeout(() => requestController?.abort(), effectiveTimeout);
   try {
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
-      ...(controller ? {signal: controller.signal} : {}),
+      ...(requestController ? {signal: requestController.signal} : {}),
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || "请求失败");
     return result;
   } catch (error) {
     if (error?.name === "AbortError") {
-      throw new Error(`请求超时（${Math.round(Math.max(1000, Number(timeoutMs) || 30000) / 1000)}秒），请检查设备连接后重试`);
+      throw new Error(`请求超时（${Math.round(effectiveTimeout / 1000)}秒），请检查设备连接后重试`);
     }
     throw error;
   } finally {
@@ -3834,14 +3836,18 @@ async function testSensorConnection({automatic = false} = {}) {
   const node = controls.hardwareCheckStatus;
   const button = $("testSensorsButton");
   const resetButton = controls.resetSensorCheck;
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  state.hardwareCheckController = controller;
   if (button) button.disabled = true;
-  if (resetButton) resetButton.disabled = true;
+  // Keep reset available so an operator can cancel a driver that stopped
+  // responding instead of waiting for the timeout.
+  if (resetButton) resetButton.disabled = false;
   if (node) {
     node.className = "hardware-check-status checking";
     node.textContent = `${automatic ? "正在自动检查" : "正在检查"}，将逐一读取每个接口的全部已选通道…`;
   }
   try {
-    const result = await postJson("/api/acquisition/test", acquisitionConfig(), {timeoutMs: 20000});
+    const result = await postJson("/api/acquisition/test", acquisitionConfig(), {timeoutMs: 20000, controller});
     if (controls.processingMode.value !== "capture_only") {
       applyPredictionModelProfile(result.prediction_model, false);
     }
@@ -3862,6 +3868,7 @@ async function testSensorConnection({automatic = false} = {}) {
     return null;
   } finally {
     state.hardwareCheckInProgress = false;
+    if (state.hardwareCheckController === controller) state.hardwareCheckController = null;
     if (button) button.disabled = false;
     if (resetButton) resetButton.disabled = false;
   }
@@ -3871,6 +3878,13 @@ async function resetAndCheckHardware() {
   if (state.acquisitionStatus?.running) {
     toast("请先停止并保存当前采集，再重置检查状态");
     return;
+  }
+  if (state.hardwareCheckInProgress) {
+    state.hardwareCheckController?.abort();
+    const deadline = Date.now() + 1000;
+    while (state.hardwareCheckInProgress && Date.now() < deadline) {
+      await new Promise((resolve) => window.setTimeout(resolve, 20));
+    }
   }
   try {
     await postJson("/api/acquisition/reset-check", {});
