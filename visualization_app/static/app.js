@@ -3011,7 +3011,8 @@ function physicalCandidatesForRole(role) {
   const profile = sensorTypeProfile(role);
   const kind = profile.physical_kind || "";
   return (Array.isArray(state.physicalInterfaces) ? state.physicalInterfaces : [])
-    .filter((item) => !kind || item.kind === kind)
+    .map((item) => ({...item, kind: item.kind || item.interface_kind || item.type || ""}))
+    .filter((item) => !kind || item.kind === kind || (kind === "ethernet" && item.kind === "ethernet_adapter") || (kind === "serial" && item.kind === "com"))
     .filter((item) => item.detected !== false || item.driver_available);
 }
 
@@ -3021,7 +3022,12 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
   if (!select) return;
   const candidates = physicalCandidatesForRole(role);
   const current = preferredId || select.value;
-  select.replaceChildren(option("", "请选择已识别的实际接口"));
+  const profile = sensorTypeProfile(role);
+  const kindLabels = {usb_hid: "USB HID", usb_uvc: "USB/UVC", ethernet: "网卡", serial: "串口"};
+  const emptyText = candidates.length
+    ? "请选择已识别的实际接口"
+    : `未发现匹配的实际接口（需要${kindLabels[profile.physical_kind] || profile.physical_kind || "对应协议"}）`;
+  select.replaceChildren(option("", emptyText));
   candidates.forEach((item) => {
     const node = option(item.id, item.label || item.endpoint || item.id);
     node.dataset.kind = item.kind || "";
@@ -3031,6 +3037,7 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
   });
   if (current && candidates.some((item) => item.id === current)) select.value = current;
   const selected = select.selectedOptions?.[0];
+  select.disabled = !candidates.length;
   select.title = selected?.value
     ? `${selected.textContent}；协议类型：${sensorTypeProfile(role).protocol || "自定义"}`
     : "必须选择自动识别到的实际接口后才能启用";
