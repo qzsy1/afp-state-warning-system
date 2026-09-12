@@ -4,14 +4,34 @@ from __future__ import annotations
 import json
 import os
 import socket
+from contextlib import contextmanager
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from copy import deepcopy
 from typing import Any
 
-from langchain_core.runnables import RunnableLambda
-from langchain_core.tools import tool
-from langsmith import tracing_context
+try:
+    from langchain_core.runnables import RunnableLambda
+    from langchain_core.tools import tool
+    from langsmith import tracing_context
+except ImportError:  # pragma: no cover - used by the dependency-light EXE
+    class RunnableLambda:
+        def __init__(self, function):
+            self.function = function
+
+        def __or__(self, other):
+            return RunnableLambda(lambda value: other.invoke(self.invoke(value)))
+
+        def invoke(self, value, config=None):
+            return self.function(value)
+
+    def tool(function):
+        function.invoke = function
+        return function
+
+    @contextmanager
+    def tracing_context(**_kwargs):
+        yield
 
 
 class AgentGateError(ValueError):
