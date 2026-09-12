@@ -90,6 +90,7 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertIn("physical_fallback", script)
         self.assertIn("仅用于测试", script)
         self.assertIn("&& !item.physical_fallback", script)
+        self.assertIn("item.endpoint = selected.endpoint", script)
         self.assertIn("传感器设置与接口映射", html)
 
     def test_model_response_parser_accepts_fenced_json(self) -> None:

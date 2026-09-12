@@ -3056,7 +3056,9 @@ function autoAssignPhysicalInterfaces(configs) {
     item.physical_interface_kind = normalizedKind(selected);
     item.physical_verified = selected.detected !== false;
     item.physical_fallback = fallback || (item.physical_interface_kind !== profile.physical_kind);
-    if (fallback && selected.endpoint) item.endpoint = selected.endpoint;
+    if ((fallback || item.physical_interface_kind === "serial" || item.physical_interface_kind === "com") && selected.endpoint) {
+      item.endpoint = selected.endpoint;
+    }
     item.enabled = true;
     if (normalizedKind(selected) === "ethernet" || normalizedKind(selected) === "ethernet_adapter") assigned.ethernet = selected;
     if (!(role === "plc" || role === "robot")) used.add(selected.id);
