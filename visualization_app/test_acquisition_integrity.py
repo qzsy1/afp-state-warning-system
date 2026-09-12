@@ -104,6 +104,16 @@ class AcquisitionIntegrityTests(unittest.TestCase):
         hid_items = [item for item in result["physical_interfaces"] if item["kind"] == "usb_hid"]
         self.assertEqual(hid_items[0]["protocol"], "smrf_hid")
 
+    def test_discovery_keeps_usb_roles_assignable_when_devices_are_not_present(self) -> None:
+        with patch("acquisition.enumerate_smrf_hid_devices", return_value=[]), \
+             patch("acquisition.socket.create_connection", side_effect=OSError("offline")):
+            result = AcquisitionManager.discover_interfaces()
+        by_kind = {item["kind"]: item for item in result["physical_interfaces"]}
+        self.assertIn("usb_hid", by_kind)
+        self.assertIn("usb_uvc", by_kind)
+        self.assertTrue(by_kind["usb_hid"]["auto_assignable"])
+        self.assertTrue(by_kind["usb_uvc"]["auto_assignable"])
+
     def test_unchecked_channels_are_removed_from_interface_assignments(self) -> None:
         config = AcquisitionConfig(
             processing_mode="capture_only",

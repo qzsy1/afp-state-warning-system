@@ -86,6 +86,7 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertIn("interface-physical", script)
         self.assertIn("未发现匹配的实际接口", script)
         self.assertIn("interface_kind", script)
+        self.assertIn("autoAssignPhysicalInterfaces", script)
         self.assertIn("传感器设置与接口映射", html)
 
     def test_model_response_parser_accepts_fenced_json(self) -> None:

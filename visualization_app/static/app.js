@@ -3013,7 +3013,42 @@ function physicalCandidatesForRole(role) {
   return (Array.isArray(state.physicalInterfaces) ? state.physicalInterfaces : [])
     .map((item) => ({...item, kind: item.kind || item.interface_kind || item.type || ""}))
     .filter((item) => !kind || item.kind === kind || (kind === "ethernet" && item.kind === "ethernet_adapter") || (kind === "serial" && item.kind === "com"))
-    .filter((item) => item.detected !== false || item.driver_available);
+    .filter((item) => item.detected !== false || item.driver_available || item.auto_assignable);
+}
+
+function autoAssignPhysicalInterfaces(configs) {
+  const candidates = Array.isArray(state.physicalInterfaces) ? state.physicalInterfaces : [];
+  const used = new Set();
+  const assigned = {};
+  const normalizedKind = (item) => item.kind || item.interface_kind || item.type || "";
+  const compatible = (item, profile) => {
+    const kind = normalizedKind(item);
+    return !profile.physical_kind || kind === profile.physical_kind
+      || (profile.physical_kind === "ethernet" && kind === "ethernet_adapter")
+      || (profile.physical_kind === "serial" && kind === "com");
+  };
+  (configs || []).forEach((item) => {
+    const profile = sensorTypeProfile(item.role || "custom");
+    const role = item.role || "custom";
+    let selected = candidates.find((candidate) => candidate.id === item.physical_interface_id && compatible(candidate, profile));
+    if (!selected && (role === "plc" || role === "robot")) {
+      selected = assigned.ethernet || candidates.find((candidate) => compatible(candidate, profile) && candidate.detected !== false);
+    }
+    if (!selected) {
+      selected = candidates.find((candidate) => compatible(candidate, profile) && candidate.detected !== false && !used.has(candidate.id));
+    }
+    if (!selected) {
+      selected = candidates.find((candidate) => compatible(candidate, profile) && candidate.auto_assignable && !used.has(candidate.id));
+    }
+    if (!selected) return;
+    item.physical_interface_id = selected.id;
+    item.physical_interface_kind = normalizedKind(selected);
+    item.physical_verified = selected.detected !== false;
+    item.enabled = true;
+    if (normalizedKind(selected) === "ethernet" || normalizedKind(selected) === "ethernet_adapter") assigned.ethernet = selected;
+    if (!(role === "plc" || role === "robot")) used.add(selected.id);
+  });
+  return configs;
 }
 
 function refreshPhysicalInterfaceOptions(row, preferredId = "") {
@@ -3032,6 +3067,7 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
     const node = option(item.id, item.label || item.endpoint || item.id);
     node.dataset.kind = item.kind || "";
     node.dataset.detected = String(item.detected !== false);
+    node.dataset.assignable = String(Boolean(item.auto_assignable || item.driver_available));
     node.dataset.endpoint = item.endpoint || "";
     select.append(node);
   });
@@ -3043,7 +3079,8 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
     : "必须选择自动识别到的实际接口后才能启用";
   const enabled = row.querySelector(".interface-enabled");
   if (enabled) {
-    enabled.disabled = !selected?.value || selected.dataset.detected !== "true";
+    enabled.disabled = !selected?.value
+      || (selected.dataset.detected !== "true" && selected.dataset.assignable !== "true");
     if (enabled.disabled) enabled.checked = false;
   }
 }
@@ -3168,7 +3205,9 @@ async function discoverInterfaces() {
     state.physicalInterfaces = Array.isArray(result.physical_interfaces)
       ? result.physical_interfaces : [];
     const defaults = result.defaults || [];
-    state.interfaceCatalog = defaults.length ? defaults : defaultInterfaceCatalog();
+    state.interfaceCatalog = autoAssignPhysicalInterfaces(
+      (defaults.length ? defaults : defaultInterfaceCatalog()).map((item) => ({...item}))
+    );
     renderInterfacePanel(state.interfaceCatalog);
     markHardwareCheckStale("接口识别结果已更新");
     const ports = state.physicalInterfaces;

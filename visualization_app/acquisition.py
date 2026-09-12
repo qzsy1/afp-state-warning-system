@@ -2268,6 +2268,24 @@ class AcquisitionManager:
                 "label": "BSV UVC热像仪（驱动已安装，待数据验证）",
                 "detected": False, "driver_available": True,
             })
+        # Keep every standard logical slot assignable on startup.  These
+        # placeholders never claim that a sensor is connected; they only hold
+        # the protocol-specific USB/serial binding until a real data check is
+        # performed.
+        if not any(item.get("kind") == "usb_hid" for item in physical_interfaces):
+            physical_interfaces.append({
+                "id": "usb_hid:auto", "kind": "usb_hid",
+                "protocol": "smrf_hid", "endpoint": "SMRFCT08B",
+                "label": "USB HID（待识别，启动后检查）",
+                "detected": False, "auto_assignable": True,
+            })
+        if not any(item.get("kind") == "usb_uvc" for item in physical_interfaces):
+            physical_interfaces.append({
+                "id": "usb_uvc:auto", "kind": "usb_uvc",
+                "protocol": "uvc", "endpoint": "BSV UVC (WinUSB)",
+                "label": "USB/UVC（待识别，启动后检查）",
+                "detected": False, "auto_assignable": True,
+            })
         try:
             import psutil
 
@@ -2295,6 +2313,12 @@ class AcquisitionManager:
                 "protocol": "ethernet", "endpoint": "默认工控网卡",
                 "label": "默认工控网卡（需协议检查确认）",
                 "detected": False, "shared_roles": ["plc", "robot"],
+            })
+        if not any(item.get("kind") == "serial" for item in physical_interfaces):
+            physical_interfaces.append({
+                "id": "serial:auto", "kind": "serial", "protocol": "serial",
+                "endpoint": "COM8", "label": "串口（待识别，启动后检查）",
+                "detected": False, "auto_assignable": True,
             })
         rtsp_reachable = False
         try:
