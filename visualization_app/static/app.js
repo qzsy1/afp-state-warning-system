@@ -2940,6 +2940,7 @@ function interfaceConfigs() {
       physical_interface_id: row.querySelector(".interface-physical")?.value || "",
       physical_interface_kind: row.querySelector(".interface-physical")?.selectedOptions?.[0]?.dataset?.kind || "",
       physical_verified: row.querySelector(".interface-physical")?.selectedOptions?.[0]?.dataset?.detected === "true",
+      physical_fallback: row.querySelector(".interface-physical")?.selectedOptions?.[0]?.dataset?.fallback === "true",
       channel_map: channelMap,
     };
   });
@@ -3010,10 +3011,15 @@ function refreshInterfaceEndpointOptions() {
 function physicalCandidatesForRole(role) {
   const profile = sensorTypeProfile(role);
   const kind = profile.physical_kind || "";
-  return (Array.isArray(state.physicalInterfaces) ? state.physicalInterfaces : [])
+  const candidates = (Array.isArray(state.physicalInterfaces) ? state.physicalInterfaces : [])
     .map((item) => ({...item, kind: item.kind || item.interface_kind || item.type || ""}))
     .filter((item) => !kind || item.kind === kind || (kind === "ethernet" && item.kind === "ethernet_adapter") || (kind === "serial" && item.kind === "com"))
     .filter((item) => item.detected !== false || item.driver_available || item.auto_assignable);
+  if (candidates.some((item) => item.detected !== false)) return candidates;
+  const serialFallbacks = (Array.isArray(state.physicalInterfaces) ? state.physicalInterfaces : [])
+    .map((item) => ({...item, kind: item.kind || item.interface_kind || item.type || ""}))
+    .filter((item) => (item.kind === "serial" || item.kind === "com") && item.detected !== false);
+  return [...candidates, ...serialFallbacks];
 }
 
 function autoAssignPhysicalInterfaces(configs) {
@@ -3034,8 +3040,13 @@ function autoAssignPhysicalInterfaces(configs) {
     if (!selected && (role === "plc" || role === "robot")) {
       selected = assigned.ethernet || candidates.find((candidate) => compatible(candidate, profile) && candidate.detected !== false);
     }
+    let fallback = false;
     if (!selected) {
       selected = candidates.find((candidate) => compatible(candidate, profile) && candidate.detected !== false && !used.has(candidate.id));
+    }
+    if (!selected) {
+      selected = candidates.find((candidate) => (normalizedKind(candidate) === "serial" || normalizedKind(candidate) === "com") && candidate.detected !== false && !used.has(candidate.id));
+      fallback = Boolean(selected);
     }
     if (!selected) {
       selected = candidates.find((candidate) => compatible(candidate, profile) && candidate.auto_assignable && !used.has(candidate.id));
@@ -3044,6 +3055,8 @@ function autoAssignPhysicalInterfaces(configs) {
     item.physical_interface_id = selected.id;
     item.physical_interface_kind = normalizedKind(selected);
     item.physical_verified = selected.detected !== false;
+    item.physical_fallback = fallback || (item.physical_interface_kind !== profile.physical_kind);
+    if (fallback && selected.endpoint) item.endpoint = selected.endpoint;
     item.enabled = true;
     if (normalizedKind(selected) === "ethernet" || normalizedKind(selected) === "ethernet_adapter") assigned.ethernet = selected;
     if (!(role === "plc" || role === "robot")) used.add(selected.id);
@@ -3068,6 +3081,7 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
     node.dataset.kind = item.kind || "";
     node.dataset.detected = String(item.detected !== false);
     node.dataset.assignable = String(Boolean(item.auto_assignable || item.driver_available));
+    node.dataset.fallback = String(item.kind === "serial" && profile.physical_kind !== "serial");
     node.dataset.endpoint = item.endpoint || "";
     select.append(node);
   });
@@ -3083,6 +3097,16 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
       || (selected.dataset.detected !== "true" && selected.dataset.assignable !== "true");
     if (enabled.disabled) enabled.checked = false;
   }
+  let warning = row.querySelector(".interface-physical-warning");
+  if (!warning) {
+    warning = document.createElement("div");
+    warning.className = "interface-physical-warning control-note";
+    row.append(warning);
+  }
+  warning.textContent = selected?.dataset?.fallback === "true"
+    ? "警告：当前未识别到匹配协议，临时分配串口，仅用于测试"
+    : "";
+  warning.classList.toggle("hidden", selected?.dataset?.fallback !== "true");
 }
 
 function defaultInterfaceCatalog() {
@@ -3676,6 +3700,7 @@ function renderHardwareCheckResult(result, {automatic = false, live = false} = {
   const sensors = (Array.isArray(result?.sensors) ? result.sensors : [])
     .filter((item) => item.selected);
   const badInterfaces = interfaces.filter((item) => item.enabled !== false && !item.ok);
+  const fallbackInterfaces = interfaces.filter((item) => item.enabled !== false && item.physical_warning);
   const badSensors = sensors.filter((item) => !item.ok && item.blocking !== false);
   const nonBlockingMissingSensors = sensors.filter((item) => !item.ok && item.blocking === false);
   const waiting = [...interfaces, ...sensors].some((item) => item.state === "waiting");
@@ -3704,6 +3729,7 @@ function renderHardwareCheckResult(result, {automatic = false, live = false} = {
     const physical = item.physical_interface_id ? ` · 实际${item.physical_interface_id}` : "";
     return `${profile.label || item.role || "接口"} ${item.endpoint || item.id || "未填写地址"}${physical}（${item.message || hardwareStateLabel(item.state)}）`;
   });
+  appendDetails("接口绑定警告", fallbackInterfaces, (item) => `${item.id || "接口"}：${item.physical_warning}`);
   appendDetails("异常通道", badSensors, (item) => `${item.name}（${item.message || hardwareStateLabel(item.state)}）`);
   appendDetails(
     "未采集通道（不阻止启动）",

@@ -441,6 +441,7 @@ body.resizing-sensor-list { cursor: ns-resize; user-select: none; }
 .interface-config-row .interface-physical-label { grid-column: 1 / -1; }
 .interface-config-row .interface-physical { border-color: #3b82c4; background: #f8fcff; }
 .interface-config-row .interface-enabled:disabled { opacity: .55; cursor: not-allowed; }
+.interface-config-row .interface-physical-warning { grid-column: 1 / -1; color: #9a5b00; background: #fff7df; border-left: 3px solid #e0a62a; padding: 3px 5px; }
 .hardware-auto-toggle { display: flex; align-items: center; gap: 6px; margin: 6px 0 4px; color: #355f7e; font-size: 9px; font-weight: 700; }
 .hardware-auto-toggle input { width: 13px; height: 13px; margin: 0; accent-color: var(--blue); }
 .hardware-check-actions { margin-bottom: 5px; }

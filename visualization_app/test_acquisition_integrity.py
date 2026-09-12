@@ -89,6 +89,17 @@ class AcquisitionIntegrityTests(unittest.TestCase):
                 interface_channel_assignments={"m3232_pressure": ["薄膜压力"]},
             )
 
+    def test_physical_binding_allows_explicit_serial_fallback_for_testing(self) -> None:
+        config = AcquisitionConfig(
+            acquisition_mode="real", dataset_schema="new_collection_v11_3",
+            selected_sensors=["温度1"],
+            interfaces=[
+                {"id": "thermocouple_8ch", "enabled": True, "role": "thermocouple", "driver": "smrf_hid", "endpoint": "COM1", "physical_interface_id": "serial:COM1", "physical_interface_kind": "serial", "physical_fallback": True},
+            ],
+            interface_channel_assignments={"thermocouple_8ch": ["温度1"]},
+        )
+        self.assertTrue(config.interfaces[0]["physical_fallback"])
+
     def test_discovery_reports_physical_interface_metadata(self) -> None:
         hid = SimpleNamespace(
             label="SMRFCT08B (Serial=SMRF-01)", product="SMRFCT08B",

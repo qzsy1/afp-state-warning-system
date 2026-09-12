@@ -405,7 +405,8 @@ def _validate_physical_interface_bindings(
             )
         expected_kind = str(profile.get("physical_kind") or "")
         actual_kind = str(item.get("physical_interface_kind") or "")
-        if actual_kind and expected_kind and actual_kind != expected_kind:
+        fallback_binding = bool(item.get("physical_fallback", False))
+        if actual_kind and expected_kind and actual_kind != expected_kind and not fallback_binding:
             raise ValueError(
                 f"接口“{item.get('id', role)}”的物理接口类型与协议不匹配："
                 f"{actual_kind}，应为{expected_kind}"
@@ -708,6 +709,7 @@ class AcquisitionConfig:
                 or ""
             ).strip().lower()
             interface["physical_verified"] = bool(interface.get("physical_verified", False))
+            interface["physical_fallback"] = bool(interface.get("physical_fallback", False))
             normalized_interfaces.append(interface)
         if not normalized_interfaces:
             raise ValueError("至少配置一个采集接口")
@@ -2397,6 +2399,11 @@ class AcquisitionManager:
             physical_id = str(item.get("physical_interface_id") or "")
             physical_kind = str(item.get("physical_interface_kind") or profile.get("physical_kind") or "")
             protocol = str(profile.get("protocol") or item.get("driver") or "")
+            physical_fallback = bool(item.get("physical_fallback", False))
+            physical_warning = (
+                "当前未识别到匹配协议，已临时分配串口，仅用于测试"
+                if physical_fallback else ""
+            )
             expected = [
                 name for name in config.interface_channel_assignments.get(interface_id, [])
                 if name in selected
@@ -2406,7 +2413,8 @@ class AcquisitionManager:
                     "id": interface_id, "role": item.get("role", "custom"),
                     "driver": item.get("driver", ""), "endpoint": endpoint,
                     "physical_interface_id": physical_id, "physical_interface_kind": physical_kind,
-                    "protocol": protocol,
+                    "protocol": protocol, "physical_fallback": physical_fallback,
+                    "physical_warning": physical_warning,
                     "enabled": False, "expected_channels": expected,
                     "detected_channels": [], "missing_channels": [],
                     "invalid_channels": [], "sample_counts": {}, "errors": [],
@@ -2419,7 +2427,8 @@ class AcquisitionManager:
                     "id": interface_id, "role": item.get("role", "custom"),
                     "driver": item.get("driver", ""), "endpoint": endpoint,
                     "physical_interface_id": physical_id, "physical_interface_kind": physical_kind,
-                    "protocol": protocol,
+                    "protocol": protocol, "physical_fallback": physical_fallback,
+                    "physical_warning": physical_warning,
                     "enabled": True, "expected_channels": [],
                     "detected_channels": [], "missing_channels": [],
                     "invalid_channels": [], "sample_counts": {}, "errors": [],
@@ -2481,7 +2490,8 @@ class AcquisitionManager:
                 "id": interface_id, "role": item.get("role", "custom"),
                 "driver": item.get("driver", ""), "endpoint": endpoint,
                 "physical_interface_id": physical_id, "physical_interface_kind": physical_kind,
-                "protocol": protocol,
+                "protocol": protocol, "physical_fallback": physical_fallback,
+                "physical_warning": physical_warning,
                 "enabled": True, "expected_channels": expected,
                 "detected_channels": sorted(detected), "missing_channels": missing,
                 "invalid_channels": invalid_channels, "sample_counts": detected,
