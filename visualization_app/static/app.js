@@ -24,7 +24,6 @@ const state = {
   hardwareCheckFingerprint: "",
   hardwareCheckInProgress: false,
   hardwareCheckTimer: null,
-  autoCheckInterval: null,
   mysqlConnectionTests: {local: null, target: null},
   agentEvents: [],
   agentResult: null,
@@ -547,9 +546,6 @@ function renderAcquisitionStatus(status) {
     `${status.layer_file ? ` · 分层文件：${status.layer_file}` : ""}` +
     `${status.full_specimen_file ? ` · 完整试样：${status.full_specimen_file}` : ""}` +
     `${status.last_error ? ` · 错误：${status.last_error}` : ""}`;
-  if (Array.isArray(status.interfaces) && status.interfaces.length) {
-    updateAgentFromHardwareResult(status, {automatic: true});
-  }
 }
 
 function renderRuntimeStatus(payload = state.payload) {
@@ -2317,11 +2313,6 @@ async function initialize() {
     );
     await loadRealtime();
     scheduleAutomaticHardwareCheck(800);
-    if (!state.autoCheckInterval) {
-      state.autoCheckInterval = window.setInterval(
-        () => scheduleAutomaticHardwareCheck(0), 30000,
-      );
-    }
   } catch (error) {
     toast(error.message);
     $("connectionStatus").textContent = "初始化失败";
@@ -2398,8 +2389,10 @@ agentModelNameInput?.addEventListener("input", handleAgentInputChange);
 agentDiagnoseButton?.addEventListener("click", () => runAgentDiagnosis({automatic: false}));
 controls.resetSensorCheck?.addEventListener("click", resetAndCheckHardware);
 controls.autoHardwareCheck?.addEventListener("change", () => {
-  if (controls.autoHardwareCheck.checked) scheduleAutomaticHardwareCheck(200);
-  else if (state.hardwareCheckTimer) window.clearTimeout(state.hardwareCheckTimer);
+  if (!controls.autoHardwareCheck.checked && state.hardwareCheckTimer) {
+    window.clearTimeout(state.hardwareCheckTimer);
+    state.hardwareCheckTimer = null;
+  }
 });
 controls.discoverInterfaces?.addEventListener("click", discoverInterfaces);
 controls.addInterface?.addEventListener("click", addInterface);
@@ -3612,7 +3605,6 @@ function markHardwareCheckStale(reason = "配置已变化") {
     node.className = "hardware-check-status stale";
     node.textContent = `${reason}，需要重新检查接口和传感器通道。`;
   }
-  scheduleAutomaticHardwareCheck(700);
 }
 
 function scheduleAutomaticHardwareCheck(delay = 700) {
@@ -3699,5 +3691,4 @@ function renderLiveHardwareMonitor(status) {
     errors: status.last_error ? [status.last_error] : [],
   };
   renderHardwareCheckResult(result, {live: true});
-  updateAgentFromHardwareResult(result, {automatic: true});
 }

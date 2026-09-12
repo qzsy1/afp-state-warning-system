@@ -302,6 +302,14 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertIn('.collapsible-subsection:not([open]) > summary::after', styles)
         self.assertIn('content: "+"', styles)
 
+    def test_hardware_check_does_not_repeat_or_replace_agent_result(self) -> None:
+        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("scheduleAutomaticHardwareCheck(800)", script)
+        self.assertNotIn("autoCheckInterval", script)
+        self.assertNotIn("scheduleAutomaticHardwareCheck(0), 30000", script)
+        self.assertNotIn("updateAgentFromHardwareResult(status, {automatic: true});", script)
+        self.assertNotIn("updateAgentFromHardwareResult(result, {automatic: true});", script)
+
     def test_app_payload_accepts_key_and_all_events_for_local_backend_only(self) -> None:
         events = interface_agent.build_agent_events(mixed_interface_result())
         payload = {
