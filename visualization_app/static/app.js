@@ -29,6 +29,7 @@ const state = {
   agentResult: null,
   agentFingerprint: "",
   agentBusy: false,
+  agentDefaultKeyAvailable: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -1065,7 +1066,7 @@ function buildAgentEvents(hardwareResult) {
 }
 
 function renderAgentGate() {
-  const keyPresent = Boolean(agentApiKeyInput?.value.trim());
+  const keyPresent = Boolean(agentApiKeyInput?.value.trim()) || state.agentDefaultKeyAvailable;
   const modelPresent = Boolean(agentModelNameInput?.value.trim());
   const eventPresent = state.agentEvents.length > 0;
   const ready = eventPresent && !state.agentBusy;
@@ -1131,14 +1132,31 @@ function appendAgentDiagnostics(node) {
 function handleAgentInputChange() {
   renderAgentGate();
   const autoStatus = $("agentAutoStatus");
-  const keyPresent = Boolean(agentApiKeyInput?.value.trim());
+  const keyPresent = Boolean(agentApiKeyInput?.value.trim()) || state.agentDefaultKeyAvailable;
   const modelPresent = Boolean(agentModelNameInput?.value.trim());
   if (autoStatus && state.agentEvents.length) {
     autoStatus.textContent = keyPresent && modelPresent
-      ? "配置已填写；点击重新诊断全部异常后叠加硅基流动模型分析。"
+      ? state.agentDefaultKeyAvailable && !agentApiKeyInput?.value.trim()
+        ? "已检测到本机默认 API Key；点击重新诊断全部异常后叠加硅基流动模型分析。"
+        : "配置已填写；点击重新诊断全部异常后叠加硅基流动模型分析。"
       : (keyPresent || modelPresent)
         ? "API Key 与模型名称需同时填写；当前仍使用本地规则。"
         : "当前使用本地规则；无需 API Key。";
+  }
+}
+
+async function loadAgentDefaults() {
+  try {
+    const response = await fetch("/api/agent/defaults", {cache: "no-store"});
+    const defaults = await response.json();
+    if (!response.ok) return;
+    state.agentDefaultKeyAvailable = Boolean(defaults.default_key_available);
+    if (agentModelNameInput && !agentModelNameInput.value.trim()) {
+      agentModelNameInput.value = defaults.model_name || "deepseek-ai/DeepSeek-V3";
+    }
+    handleAgentInputChange();
+  } catch (_error) {
+    // The UI remains usable with explicit fields and local-rule fallback.
   }
 }
 
@@ -2239,6 +2257,7 @@ function renderLayerProgress(layers) {
 
 async function initialize() {
   try {
+    await loadAgentDefaults();
     syncLocalMysqlSection();
     syncTargetMysqlSection();
     await loadMysqlDefaults();

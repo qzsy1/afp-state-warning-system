@@ -3931,6 +3931,11 @@ class AppHandler(BaseHTTPRequestHandler):
                 {"status": "ok", "version": APP_VERSION, "build_id": BUILD_ID}
             )
             return
+        if parsed.path == "/api/agent/defaults":
+            from interface_agent import get_agent_defaults
+
+            self._send_json(get_agent_defaults())
+            return
         if parsed.path == "/api/training/status":
             query = parse_qs(parsed.query)
             self._send_json(self.dashboard.web_training.status(int(self._one(query, "after_seq", "0"))))

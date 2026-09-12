@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -430,6 +431,27 @@ _LOCAL_CHAIN = (
 
 
 SILICONFLOW_CHAT_COMPLETIONS_URL = "https://api.siliconflow.cn/v1/chat/completions"
+DEFAULT_SILICONFLOW_MODEL = "deepseek-ai/DeepSeek-V3"
+
+
+def get_agent_defaults() -> dict[str, Any]:
+    """Return safe UI defaults without returning the local API key."""
+
+    model_name = str(os.environ.get("AFP_SILICONFLOW_MODEL") or DEFAULT_SILICONFLOW_MODEL).strip()
+    return {
+        "model_name": model_name or DEFAULT_SILICONFLOW_MODEL,
+        "default_key_available": bool(str(os.environ.get("AFP_SILICONFLOW_API_KEY") or "").strip()),
+    }
+
+
+def _resolve_agent_credentials(api_key: str, model_name: str) -> tuple[str, str]:
+    """Use request values first, then optional machine-local environment defaults."""
+
+    clean_key = str(api_key or "").strip() or str(os.environ.get("AFP_SILICONFLOW_API_KEY") or "").strip()
+    clean_model = str(model_name or "").strip() or str(
+        os.environ.get("AFP_SILICONFLOW_MODEL") or DEFAULT_SILICONFLOW_MODEL
+    ).strip()
+    return clean_key, clean_model or DEFAULT_SILICONFLOW_MODEL
 
 
 def _content_to_text(content: Any) -> str:
@@ -612,7 +634,7 @@ def _request_siliconflow(
         method="POST",
     )
     try:
-        with urlopen(request, timeout=30) as response:
+        with urlopen(request, timeout=60) as response:
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
         if error.code in {401, 403}:
@@ -736,7 +758,7 @@ def run_interface_diagnoses(
         raise AgentGateError("当前没有可诊断的接口异常")
 
     diagnoses: list[dict[str, Any]] = []
-    display_model = str(model_name).strip() or "本地规则"
+    _, display_model = _resolve_agent_credentials(api_key, model_name)
     with tracing_context(enabled=False):
         for event in clean_events:
             local_result = _LOCAL_CHAIN.invoke(
@@ -745,8 +767,7 @@ def run_interface_diagnoses(
             )
             diagnoses.append(local_result["diagnosis"])
 
-    clean_key = str(api_key).strip()
-    clean_model = str(model_name).strip()
+    clean_key, clean_model = _resolve_agent_credentials(api_key, model_name)
     if not clean_key or not clean_model:
         return {
             "execution_mode": "local_rules",

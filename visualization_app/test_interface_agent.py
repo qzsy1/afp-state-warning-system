@@ -117,6 +117,37 @@ class InterfaceAgentTests(unittest.TestCase):
 
         self.assertEqual(parse(response), [{"event_index": 2, "analysis": "数据异常"}])
 
+    def test_agent_defaults_use_deepseek_v3_without_exposing_key(self) -> None:
+        with patch.dict(os.environ, {"AFP_SILICONFLOW_API_KEY": "sk-test-only"}, clear=False):
+            defaults = interface_agent.get_agent_defaults()
+
+        self.assertEqual(defaults["model_name"], "deepseek-ai/DeepSeek-V3")
+        self.assertTrue(defaults["default_key_available"])
+        self.assertNotIn("api_key", defaults)
+
+    def test_empty_request_uses_local_environment_key(self) -> None:
+        events = interface_agent.build_agent_events(mixed_interface_result())
+        captured: list[tuple[str, str]] = []
+
+        def successful_model(api_key, model_name, _events, local_diagnoses):
+            captured.append((api_key, model_name))
+            return [
+                {"event_index": index, "analysis": "环境变量密钥调用成功"}
+                for index in range(len(local_diagnoses))
+            ]
+
+        with patch.dict(
+            os.environ,
+            {"AFP_SILICONFLOW_API_KEY": "sk-test-only", "AFP_SILICONFLOW_MODEL": "deepseek-ai/DeepSeek-V3"},
+            clear=False,
+        ):
+            result = interface_agent.run_interface_diagnoses(
+                events, api_key="", model_name="", model_caller=successful_model
+            )
+
+        self.assertEqual(result["model_status"], "success")
+        self.assertEqual(captured, [("sk-test-only", "deepseek-ai/DeepSeek-V3")])
+
     def test_model_alias_fields_are_normalized_into_enhancement(self) -> None:
         result = interface_agent.run_interface_diagnoses(
             interface_agent.build_agent_events(mixed_interface_result()),
@@ -348,9 +379,12 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertIn("LangChain", html)
         self.assertIn("硅基流动", html)
         self.assertIn("本地规则", html)
+        self.assertIn("deepseek-ai/DeepSeek-V3", html)
+        self.assertIn("/api/agent/defaults", script)
         self.assertNotIn("工具调用轨迹", html)
         self.assertNotIn("agent-trace", script)
         self.assertIn("/api/agent/diagnose", app_source)
+        self.assertIn("/api/agent/defaults", app_source)
         self.assertIn("run_interface_diagnoses", app_source)
         self.assertIn("langchain-core==1.6.2", requirements)
 
