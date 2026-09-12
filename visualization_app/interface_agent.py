@@ -26,7 +26,11 @@ except ImportError:  # pragma: no cover - used by the dependency-light EXE
             return self.function(value)
 
     def tool(function):
-        function.invoke = function
+        def invoke(payload=None, **kwargs):
+            values = payload if isinstance(payload, dict) else kwargs
+            return function(**values)
+
+        function.invoke = invoke
         return function
 
     @contextmanager
