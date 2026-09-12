@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import interface_agent
 from interface_agent import (
     AgentGateError,
     build_agent_event,
@@ -74,6 +75,86 @@ def mixed_interface_result() -> dict:
 
 
 class InterfaceAgentTests(unittest.TestCase):
+    def test_build_events_keeps_every_abnormal_interface(self) -> None:
+        build_all = getattr(interface_agent, "build_agent_events", lambda _result: [])
+
+        events = build_all(mixed_interface_result())
+
+        self.assertEqual(len(events), 2)
+        self.assertEqual(
+            {(item["interface_id"], item["sensor_name"]) for item in events},
+            {("plc_process", "压力"), ("m3232_pressure", "薄膜压力")},
+        )
+
+    def test_missing_model_configuration_returns_all_local_diagnoses(self) -> None:
+        run_all = getattr(
+            interface_agent,
+            "run_interface_diagnoses",
+            lambda *_args, **_kwargs: {
+                "execution_mode": "missing",
+                "model_status": "missing",
+                "diagnoses": [],
+            },
+        )
+
+        result = run_all(
+            interface_agent.build_agent_events(mixed_interface_result()),
+            api_key="",
+            model_name="",
+        )
+
+        self.assertEqual(result["execution_mode"], "local_rules")
+        self.assertEqual(result["model_status"], "not_configured")
+        self.assertEqual(len(result["diagnoses"]), 2)
+        self.assertTrue(all("model_enhancement" not in item for item in result["diagnoses"]))
+
+    def test_valid_model_configuration_adds_enhancement_to_every_diagnosis(self) -> None:
+        def successful_model(_api_key, _model_name, _events, _local_diagnoses):
+            return [
+                {
+                    "event_index": 0,
+                    "analysis": "PLC 通信链路需要进一步核对",
+                    "possible_causes": ["模型补充原因 A"],
+                    "recommended_actions": ["模型补充建议 A"],
+                },
+                {
+                    "event_index": 1,
+                    "analysis": "M3232 原始帧需要进一步核对",
+                    "possible_causes": ["模型补充原因 B"],
+                    "recommended_actions": ["模型补充建议 B"],
+                },
+            ]
+
+        result = interface_agent.run_interface_diagnoses(
+            interface_agent.build_agent_events(mixed_interface_result()),
+            api_key="sk-test-only",
+            model_name="deepseek-ai/DeepSeek-V4-Flash",
+            model_caller=successful_model,
+        )
+
+        self.assertEqual(result["execution_mode"], "siliconflow_enhanced")
+        self.assertEqual(result["model_status"], "success")
+        self.assertEqual(
+            [item["model_enhancement"]["analysis"] for item in result["diagnoses"]],
+            ["PLC 通信链路需要进一步核对", "M3232 原始帧需要进一步核对"],
+        )
+
+    def test_invalid_model_configuration_falls_back_without_leaking_key(self) -> None:
+        def failed_model(_api_key, _model_name, _events, _local_diagnoses):
+            raise RuntimeError("401 invalid sk-test-only")
+
+        result = interface_agent.run_interface_diagnoses(
+            interface_agent.build_agent_events(mixed_interface_result()),
+            api_key="sk-test-only",
+            model_name="missing/model",
+            model_caller=failed_model,
+        )
+
+        self.assertEqual(result["execution_mode"], "local_rules")
+        self.assertEqual(result["model_status"], "failed")
+        self.assertEqual(len(result["diagnoses"]), 2)
+        self.assertNotIn("sk-test-only", json.dumps(result, ensure_ascii=False))
+
     def test_build_event_keeps_m3232_thin_film_pressure_identity(self) -> None:
         event = build_agent_event(m3232_result())
 
@@ -156,18 +237,23 @@ class InterfaceAgentTests(unittest.TestCase):
             "agentModelNameInput",
             "agentGateStatus",
             "agentDiagnoseButton",
-            "agentDiagnosisPanel",
+            "hardwareCheckStatus",
         ):
             self.assertIn(f'id="{element_id}"', html)
+        self.assertNotIn('id="agentDiagnosisPanel"', html)
         self.assertIn("/api/agent/diagnose", script)
-        self.assertIn("api_key_present", script)
-        self.assertNotIn("api_key: agentApiKeyInput.value", script)
+        self.assertIn("api_key: agentApiKeyInput.value.trim()", script)
+        self.assertNotIn("api_key_present", script)
+        self.assertIn("buildAgentEvents", script)
+        self.assertIn("result.diagnoses", script)
         self.assertIn("薄膜压力", html)
         self.assertIn("LangChain", html)
+        self.assertIn("硅基流动", html)
+        self.assertIn("本地规则", html)
         self.assertNotIn("工具调用轨迹", html)
         self.assertNotIn("agent-trace", script)
         self.assertIn("/api/agent/diagnose", app_source)
-        self.assertIn("run_interface_diagnosis", app_source)
+        self.assertIn("run_interface_diagnoses", app_source)
         self.assertIn("langchain-core==1.6.2", requirements)
 
     def test_original_frontend_groups_functional_modules_as_collapsible_sections(self) -> None:
@@ -216,20 +302,27 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertIn('.collapsible-subsection:not([open]) > summary::after', styles)
         self.assertIn('content: "+"', styles)
 
-    def test_app_payload_accepts_only_presence_flag_and_event(self) -> None:
+    def test_app_payload_accepts_key_and_all_events_for_local_backend_only(self) -> None:
+        events = interface_agent.build_agent_events(mixed_interface_result())
         payload = {
-            "api_key_present": True,
-            "model_name": "local-demo-model",
-            "event": build_agent_event(m3232_result()),
+            "api_key": "sk-test-only",
+            "model_name": "deepseek-ai/DeepSeek-V4-Flash",
+            "events": events,
         }
-        self.assertEqual(validate_agent_payload(payload), payload["event"])
+        try:
+            validated = validate_agent_payload(payload)
+        except ValueError:
+            validated = {"api_key": "", "model_name": "", "events": []}
+        self.assertEqual(validated["api_key"], "sk-test-only")
+        self.assertEqual(validated["model_name"], "deepseek-ai/DeepSeek-V4-Flash")
+        self.assertEqual(len(validated["events"]), 2)
 
-    def test_app_payload_rejects_secret_or_unknown_fields(self) -> None:
+    def test_app_payload_rejects_unknown_fields(self) -> None:
         payload = {
-            "api_key_present": True,
-            "model_name": "local-demo-model",
-            "event": build_agent_event(m3232_result()),
-            "api_key": "sk-secret",
+            "api_key": "sk-test-only",
+            "model_name": "deepseek-ai/DeepSeek-V4-Flash",
+            "events": interface_agent.build_agent_events(mixed_interface_result()),
+            "unexpected": "value",
         }
         with self.assertRaisesRegex(ValueError, "未允许字段"):
             validate_agent_payload(payload)

@@ -441,7 +441,7 @@ body.resizing-sensor-list { cursor: ns-resize; user-select: none; }
 .hardware-auto-toggle { display: flex; align-items: center; gap: 6px; margin: 6px 0 4px; color: #355f7e; font-size: 9px; font-weight: 700; }
 .hardware-auto-toggle input { width: 13px; height: 13px; margin: 0; accent-color: var(--blue); }
 .hardware-check-actions { margin-bottom: 5px; }
-.hardware-check-status { display: grid; gap: 3px; margin: 0 0 6px; padding: 7px 8px; color: #315d7c; background: #edf7fd; border: 1px solid #c7dfef; border-left-width: 4px; border-radius: 5px; font-size: 8.5px; line-height: 1.4; overflow-wrap: anywhere; }
+.hardware-check-status { display: grid; gap: 3px; max-height: 420px; margin: 0 0 6px; padding: 7px 8px; color: #315d7c; background: #edf7fd; border: 1px solid #c7dfef; border-left-width: 4px; border-radius: 5px; font-size: 8.5px; line-height: 1.4; overflow: auto; overflow-wrap: anywhere; }
 .hardware-check-status strong { font-size: 9.5px; }
 .hardware-check-status small { color: #6f8798; }
 .hardware-check-status.ok { color: #176646; background: #eefaf5; border-color: #9ed9be; }
@@ -462,21 +462,19 @@ body.resizing-sensor-list { cursor: ns-resize; user-select: none; }
 .agent-actions .control-note { flex: 1 1 auto; min-width: 0; }
 .agent-actions button { flex: 0 0 auto; }
 .agent-scope-note { margin: 0; color: #687a90; font-size: 8px; line-height: 1.45; }
-.agent-diagnosis-panel { min-width: 0; padding: 7px 8px; color: #496077; background: #fff; border: 1px solid #d8e1eb; border-radius: 5px; font-size: 9px; line-height: 1.5; overflow-wrap: anywhere; }
-.agent-diagnosis-panel.empty { color: #718397; background: #f8fafc; }
-.agent-diagnosis-panel.pending { color: #765d24; background: #fffaf0; border-color: #ead7a7; }
-.agent-event-summary, .agent-result-heading { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
-.agent-event-summary strong, .agent-result-heading strong { color: #3f2f67; }
-.agent-event-summary span, .agent-result-heading span { color: #7a6b8f; font-size: 8px; }
-.agent-result-heading { padding-bottom: 4px; border-bottom: 1px solid #e5dff0; }
-.agent-result-summary { margin: 5px 0; color: #354f67; font-weight: 700; }
-.agent-result-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
-.agent-result-grid > div { min-width: 0; padding: 4px 5px; background: #f8f7fc; border-radius: 4px; }
-.agent-result-grid b { display: block; color: #66528a; font-size: 8px; }
-.agent-result-grid span { display: block; overflow-wrap: anywhere; }
-.agent-result-grid ul { margin: 2px 0 0; padding-left: 15px; }
-.agent-boundary { display: block; margin-top: 5px; color: #7b8795; }
-@media (max-width: 520px) { .agent-input-grid, .agent-result-grid { grid-template-columns: minmax(0, 1fr); } .agent-actions { align-items: stretch; flex-direction: column; } .agent-actions button { width: 100%; } }
+.hardware-agent-results { display: grid; gap: 5px; margin-top: 4px; padding-top: 6px; border-top: 1px solid currentColor; }
+.hardware-agent-header { color: #4f3a78; font-weight: 800; }
+.hardware-agent-message { color: #6d567e; }
+.hardware-agent-item { display: grid; gap: 3px; min-width: 0; padding: 6px; color: #3b4f65; background: rgba(255, 255, 255, .82); border: 1px solid #d7cce5; border-radius: 4px; }
+.hardware-agent-title { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 3px 7px; color: #4f3a78; }
+.hardware-agent-title span { color: #7b618f; font-size: 8px; }
+.hardware-agent-grid { display: grid; gap: 4px; }
+.hardware-agent-grid > div, .hardware-agent-model { padding: 4px 5px; background: #f7f4fb; border-radius: 3px; }
+.hardware-agent-item b { color: #66528a; }
+.hardware-agent-item ul { margin: 2px 0 0; padding-left: 15px; }
+.hardware-agent-item small { color: #7b8795; }
+.hardware-agent-model { display: grid; gap: 2px; border-left: 3px solid #7b61a8; }
+@media (max-width: 520px) { .agent-input-grid { grid-template-columns: minmax(0, 1fr); } .agent-actions { align-items: stretch; flex-direction: column; } .agent-actions button { width: 100%; } }
 .acquisition-parameter-panel {
   display: grid;
   gap: 0;

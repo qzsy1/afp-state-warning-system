@@ -1,11 +1,10 @@
-"""Local LangChain diagnosis for the original AFP acquisition UI.
-
-The module deliberately accepts only a normalized hardware-check event.  It
-does not receive credentials, instantiate a provider model, or perform network
-I/O; LangChain Core is used only to make the local tool sequence auditable.
-"""
+"""Local-first LangChain diagnosis for the original AFP acquisition UI."""
 from __future__ import annotations
 
+import json
+import socket
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from copy import deepcopy
 from typing import Any
 
@@ -16,6 +15,14 @@ from langsmith import tracing_context
 
 class AgentGateError(ValueError):
     """Raised when the UI gate is not satisfied."""
+
+
+class SiliconFlowCallError(RuntimeError):
+    """A sanitized provider failure that is safe to return to the local UI."""
+
+    def __init__(self, public_message: str):
+        super().__init__(public_message)
+        self.public_message = public_message
 
 
 _INTERFACE_LABELS = {
@@ -53,26 +60,36 @@ _EVIDENCE_FIELDS = {
 
 
 def validate_agent_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Validate the browser payload without accepting credential material."""
+    """Validate one local request before any optional provider call."""
 
-    allowed = {"api_key_present", "model_name", "event"}
+    allowed = {"api_key", "model_name", "events"}
     unexpected = set(payload or {}) - allowed
     if unexpected:
-        raise ValueError("Agent 请求包含未允许字段；API Key、密码或令牌原文不得发送")
-    event = (payload or {}).get("event")
-    if not isinstance(event, dict):
-        raise ValueError("Agent 请求缺少接口异常事件")
-    unexpected_event = set(event) - _EVENT_FIELDS
-    if unexpected_event:
-        raise ValueError("Agent 事件包含未允许字段；不得携带凭据或其他秘密")
-    evidence = event.get("evidence")
-    if evidence is not None:
-        if not isinstance(evidence, dict):
-            raise ValueError("Agent 事件证据必须是对象")
-        unexpected_evidence = set(evidence) - _EVIDENCE_FIELDS
-        if unexpected_evidence:
-            raise ValueError("Agent 事件证据包含未允许字段")
-    return event
+        raise ValueError("Agent 请求包含未允许字段")
+    api_key = str((payload or {}).get("api_key") or "").strip()
+    model_name = str((payload or {}).get("model_name") or "").strip()
+    if len(api_key) > 512:
+        raise ValueError("API Key 长度无效")
+    if len(model_name) > 240:
+        raise ValueError("模型名称长度无效")
+    events = (payload or {}).get("events")
+    if not isinstance(events, list) or not events or len(events) > 64:
+        raise ValueError("Agent 请求缺少有效的接口异常列表")
+    clean_events: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            raise ValueError("Agent 异常条目必须是对象")
+        unexpected_event = set(event) - _EVENT_FIELDS
+        if unexpected_event:
+            raise ValueError("Agent 异常条目包含未允许字段")
+        evidence = event.get("evidence")
+        if evidence is not None:
+            if not isinstance(evidence, dict):
+                raise ValueError("Agent 事件证据必须是对象")
+            if set(evidence) - _EVIDENCE_FIELDS:
+                raise ValueError("Agent 事件证据包含未允许字段")
+        clean_events.append(_clean_event(event))
+    return {"api_key": api_key, "model_name": model_name, "events": clean_events}
 
 
 def _trace(context: dict[str, Any], step_id: str, title: str, detail: str) -> None:
@@ -158,6 +175,75 @@ def build_agent_event(hardware_result: dict[str, Any]) -> dict[str, Any] | None:
             "simulated": bool(hardware_result.get("simulated", False)),
         }
     )
+
+
+def build_agent_events(hardware_result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Convert every abnormal interface or selected sensor into an event."""
+
+    interfaces = [
+        item
+        for item in hardware_result.get("interfaces") or []
+        if isinstance(item, dict) and item.get("enabled", True) and not item.get("ok")
+    ]
+    sensors = {
+        str(item.get("name")): item
+        for item in hardware_result.get("sensors") or []
+        if isinstance(item, dict) and item.get("selected") and not item.get("ok")
+    }
+    events: list[dict[str, Any]] = []
+    covered_sensors: set[str] = set()
+
+    for interface in interfaces:
+        names = list(
+            dict.fromkeys(
+                str(name)
+                for name in [
+                    *(interface.get("invalid_channels") or []),
+                    *(interface.get("missing_channels") or []),
+                ]
+                if str(name)
+            )
+        )
+        if not names:
+            names = [
+                str(name)
+                for name in interface.get("expected_channels") or []
+                if str(name) in sensors
+            ]
+        if not names:
+            event = build_agent_event(
+                {"simulated": hardware_result.get("simulated", False), "interfaces": [interface], "sensors": []}
+            )
+            if event:
+                events.append(event)
+            continue
+        for name in names:
+            event = build_agent_event(
+                {
+                    "simulated": hardware_result.get("simulated", False),
+                    "interfaces": [interface],
+                    "sensors": [sensors[name]] if name in sensors else [],
+                }
+            )
+            if event:
+                event["sensor_name"] = name
+                event["channels"] = [name]
+                events.append(_clean_event(event))
+                covered_sensors.add(name)
+
+    for name, sensor in sensors.items():
+        if name in covered_sensors:
+            continue
+        event = build_agent_event(
+            {"simulated": hardware_result.get("simulated", False), "interfaces": [], "sensors": [sensor]}
+        )
+        if event:
+            events.append(event)
+
+    unique: dict[tuple[str, str], dict[str, Any]] = {}
+    for event in events:
+        unique[(str(event.get("interface_id")), str(event.get("sensor_name")))] = event
+    return list(unique.values())
 
 
 @tool
@@ -341,6 +427,209 @@ _LOCAL_CHAIN = (
     | RunnableLambda(_call_report_tool)
     | RunnableLambda(_complete)
 )
+
+
+SILICONFLOW_CHAT_COMPLETIONS_URL = "https://api.siliconflow.cn/v1/chat/completions"
+
+
+def call_siliconflow_model(
+    api_key: str,
+    model_name: str,
+    events: list[dict[str, Any]],
+    local_diagnoses: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Request one structured enhancement for all local diagnoses."""
+
+    prompt_data = [
+        {
+            "event_index": index,
+            "interface": item.get("interface_label"),
+            "endpoint": events[index].get("endpoint"),
+            "sensor": item.get("sensor_name"),
+            "channels": item.get("channels"),
+            "state": events[index].get("state"),
+            "original_error": item.get("error_message"),
+            "evidence": item.get("evidence"),
+            "local_fault_type": item.get("fault_type"),
+            "local_causes": item.get("possible_causes"),
+            "local_actions": item.get("recommended_actions"),
+        }
+        for index, item in enumerate(local_diagnoses)
+    ]
+    payload = {
+        "model": model_name,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "你是工业传感器接口诊断助手。只能基于给定证据补充分析，不能把推测写成已确认硬件故障。"
+                    "输出 JSON 对象，键 diagnoses 为数组；每项包含 event_index、analysis、"
+                    "possible_causes、recommended_actions。必须覆盖每个 event_index。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(prompt_data, ensure_ascii=False, separators=(",", ":")),
+            },
+        ],
+        "response_format": {"type": "json_object"},
+        "stream": False,
+        "temperature": 0.2,
+        "max_tokens": 1600,
+    }
+    request = Request(
+        SILICONFLOW_CHAT_COMPLETIONS_URL,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=15) as response:
+            response_data = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        if error.code in {401, 403}:
+            raise SiliconFlowCallError("硅基流动 API Key 无效或没有调用权限") from None
+        if error.code in {400, 404}:
+            raise SiliconFlowCallError("硅基流动模型名称无效或请求不受支持") from None
+        if error.code == 429:
+            raise SiliconFlowCallError("硅基流动调用受限或账户额度不足") from None
+        raise SiliconFlowCallError(f"硅基流动服务暂不可用（HTTP {error.code}）") from None
+    except (URLError, TimeoutError, socket.timeout):
+        raise SiliconFlowCallError("连接硅基流动超时或网络不可用") from None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise SiliconFlowCallError("硅基流动返回了无法解析的响应") from None
+
+    try:
+        content = response_data["choices"][0]["message"]["content"]
+        parsed = json.loads(content)
+        diagnoses = parsed["diagnoses"]
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+        raise SiliconFlowCallError("硅基流动模型未返回完整的结构化诊断") from None
+    if not isinstance(diagnoses, list):
+        raise SiliconFlowCallError("硅基流动模型未返回完整的结构化诊断")
+    return diagnoses
+
+
+def _call_model_runnable(context: dict[str, Any]) -> list[dict[str, Any]]:
+    return call_siliconflow_model(
+        context["api_key"],
+        context["model_name"],
+        context["events"],
+        context["local_diagnoses"],
+    )
+
+
+_MODEL_ENHANCEMENT_CHAIN = RunnableLambda(_call_model_runnable)
+
+
+def _clean_model_enhancements(
+    items: list[dict[str, Any]], expected_count: int
+) -> dict[int, dict[str, Any]]:
+    cleaned: dict[int, dict[str, Any]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            index = int(item.get("event_index"))
+        except (TypeError, ValueError):
+            continue
+        if index < 0 or index >= expected_count:
+            continue
+        analysis = str(item.get("analysis") or "").strip()[:1200]
+        causes = [str(value).strip()[:300] for value in item.get("possible_causes") or [] if str(value).strip()][:6]
+        actions = [str(value).strip()[:300] for value in item.get("recommended_actions") or [] if str(value).strip()][:6]
+        if analysis or causes or actions:
+            cleaned[index] = {
+                "analysis": analysis,
+                "possible_causes": causes,
+                "recommended_actions": actions,
+            }
+    if len(cleaned) != expected_count:
+        raise SiliconFlowCallError("硅基流动模型未覆盖全部异常，已保留完整本地诊断")
+    return cleaned
+
+
+def run_interface_diagnoses(
+    events: list[dict[str, Any]] | None,
+    *,
+    api_key: str,
+    model_name: str,
+    model_caller: Any = None,
+) -> dict[str, Any]:
+    """Run the local LangChain flow for every reported abnormality."""
+
+    clean_events = [
+        _clean_event(event)
+        for event in events or []
+        if isinstance(event, dict)
+        and str(event.get("state")) not in {"ok", "healthy", "disabled", "video_only"}
+    ]
+    if not clean_events:
+        raise AgentGateError("当前没有可诊断的接口异常")
+
+    diagnoses: list[dict[str, Any]] = []
+    display_model = str(model_name).strip() or "本地规则"
+    with tracing_context(enabled=False):
+        for event in clean_events:
+            local_result = _LOCAL_CHAIN.invoke(
+                {"event": event, "model_name": display_model, "trace": []},
+                config={"callbacks": []},
+            )
+            diagnoses.append(local_result["diagnosis"])
+
+    clean_key = str(api_key).strip()
+    clean_model = str(model_name).strip()
+    if not clean_key or not clean_model:
+        return {
+            "execution_mode": "local_rules",
+            "model_status": "not_configured",
+            "model_message": "未配置完整的 API Key 和模型名称，已使用本地规则",
+            "model_name": clean_model,
+            "diagnoses": diagnoses,
+        }
+
+    caller = model_caller or call_siliconflow_model
+    try:
+        if model_caller is None:
+            with tracing_context(enabled=False):
+                raw_enhancements = _MODEL_ENHANCEMENT_CHAIN.invoke(
+                    {
+                        "api_key": clean_key,
+                        "model_name": clean_model,
+                        "events": clean_events,
+                        "local_diagnoses": diagnoses,
+                    },
+                    config={"callbacks": []},
+                )
+        else:
+            raw_enhancements = caller(clean_key, clean_model, clean_events, diagnoses)
+        enhancements = _clean_model_enhancements(
+            raw_enhancements, len(diagnoses)
+        )
+        for index, diagnosis in enumerate(diagnoses):
+            diagnosis["model_enhancement"] = enhancements[index]
+        return {
+            "execution_mode": "siliconflow_enhanced",
+            "model_status": "success",
+            "model_message": "硅基流动模型增强完成",
+            "model_name": clean_model,
+            "diagnoses": diagnoses,
+        }
+    except SiliconFlowCallError as error:
+        message = error.public_message
+    except Exception:
+        message = "硅基流动模型调用失败，已使用本地规则"
+    return {
+        "execution_mode": "local_rules",
+        "model_status": "failed",
+        "model_message": message,
+        "model_name": clean_model,
+        "diagnoses": diagnoses,
+    }
 
 
 def run_interface_diagnosis(
