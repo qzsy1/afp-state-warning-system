@@ -432,16 +432,124 @@ _LOCAL_CHAIN = (
 SILICONFLOW_CHAT_COMPLETIONS_URL = "https://api.siliconflow.cn/v1/chat/completions"
 
 
-def call_siliconflow_model(
-    api_key: str,
-    model_name: str,
+def _content_to_text(content: Any) -> str:
+    """Flatten OpenAI-compatible text content into one string.
+
+    SiliconFlow models normally return a string, but some compatible gateways
+    return a list of typed content blocks.  Keeping this conversion local lets
+    the rest of the parser handle both forms without weakening validation.
+    """
+
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        text = content.get("text")
+        if isinstance(text, str):
+            return text
+        nested = content.get("content")
+        if nested is not None:
+            return _content_to_text(nested)
+        return ""
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                elif block.get("content") is not None:
+                    parts.append(_content_to_text(block.get("content")))
+        return "".join(parts)
+    return ""
+
+
+def _json_candidates(text: str) -> list[Any]:
+    """Return JSON values found in fenced, prefixed, or plain model output."""
+
+    source = str(text or "").replace("\ufeff", "").strip()
+    if not source:
+        return []
+    candidates: list[str] = []
+    if "```" in source:
+        chunks = source.split("```")
+        for index in range(1, len(chunks), 2):
+            chunk = chunks[index].strip()
+            if chunk.lower().startswith("json"):
+                chunk = chunk[4:].lstrip(" :\t\r\n")
+            if chunk:
+                candidates.append(chunk)
+    candidates.append(source)
+    decoder = json.JSONDecoder()
+    for start, char in enumerate(source):
+        if char not in "[{":
+            continue
+        try:
+            _, end = decoder.raw_decode(source[start:])
+        except json.JSONDecodeError:
+            continue
+        candidates.append(source[start : start + end])
+
+    parsed: list[Any] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            parsed.append(json.loads(candidate))
+        except (TypeError, json.JSONDecodeError):
+            continue
+    return parsed
+
+
+def parse_model_diagnoses(response_data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract the diagnoses array from common SiliconFlow response shapes."""
+
+    try:
+        message = response_data["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        raise SiliconFlowCallError("硅基流动响应缺少 choices/message 字段") from None
+    if not isinstance(message, dict):
+        raise SiliconFlowCallError("硅基流动响应的 message 格式无效") from None
+
+    content = message.get("content")
+    if content is None or content == "":
+        # A few reasoning-capable models put their final text in this field.
+        content = message.get("reasoning_content")
+    if isinstance(content, dict):
+        parsed_values: list[Any] = [content]
+    else:
+        parsed_values = _json_candidates(_content_to_text(content))
+
+    for parsed in parsed_values:
+        if isinstance(parsed, dict):
+            diagnoses = parsed.get("diagnoses")
+            if isinstance(diagnoses, list):
+                return [item for item in diagnoses if isinstance(item, dict)]
+            # Accept a one-item object returned without the wrapper; coverage
+            # validation still happens in _clean_model_enhancements.
+            if parsed.get("event_index") is not None:
+                return [parsed]
+        elif isinstance(parsed, list):
+            items = [item for item in parsed if isinstance(item, dict)]
+            if items:
+                return items
+    raise SiliconFlowCallError("硅基流动模型响应格式无法解析，已保留完整本地诊断") from None
+
+
+def _model_prompt_data(
     events: list[dict[str, Any]],
     local_diagnoses: list[dict[str, Any]],
+    *,
+    compact: bool = False,
 ) -> list[dict[str, Any]]:
-    """Request one structured enhancement for all local diagnoses."""
+    """Build a bounded prompt so large event batches do not truncate JSON."""
 
-    prompt_data = [
-        {
+    result: list[dict[str, Any]] = []
+    for index, item in enumerate(local_diagnoses):
+        base = {
             "event_index": index,
             "interface": item.get("interface_label"),
             "endpoint": events[index].get("endpoint"),
@@ -449,22 +557,37 @@ def call_siliconflow_model(
             "channels": item.get("channels"),
             "state": events[index].get("state"),
             "original_error": item.get("error_message"),
-            "evidence": item.get("evidence"),
-            "local_fault_type": item.get("fault_type"),
-            "local_causes": item.get("possible_causes"),
-            "local_actions": item.get("recommended_actions"),
         }
-        for index, item in enumerate(local_diagnoses)
-    ]
+        if not compact:
+            base.update(
+                {
+                    "evidence": item.get("evidence"),
+                    "local_fault_type": item.get("fault_type"),
+                    "local_causes": item.get("possible_causes"),
+                    "local_actions": item.get("recommended_actions"),
+                }
+            )
+        result.append(base)
+    return result
+
+
+def _request_siliconflow(
+    api_key: str,
+    model_name: str,
+    prompt_data: list[dict[str, Any]],
+    *,
+    max_tokens: int,
+    include_response_format: bool = True,
+) -> dict[str, Any]:
     payload = {
         "model": model_name,
         "messages": [
             {
                 "role": "system",
                 "content": (
-                    "你是工业传感器接口诊断助手。只能基于给定证据补充分析，不能把推测写成已确认硬件故障。"
-                    "输出 JSON 对象，键 diagnoses 为数组；每项包含 event_index、analysis、"
-                    "possible_causes、recommended_actions。必须覆盖每个 event_index。"
+                    "你是工业传感器接口诊断助手。只能基于给定证据分析，不能把推测写成已确认硬件故障。"
+                    "只输出一个 JSON 对象，不要 Markdown、不要解释文字。对象必须只有 diagnoses 数组；"
+                    "数组每项包含 event_index、analysis、possible_causes、recommended_actions，且覆盖所有 event_index。"
                 ),
             },
             {
@@ -472,11 +595,12 @@ def call_siliconflow_model(
                 "content": json.dumps(prompt_data, ensure_ascii=False, separators=(",", ":")),
             },
         ],
-        "response_format": {"type": "json_object"},
         "stream": False,
-        "temperature": 0.2,
-        "max_tokens": 1600,
+        "temperature": 0.1,
+        "max_tokens": max_tokens,
     }
+    if include_response_format:
+        payload["response_format"] = {"type": "json_object"}
     request = Request(
         SILICONFLOW_CHAT_COMPLETIONS_URL,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -488,8 +612,8 @@ def call_siliconflow_model(
         method="POST",
     )
     try:
-        with urlopen(request, timeout=15) as response:
-            response_data = json.loads(response.read().decode("utf-8"))
+        with urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
         if error.code in {401, 403}:
             raise SiliconFlowCallError("硅基流动 API Key 无效或没有调用权限") from None
@@ -503,15 +627,47 @@ def call_siliconflow_model(
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise SiliconFlowCallError("硅基流动返回了无法解析的响应") from None
 
-    try:
-        content = response_data["choices"][0]["message"]["content"]
-        parsed = json.loads(content)
-        diagnoses = parsed["diagnoses"]
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError):
-        raise SiliconFlowCallError("硅基流动模型未返回完整的结构化诊断") from None
-    if not isinstance(diagnoses, list):
-        raise SiliconFlowCallError("硅基流动模型未返回完整的结构化诊断")
-    return diagnoses
+
+def call_siliconflow_model(
+    api_key: str,
+    model_name: str,
+    events: list[dict[str, Any]],
+    local_diagnoses: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Request structured enhancements, retrying once with a compact prompt."""
+
+    if not events or not local_diagnoses:
+        raise SiliconFlowCallError("没有可发送给硅基流动的诊断数据")
+    expected_count = len(local_diagnoses)
+    attempts = (
+        (_model_prompt_data(events, local_diagnoses), max(4096, expected_count * 240), True),
+        (_model_prompt_data(events, local_diagnoses, compact=True), max(4096, expected_count * 180), False),
+    )
+    last_error: SiliconFlowCallError | None = None
+    for prompt_data, max_tokens, include_response_format in attempts:
+        try:
+            response_data = _request_siliconflow(
+                api_key,
+                model_name,
+                prompt_data,
+                max_tokens=min(max_tokens, 8192),
+                include_response_format=include_response_format,
+            )
+            diagnoses = parse_model_diagnoses(response_data)
+            # If the provider returned only part of the batch, the compact retry
+            # gets a chance to recover instead of silently accepting a partial result.
+            indexes = {
+                int(item.get("event_index"))
+                for item in diagnoses
+                if isinstance(item, dict)
+                and str(item.get("event_index", "")).strip().lstrip("-").isdigit()
+            }
+            if len(indexes) == expected_count and indexes == set(range(expected_count)):
+                return diagnoses
+            last_error = SiliconFlowCallError("硅基流动模型未覆盖全部异常，已自动重试")
+        except SiliconFlowCallError as error:
+            last_error = error
+    raise last_error or SiliconFlowCallError("硅基流动模型调用失败，已使用本地规则")
 
 
 def _call_model_runnable(context: dict[str, Any]) -> list[dict[str, Any]]:
@@ -539,9 +695,17 @@ def _clean_model_enhancements(
             continue
         if index < 0 or index >= expected_count:
             continue
-        analysis = str(item.get("analysis") or "").strip()[:1200]
-        causes = [str(value).strip()[:300] for value in item.get("possible_causes") or [] if str(value).strip()][:6]
-        actions = [str(value).strip()[:300] for value in item.get("recommended_actions") or [] if str(value).strip()][:6]
+        analysis = str(
+            item.get("analysis") or item.get("summary") or item.get("diagnosis") or item.get("reason") or ""
+        ).strip()[:1200]
+        raw_causes = item.get("possible_causes") or item.get("causes") or []
+        raw_actions = item.get("recommended_actions") or item.get("actions") or []
+        if isinstance(raw_causes, str):
+            raw_causes = [raw_causes]
+        if isinstance(raw_actions, str):
+            raw_actions = [raw_actions]
+        causes = [str(value).strip()[:300] for value in raw_causes if str(value).strip()][:6]
+        actions = [str(value).strip()[:300] for value in raw_actions if str(value).strip()][:6]
         if analysis or causes or actions:
             cleaned[index] = {
                 "analysis": analysis,

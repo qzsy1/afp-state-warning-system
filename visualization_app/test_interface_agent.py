@@ -4,6 +4,7 @@ import json
 import os
 import unittest
 from pathlib import Path
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 import interface_agent
@@ -75,6 +76,103 @@ def mixed_interface_result() -> dict:
 
 
 class InterfaceAgentTests(unittest.TestCase):
+    def test_model_response_parser_accepts_fenced_json(self) -> None:
+        parse = getattr(interface_agent, "parse_model_diagnoses")
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "```json\n{\"diagnoses\":[{\"event_index\":0,\"analysis\":\"链路异常\"}]}\n```"
+                    }
+                }
+            ]
+        }
+
+        self.assertEqual(parse(response), [{"event_index": 0, "analysis": "链路异常"}])
+
+    def test_model_response_parser_accepts_structured_content_blocks(self) -> None:
+        parse = getattr(interface_agent, "parse_model_diagnoses")
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": [
+                            {"type": "text", "text": "前置说明"},
+                            {"type": "text", "text": "{\"diagnoses\":[{\"event_index\":1,\"analysis\":\"无数据\"}]}"},
+                        ]
+                    }
+                }
+            ]
+        }
+
+        self.assertEqual(parse(response), [{"event_index": 1, "analysis": "无数据"}])
+
+    def test_model_response_parser_accepts_direct_object_content(self) -> None:
+        parse = getattr(interface_agent, "parse_model_diagnoses")
+        response = {
+            "choices": [
+                {"message": {"content": {"diagnoses": [{"event_index": 2, "analysis": "数据异常"}]}}}
+            ]
+        }
+
+        self.assertEqual(parse(response), [{"event_index": 2, "analysis": "数据异常"}])
+
+    def test_model_alias_fields_are_normalized_into_enhancement(self) -> None:
+        result = interface_agent.run_interface_diagnoses(
+            interface_agent.build_agent_events(mixed_interface_result()),
+            api_key="sk-test-only",
+            model_name="deepseek-ai/DeepSeek-V4-Flash",
+            model_caller=lambda *_args: [
+                {"event_index": 0, "summary": "PLC 链路分析", "causes": ["网络不通"], "actions": ["检查网线"]},
+                {"event_index": 1, "diagnosis": "M3232 帧分析", "causes": ["帧格式"], "actions": ["抓取原始帧"]},
+            ],
+        )
+
+        self.assertEqual(result["model_status"], "success")
+        self.assertEqual(result["diagnoses"][0]["model_enhancement"]["analysis"], "PLC 链路分析")
+        self.assertEqual(result["diagnoses"][1]["model_enhancement"]["recommended_actions"], ["抓取原始帧"])
+
+    def test_siliconflow_retries_without_json_mode_when_provider_rejects_it(self) -> None:
+        events = interface_agent.build_agent_events(mixed_interface_result())
+        local_diagnoses = [
+            {"interface_label": "PLC", "sensor_name": "压力", "channels": ["压力"], "error_message": "无数据", "evidence": {}, "fault_type": "接口未收到有效数据", "possible_causes": [], "recommended_actions": []},
+            {"interface_label": "M3232", "sensor_name": "薄膜压力", "channels": ["薄膜压力"], "error_message": "非数值", "evidence": {}, "fault_type": "采集数据解析异常", "possible_causes": [], "recommended_actions": []},
+        ]
+        bodies: list[dict] = []
+
+        class FakeResponse:
+            def __init__(self, body: dict):
+                self.body = json.dumps(body, ensure_ascii=False).encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return self.body
+
+        success = {
+            "choices": [{"message": {"content": "{\"diagnoses\":[{\"event_index\":0,\"analysis\":\"a\"},{\"event_index\":1,\"analysis\":\"b\"}]}"}}]
+        }
+
+        def fake_urlopen(request, timeout):
+            body = json.loads(request.data.decode("utf-8"))
+            bodies.append(body)
+            if len(bodies) == 1:
+                raise HTTPError(request.full_url, 400, "response_format unsupported", {}, None)
+            return FakeResponse(success)
+
+        with patch.object(interface_agent, "urlopen", side_effect=fake_urlopen):
+            result = interface_agent.call_siliconflow_model(
+                "sk-test-only", "deepseek-ai/DeepSeek-V4-Flash", events, local_diagnoses
+            )
+
+        self.assertEqual(len(result), 2)
+        self.assertIn("response_format", bodies[0])
+        self.assertNotIn("response_format", bodies[1])
+
     def test_build_events_keeps_every_abnormal_interface(self) -> None:
         build_all = getattr(interface_agent, "build_agent_events", lambda _result: [])
 
