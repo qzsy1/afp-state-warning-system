@@ -30,6 +30,7 @@ const state = {
   agentFingerprint: "",
   agentBusy: false,
   agentDefaultKeyAvailable: false,
+  physicalInterfaces: [],
 };
 
 const $ = (id) => document.getElementById(id);
@@ -352,6 +353,7 @@ async function discoverInterfaces() {
   // be blocked by the presence (or absence) of physical COM ports.
   if (controls.acquisitionMode?.value === "simulation") {
     state.availableInterfaces = [];
+    state.physicalInterfaces = [];
     if (controls.interfaceDiscoveryStatus) {
       controls.interfaceDiscoveryStatus.textContent =
         "模拟采集不需要识别物理接口；仅使用当前选择的 CSV/文件夹/MySQL 数据源";
@@ -2935,6 +2937,9 @@ function interfaceConfigs() {
       driver: row.querySelector(".interface-driver")?.value || "serial_json",
       endpoint: row.querySelector(".interface-endpoint")?.value?.trim() || "",
       baudrate: Number(row.querySelector(".interface-baudrate")?.value) || 115200,
+      physical_interface_id: row.querySelector(".interface-physical")?.value || "",
+      physical_interface_kind: row.querySelector(".interface-physical")?.selectedOptions?.[0]?.dataset?.kind || "",
+      physical_verified: row.querySelector(".interface-physical")?.selectedOptions?.[0]?.dataset?.detected === "true",
       channel_map: channelMap,
     };
   });
@@ -3002,6 +3007,40 @@ function refreshInterfaceEndpointOptions() {
     });
 }
 
+function physicalCandidatesForRole(role) {
+  const profile = sensorTypeProfile(role);
+  const kind = profile.physical_kind || "";
+  return (Array.isArray(state.physicalInterfaces) ? state.physicalInterfaces : [])
+    .filter((item) => !kind || item.kind === kind)
+    .filter((item) => item.detected !== false || item.driver_available);
+}
+
+function refreshPhysicalInterfaceOptions(row, preferredId = "") {
+  const select = row.querySelector(".interface-physical");
+  const role = row.querySelector(".interface-role")?.value || "custom";
+  if (!select) return;
+  const candidates = physicalCandidatesForRole(role);
+  const current = preferredId || select.value;
+  select.replaceChildren(option("", "请选择已识别的实际接口"));
+  candidates.forEach((item) => {
+    const node = option(item.id, item.label || item.endpoint || item.id);
+    node.dataset.kind = item.kind || "";
+    node.dataset.detected = String(item.detected !== false);
+    node.dataset.endpoint = item.endpoint || "";
+    select.append(node);
+  });
+  if (current && candidates.some((item) => item.id === current)) select.value = current;
+  const selected = select.selectedOptions?.[0];
+  select.title = selected?.value
+    ? `${selected.textContent}；协议类型：${sensorTypeProfile(role).protocol || "自定义"}`
+    : "必须选择自动识别到的实际接口后才能启用";
+  const enabled = row.querySelector(".interface-enabled");
+  if (enabled) {
+    enabled.disabled = !selected?.value || selected.dataset.detected !== "true";
+    if (enabled.disabled) enabled.checked = false;
+  }
+}
+
 function defaultInterfaceCatalog() {
   return [
     {
@@ -3017,7 +3056,6 @@ function defaultInterfaceCatalog() {
 
 function renderInterfacePanel(configs) {
   if (!controls.interfacePanel) return;
-  const ports = recognizedInterfacePorts();
   const defaults = Array.isArray(configs) ? configs : [];
   const initial = defaults.length ? defaults : defaultInterfaceCatalog();
   const unique = [];
@@ -3056,6 +3094,7 @@ function renderInterfacePanel(configs) {
     const currentEndpoint = String(item.endpoint || "");
     endpoint.value = currentEndpoint;
     const baud = document.createElement("input"); baud.className = "interface-baudrate"; baud.type = "number"; baud.min = "1200"; baud.value = String(Number(item.baudrate || 115200));
+    const physical = document.createElement("select"); physical.className = "interface-physical";
     const map = document.createElement("input"); map.className = "interface-map"; map.type = "text"; map.value = typeof item.channel_map === "string" ? item.channel_map : JSON.stringify(item.channel_map || {}); map.placeholder = '{"force":"压力"}';
     const summary = document.createElement("div"); summary.className = "interface-channel-summary";
     const profileDetail = document.createElement("div"); profileDetail.className = "interface-profile-detail control-note";
@@ -3071,8 +3110,8 @@ function renderInterfacePanel(configs) {
       refreshInterfaceEndpointOptions();
       markHardwareCheckStale("接口配置已删除");
     });
-    row.append(addLabel(`接口 ${index + 1} · 启用`, enabled), addLabel("传感器类型", role), addLabel("自动驱动", driver), addLabel("连接地址", endpoint), addLabel("波特率", baud), addLabel("通道映射（仅自定义JSON）", map, "interface-map-label"), profileDetail, summary, removeButton);
-    role.addEventListener("change", () => { applySensorTypeProfile(row, true); refreshChannelInterfaceOptions(); });
+    row.append(addLabel(`接口 ${index + 1} · 启用`, enabled), addLabel("传感器类型", role), addLabel("实际物理接口", physical, "interface-physical-label"), addLabel("自动驱动/协议", driver), addLabel("连接地址", endpoint), addLabel("波特率", baud), addLabel("通道映射（仅自定义JSON）", map, "interface-map-label"), profileDetail, summary, removeButton);
+    role.addEventListener("change", () => { applySensorTypeProfile(row, true); refreshPhysicalInterfaceOptions(row); refreshChannelInterfaceOptions(); markHardwareCheckStale("接口类型已变化"); });
     driver.addEventListener("change", () => {
       if (controls.acquisitionMode?.value !== "simulation" && driver.value === "simulator") {
         driver.value = "serial_json";
@@ -3082,9 +3121,25 @@ function renderInterfacePanel(configs) {
       refreshChannelInterfaceOptions();
     });
     endpoint.addEventListener("change", () => { refreshInterfaceEndpointOptions(); refreshChannelInterfaceOptions(); });
+    physical.addEventListener("change", () => {
+      const selected = physical.selectedOptions?.[0];
+      const profile = sensorTypeProfile(role.value);
+      if (selected?.dataset.endpoint && ["serial", "usb_hid", "usb_uvc"].includes(selected.dataset.kind)) {
+        endpoint.value = selected.dataset.endpoint;
+      } else if (profile.endpoint && !endpoint.value.trim()) {
+        endpoint.value = profile.endpoint;
+      }
+      refreshPhysicalInterfaceOptions(row, physical.value);
+      refreshChannelInterfaceOptions();
+      markHardwareCheckStale("实际物理接口已变化");
+    });
     enabled.addEventListener("change", refreshChannelInterfaceOptions);
     createInterfaceChannelEditor(row, row.dataset.interfaceId);
     applySensorTypeProfile(row, false);
+    refreshPhysicalInterfaceOptions(row, item.physical_interface_id || "");
+    if (item.physical_interface_id && physical.value === item.physical_interface_id) {
+      enabled.checked = item.enabled !== false;
+    }
     return row;
   }));
   hideLegacyInterfaceFields();
@@ -3103,14 +3158,16 @@ async function discoverInterfaces() {
   try {
     const result = await fetch("/api/acquisition/discover", {cache: "no-store"}).then((response) => response.json());
     state.availableInterfaces = recognizedInterfacePortsFrom(result.ports || []);
+    state.physicalInterfaces = Array.isArray(result.physical_interfaces)
+      ? result.physical_interfaces : [];
     const defaults = result.defaults || [];
     state.interfaceCatalog = defaults.length ? defaults : defaultInterfaceCatalog();
     renderInterfacePanel(state.interfaceCatalog);
     markHardwareCheckStale("接口识别结果已更新");
-    const ports = state.availableInterfaces;
+    const ports = state.physicalInterfaces;
     if (controls.interfaceDiscoveryStatus) controls.interfaceDiscoveryStatus.textContent = ports.length
-      ? `发现 ${ports.length} 个接口（仅表示接口存在，传感器数据需再检查）：${ports.map((item) => item.endpoint).join(", ")}`
-      : "未发现物理接口；可手动填写 COM/TCP 地址后再检查数据";
+      ? `发现 ${ports.length} 个实际接口；启用前必须选择对应接口并通过协议检查：${ports.map((item) => item.label || item.endpoint).join(", ")}`
+      : "未发现物理接口；请检查 USB/串口/网卡驱动后重试";
   } catch (error) {
     if (controls.interfaceDiscoveryStatus) controls.interfaceDiscoveryStatus.textContent = `接口识别失败：${error.message}`;
   }
@@ -3128,15 +3185,14 @@ function recognizedInterfacePortsFrom(ports) {
 }
 
 function addInterface() {
-  const ports = recognizedInterfacePorts();
   const current = interfaceConfigs().interfaces;
   if (current.length >= 8) {
     toast("最多配置 8 个传感器接口");
     return;
   }
-  const used = new Set(current.map((item) => item.endpoint.toUpperCase()));
-  const nextPort = ports.find((port) => !used.has(String(port.endpoint || port.id).toUpperCase()));
-  current.push({id: `interface_${current.length + 1}`, enabled: true, role: "custom", driver: "serial_json", endpoint: nextPort?.endpoint || "", baudrate: 115200, channel_map: {}});
+  const used = new Set(current.map((item) => item.physical_interface_id).filter(Boolean));
+  const nextPhysical = (state.physicalInterfaces || []).find((item) => !used.has(item.id) && item.detected !== false);
+  current.push({id: `interface_${current.length + 1}`, enabled: Boolean(nextPhysical), role: "custom", driver: "serial_json", endpoint: nextPhysical?.endpoint || "", baudrate: 115200, channel_map: {}, physical_interface_id: nextPhysical?.id || "", physical_interface_kind: nextPhysical?.kind || "", physical_verified: Boolean(nextPhysical)});
   state.interfaceCatalog = current;
   renderInterfacePanel(current);
   markHardwareCheckStale("已增加接口配置");
@@ -3276,6 +3332,7 @@ async function selectSimulationSource() {
 function acquisitionConfig() {
   const newSchema = controls.datasetSchema.value === "new_collection_v11_3";
   const interfaceState = interfaceConfigs();
+  validatePhysicalInterfaceBindings(interfaceState.interfaces, controls.acquisitionMode?.value !== "simulation");
   const first = interfaceState.interfaces[0] || {};
   const simulation = controls.acquisitionMode?.value === "simulation";
   return {
@@ -3335,6 +3392,27 @@ function acquisitionConfig() {
     temperature_setpoint_C: Number(controls.temperatureSetpoint.value) || 0,
     replicate: Number(controls.replicate.value) || 1,
   };
+}
+
+function validatePhysicalInterfaceBindings(items, realMode) {
+  if (!realMode) return;
+  const seen = new Map();
+  for (const item of items.filter((entry) => entry.enabled)) {
+    const profile = sensorTypeProfile(item.role);
+    if (!item.physical_interface_id) {
+      throw new Error(`接口“${item.id}”未选择实际物理接口，不能启用`);
+    }
+    const expectedKind = profile.physical_kind || "";
+    if (item.physical_interface_kind && expectedKind && item.physical_interface_kind !== expectedKind) {
+      throw new Error(`接口“${item.id}”的物理接口类型与协议不匹配`);
+    }
+    const previous = seen.get(item.physical_interface_id);
+    if (!previous) { seen.set(item.physical_interface_id, item); continue; }
+    const shared = new Set([previous.role, item.role]);
+    if (!(shared.has("plc") && shared.has("robot") && shared.size === 2 && expectedKind === "ethernet" && previous.physical_interface_kind === "ethernet")) {
+      throw new Error(`物理接口“${item.physical_interface_id}”重复绑定；仅允许PLC与ABB共享同一网卡`);
+    }
+  }
 }
 
 controls.acquisitionMode?.addEventListener("change", () => {
@@ -3513,6 +3591,8 @@ function hardwareConfigFingerprint() {
       interfaces: (config.interfaces || []).map((item) => ({
         id: item.id, enabled: item.enabled, role: item.role,
         driver: item.driver, endpoint: item.endpoint, baudrate: item.baudrate,
+        physical_interface_id: item.physical_interface_id,
+        physical_interface_kind: item.physical_interface_kind,
       })),
       assignments: config.interface_channel_assignments || {},
       source_file: config.source_file || "",
@@ -3572,7 +3652,8 @@ function renderHardwareCheckResult(result, {automatic = false, live = false} = {
   };
   appendDetails("异常接口", badInterfaces, (item) => {
     const profile = sensorTypeProfile(item.role || "custom");
-    return `${profile.label || item.role || "接口"} ${item.endpoint || item.id || "未填写地址"}（${item.message || hardwareStateLabel(item.state)}）`;
+    const physical = item.physical_interface_id ? ` · 实际${item.physical_interface_id}` : "";
+    return `${profile.label || item.role || "接口"} ${item.endpoint || item.id || "未填写地址"}${physical}（${item.message || hardwareStateLabel(item.state)}）`;
   });
   appendDetails("异常通道", badSensors, (item) => `${item.name}（${item.message || hardwareStateLabel(item.state)}）`);
   appendDetails(

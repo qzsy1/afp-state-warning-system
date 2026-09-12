@@ -212,6 +212,8 @@ SENSOR_INTERFACE_PROFILES: dict[str, dict[str, Any]] = {
     "thermocouple": {
         "label": "八通道热电偶",
         "driver": "smrf_hid",
+        "protocol": "smrf_hid",
+        "physical_kind": "usb_hid",
         "endpoint": "SMRFCT08B",
         "channels": [f"温度{index}" for index in range(1, 9)],
         "channel_types": ["K"] * 8,
@@ -223,6 +225,8 @@ SENSOR_INTERFACE_PROFILES: dict[str, dict[str, Any]] = {
     "plc": {
         "label": "松下PLC过程传感器",
         "driver": "modbus_tcp",
+        "protocol": "modbus_tcp",
+        "physical_kind": "ethernet",
         "endpoint": f"{DEFAULT_PLC_IP}:{DEFAULT_PLC_PORT}",
         "channels": ["温度", "压力", "张力"],
         "processing": "Modbus TCP FC03；float32低字在前",
@@ -230,6 +234,8 @@ SENSOR_INTERFACE_PROFILES: dict[str, dict[str, Any]] = {
     "robot": {
         "label": "ABB机器人",
         "driver": "abb_robot",
+        "protocol": "abb_rws",
+        "physical_kind": "ethernet",
         "endpoint": DEFAULT_ABB_IP,
         "channels": ["ABB_X", "ABB_Y", "ABB_Z", "线速度"],
         "processing": "RWS读取robtarget；相邻XYZ欧氏距离除以时间差得到线速度",
@@ -237,6 +243,8 @@ SENSOR_INTERFACE_PROFILES: dict[str, dict[str, Any]] = {
     "thermal_uvc": {
         "label": "BSV UVC测温热像仪",
         "driver": "uvc_thermal",
+        "protocol": "uvc",
+        "physical_kind": "usb_uvc",
         "endpoint": "BSV UVC (WinUSB)",
         "channels": ["ROI平均温度"],
         "processing": "256×192温度矩阵按raw/64-50换算后计算ROI均值",
@@ -244,6 +252,8 @@ SENSOR_INTERFACE_PROFILES: dict[str, dict[str, Any]] = {
     "thermal_rtsp": {
         "label": "IP热像仪RTSP视频",
         "driver": "rtsp_thermal",
+        "protocol": "rtsp",
+        "physical_kind": "ethernet",
         "endpoint": DEFAULT_RTSP_URL,
         "channels": [],
         "processing": "仅预览/录像；无辐射测温标定时不生成数值温度通道",
@@ -251,6 +261,8 @@ SENSOR_INTERFACE_PROFILES: dict[str, dict[str, Any]] = {
     "pressure": {
         "label": "M3232薄膜压力",
         "driver": "m3232_pressure",
+        "protocol": "m3232_serial",
+        "physical_kind": "serial",
         "endpoint": "COM8",
         "baudrate": M3232_BAUDRATE,
         "channels": ["薄膜压力"],
@@ -259,6 +271,8 @@ SENSOR_INTERFACE_PROFILES: dict[str, dict[str, Any]] = {
     "custom": {
         "label": "自定义JSON传感器",
         "driver": "serial_json",
+        "protocol": "custom",
+        "physical_kind": "serial",
         "endpoint": "COM4",
         "baudrate": 115200,
         "channels": [],
@@ -361,6 +375,64 @@ def _apply_sensor_interface_profile(interface: dict[str, Any]) -> dict[str, Any]
             interface.get("slave_id") or DEFAULT_PLC_SLAVE_ID
         )
     return interface
+
+
+def _physical_interface_key(value: Any) -> str:
+    """Normalize a physical-interface identifier for duplicate checks."""
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def _validate_physical_interface_bindings(
+    interfaces: list[dict[str, Any]], acquisition_mode: str
+) -> None:
+    """Validate role/protocol and physical endpoint ownership.
+
+    PLC and ABB intentionally share the same Ethernet adapter.  Every other
+    enabled logical interface must own a distinct physical adapter/device.
+    """
+    seen: dict[str, dict[str, Any]] = {}
+    for item in interfaces:
+        if not item.get("enabled", True):
+            continue
+        role = _canonical_sensor_type(item.get("role"), item.get("driver"))
+        profile = SENSOR_INTERFACE_PROFILES.get(role, SENSOR_INTERFACE_PROFILES["custom"])
+        expected_driver = str(profile.get("driver") or "")
+        actual_driver = str(item.get("driver") or "")
+        if not profile.get("editable_driver") and actual_driver != expected_driver:
+            raise ValueError(
+                f"接口“{item.get('id', role)}”的协议/驱动与传感器类型不匹配："
+                f"{actual_driver or '未填写'}，应为{expected_driver}"
+            )
+        expected_kind = str(profile.get("physical_kind") or "")
+        actual_kind = str(item.get("physical_interface_kind") or "")
+        if actual_kind and expected_kind and actual_kind != expected_kind:
+            raise ValueError(
+                f"接口“{item.get('id', role)}”的物理接口类型与协议不匹配："
+                f"{actual_kind}，应为{expected_kind}"
+            )
+        physical_id = _physical_interface_key(item.get("physical_interface_id"))
+        if acquisition_mode == "real" and not physical_id:
+            raise ValueError(
+                f"真实接口“{item.get('id', role)}”尚未绑定实际物理接口"
+            )
+        if not physical_id:
+            continue
+        previous = seen.get(physical_id)
+        if previous is None:
+            seen[physical_id] = item
+            continue
+        shared_roles = {str(previous.get("role") or ""), role}
+        shared_kinds = {
+            str(previous.get("physical_interface_kind") or expected_kind),
+            actual_kind or expected_kind,
+        }
+        if shared_roles == {"plc", "robot"} and shared_kinds == {"ethernet"}:
+            continue
+        raise ValueError(
+            f"物理接口“{item.get('physical_interface_id')}”重复绑定："
+            f"{previous.get('id', '前一接口')}与{item.get('id', role)}；"
+            "仅允许PLC与ABB共享同一网卡"
+        )
 
 
 def _resolve_interface_channel_assignments(
@@ -588,7 +660,20 @@ class AcquisitionConfig:
             interface = dict(item)
             interface["id"] = str(interface.get("id") or f"interface_{index + 1}")
             interface["enabled"] = bool(interface.get("enabled", True))
-            interface["driver"] = str(interface.get("driver") or self.driver)
+            role_hint = _canonical_sensor_type(interface.get("role"), interface.get("driver"))
+            profile_hint = SENSOR_INTERFACE_PROFILES.get(role_hint, SENSOR_INTERFACE_PROFILES["custom"])
+            requested_driver = str(interface.get("driver") or "").strip()
+            if requested_driver and not profile_hint.get("editable_driver"):
+                expected_driver = str(profile_hint.get("driver") or "")
+                if requested_driver != expected_driver:
+                    raise ValueError(
+                        f"接口“{interface['id']}”的协议/驱动与传感器类型不匹配："
+                        f"{requested_driver}，应为{expected_driver}"
+                    )
+            interface["driver"] = requested_driver or (
+                str(profile_hint.get("driver") or self.driver)
+                if role_hint != "custom" else self.driver
+            )
             interface["endpoint"] = str(interface.get("endpoint") or "").strip()
             interface["baudrate"] = int(interface.get("baudrate") or self.baudrate)
             interface["timeout"] = max(0.01, min(float(interface.get("timeout") or 0.05), 2.0))
@@ -614,10 +699,20 @@ class AcquisitionConfig:
                 interface.get("slave_id") or DEFAULT_PLC_SLAVE_ID
             )
             _apply_sensor_interface_profile(interface)
+            interface["physical_interface_id"] = str(
+                interface.get("physical_interface_id") or ""
+            ).strip()
+            interface["physical_interface_kind"] = str(
+                interface.get("physical_interface_kind")
+                or SENSOR_INTERFACE_PROFILES.get(interface["role"], SENSOR_INTERFACE_PROFILES["custom"]).get("physical_kind")
+                or ""
+            ).strip().lower()
+            interface["physical_verified"] = bool(interface.get("physical_verified", False))
             normalized_interfaces.append(interface)
         if not normalized_interfaces:
             raise ValueError("至少配置一个采集接口")
         self.interfaces = normalized_interfaces
+        _validate_physical_interface_bindings(normalized_interfaces, self.acquisition_mode)
         raw_assignments = self.interface_channel_assignments or {}
         requested_assignments = {
             str(key): [str(name) for name in (value or [])]
@@ -2050,6 +2145,7 @@ class AcquisitionManager:
         :meth:`test_connection`).
         """
         ports: list[dict[str, Any]] = []
+        physical_interfaces: list[dict[str, Any]] = []
         error = ""
         try:
             from serial.tools import list_ports
@@ -2061,6 +2157,18 @@ class AcquisitionManager:
                     "manufacturer": str(item.manufacturer or ""),
                     "vid": item.vid,
                     "pid": item.pid,
+                })
+                physical_interfaces.append({
+                    "id": f"serial:{str(item.device).upper()}",
+                    "kind": "serial",
+                    "protocol": "serial",
+                    "endpoint": str(item.device),
+                    "label": f"串口 {item.device}",
+                    "description": str(item.description or ""),
+                    "manufacturer": str(item.manufacturer or ""),
+                    "vid": item.vid,
+                    "pid": item.pid,
+                    "detected": True,
                 })
         except Exception as exc:
             error = str(exc)
@@ -2090,11 +2198,21 @@ class AcquisitionManager:
                                     "pid": None,
                                 }
                             )
+                            physical_interfaces.append({
+                                "id": f"serial:{endpoint.upper()}",
+                                "kind": "serial", "protocol": "serial",
+                                "endpoint": endpoint,
+                                "label": f"串口 {endpoint}",
+                                "description": str(value_name or "Windows serial interface"),
+                                "manufacturer": "", "vid": None, "pid": None,
+                                "detected": True,
+                            })
                             index += 1
                 except Exception as registry_exc:
                     error = f"{error}; Windows接口枚举失败：{registry_exc}"
         smrf_devices: list[dict[str, Any]] = []
         try:
+            smrf_objects = enumerate_smrf_hid_devices()
             smrf_devices = [
                 {
                     "id": item.label,
@@ -2103,9 +2221,18 @@ class AcquisitionManager:
                     "serial": item.serial,
                     "vid": item.vendor_id,
                     "pid": item.product_id,
+                    "path": item.path,
                 }
-                for item in enumerate_smrf_hid_devices()
+                for item in smrf_objects
             ]
+            physical_interfaces.extend({
+                "id": f"hid:{item.path or item.serial or item.label}",
+                "kind": "usb_hid", "protocol": "smrf_hid",
+                "endpoint": item.label, "label": f"SMRF HID · {item.label}",
+                "path": item.path, "serial": item.serial,
+                "vid": item.vendor_id, "pid": item.product_id,
+                "detected": True,
+            } for item in smrf_objects)
         except Exception as exc:
             error = f"{error}; SMRF HID枚举失败：{exc}" if error else f"SMRF HID枚举失败：{exc}"
         plc_reachable = False
@@ -2131,6 +2258,44 @@ class AcquisitionManager:
                 Path.cwd() / BSV_UVC_DLL_NAME,
             )
         )
+        if uvc_dll_found:
+            # The native DLL confirms that the vendor driver is installed; a
+            # camera instance still needs protocol/data verification.
+            physical_interfaces.append({
+                "id": "uvc:bsv",
+                "kind": "usb_uvc", "protocol": "uvc",
+                "endpoint": "BSV UVC (WinUSB)",
+                "label": "BSV UVC热像仪（驱动已安装，待数据验证）",
+                "detected": False, "driver_available": True,
+            })
+        try:
+            import psutil
+
+            for name, addresses in psutil.net_if_addrs().items():
+                ipv4 = [
+                    str(address.address)
+                    for address in addresses
+                    if getattr(address, "family", None) == socket.AF_INET
+                    and not str(address.address).startswith("127.")
+                ]
+                if not ipv4:
+                    continue
+                physical_interfaces.append({
+                    "id": f"ethernet:{name}", "kind": "ethernet",
+                    "protocol": "ethernet", "endpoint": name,
+                    "label": f"网卡 {name}（{', '.join(ipv4)}）",
+                    "name": name, "addresses": ipv4, "detected": True,
+                    "shared_roles": ["plc", "robot"],
+                })
+        except Exception as exc:
+            error = f"{error}; 网卡枚举失败：{exc}" if error else f"网卡枚举失败：{exc}"
+        if not any(item.get("kind") == "ethernet" for item in physical_interfaces):
+            physical_interfaces.append({
+                "id": "ethernet:default", "kind": "ethernet",
+                "protocol": "ethernet", "endpoint": "默认工控网卡",
+                "label": "默认工控网卡（需协议检查确认）",
+                "detected": False, "shared_roles": ["plc", "robot"],
+            })
         rtsp_reachable = False
         try:
             sock = socket.create_connection(("192.168.125.2", 554), timeout=1.0)
@@ -2140,6 +2305,7 @@ class AcquisitionManager:
             pass
         return {
             "ports": ports,
+            "physical_interfaces": physical_interfaces,
             "hid_devices": smrf_devices,
             "defaults": default_capture_interfaces(),
             "sensor_type_profiles": sensor_interface_profiles(),
@@ -2202,6 +2368,11 @@ class AcquisitionManager:
         for item in ([] if config.acquisition_mode == "simulation" else (config.interfaces or [])):
             interface_id = str(item.get("id") or "")
             endpoint = str(item.get("endpoint") or interface_id or "未填写地址")
+            role = str(item.get("role") or "custom")
+            profile = SENSOR_INTERFACE_PROFILES.get(role, SENSOR_INTERFACE_PROFILES["custom"])
+            physical_id = str(item.get("physical_interface_id") or "")
+            physical_kind = str(item.get("physical_interface_kind") or profile.get("physical_kind") or "")
+            protocol = str(profile.get("protocol") or item.get("driver") or "")
             expected = [
                 name for name in config.interface_channel_assignments.get(interface_id, [])
                 if name in selected
@@ -2210,6 +2381,8 @@ class AcquisitionManager:
                 interface_results.append({
                     "id": interface_id, "role": item.get("role", "custom"),
                     "driver": item.get("driver", ""), "endpoint": endpoint,
+                    "physical_interface_id": physical_id, "physical_interface_kind": physical_kind,
+                    "protocol": protocol,
                     "enabled": False, "expected_channels": expected,
                     "detected_channels": [], "missing_channels": [],
                     "invalid_channels": [], "sample_counts": {}, "errors": [],
@@ -2221,6 +2394,8 @@ class AcquisitionManager:
                 interface_results.append({
                     "id": interface_id, "role": item.get("role", "custom"),
                     "driver": item.get("driver", ""), "endpoint": endpoint,
+                    "physical_interface_id": physical_id, "physical_interface_kind": physical_kind,
+                    "protocol": protocol,
                     "enabled": True, "expected_channels": [],
                     "detected_channels": [], "missing_channels": [],
                     "invalid_channels": [], "sample_counts": {}, "errors": [],
@@ -2281,6 +2456,8 @@ class AcquisitionManager:
             interface_results.append({
                 "id": interface_id, "role": item.get("role", "custom"),
                 "driver": item.get("driver", ""), "endpoint": endpoint,
+                "physical_interface_id": physical_id, "physical_interface_kind": physical_kind,
+                "protocol": protocol,
                 "enabled": True, "expected_channels": expected,
                 "detected_channels": sorted(detected), "missing_channels": missing,
                 "invalid_channels": invalid_channels, "sample_counts": detected,

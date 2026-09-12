@@ -76,6 +76,16 @@ def mixed_interface_result() -> dict:
 
 
 class InterfaceAgentTests(unittest.TestCase):
+    def test_interface_ui_exposes_physical_binding_and_shared_nic_rules(self) -> None:
+        html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("实际物理接口", script)
+        self.assertIn("physical_interface_id", script)
+        self.assertIn("physical_interfaces", script)
+        self.assertIn("仅允许PLC与ABB共享同一网卡", script)
+        self.assertIn("interface-physical", script)
+        self.assertIn("传感器设置与接口映射", html)
+
     def test_model_response_parser_accepts_fenced_json(self) -> None:
         parse = getattr(interface_agent, "parse_model_diagnoses")
         response = {

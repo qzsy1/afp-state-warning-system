@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -22,6 +23,87 @@ from training_data import read_excel_or_folder  # noqa: E402
 
 
 class AcquisitionIntegrityTests(unittest.TestCase):
+    def test_physical_binding_allows_plc_and_abb_to_share_one_ethernet_adapter(self) -> None:
+        interfaces = [
+            {
+                "id": "thermocouple_8ch", "enabled": True, "role": "thermocouple",
+                "driver": "smrf_hid", "endpoint": "SMRFCT08B",
+                "physical_interface_id": "hid:smrf-01", "physical_interface_kind": "usb_hid",
+            },
+            {
+                "id": "plc_process", "enabled": True, "role": "plc",
+                "driver": "modbus_tcp", "endpoint": "192.168.125.5:502",
+                "physical_interface_id": "ethernet:工控网卡1", "physical_interface_kind": "ethernet",
+            },
+            {
+                "id": "uvc_temperature", "enabled": True, "role": "thermal_uvc",
+                "driver": "uvc_thermal", "endpoint": "BSV UVC (WinUSB)",
+                "physical_interface_id": "uvc:bsv-01", "physical_interface_kind": "usb_uvc",
+            },
+            {
+                "id": "abb_motion", "enabled": True, "role": "robot",
+                "driver": "abb_robot", "endpoint": "192.168.125.1",
+                "physical_interface_id": "ethernet:工控网卡1", "physical_interface_kind": "ethernet",
+            },
+            {
+                "id": "m3232_pressure", "enabled": True, "role": "pressure",
+                "driver": "m3232_pressure", "endpoint": "COM8",
+                "physical_interface_id": "serial:COM8", "physical_interface_kind": "serial",
+            },
+        ]
+        config = AcquisitionConfig(
+            acquisition_mode="real", dataset_schema="new_collection_v11_3",
+            selected_sensors=["温度", "压力", "薄膜压力", "ROI平均温度", "张力", "线速度", "ABB_X", "ABB_Y", "ABB_Z", "温度1"],
+            interfaces=interfaces,
+            interface_channel_assignments={
+                "thermocouple_8ch": ["温度1"],
+                "plc_process": ["温度", "压力", "张力"],
+                "uvc_temperature": ["ROI平均温度"],
+                "abb_motion": ["线速度", "ABB_X", "ABB_Y", "ABB_Z"],
+                "m3232_pressure": ["薄膜压力"],
+            },
+        )
+        self.assertEqual(config.interfaces[1]["physical_interface_id"], config.interfaces[3]["physical_interface_id"])
+        self.assertEqual(config.interfaces[1]["physical_interface_kind"], "ethernet")
+
+    def test_physical_binding_rejects_duplicate_non_shared_interface(self) -> None:
+        with self.assertRaisesRegex(ValueError, "物理接口.*重复"):
+            AcquisitionConfig(
+                acquisition_mode="real", dataset_schema="new_collection_v11_3",
+                selected_sensors=["温度"],
+                interfaces=[
+                    {"id": "a", "enabled": True, "role": "custom", "driver": "serial_json", "endpoint": "COM8", "physical_interface_id": "serial:COM8", "physical_interface_kind": "serial"},
+                    {"id": "b", "enabled": True, "role": "custom", "driver": "serial_json", "endpoint": "COM9", "physical_interface_id": "serial:COM8", "physical_interface_kind": "serial"},
+                ],
+                interface_channel_assignments={"a": ["温度"]},
+            )
+
+    def test_physical_binding_rejects_role_protocol_mismatch(self) -> None:
+        with self.assertRaisesRegex(ValueError, "协议.*不匹配"):
+            AcquisitionConfig(
+                acquisition_mode="real", dataset_schema="new_collection_v11_3",
+                selected_sensors=["薄膜压力"],
+                interfaces=[
+                    {"id": "m3232_pressure", "enabled": True, "role": "pressure", "driver": "modbus_tcp", "endpoint": "COM8", "physical_interface_id": "serial:COM8", "physical_interface_kind": "serial"},
+                ],
+                interface_channel_assignments={"m3232_pressure": ["薄膜压力"]},
+            )
+
+    def test_discovery_reports_physical_interface_metadata(self) -> None:
+        hid = SimpleNamespace(
+            label="SMRFCT08B (Serial=SMRF-01)", product="SMRFCT08B",
+            serial="SMRF-01", vendor_id=0x1234, product_id=0x5678,
+            path="hid-path-01",
+        )
+        with patch("acquisition.enumerate_smrf_hid_devices", return_value=[hid]), \
+             patch("acquisition.socket.create_connection", side_effect=OSError("offline")):
+            result = AcquisitionManager.discover_interfaces()
+        kinds = {item["kind"] for item in result["physical_interfaces"]}
+        self.assertIn("usb_hid", kinds)
+        self.assertIn("ethernet", kinds)
+        hid_items = [item for item in result["physical_interfaces"] if item["kind"] == "usb_hid"]
+        self.assertEqual(hid_items[0]["protocol"], "smrf_hid")
+
     def test_unchecked_channels_are_removed_from_interface_assignments(self) -> None:
         config = AcquisitionConfig(
             processing_mode="capture_only",
