@@ -451,15 +451,27 @@ function enforceStepOneInteger(control, minimum) {
   control.addEventListener("blur", normalize);
 }
 
-async function postJson(url, payload = {}) {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  const result = await response.json();
-  if (!response.ok) throw new Error(result.error || "请求失败");
-  return result;
+async function postJson(url, payload = {}, {timeoutMs = 30000} = {}) {
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  const timer = window.setTimeout(() => controller?.abort(), Math.max(1000, Number(timeoutMs) || 30000));
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      ...(controller ? {signal: controller.signal} : {}),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "请求失败");
+    return result;
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(`请求超时（${Math.round(Math.max(1000, Number(timeoutMs) || 30000) / 1000)}秒），请检查设备连接后重试`);
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timer);
+  }
 }
 
 function renderAcquisitionStatus(status) {
@@ -1209,7 +1221,7 @@ async function runAgentDiagnosis({automatic = false} = {}) {
       api_key: agentApiKeyInput.value.trim(),
       model_name: agentModelNameInput.value.trim(),
       events: state.agentEvents,
-    });
+    }, {timeoutMs: 150000});
     state.agentResult = result;
     if (autoStatus) autoStatus.textContent = result.model_message || "LangChain 诊断已完成。";
     return result;
@@ -1225,7 +1237,7 @@ async function runAgentDiagnosis({automatic = false} = {}) {
 
 async function testSensorConnection({automatic = false} = {}) {
   try {
-    const result = await postJson("/api/acquisition/test", acquisitionConfig());
+    const result = await postJson("/api/acquisition/test", acquisitionConfig(), {timeoutMs: 20000});
     if (controls.processingMode.value !== "capture_only") {
       applyPredictionModelProfile(result.prediction_model, false);
     }
@@ -3829,7 +3841,7 @@ async function testSensorConnection({automatic = false} = {}) {
     node.textContent = `${automatic ? "正在自动检查" : "正在检查"}，将逐一读取每个接口的全部已选通道…`;
   }
   try {
-    const result = await postJson("/api/acquisition/test", acquisitionConfig());
+    const result = await postJson("/api/acquisition/test", acquisitionConfig(), {timeoutMs: 20000});
     if (controls.processingMode.value !== "capture_only") {
       applyPredictionModelProfile(result.prediction_model, false);
     }

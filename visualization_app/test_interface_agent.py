@@ -458,6 +458,12 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertIn("run_interface_diagnoses", app_source)
         self.assertIn("langchain-core==1.6.2", requirements)
 
+    def test_frontend_requests_have_timeout_and_abort_message(self) -> None:
+        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("AbortController", script)
+        self.assertIn("请求超时", script)
+        self.assertIn("timeoutMs: 20000", script)
+
     def test_original_frontend_groups_functional_modules_as_collapsible_sections(self) -> None:
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
         styles = (ROOT / "static" / "styles.css").read_text(encoding="utf-8")
