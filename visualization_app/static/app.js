@@ -1011,18 +1011,37 @@ function buildAgentEvents(hardwareResult) {
   const events = [];
   const coveredSensors = new Set();
 
-  const makeEvent = (interfaceItem = {}, sensorName = "接口") => {
+  const makeEvent = (interfaceItem = {}, sensorName = "接口", channelNames = null) => {
     const sensor = sensorByName.get(sensorName) || {};
     const interfaceId = String(interfaceItem.id || "sensor_channel");
     const expected = (interfaceItem.expected_channels || []).map(String);
+    const channels = (channelNames || (sensorName === "接口" ? expected : [sensorName]))
+      .map(String).filter(Boolean);
+    const sensorStates = {};
+    channels.forEach((name) => {
+      const channel = sensorByName.get(name);
+      if (!channel) return;
+      sensorStates[name] = {
+        state: channel.state,
+        message: channel.message,
+        received_samples: channel.received_samples,
+        invalid_samples: channel.invalid_samples,
+        last_sample_age_seconds: channel.last_sample_age_seconds,
+      };
+    });
     return {
       interface_id: interfaceId,
       interface_label: String(interfaceItem.label || interfaceLabels[interfaceId] || "传感器接口"),
       role: String(interfaceItem.role || "custom"),
       driver: String(interfaceItem.driver || ""),
       endpoint: String(interfaceItem.endpoint || "未填写地址"),
+      physical_interface_id: String(interfaceItem.physical_interface_id || ""),
+      physical_interface_kind: String(interfaceItem.physical_interface_kind || ""),
+      protocol: String(interfaceItem.protocol || interfaceItem.driver || ""),
+      physical_fallback: Boolean(interfaceItem.physical_fallback),
+      physical_warning: String(interfaceItem.physical_warning || ""),
       sensor_name: sensorName,
-      channels: sensorName === "接口" ? expected : [sensorName],
+      channels,
       state: String(interfaceItem.state || sensor.state || "no_data"),
       message: String(interfaceItem.message || sensor.message || "接口或通道未返回有效数据"),
       evidence: {
@@ -1035,6 +1054,7 @@ function buildAgentEvents(hardwareResult) {
         received_samples: sensor.received_samples,
         invalid_samples: sensor.invalid_samples,
         last_sample_age_seconds: sensor.last_sample_age_seconds,
+        sensor_states: sensorStates,
       },
       simulated: Boolean(hardwareResult?.simulated),
     };
@@ -1052,10 +1072,8 @@ function buildAgentEvents(hardwareResult) {
       events.push(makeEvent(interfaceItem));
       return;
     }
-    channels.forEach((name) => {
-      events.push(makeEvent(interfaceItem, name));
-      coveredSensors.add(name);
-    });
+    events.push(makeEvent(interfaceItem, channels[0] || "接口", channels));
+    channels.forEach((name) => coveredSensors.add(name));
   });
   badSensors.forEach((sensor) => {
     const name = String(sensor.name || "传感器通道");

@@ -91,6 +91,8 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertIn("仅用于测试", script)
         self.assertIn("&& !item.physical_fallback", script)
         self.assertIn("item.endpoint = selected.endpoint", script)
+        self.assertIn("sensor_states", script)
+        self.assertIn("physical_interface_kind", script)
         self.assertIn("传感器设置与接口映射", html)
 
     def test_model_response_parser_accepts_fenced_json(self) -> None:
@@ -244,6 +246,44 @@ class InterfaceAgentTests(unittest.TestCase):
             {(item["interface_id"], item["sensor_name"]) for item in events},
             {("plc_process", "压力"), ("m3232_pressure", "薄膜压力")},
         )
+
+    def test_build_events_aggregates_channels_for_one_interface(self) -> None:
+        channels = [f"温度{i}℃" for i in range(1, 9)]
+        result = {
+            "simulated": False,
+            "interfaces": [{
+                "id": "thermocouple_8ch",
+                "role": "thermocouple",
+                "driver": "smrf_hid",
+                "endpoint": "SMRFCT08B",
+                "expected_channels": channels,
+                "detected_channels": [],
+                "missing_channels": channels,
+                "invalid_channels": channels,
+                "state": "not_connected",
+                "message": "接口无法打开或读取：未识别到 SMRF HID",
+                "ok": False,
+            }],
+            "sensors": [
+                {
+                    "name": name,
+                    "selected": True,
+                    "received_samples": 0,
+                    "invalid_samples": 0,
+                    "state": "not_connected",
+                    "message": "没有采集数据",
+                    "ok": False,
+                }
+                for name in channels
+            ],
+        }
+
+        events = interface_agent.build_agent_events(result)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["interface_id"], "thermocouple_8ch")
+        self.assertEqual(events[0]["channels"], channels)
+        self.assertEqual(set(events[0]["evidence"]["sensor_states"]), set(channels))
 
     def test_missing_model_configuration_returns_all_local_diagnoses(self) -> None:
         run_all = getattr(

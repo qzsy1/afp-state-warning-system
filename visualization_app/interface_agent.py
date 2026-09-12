@@ -86,6 +86,7 @@ _EVIDENCE_FIELDS = {
     "received_samples",
     "invalid_samples",
     "last_sample_age_seconds",
+    "sensor_states",
 }
 
 
@@ -176,6 +177,20 @@ def build_agent_event(hardware_result: dict[str, Any]) -> dict[str, Any] | None:
     ]
     sensor_name = candidates[0] if candidates else (next(iter(sensors), "接口"))
     sensor = sensors.get(sensor_name) or {}
+    sensor_states = {
+        name: {
+            key: deepcopy(value)
+            for key, value in item.items()
+            if key in {
+                "state",
+                "message",
+                "received_samples",
+                "invalid_samples",
+                "last_sample_age_seconds",
+            }
+        }
+        for name, item in sensors.items()
+    }
     state = str(interface.get("state") or sensor.get("state") or "no_data")
     message = str(interface.get("message") or sensor.get("message") or "接口或通道未返回有效数据")
     channels = expected or ([sensor_name] if sensor_name != "接口" else [])
@@ -189,6 +204,7 @@ def build_agent_event(hardware_result: dict[str, Any]) -> dict[str, Any] | None:
         "received_samples": sensor.get("received_samples"),
         "invalid_samples": sensor.get("invalid_samples"),
         "last_sample_age_seconds": sensor.get("last_sample_age_seconds"),
+        "sensor_states": sensor_states,
     }
     return _clean_event(
         {
@@ -252,19 +268,23 @@ def build_agent_events(hardware_result: dict[str, Any]) -> list[dict[str, Any]]:
             if event:
                 events.append(event)
             continue
-        for name in names:
-            event = build_agent_event(
-                {
-                    "simulated": hardware_result.get("simulated", False),
-                    "interfaces": [interface],
-                    "sensors": [sensors[name]] if name in sensors else [],
-                }
-            )
-            if event:
-                event["sensor_name"] = name
-                event["channels"] = [name]
-                events.append(_clean_event(event))
-                covered_sensors.add(name)
+        # Keep one event per physical interface. A multi-channel device (for
+        # example the eight-channel SMRF thermocouple) used to produce one
+        # identical model request per channel, which obscured the real fault
+        # and could exceed provider limits. Preserve every affected channel
+        # and per-channel counters in the single event instead.
+        selected_sensors = [sensors[name] for name in names if name in sensors]
+        event = build_agent_event(
+            {
+                "simulated": hardware_result.get("simulated", False),
+                "interfaces": [interface],
+                "sensors": selected_sensors,
+            }
+        )
+        if event:
+            event["channels"] = names or list(event.get("channels") or [])
+            events.append(_clean_event(event))
+            covered_sensors.update(name for name in names if name in sensors)
 
     for name, sensor in sensors.items():
         if name in covered_sensors:
