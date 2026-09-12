@@ -3211,8 +3211,11 @@ async function discoverInterfaces() {
     renderInterfacePanel(state.interfaceCatalog);
     markHardwareCheckStale("接口识别结果已更新");
     const ports = state.physicalInterfaces;
+    const assigned = (state.interfaceCatalog || [])
+      .filter((item) => item.enabled && item.physical_interface_id)
+      .map((item) => `${item.id}→${item.physical_interface_id}`);
     if (controls.interfaceDiscoveryStatus) controls.interfaceDiscoveryStatus.textContent = ports.length
-      ? `发现 ${ports.length} 个实际接口；启用前必须选择对应接口并通过协议检查：${ports.map((item) => item.label || item.endpoint).join(", ")}`
+      ? `已自动识别 ${ports.length} 个实际接口并分配默认绑定：${assigned.join("、")}`
       : "未发现物理接口；请检查 USB/串口/网卡驱动后重试";
   } catch (error) {
     if (controls.interfaceDiscoveryStatus) controls.interfaceDiscoveryStatus.textContent = `接口识别失败：${error.message}`;
