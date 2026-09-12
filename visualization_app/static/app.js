@@ -3476,7 +3476,7 @@ function validatePhysicalInterfaceBindings(items, realMode) {
       throw new Error(`接口“${item.id}”未选择实际物理接口，不能启用`);
     }
     const expectedKind = profile.physical_kind || "";
-    if (item.physical_interface_kind && expectedKind && item.physical_interface_kind !== expectedKind) {
+    if (item.physical_interface_kind && expectedKind && item.physical_interface_kind !== expectedKind && !item.physical_fallback) {
       throw new Error(`接口“${item.id}”的物理接口类型与协议不匹配`);
     }
     const previous = seen.get(item.physical_interface_id);

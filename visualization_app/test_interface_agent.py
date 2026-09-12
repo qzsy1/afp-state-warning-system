@@ -89,6 +89,7 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertIn("autoAssignPhysicalInterfaces", script)
         self.assertIn("physical_fallback", script)
         self.assertIn("仅用于测试", script)
+        self.assertIn("&& !item.physical_fallback", script)
         self.assertIn("传感器设置与接口映射", html)
 
     def test_model_response_parser_accepts_fenced_json(self) -> None:
@@ -131,6 +132,19 @@ class InterfaceAgentTests(unittest.TestCase):
         }
 
         self.assertEqual(parse(response), [{"event_index": 2, "analysis": "数据异常"}])
+
+    def test_agent_event_preserves_serial_fallback_warning(self) -> None:
+        result = m3232_result()
+        result["interfaces"][0].update({
+            "physical_interface_id": "serial:COM1",
+            "physical_interface_kind": "serial",
+            "protocol": "smrf_hid",
+            "physical_fallback": True,
+            "physical_warning": "当前未识别到匹配协议，已临时分配串口，仅用于测试",
+        })
+        event = build_agent_event(result)
+        self.assertTrue(event["physical_fallback"])
+        self.assertIn("临时分配串口", event["physical_warning"])
 
     def test_agent_defaults_use_deepseek_v3_without_exposing_key(self) -> None:
         with patch.dict(os.environ, {"AFP_SILICONFLOW_API_KEY": "sk-test-only"}, clear=False):
