@@ -406,6 +406,40 @@ class SiliconFlowAgentTests(unittest.TestCase):
         )
         return context
 
+    def test_streaming_response_reassembles_fragmented_tool_call(self) -> None:
+        chunks = [
+            b'data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"check_network_","arguments":"{\\"interface_id\\":\\"plc_"}}]},"finish_reason":null}]}\n',
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"path","arguments":"process\\"}"}}]},"finish_reason":"tool_calls"}]}\n',
+            b'data: [DONE]\n',
+        ]
+
+        response = agentic_diagnosis._parse_siliconflow_sse(chunks)
+
+        message = response["choices"][0]["message"]
+        self.assertEqual(message["role"], "assistant")
+        self.assertEqual(message["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(message["tool_calls"][0]["function"]["name"], "check_network_path")
+        self.assertEqual(
+            json.loads(message["tool_calls"][0]["function"]["arguments"]),
+            {"interface_id": "plc_process"},
+        )
+        self.assertEqual(response["choices"][0]["finish_reason"], "tool_calls")
+
+    def test_streaming_response_reassembles_json_content(self) -> None:
+        chunks = [
+            b'data: {"choices":[{"delta":{"role":"assistant","content":"{\\"diagnoses\\":"},"finish_reason":null}]}\n',
+            b'data: {"choices":[{"delta":{"content":"[]}"},"finish_reason":"stop"}]}\n',
+            b'data: [DONE]\n',
+        ]
+
+        response = agentic_diagnosis._parse_siliconflow_sse(chunks)
+
+        self.assertEqual(
+            response["choices"][0]["message"]["content"],
+            '{"diagnoses":[]}',
+        )
+        self.assertEqual(response["choices"][0]["finish_reason"], "stop")
+
     def test_model_selects_network_tool_then_returns_evidence_backed_result(self) -> None:
         context = self._plc_context()
         payloads = []

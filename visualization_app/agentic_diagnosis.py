@@ -386,9 +386,13 @@ def _build_chat_payload(model_name: str, messages: list[dict[str, Any]]) -> dict
         "messages": deepcopy(messages),
         "tools": tool_definitions(),
         "tool_choice": "auto",
-        "stream": False,
+        # SiliconFlow can take a long time to return the first complete JSON
+        # response for tool-capable DeepSeek models.  Streaming returns headers
+        # and partial deltas promptly, avoiding a false socket timeout while the
+        # model is still producing tool arguments.
+        "stream": True,
         "temperature": 0.1,
-        "max_tokens": 4096,
+        "max_tokens": 1536,
     }
 
 
@@ -428,7 +432,7 @@ def _build_structured_payload(
             },
         ],
         "response_format": {"type": "json_object"},
-        "stream": False,
+        "stream": True,
         "temperature": 0.1,
         "max_tokens": 4096,
     }
@@ -506,13 +510,76 @@ def _build_evidence_synthesis_payload(
                 ),
             },
         ],
-        "stream": False,
+        "stream": True,
         "temperature": 0.1,
         "max_tokens": 4096,
     }
     if include_response_format:
         payload["response_format"] = {"type": "json_object"}
     return payload
+
+
+def _parse_siliconflow_sse(lines: Any) -> dict[str, Any]:
+    """Reassemble OpenAI-compatible SSE deltas into one assistant message."""
+
+    message: dict[str, Any] = {"role": "assistant", "content": ""}
+    tool_calls: dict[int, dict[str, Any]] = {}
+    finish_reason: Any = None
+    received_choice = False
+    for raw_line in lines:
+        if isinstance(raw_line, bytes):
+            line = raw_line.decode("utf-8").strip()
+        else:
+            line = str(raw_line).strip()
+        if not line or line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            line = line[5:].strip()
+        if not line or line == "[DONE]":
+            continue
+        try:
+            chunk = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        choices = chunk.get("choices") if isinstance(chunk, dict) else None
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            continue
+        received_choice = True
+        choice = choices[0]
+        delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+        if delta.get("role"):
+            message["role"] = str(delta["role"])
+        content = delta.get("content")
+        if isinstance(content, str):
+            message["content"] += content
+        for fragment in delta.get("tool_calls") or []:
+            if not isinstance(fragment, dict):
+                continue
+            try:
+                index = int(fragment.get("index", 0))
+            except (TypeError, ValueError):
+                index = 0
+            call = tool_calls.setdefault(
+                index,
+                {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+            )
+            if fragment.get("id"):
+                call["id"] += str(fragment["id"])
+            if fragment.get("type"):
+                call["type"] = str(fragment["type"])
+            function = fragment.get("function")
+            if isinstance(function, dict):
+                if function.get("name"):
+                    call["function"]["name"] += str(function["name"])
+                if function.get("arguments"):
+                    call["function"]["arguments"] += str(function["arguments"])
+        if choice.get("finish_reason") is not None:
+            finish_reason = choice.get("finish_reason")
+    if not received_choice:
+        raise AgentToolCallError("硅基流动返回了空的流式响应")
+    if tool_calls:
+        message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
+    return {"choices": [{"message": message, "finish_reason": finish_reason}]}
 
 
 def _request_siliconflow(
@@ -530,7 +597,13 @@ def _request_siliconflow(
     )
     try:
         with urlopen(request, timeout=timeout_seconds) as response:
-            return json.loads(response.read().decode("utf-8"))
+            content_type = str(response.headers.get("Content-Type") or "").lower()
+            if "text/event-stream" in content_type:
+                return _parse_siliconflow_sse(response)
+            raw = response.read()
+            if raw.lstrip().startswith(b"data:"):
+                return _parse_siliconflow_sse(raw.splitlines())
+            return json.loads(raw.decode("utf-8"))
     except HTTPError as error:
         if error.code in {401, 403}:
             raise AgentToolCallError("硅基流动API Key无效或没有调用权限") from None
