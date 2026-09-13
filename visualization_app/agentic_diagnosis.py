@@ -519,6 +519,166 @@ def _build_evidence_synthesis_payload(
     return payload
 
 
+def _build_tool_plan_payload(model_name: str, context: DiagnosticToolContext) -> dict[str, Any]:
+    """Ask the model to choose a bounded read-only tool plan in plain JSON."""
+
+    available_tools = [
+        {
+            "name": str(item.get("function", {}).get("name") or ""),
+            "description": str(item.get("function", {}).get("description") or ""),
+            "parameters": deepcopy(item.get("function", {}).get("parameters") or {}),
+        }
+        for item in tool_definitions()
+        if isinstance(item, dict)
+    ]
+    return {
+        "model": model_name,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "你是AFP工业采集接口诊断Agent的工具规划器。根据异常现象自主选择必要的"
+                    "只读取证工具，覆盖每个异常接口，但不要机械调用全部工具。只输出JSON对象："
+                    '{"tool_calls":[{"name":"工具名","arguments":{}}]}。'
+                    "只能使用available_tools中的名称和参数；最多12次调用，不得输出诊断结论。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "case": _initial_case_payload(context),
+                        "available_tools": available_tools,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            },
+        ],
+        "response_format": {"type": "json_object"},
+        "stream": True,
+        "temperature": 0.1,
+        "max_tokens": 1536,
+    }
+
+
+def _synthesize_from_evidence(
+    caller: Any,
+    model_name: str,
+    context: DiagnosticToolContext,
+    evidence_by_id: dict[str, dict[str, Any]],
+    local_diagnoses: list[dict[str, Any]],
+    tool_call_count: int,
+) -> dict[str, Any]:
+    last_error: AgentToolCallError | None = None
+    for include_response_format in (True, False):
+        try:
+            response = caller(
+                _build_evidence_synthesis_payload(
+                    model_name,
+                    context,
+                    evidence_by_id,
+                    include_response_format=include_response_format,
+                )
+            )
+            message = _assistant_message(response)
+            parsed = _parse_final_json(_final_message_content(message))
+            return _validate_final_result(
+                parsed,
+                context,
+                evidence_by_id,
+                local_diagnoses,
+                model_name,
+                tool_call_count,
+            )
+        except AgentToolCallError as error:
+            last_error = error
+            public = error.public_message
+            non_retryable = ("API Key", "权限", "额度", "超时", "网络", "服务暂不可用")
+            if not include_response_format or any(item in public for item in non_retryable):
+                raise
+    raise last_error or AgentToolCallError("模型没有返回最终结构化诊断")
+
+
+def run_siliconflow_planned_agent(
+    api_key: str,
+    model_name: str,
+    context: DiagnosticToolContext,
+    local_diagnoses: list[dict[str, Any]],
+    *,
+    transport: Any = None,
+) -> dict[str, Any]:
+    """Use a model-selected JSON tool plan when native tool calls are slow."""
+
+    caller = transport or (lambda payload: _request_siliconflow(api_key, payload))
+    response = caller(_build_tool_plan_payload(model_name, context))
+    message = _assistant_message(response)
+    parsed = _parse_final_json(_final_message_content(message))
+    calls = parsed.get("tool_calls")
+    if not isinstance(calls, list):
+        raise AgentToolCallError("模型没有返回可执行的诊断工具计划")
+    allowed_tool_names = {
+        str(item.get("function", {}).get("name") or "")
+        for item in tool_definitions()
+        if isinstance(item, dict)
+    }
+    evidence_by_id: dict[str, dict[str, Any]] = {}
+    covered_interface_ids: set[str] = set()
+    seen_calls: set[str] = set()
+    tool_call_count = 0
+    for raw_call in calls[:12]:
+        if not isinstance(raw_call, dict):
+            continue
+        tool_name = str(raw_call.get("name") or "")
+        if tool_name not in allowed_tool_names:
+            continue
+        arguments = raw_call.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(arguments, dict):
+            continue
+        cache_key = _cache_key(tool_name, arguments)
+        if cache_key in seen_calls:
+            continue
+        seen_calls.add(cache_key)
+        try:
+            evidence = execute_tool(context, tool_name, arguments)
+        except DiagnosticToolError:
+            continue
+        evidence_by_id[str(evidence["evidence_id"])] = evidence
+        tool_call_count += 1
+        if arguments.get("interface_id"):
+            covered_interface_ids.add(str(arguments["interface_id"]))
+        covered_interface_ids.update(str(value) for value in arguments.get("interface_ids") or [])
+
+    # A model plan may overlook one interface.  Add only a read-only mapping
+    # snapshot for the missed interface so the final model cannot invent a
+    # diagnosis without any evidence; fault classification remains model-led.
+    for interface_id in sorted(context.interface_ids - covered_interface_ids):
+        if tool_call_count >= MAX_TOOL_CALLS:
+            break
+        arguments = {"interface_id": interface_id}
+        evidence = execute_tool(context, "inspect_interface_mapping", arguments)
+        evidence_by_id[str(evidence["evidence_id"])] = evidence
+        tool_call_count += 1
+    if not evidence_by_id:
+        raise AgentToolCallError("模型工具计划没有取得有效诊断证据")
+    result = _synthesize_from_evidence(
+        caller,
+        model_name,
+        context,
+        evidence_by_id,
+        local_diagnoses,
+        tool_call_count,
+    )
+    result["agent_strategy"] = "model_planned_tools"
+    result["model_message"] = "硅基流动模型已自主规划并调用只读取证工具完成诊断"
+    return result
+
+
 def _parse_siliconflow_sse(lines: Any) -> dict[str, Any]:
     """Reassemble OpenAI-compatible SSE deltas into one assistant message."""
 
@@ -999,6 +1159,14 @@ def run_agentic_diagnoses(
     if not str(api_key).strip() or not str(model_name).strip():
         return run_offline_diagnosis(context, local_diagnoses)
     try:
+        if str(model_name).strip().lower().endswith("/deepseek-v3"):
+            return run_siliconflow_planned_agent(
+                str(api_key).strip(),
+                str(model_name).strip(),
+                context,
+                local_diagnoses,
+                transport=transport,
+            )
         return run_siliconflow_tool_agent(
             str(api_key).strip(),
             str(model_name).strip(),

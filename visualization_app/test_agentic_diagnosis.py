@@ -440,6 +440,59 @@ class SiliconFlowAgentTests(unittest.TestCase):
         )
         self.assertEqual(response["choices"][0]["finish_reason"], "stop")
 
+    def test_deepseek_v3_uses_model_planned_read_only_tools(self) -> None:
+        context = self._plc_context()
+        payloads = []
+        responses = iter(
+            [
+                {
+                    "choices": [{"message": {"role": "assistant", "content": json.dumps({
+                        "tool_calls": [{
+                            "name": "check_network_path",
+                            "arguments": {"interface_id": "plc_process"},
+                        }]
+                    }, ensure_ascii=False)}}]
+                },
+                {
+                    "choices": [{"message": {"role": "assistant", "content": json.dumps({
+                        "diagnoses": [{
+                            "interface_id": "plc_process",
+                            "observed_facts": [{"text": "PLC端点不可达", "evidence_ids": ["EV-001"]}],
+                            "hypotheses": [{
+                                "cause": "网络路径或配置待检查",
+                                "confidence": 0.75,
+                                "evidence_ids": ["EV-001"],
+                            }],
+                            "cross_interface_findings": [],
+                            "recommended_actions": [],
+                            "unknowns": ["网线状态待确认"],
+                        }]
+                    }, ensure_ascii=False)}}]
+                },
+            ]
+        )
+
+        def transport(payload):
+            payloads.append(payload)
+            return next(responses)
+
+        result = agentic_diagnosis.run_agentic_diagnoses(
+            context,
+            [],
+            api_key="sk-test-only",
+            model_name="deepseek-ai/DeepSeek-V3",
+            transport=transport,
+        )
+
+        self.assertEqual(result["execution_mode"], "siliconflow_agent")
+        self.assertEqual(result["model_status"], "success")
+        self.assertEqual(result["tool_call_count"], 1)
+        self.assertEqual(result["agent_strategy"], "model_planned_tools")
+        self.assertNotIn("tools", payloads[0])
+        plan_input = json.loads(payloads[0]["messages"][1]["content"])
+        self.assertEqual(plan_input["case"]["events"][0]["interface_id"], "plc_process")
+        self.assertEqual(len(plan_input["available_tools"]), 8)
+
     def test_model_selects_network_tool_then_returns_evidence_backed_result(self) -> None:
         context = self._plc_context()
         payloads = []
