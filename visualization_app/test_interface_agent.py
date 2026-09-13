@@ -157,6 +157,25 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertTrue(defaults["default_key_available"])
         self.assertNotIn("api_key", defaults)
 
+    def test_agent_defaults_read_current_windows_user_environment(self) -> None:
+        values = {
+            "AFP_SILICONFLOW_API_KEY": "sk-registry-test-only",
+            "AFP_SILICONFLOW_MODEL": "deepseek-ai/DeepSeek-V3",
+        }
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            interface_agent,
+            "_read_user_environment_setting",
+            side_effect=lambda name: values.get(name, ""),
+        ):
+            defaults = interface_agent.get_agent_defaults()
+            key, model = interface_agent._resolve_agent_credentials("", "")
+
+        self.assertTrue(defaults["default_key_available"])
+        self.assertEqual(defaults["model_name"], "deepseek-ai/DeepSeek-V3")
+        self.assertEqual(key, "sk-registry-test-only")
+        self.assertEqual(model, "deepseek-ai/DeepSeek-V3")
+        self.assertNotIn("api_key", defaults)
+
     def test_empty_request_uses_local_environment_key(self) -> None:
         events = interface_agent.build_agent_events(mixed_interface_result())
         captured: list[tuple[str, str]] = []
@@ -296,11 +315,16 @@ class InterfaceAgentTests(unittest.TestCase):
             },
         )
 
-        result = run_all(
-            interface_agent.build_agent_events(mixed_interface_result()),
-            api_key="",
-            model_name="",
-        )
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            interface_agent,
+            "_read_user_environment_setting",
+            return_value="",
+        ):
+            result = run_all(
+                interface_agent.build_agent_events(mixed_interface_result()),
+                api_key="",
+                model_name="",
+            )
 
         self.assertEqual(result["execution_mode"], "offline_test")
         self.assertEqual(result["model_status"], "offline_success")

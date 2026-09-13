@@ -578,23 +578,42 @@ SILICONFLOW_CHAT_COMPLETIONS_URL = "https://api.siliconflow.cn/v1/chat/completio
 DEFAULT_SILICONFLOW_MODEL = "deepseek-ai/DeepSeek-V3"
 
 
+def _read_user_environment_setting(name: str) -> str:
+    """Read the current Windows user environment even if the process is stale."""
+
+    if os.name != "nt":
+        return ""
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+            value, _value_type = winreg.QueryValueEx(key, name)
+        return str(value or "").strip()
+    except (ImportError, OSError, TypeError, ValueError):
+        return ""
+
+
+def _environment_setting(name: str) -> str:
+    return str(os.environ.get(name) or "").strip() or _read_user_environment_setting(name)
+
+
 def get_agent_defaults() -> dict[str, Any]:
     """Return safe UI defaults without returning the local API key."""
 
-    model_name = str(os.environ.get("AFP_SILICONFLOW_MODEL") or DEFAULT_SILICONFLOW_MODEL).strip()
+    model_name = _environment_setting("AFP_SILICONFLOW_MODEL") or DEFAULT_SILICONFLOW_MODEL
     return {
         "model_name": model_name or DEFAULT_SILICONFLOW_MODEL,
-        "default_key_available": bool(str(os.environ.get("AFP_SILICONFLOW_API_KEY") or "").strip()),
+        "default_key_available": bool(_environment_setting("AFP_SILICONFLOW_API_KEY")),
     }
 
 
 def _resolve_agent_credentials(api_key: str, model_name: str) -> tuple[str, str]:
     """Use request values first, then optional machine-local environment defaults."""
 
-    clean_key = str(api_key or "").strip() or str(os.environ.get("AFP_SILICONFLOW_API_KEY") or "").strip()
-    clean_model = str(model_name or "").strip() or str(
-        os.environ.get("AFP_SILICONFLOW_MODEL") or DEFAULT_SILICONFLOW_MODEL
-    ).strip()
+    clean_key = str(api_key or "").strip() or _environment_setting("AFP_SILICONFLOW_API_KEY")
+    clean_model = str(model_name or "").strip() or (
+        _environment_setting("AFP_SILICONFLOW_MODEL") or DEFAULT_SILICONFLOW_MODEL
+    )
     return clean_key, clean_model or DEFAULT_SILICONFLOW_MODEL
 
 
