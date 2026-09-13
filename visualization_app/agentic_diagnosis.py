@@ -23,8 +23,8 @@ from diagnostic_tools import (
 )
 
 
-MAX_AGENT_ROUNDS = 5
-MAX_TOOL_CALLS = 8
+MAX_AGENT_ROUNDS = 8
+MAX_TOOL_CALLS = 24
 OFFLINE_BOUNDARY = "离线测试诊断只验证软件流程，不等同于真实硬件故障确认"
 SILICONFLOW_CHAT_COMPLETIONS_URL = "https://api.siliconflow.cn/v1/chat/completions"
 ONLINE_BOUNDARY = "模型结论基于本次只读工具证据，仍不等同于已确认硬件损坏"
@@ -434,6 +434,87 @@ def _build_structured_payload(
     }
 
 
+def _build_evidence_synthesis_payload(
+    model_name: str,
+    context: DiagnosticToolContext,
+    evidence_by_id: dict[str, dict[str, Any]],
+    *,
+    include_response_format: bool = True,
+) -> dict[str, Any]:
+    """Build a clean no-tools request from evidence gathered by the model."""
+
+    required_interface_ids = [
+        str(item.get("interface_id"))
+        for item in context.events
+        if str(item.get("state")) not in {"ok", "healthy", "disabled", "video_only"}
+    ]
+    payload = {
+        "model": model_name,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "你是AFP工业采集接口诊断Agent的最终结论生成器。工具检查已经结束，"
+                    "本次请求不提供任何工具。只能根据tool_evidence中的evidence_id形成结论。"
+                    "只输出一个JSON对象，顶层必须且只能包含diagnoses数组。diagnoses必须按"
+                    "required_interface_ids逐项完整覆盖，不能输出下一步工具参数。每项必须包含"
+                    "interface_id、observed_facts、hypotheses、cross_interface_findings、"
+                    "recommended_actions和unknowns。observed_facts每项包含text和evidence_ids；"
+                    "hypotheses每项包含cause、confidence和evidence_ids；recommended_actions每项"
+                    "包含priority、action、reason和requires_shutdown。没有独立证据时不得宣称硬件损坏。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "required_interface_ids": required_interface_ids,
+                        "case": _initial_case_payload(context),
+                        "tool_evidence": list(evidence_by_id.values()),
+                        "output_example": {
+                            "diagnoses": [
+                                {
+                                    "interface_id": required_interface_ids[0]
+                                    if required_interface_ids
+                                    else "interface_id",
+                                    "observed_facts": [
+                                        {"text": "已观察事实", "evidence_ids": ["EV-001"]}
+                                    ],
+                                    "hypotheses": [
+                                        {
+                                            "cause": "待验证原因",
+                                            "confidence": 0.5,
+                                            "evidence_ids": ["EV-001"],
+                                        }
+                                    ],
+                                    "cross_interface_findings": [],
+                                    "recommended_actions": [
+                                        {
+                                            "priority": 1,
+                                            "action": "下一步检查",
+                                            "reason": "基于现有证据",
+                                            "requires_shutdown": False,
+                                        }
+                                    ],
+                                    "unknowns": ["仍需确认的信息"],
+                                }
+                            ]
+                        },
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            },
+        ],
+        "stream": False,
+        "temperature": 0.1,
+        "max_tokens": 4096,
+    }
+    if include_response_format:
+        payload["response_format"] = {"type": "json_object"}
+    return payload
+
+
 def _request_siliconflow(
     api_key: str, payload: dict[str, Any], *, timeout_seconds: float = 60.0
 ) -> dict[str, Any]:
@@ -683,8 +764,13 @@ def run_siliconflow_tool_agent(
     ]
     evidence_by_id: dict[str, dict[str, Any]] = {}
     tool_call_count = 0
+    allowed_tool_names = {
+        str(item.get("function", {}).get("name") or "")
+        for item in tool_definitions()
+        if isinstance(item, dict)
+    }
     caller = transport or (lambda payload: _request_siliconflow(api_key, payload))
-    for _round_index in range(MAX_AGENT_ROUNDS):
+    for _round_index in range(MAX_AGENT_ROUNDS - 1):
         if time.monotonic() - started > 90:
             raise AgentToolCallError("模型工具诊断超过90秒限制")
         response = caller(_build_chat_payload(model_name, messages))
@@ -705,7 +791,7 @@ def run_siliconflow_tool_agent(
         messages.append(message)
         for call in calls:
             if tool_call_count >= MAX_TOOL_CALLS:
-                raise AgentToolCallError("模型工具调用超过8次限制")
+                raise AgentToolCallError(f"模型工具调用超过{MAX_TOOL_CALLS}次限制")
             function = call.get("function") if isinstance(call, dict) else None
             if not isinstance(function, dict):
                 raise AgentToolCallError("模型工具调用缺少函数信息")
@@ -713,17 +799,57 @@ def run_siliconflow_tool_agent(
                 arguments = json.loads(str(function.get("arguments") or "{}"))
             except json.JSONDecodeError:
                 raise AgentToolCallError("模型工具参数不是有效JSON") from None
-            evidence = execute_tool(context, str(function.get("name") or ""), arguments)
-            evidence_by_id[evidence["evidence_id"]] = evidence
+            tool_name = str(function.get("name") or "")
+            if tool_name not in allowed_tool_names:
+                raise AgentToolCallError(f"模型请求了未授权诊断工具：{tool_name}")
+            try:
+                evidence = execute_tool(context, tool_name, arguments)
+            except DiagnosticToolError as error:
+                tool_result = {
+                    "ok": False,
+                    "error": str(error)[:300],
+                    "allowed_interface_ids": sorted(context.interface_ids),
+                    "instruction": "请使用当前任务中的接口ID修正参数后重试",
+                }
+            else:
+                evidence_by_id[evidence["evidence_id"]] = evidence
+                tool_result = evidence
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": str(call.get("id") or f"call_{tool_call_count + 1}"),
-                    "content": json.dumps(evidence, ensure_ascii=False, separators=(",", ":")),
+                    "content": json.dumps(tool_result, ensure_ascii=False, separators=(",", ":")),
                 }
             )
             tool_call_count += 1
-    raise AgentToolCallError("模型工具诊断超过5轮限制")
+    last_error: AgentToolCallError | None = None
+    for include_response_format in (True, False):
+        try:
+            response = caller(
+                _build_evidence_synthesis_payload(
+                    model_name,
+                    context,
+                    evidence_by_id,
+                    include_response_format=include_response_format,
+                )
+            )
+            message = _assistant_message(response)
+            parsed = _parse_final_json(_final_message_content(message))
+            return _validate_final_result(
+                parsed,
+                context,
+                evidence_by_id,
+                local_diagnoses,
+                model_name,
+                tool_call_count,
+            )
+        except AgentToolCallError as error:
+            last_error = error
+            public = error.public_message
+            non_retryable = ("API Key", "权限", "额度", "超时", "网络", "服务暂不可用")
+            if not include_response_format or any(item in public for item in non_retryable):
+                raise
+    raise last_error or AgentToolCallError("模型没有返回最终结构化诊断")
 
 
 def _run_structured_fallback(

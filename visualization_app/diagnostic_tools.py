@@ -190,6 +190,54 @@ def _event(context: DiagnosticToolContext, interface_id: str) -> dict[str, Any]:
     raise DiagnosticToolError(f"未知接口：{interface_id}")
 
 
+def _resolve_interface_id(context: DiagnosticToolContext, value: Any) -> str:
+    """Resolve a model-supplied unique device alias to the current interface ID."""
+
+    requested = str(value or "").strip()
+    if requested in context.interface_ids:
+        return requested
+    folded = requested.casefold()
+    matches: set[str] = set()
+    aliases_by_interface: dict[str, set[str]] = {}
+    for item in context.events:
+        canonical = str(item.get("interface_id") or item.get("id") or "").strip()
+        aliases = {
+            str(item.get(key) or "").strip().casefold()
+            for key in (
+                "role",
+                "driver",
+                "protocol",
+                "endpoint",
+                "physical_interface_id",
+                "sensor_name",
+            )
+            if str(item.get(key) or "").strip()
+        }
+        aliases.update(
+            str(channel).strip().casefold()
+            for channel in (item.get("channels") or [])
+            if str(channel).strip()
+        )
+        if canonical:
+            aliases_by_interface[canonical] = aliases
+        if folded and folded in aliases and canonical:
+            matches.add(canonical)
+    if len(matches) == 1:
+        return next(iter(matches))
+    if len(folded) >= 3:
+        fuzzy_matches = {
+            canonical
+            for canonical, aliases in aliases_by_interface.items()
+            if any(
+                len(alias) >= 3 and (folded in alias or alias in folded)
+                for alias in aliases
+            )
+        }
+        if len(fuzzy_matches) == 1:
+            return next(iter(fuzzy_matches))
+    raise DiagnosticToolError(f"未知接口：{requested}")
+
+
 def _hardware_interface(context: DiagnosticToolContext, interface_id: str) -> dict[str, Any]:
     for item in context.hardware_result.get("interfaces") or []:
         if isinstance(item, dict) and str(item.get("id")) == interface_id:
@@ -484,8 +532,7 @@ def _validate_arguments(
         raise DiagnosticToolError("诊断工具参数必须是JSON对象")
     clean = deepcopy(arguments)
     if "interface_id" in clean:
-        interface_id = str(clean["interface_id"])
-        _event(context, interface_id)
+        interface_id = _resolve_interface_id(context, clean["interface_id"])
         clean["interface_id"] = interface_id
     if name == "recheck_interface":
         duration = _number(clean.get("duration_seconds"), 1.0)
@@ -504,9 +551,9 @@ def _validate_arguments(
         interface_ids = clean.get("interface_ids")
         if not isinstance(interface_ids, list) or len(interface_ids) < 2:
             raise DiagnosticToolError("跨接口检查至少需要两个接口")
-        clean["interface_ids"] = [str(value) for value in interface_ids]
-        for interface_id in clean["interface_ids"]:
-            _event(context, interface_id)
+        clean["interface_ids"] = [
+            _resolve_interface_id(context, value) for value in interface_ids
+        ]
     if name == "check_network_path":
         event = _event(context, clean["interface_id"])
         if str(event.get("physical_interface_kind")) != "ethernet" or clean["interface_id"] not in {
@@ -515,9 +562,7 @@ def _validate_arguments(
         }:
             raise DiagnosticToolError("该工具只允许检查已配置的PLC或ABB网络接口")
     if name == "lookup_device_knowledge":
-        device_type = str(clean.get("device_type") or "")
-        if device_type not in context.interface_ids:
-            raise DiagnosticToolError(f"未知接口：{device_type}")
+        device_type = _resolve_interface_id(context, clean.get("device_type"))
         clean["device_type"] = device_type
         clean["symptom"] = str(clean.get("symptom") or "")[:200]
     return clean

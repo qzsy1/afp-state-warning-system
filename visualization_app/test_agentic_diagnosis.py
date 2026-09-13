@@ -284,6 +284,25 @@ class DiagnosticToolTests(unittest.TestCase):
                 context, "check_network_path", {"interface_id": "m3232_pressure"}
             )
 
+    def test_unique_device_aliases_resolve_to_current_interface_id(self) -> None:
+        context = diagnostic_context_for(no_sensor_hardware_result())
+
+        for alias in ("smrf_hid", "SMRFCT08B", "温度1"):
+            with self.subTest(alias=alias):
+                result = diagnostic_tools.execute_tool(
+                    context,
+                    "inspect_interface_mapping",
+                    {"interface_id": alias},
+                )
+                self.assertEqual(result["interface_id"], "thermocouple_8ch")
+
+        uvc = diagnostic_tools.execute_tool(
+            context,
+            "inspect_interface_mapping",
+            {"interface_id": "BSV UVC"},
+        )
+        self.assertEqual(uvc["interface_id"], "uvc_temperature")
+
     def test_tool_registry_enforces_duration_and_window_limits(self) -> None:
         context = diagnostic_context_for(no_sensor_hardware_result())
 
@@ -477,6 +496,219 @@ class SiliconFlowAgentTests(unittest.TestCase):
         self.assertEqual(len(payloads[0]["tools"]), 8)
         self.assertEqual(payloads[1]["messages"][-1]["role"], "tool")
         self.assertNotIn("sk-test-only", json.dumps(payloads, ensure_ascii=False))
+
+    def test_five_interface_case_allows_more_than_eight_model_tool_calls(self) -> None:
+        context = diagnostic_context_for(no_sensor_hardware_result())
+        tool_specs = [
+            ("inspect_interface_mapping", {"interface_id": item["id"]})
+            for item in INTERFACE_FIXTURES
+        ] + [
+            ("check_network_path", {"interface_id": "plc_process"}),
+            ("check_network_path", {"interface_id": "abb_motion"}),
+            ("recheck_interface", {"interface_id": "uvc_temperature", "duration_seconds": 1}),
+            ("recheck_interface", {"interface_id": "m3232_pressure", "duration_seconds": 1}),
+        ]
+        calls = [
+            {
+                "id": f"call_{index}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(arguments, ensure_ascii=False),
+                },
+            }
+            for index, (name, arguments) in enumerate(tool_specs, start=1)
+        ]
+        evidence_ids = {
+            "thermocouple_8ch": "EV-001",
+            "plc_process": "EV-006",
+            "uvc_temperature": "EV-008",
+            "abb_motion": "EV-007",
+            "m3232_pressure": "EV-009",
+        }
+        final_diagnoses = [
+            {
+                "interface_id": item["id"],
+                "observed_facts": [
+                    {"text": "本次检查未确认有效数据", "evidence_ids": [evidence_ids[item["id"]]]}
+                ],
+                "hypotheses": [
+                    {
+                        "cause": "设备未连接或接口参数仍待确认",
+                        "confidence": 0.6,
+                        "evidence_ids": [evidence_ids[item["id"]]],
+                    }
+                ],
+                "cross_interface_findings": [],
+                "recommended_actions": [],
+                "unknowns": ["真实设备尚未连接"],
+            }
+            for item in INTERFACE_FIXTURES
+        ]
+        responses = iter(
+            [
+                {"choices": [{"message": {"role": "assistant", "content": "", "tool_calls": calls}}]},
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": json.dumps(
+                                    {"diagnoses": final_diagnoses}, ensure_ascii=False
+                                ),
+                            }
+                        }
+                    ]
+                },
+            ]
+        )
+
+        result = agentic_diagnosis.run_siliconflow_tool_agent(
+            "sk-test-only",
+            "deepseek-ai/DeepSeek-V3",
+            context,
+            [],
+            transport=lambda _payload: next(responses),
+        )
+
+        self.assertEqual(result["execution_mode"], "siliconflow_agent")
+        self.assertEqual(result["tool_call_count"], 9)
+        self.assertEqual(len(result["diagnoses"]), 5)
+
+    def test_allowed_tool_argument_error_is_returned_for_model_self_correction(self) -> None:
+        context = self._plc_context()
+        responses = iter(
+            [
+                {
+                    "choices": [{"message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "call_bad_arg",
+                            "type": "function",
+                            "function": {
+                                "name": "check_network_path",
+                                "arguments": '{"interface_id":"unknown_interface"}',
+                            },
+                        }],
+                    }}]
+                },
+                {
+                    "choices": [{"message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "call_corrected",
+                            "type": "function",
+                            "function": {
+                                "name": "check_network_path",
+                                "arguments": '{"interface_id":"plc_process"}',
+                            },
+                        }],
+                    }}]
+                },
+                {
+                    "choices": [{"message": {
+                        "role": "assistant",
+                        "content": json.dumps({
+                            "diagnoses": [{
+                                "interface_id": "plc_process",
+                                "observed_facts": [
+                                    {"text": "PLC端点不可达", "evidence_ids": ["EV-001"]}
+                                ],
+                                "hypotheses": [{
+                                    "cause": "网络路径或配置待检查",
+                                    "confidence": 0.7,
+                                    "evidence_ids": ["EV-001"],
+                                }],
+                                "cross_interface_findings": [],
+                                "recommended_actions": [],
+                                "unknowns": ["物理网线状态待确认"],
+                            }]
+                        }, ensure_ascii=False),
+                    }}]
+                },
+            ]
+        )
+        payloads = []
+
+        def transport(payload):
+            payloads.append(payload)
+            return next(responses)
+
+        result = agentic_diagnosis.run_siliconflow_tool_agent(
+            "sk-test-only",
+            "deepseek-ai/DeepSeek-V3",
+            context,
+            [],
+            transport=transport,
+        )
+
+        error_payload = json.loads(payloads[1]["messages"][-1]["content"])
+        self.assertFalse(error_payload["ok"])
+        self.assertIn("plc_process", error_payload["allowed_interface_ids"])
+        self.assertEqual(result["execution_mode"], "siliconflow_agent")
+        self.assertEqual(result["tool_call_count"], 2)
+
+    def test_last_agent_round_uses_clean_structured_evidence_synthesis(self) -> None:
+        context = self._plc_context()
+        payloads = []
+
+        def transport(payload):
+            payloads.append(payload)
+            if "tools" in payload:
+                call_number = len(payloads)
+                return {
+                    "choices": [{"message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": f"call_{call_number}",
+                            "type": "function",
+                            "function": {
+                                "name": "check_network_path",
+                                "arguments": '{"interface_id":"plc_process"}',
+                            },
+                        }],
+                    }}]
+                }
+            return {
+                "choices": [{"message": {
+                    "role": "assistant",
+                    "content": json.dumps({
+                        "diagnoses": [{
+                            "interface_id": "plc_process",
+                            "observed_facts": [
+                                {"text": "PLC端点不可达", "evidence_ids": ["EV-001"]}
+                            ],
+                            "hypotheses": [{
+                                "cause": "网络路径或配置待检查",
+                                "confidence": 0.7,
+                                "evidence_ids": ["EV-001"],
+                            }],
+                            "cross_interface_findings": [],
+                            "recommended_actions": [],
+                            "unknowns": ["物理网线状态待确认"],
+                        }]
+                    }, ensure_ascii=False),
+                }}]
+            }
+
+        result = agentic_diagnosis.run_siliconflow_tool_agent(
+            "sk-test-only",
+            "deepseek-ai/DeepSeek-V3",
+            context,
+            [],
+            transport=transport,
+        )
+
+        self.assertNotIn("tools", payloads[-1])
+        self.assertEqual(payloads[-1]["response_format"], {"type": "json_object"})
+        synthesis_input = json.loads(payloads[-1]["messages"][1]["content"])
+        self.assertEqual(synthesis_input["required_interface_ids"], ["plc_process"])
+        self.assertTrue(synthesis_input["tool_evidence"])
+        self.assertEqual(result["execution_mode"], "siliconflow_agent")
+        self.assertEqual(result["model_status"], "success")
 
     def test_illegal_model_tool_call_falls_back_to_offline_without_secret(self) -> None:
         context = diagnostic_context_for(no_sensor_hardware_result())
