@@ -225,18 +225,18 @@
                   <div id="agentDiagnosisTitle" class="sensor-selector-title">LangChain 接口诊断提示</div>
                   <p class="control-note">诊断提示合并显示在上方自动检查结果中，并覆盖全部异常。</p>
                 </div>
-                <span id="agentGateStatus" class="agent-gate-status">本地规则</span>
+                <span id="agentGateStatus" class="agent-gate-status">离线测试诊断</span>
               </summary>
               <div class="collapsible-subsection-content">
               <div class="compact-input-grid agent-input-grid">
                 <label>硅基流动 API Key（仅本次运行）<input id="agentApiKeyInput" type="password" autocomplete="off" placeholder="sk-..."></label>
-                <label>模型名称<input id="agentModelNameInput" type="text" autocomplete="off" value="deepseek-ai/DeepSeek-V3" placeholder="deepseek-ai/DeepSeek-V3"></label>
+                <label>模型名称<input id="agentModelNameInput" type="text" autocomplete="off" value="deepseek-ai/DeepSeek-V3.2" placeholder="deepseek-ai/DeepSeek-V3.2"></label>
               </div>
               <div class="agent-actions">
-                <span id="agentAutoStatus" class="control-note">未配置时自动使用本地规则；配置正确时叠加模型分析。</span>
+                <span id="agentAutoStatus" class="control-note">未配置时使用内置离线测试诊断；配置正确时由模型按现象选择只读取证工具。</span>
                 <button id="agentDiagnoseButton" class="secondary-button" type="button" disabled>重新诊断全部异常</button>
               </div>
-              <p class="agent-scope-note">覆盖 SMRF 热电偶、PLC、UVC、ABB 与 M3232 薄膜压力传感器接口。Key 不保存、不写日志；仅在配置完整时发往硅基流动。</p>
+              <p class="agent-scope-note">覆盖 SMRF 热电偶、PLC、UVC、ABB 与 M3232 薄膜压力传感器接口。只展示诊断结论和证据来源，不展示调用轨迹；异常失败时保留本地规则兜底。Key 不保存、不写日志。</p>
               </div>
             </details>
             <details id="acquisitionParameterPanel" class="acquisition-parameter-panel collapsible-subsection" aria-labelledby="acquisitionParameterTitle">

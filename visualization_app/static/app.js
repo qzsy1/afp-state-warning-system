@@ -30,6 +30,8 @@ const state = {
   agentResult: null,
   agentFingerprint: "",
   agentBusy: false,
+  agentController: null,
+  agentRequestId: 0,
   agentDefaultKeyAvailable: false,
   physicalInterfaces: [],
 };
@@ -1107,11 +1109,11 @@ function renderAgentGate() {
   const status = $("agentGateStatus");
   if (status) {
     const configured = keyPresent && modelPresent;
-    status.className = `agent-gate-status ${configured && ready ? "ready" : ""}`;
+    status.className = `agent-gate-status ${ready ? "ready" : ""}`;
     status.textContent = state.agentBusy
       ? "诊断中"
       : !eventPresent ? "等待异常"
-        : configured ? "模型增强" : (keyPresent || modelPresent) ? "配置不完整" : "本地规则";
+        : configured ? "模型工具诊断" : (keyPresent || modelPresent) ? "离线诊断（配置不完整）" : "离线测试诊断";
   }
   if (agentDiagnoseButton) agentDiagnoseButton.disabled = !ready;
   return ready;
@@ -1130,9 +1132,13 @@ function appendAgentDiagnostics(node) {
     node.appendChild(container);
     return;
   }
-  const statusText = result.model_status === "success"
-    ? "本地规则 + 硅基流动模型增强"
-    : result.model_status === "failed" ? "模型调用失败，已回退本地规则" : "本地规则诊断";
+  const statusText = result.execution_mode === "siliconflow_agent"
+    ? "硅基流动模型已自主选用诊断工具"
+    : result.model_status === "failed_offline_fallback"
+      ? "模型工具调用失败，已完成离线测试诊断"
+      : result.execution_mode === "offline_test"
+        ? "内置离线测试诊断器已按现象选用工具"
+        : "本地规则兜底诊断";
   heading.textContent = `LangChain：${statusText}（${(result.diagnoses || []).length} 项）`;
   container.appendChild(heading);
   if (result.model_message) {
@@ -1144,19 +1150,37 @@ function appendAgentDiagnostics(node) {
   (result.diagnoses || []).forEach((diagnosis, index) => {
     const item = document.createElement("div");
     item.className = "hardware-agent-item";
-    const causes = (diagnosis.possible_causes || []).map((value) => `<li>${agentEscapeHtml(value)}</li>`).join("");
-    const actions = (diagnosis.recommended_actions || []).map((value) => `<li>${agentEscapeHtml(value)}</li>`).join("");
-    const enhancement = diagnosis.model_enhancement;
-    const modelBlock = enhancement ? `
-      <div class="hardware-agent-model"><b>模型补充分析</b><span>${agentEscapeHtml(enhancement.analysis || "未补充文字分析")}</span>
-      ${(enhancement.possible_causes || []).length ? `<b>模型补充原因</b><ul>${enhancement.possible_causes.map((value) => `<li>${agentEscapeHtml(value)}</li>`).join("")}</ul>` : ""}
-      ${(enhancement.recommended_actions || []).length ? `<b>模型补充建议</b><ul>${enhancement.recommended_actions.map((value) => `<li>${agentEscapeHtml(value)}</li>`).join("")}</ul>` : ""}</div>` : "";
+    const facts = (diagnosis.observed_facts || []).map((value) =>
+      `<li>${agentEscapeHtml(value?.text || value)}</li>`).join("");
+    const hypotheses = (diagnosis.hypotheses || []).map((value) => {
+      const confidence = Number(value?.confidence);
+      const suffix = Number.isFinite(confidence) ? `（可信度 ${Math.round(confidence * 100)}%）` : "";
+      return `<li>${agentEscapeHtml(value?.cause || value)}${agentEscapeHtml(suffix)}</li>`;
+    }).join("");
+    const legacyCauses = (diagnosis.possible_causes || []).map((value) => `<li>${agentEscapeHtml(value)}</li>`).join("");
+    const actions = (diagnosis.recommended_actions || []).map((value, actionIndex) => {
+      if (value && typeof value === "object") {
+        const action = value.action || "待确认操作";
+        const reason = value.reason ? `——${value.reason}` : "";
+        return `<li>${agentEscapeHtml(value.priority || actionIndex + 1)}. ${agentEscapeHtml(action)}${agentEscapeHtml(reason)}</li>`;
+      }
+      return `<li>${agentEscapeHtml(value)}</li>`;
+    }).join("");
+    const crossFindings = (diagnosis.cross_interface_findings || []).map((value) => `<li>${agentEscapeHtml(value)}</li>`).join("");
+    const unknowns = (diagnosis.unknowns || []).map((value) => `<li>${agentEscapeHtml(value)}</li>`).join("");
+    const sources = (diagnosis.evidence_sources || []).map((value) => agentEscapeHtml(value)).join("、") || "本次接口检查";
     item.innerHTML = `
       <div class="hardware-agent-title"><strong>${index + 1}. ${agentEscapeHtml(diagnosis.interface_label)} / ${agentEscapeHtml(diagnosis.sensor_name)}</strong><span>${agentEscapeHtml(diagnosis.fault_type)}</span></div>
-      <div><b>原始报错：</b>${agentEscapeHtml(diagnosis.error_message || diagnosis.summary)}</div>
+      <div><b>原始报错：</b>${agentEscapeHtml(diagnosis.original_error || diagnosis.error_message || diagnosis.summary)}</div>
       <div><b>接口/通道：</b>${agentEscapeHtml((diagnosis.channels || []).join("、") || "接口级异常")}</div>
-      <div class="hardware-agent-grid"><div><b>本地规则可能原因</b><ul>${causes}</ul></div><div><b>处理建议</b><ul>${actions}</ul></div></div>
-      ${modelBlock}
+      <div class="hardware-agent-grid">
+        <div><b>已观察事实</b><ul>${facts || "<li>没有取得更多可验证事实</li>"}</ul></div>
+        <div><b>原因判断</b><ul>${hypotheses || legacyCauses || "<li>证据不足，暂不判断具体原因</li>"}</ul></div>
+        ${crossFindings ? `<div><b>跨接口判断</b><ul>${crossFindings}</ul></div>` : ""}
+        <div><b>建议操作</b><ul>${actions || "<li>保持当前配置并取得更多诊断证据</li>"}</ul></div>
+        <div><b>仍待确认</b><ul>${unknowns || "<li>需要连接真实设备后复核</li>"}</ul></div>
+      </div>
+      <div class="hardware-agent-evidence"><b>证据来源：</b>${sources}</div>
       <small>${agentEscapeHtml(diagnosis.evidence_boundary)}</small>`;
     container.appendChild(item);
   });
@@ -1171,11 +1195,11 @@ function handleAgentInputChange() {
   if (autoStatus && state.agentEvents.length) {
     autoStatus.textContent = keyPresent && modelPresent
       ? state.agentDefaultKeyAvailable && !agentApiKeyInput?.value.trim()
-        ? "已检测到本机默认 API Key；点击重新诊断全部异常后叠加硅基流动模型分析。"
-        : "配置已填写；点击重新诊断全部异常后叠加硅基流动模型分析。"
+        ? "已检测到本机默认 API Key；模型会按异常现象自主选择只读取证工具。"
+        : "配置完整；模型会按异常现象自主选择只读取证工具。"
       : (keyPresent || modelPresent)
-        ? "API Key 与模型名称需同时填写；当前仍使用本地规则。"
-        : "当前使用本地规则；无需 API Key。";
+        ? "API Key 与模型名称需同时有效；当前使用内置离线测试诊断。"
+        : "当前使用内置离线测试诊断，不调用外部服务。";
   }
 }
 
@@ -1186,7 +1210,7 @@ async function loadAgentDefaults() {
     if (!response.ok) return;
     state.agentDefaultKeyAvailable = Boolean(defaults.default_key_available);
     if (agentModelNameInput && !agentModelNameInput.value.trim()) {
-      agentModelNameInput.value = defaults.model_name || "deepseek-ai/DeepSeek-V3";
+      agentModelNameInput.value = defaults.model_name || "deepseek-ai/DeepSeek-V3.2";
     }
     handleAgentInputChange();
   } catch (_error) {
@@ -1200,12 +1224,16 @@ function updateAgentFromHardwareResult(result, {automatic = false} = {}) {
   const changed = fingerprint !== state.agentFingerprint;
   state.agentEvents = events;
   if (changed) {
+    state.agentRequestId += 1;
+    state.agentController?.abort();
+    state.agentController = null;
+    state.agentBusy = false;
     state.agentFingerprint = fingerprint;
     state.agentResult = null;
     const autoStatus = $("agentAutoStatus");
     if (autoStatus) autoStatus.textContent = events.length
       ? `发现 ${events.length} 项异常，正在自动诊断全部异常。`
-      : "等待接口异常；未配置模型时使用本地规则。";
+      : "等待接口异常；未配置模型时使用内置离线测试诊断。";
   }
   renderAgentGate();
   if (events.length && changed && !state.agentResult) runAgentDiagnosis({automatic: true});
@@ -1213,6 +1241,10 @@ function updateAgentFromHardwareResult(result, {automatic = false} = {}) {
 
 async function runAgentDiagnosis({automatic = false} = {}) {
   if (!state.agentEvents.length || !renderAgentGate()) return null;
+  const requestId = ++state.agentRequestId;
+  state.agentController?.abort();
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  state.agentController = controller;
   state.agentBusy = true;
   renderAgentGate();
   if (state.hardwareCheck) renderHardwareCheckResult(state.hardwareCheck, {automatic});
@@ -1223,17 +1255,22 @@ async function runAgentDiagnosis({automatic = false} = {}) {
       api_key: agentApiKeyInput.value.trim(),
       model_name: agentModelNameInput.value.trim(),
       events: state.agentEvents,
-    }, {timeoutMs: 150000});
+      hardware_result: state.hardwareCheck,
+    }, {timeoutMs: 150000, controller});
+    if (requestId !== state.agentRequestId) return null;
     state.agentResult = result;
     if (autoStatus) autoStatus.textContent = result.model_message || "LangChain 诊断已完成。";
     return result;
   } catch (error) {
-    if (autoStatus) autoStatus.textContent = `诊断未完成：${error.message}`;
+    if (requestId === state.agentRequestId && autoStatus) autoStatus.textContent = `诊断未完成：${error.message}`;
     return null;
   } finally {
-    state.agentBusy = false;
-    renderAgentGate();
-    if (state.hardwareCheck) renderHardwareCheckResult(state.hardwareCheck, {automatic});
+    if (requestId === state.agentRequestId) {
+      state.agentBusy = false;
+      if (state.agentController === controller) state.agentController = null;
+      renderAgentGate();
+      if (state.hardwareCheck) renderHardwareCheckResult(state.hardwareCheck, {automatic});
+    }
   }
 }
 
@@ -3714,7 +3751,11 @@ function hardwareStateLabel(value) {
     ok: "正常", disabled: "已停用", video_only: "仅视频",
     no_channels: "无已选通道", waiting: "等待数据",
     not_connected: "未连接", no_data: "没有采集数据",
-    invalid_data: "采集数据无效", partial: "部分通道异常",
+    identity_unconfirmed: "目标设备身份未确认",
+    endpoint_unreachable: "目标网络端点不可达",
+    open_failed: "接口无法打开或读取",
+    invalid_protocol: "协议数据无效",
+    invalid_data: "采集数据无效", partial: "部分通道异常", partial_data: "部分通道异常",
     stale: "数据已中断", not_selected: "未选择",
   })[value] || "异常";
 }
@@ -3806,6 +3847,13 @@ function renderHardwareCheckResult(result, {automatic = false, live = false} = {
 }
 
 function markHardwareCheckStale(reason = "配置已变化") {
+  state.agentRequestId += 1;
+  state.agentController?.abort();
+  state.agentController = null;
+  state.agentBusy = false;
+  state.agentEvents = [];
+  state.agentResult = null;
+  state.agentFingerprint = "";
   state.hardwareCheck = null;
   state.hardwareCheckFingerprint = "";
   clearHardwareRowStates();
@@ -3879,6 +3927,11 @@ async function resetAndCheckHardware() {
     toast("请先停止并保存当前采集，再重置检查状态");
     return;
   }
+  state.agentRequestId += 1;
+  state.agentController?.abort();
+  state.agentController = null;
+  state.agentBusy = false;
+  state.agentResult = null;
   if (state.hardwareCheckInProgress) {
     state.hardwareCheckController?.abort();
     const deadline = Date.now() + 1000;

@@ -4088,6 +4088,9 @@ class AppHandler(BaseHTTPRequestHandler):
                     request_data["events"],
                     api_key=request_data["api_key"],
                     model_name=request_data["model_name"],
+                    hardware_result=request_data["hardware_result"],
+                    discovery=self.dashboard.acquisition.discover_interfaces(),
+                    acquisition_status=self.dashboard.acquisition.status(),
                 )
                 self._send_json(result)
                 return

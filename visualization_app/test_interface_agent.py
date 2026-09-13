@@ -442,9 +442,18 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertNotIn('id="agentDiagnosisPanel"', html)
         self.assertIn("/api/agent/diagnose", script)
         self.assertIn("api_key: agentApiKeyInput.value.trim()", script)
+        self.assertIn("hardware_result: state.hardwareCheck", script)
         self.assertNotIn("api_key_present", script)
         self.assertIn("buildAgentEvents", script)
         self.assertIn("result.diagnoses", script)
+        self.assertIn('execution_mode === "offline_test"', script)
+        self.assertIn('execution_mode === "siliconflow_agent"', script)
+        self.assertIn("observed_facts", script)
+        self.assertIn("hypotheses", script)
+        self.assertIn("evidence_sources", script)
+        self.assertIn("unknowns", script)
+        self.assertIn("agentRequestId", script)
+        self.assertIn("agentController", script)
         self.assertIn("薄膜压力", html)
         self.assertIn("LangChain", html)
         self.assertIn("硅基流动", html)
@@ -526,6 +535,7 @@ class InterfaceAgentTests(unittest.TestCase):
             "api_key": "sk-test-only",
             "model_name": "deepseek-ai/DeepSeek-V4-Flash",
             "events": events,
+            "hardware_result": mixed_interface_result(),
         }
         try:
             validated = validate_agent_payload(payload)
@@ -534,6 +544,18 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertEqual(validated["api_key"], "sk-test-only")
         self.assertEqual(validated["model_name"], "deepseek-ai/DeepSeek-V4-Flash")
         self.assertEqual(len(validated["events"]), 2)
+        self.assertEqual(len(validated["hardware_result"]["interfaces"]), 2)
+
+    def test_app_payload_rejects_oversized_hardware_result(self) -> None:
+        payload = {
+            "api_key": "",
+            "model_name": "",
+            "events": interface_agent.build_agent_events(mixed_interface_result()),
+            "hardware_result": {"interfaces": [], "sensors": [], "padding": "x" * 250_000},
+        }
+
+        with self.assertRaisesRegex(ValueError, "硬件检查结果过大"):
+            validate_agent_payload(payload)
 
     def test_app_payload_rejects_unknown_fields(self) -> None:
         payload = {

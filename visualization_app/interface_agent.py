@@ -89,11 +89,91 @@ _EVIDENCE_FIELDS = {
     "sensor_states",
 }
 
+_HARDWARE_INTERFACE_FIELDS = {
+    "id",
+    "label",
+    "role",
+    "driver",
+    "endpoint",
+    "physical_interface_id",
+    "physical_interface_kind",
+    "protocol",
+    "physical_verified",
+    "physical_fallback",
+    "physical_warning",
+    "enabled",
+    "expected_channels",
+    "detected_channels",
+    "missing_channels",
+    "invalid_channels",
+    "sample_counts",
+    "invalid_sample_counts",
+    "errors",
+    "state",
+    "message",
+    "ok",
+    "protocol_evidence",
+    "raw_frame_summary",
+}
+
+_HARDWARE_SENSOR_FIELDS = {
+    "name",
+    "selected",
+    "received_samples",
+    "invalid_samples",
+    "last_sample_age_seconds",
+    "state",
+    "message",
+    "blocking",
+    "ok",
+}
+
+
+def _clean_hardware_result(value: Any) -> dict[str, Any]:
+    if value in (None, {}):
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("硬件检查结果必须是对象")
+    try:
+        encoded = json.dumps(value, ensure_ascii=False).encode("utf-8")
+    except (TypeError, ValueError):
+        raise ValueError("硬件检查结果不能序列化") from None
+    if len(encoded) > 200_000:
+        raise ValueError("硬件检查结果过大")
+    interfaces = value.get("interfaces") or []
+    sensors = value.get("sensors") or []
+    if not isinstance(interfaces, list) or len(interfaces) > 64:
+        raise ValueError("硬件接口检查结果无效")
+    if not isinstance(sensors, list) or len(sensors) > 128:
+        raise ValueError("硬件通道检查结果无效")
+    clean_interfaces = []
+    for item in interfaces:
+        if not isinstance(item, dict):
+            raise ValueError("硬件接口检查条目必须是对象")
+        clean_interfaces.append(
+            {key: deepcopy(item.get(key)) for key in _HARDWARE_INTERFACE_FIELDS if key in item}
+        )
+    clean_sensors = []
+    for item in sensors:
+        if not isinstance(item, dict):
+            raise ValueError("硬件通道检查条目必须是对象")
+        clean_sensors.append(
+            {key: deepcopy(item.get(key)) for key in _HARDWARE_SENSOR_FIELDS if key in item}
+        )
+    return {
+        "simulated": bool(value.get("simulated", False)),
+        "ok": bool(value.get("ok", False)),
+        "interfaces": clean_interfaces,
+        "sensors": clean_sensors,
+        "errors": [str(item)[:500] for item in (value.get("errors") or [])[:20]],
+        "elapsed_seconds": value.get("elapsed_seconds"),
+    }
+
 
 def validate_agent_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Validate one local request before any optional provider call."""
 
-    allowed = {"api_key", "model_name", "events"}
+    allowed = {"api_key", "model_name", "events", "hardware_result"}
     unexpected = set(payload or {}) - allowed
     if unexpected:
         raise ValueError("Agent 请求包含未允许字段")
@@ -120,7 +200,12 @@ def validate_agent_payload(payload: dict[str, Any]) -> dict[str, Any]:
             if set(evidence) - _EVIDENCE_FIELDS:
                 raise ValueError("Agent 事件证据包含未允许字段")
         clean_events.append(_clean_event(event))
-    return {"api_key": api_key, "model_name": model_name, "events": clean_events}
+    return {
+        "api_key": api_key,
+        "model_name": model_name,
+        "events": clean_events,
+        "hardware_result": _clean_hardware_result((payload or {}).get("hardware_result")),
+    }
 
 
 def _trace(context: dict[str, Any], step_id: str, title: str, detail: str) -> None:
