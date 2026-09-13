@@ -479,6 +479,7 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertIn("unknowns", script)
         self.assertIn("agentRequestId", script)
         self.assertIn("agentController", script)
+        self.assertIn("timeoutMs: 210000", script)
         self.assertIn("薄膜压力", html)
         self.assertIn("LangChain", html)
         self.assertIn("硅基流动", html)

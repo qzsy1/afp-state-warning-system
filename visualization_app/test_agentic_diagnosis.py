@@ -491,7 +491,10 @@ class SiliconFlowAgentTests(unittest.TestCase):
         self.assertNotIn("tools", payloads[0])
         plan_input = json.loads(payloads[0]["messages"][1]["content"])
         self.assertEqual(plan_input["case"]["events"][0]["interface_id"], "plc_process")
+        self.assertNotIn("evidence", plan_input["case"]["events"][0])
         self.assertEqual(len(plan_input["available_tools"]), 8)
+        synthesis_input = json.loads(payloads[1]["messages"][1]["content"])
+        self.assertNotIn("evidence", synthesis_input["case"]["events"][0])
 
     def test_model_selects_network_tool_then_returns_evidence_backed_result(self) -> None:
         context = self._plc_context()

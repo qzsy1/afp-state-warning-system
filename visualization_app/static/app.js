@@ -1258,7 +1258,7 @@ async function runAgentDiagnosis({automatic = false} = {}) {
       model_name: agentModelNameInput.value.trim(),
       events: state.agentEvents,
       hardware_result: state.hardwareCheck,
-    }, {timeoutMs: 150000, controller});
+    }, {timeoutMs: 210000, controller});
     if (requestId !== state.agentRequestId) return null;
     state.agentResult = result;
     if (autoStatus) autoStatus.textContent = result.model_message || "LangChain 诊断已完成。";

@@ -331,11 +331,12 @@ def run_offline_diagnosis(
     }
 
 
-def _initial_case_payload(context: DiagnosticToolContext) -> dict[str, Any]:
+def _initial_case_payload(
+    context: DiagnosticToolContext, *, include_event_evidence: bool = True
+) -> dict[str, Any]:
     events = []
     for item in context.events:
-        events.append(
-            {
+        event = {
                 key: deepcopy(item.get(key))
                 for key in (
                     "interface_id",
@@ -355,7 +356,9 @@ def _initial_case_payload(context: DiagnosticToolContext) -> dict[str, Any]:
                     "evidence",
                 )
             }
-        )
+        if not include_event_evidence:
+            event.pop("evidence", None)
+        events.append(event)
     return {
         "task": "根据现象自主选择只读取证工具；证据充分后输出结构化诊断",
         "events": events,
@@ -423,7 +426,7 @@ def _build_structured_payload(
                 "role": "user",
                 "content": json.dumps(
                     {
-                        "case": _initial_case_payload(context),
+                        "case": _initial_case_payload(context, include_event_evidence=False),
                         "offline_evidence": evidence,
                     },
                     ensure_ascii=False,
@@ -473,7 +476,7 @@ def _build_evidence_synthesis_payload(
                 "content": json.dumps(
                     {
                         "required_interface_ids": required_interface_ids,
-                        "case": _initial_case_payload(context),
+                        "case": _initial_case_payload(context, include_event_evidence=False),
                         "tool_evidence": list(evidence_by_id.values()),
                         "output_example": {
                             "diagnoses": [
@@ -547,7 +550,7 @@ def _build_tool_plan_payload(model_name: str, context: DiagnosticToolContext) ->
                 "role": "user",
                 "content": json.dumps(
                     {
-                        "case": _initial_case_payload(context),
+                        "case": _initial_case_payload(context, include_event_evidence=False),
                         "available_tools": available_tools,
                     },
                     ensure_ascii=False,
@@ -611,7 +614,10 @@ def run_siliconflow_planned_agent(
     """Use a model-selected JSON tool plan when native tool calls are slow."""
 
     caller = transport or (lambda payload: _request_siliconflow(api_key, payload))
-    response = caller(_build_tool_plan_payload(model_name, context))
+    try:
+        response = caller(_build_tool_plan_payload(model_name, context))
+    except AgentToolCallError as error:
+        raise AgentToolCallError(f"模型工具规划阶段失败：{error.public_message}") from None
     message = _assistant_message(response)
     parsed = _parse_final_json(_final_message_content(message))
     calls = parsed.get("tool_calls")
@@ -666,14 +672,17 @@ def run_siliconflow_planned_agent(
         tool_call_count += 1
     if not evidence_by_id:
         raise AgentToolCallError("模型工具计划没有取得有效诊断证据")
-    result = _synthesize_from_evidence(
-        caller,
-        model_name,
-        context,
-        evidence_by_id,
-        local_diagnoses,
-        tool_call_count,
-    )
+    try:
+        result = _synthesize_from_evidence(
+            caller,
+            model_name,
+            context,
+            evidence_by_id,
+            local_diagnoses,
+            tool_call_count,
+        )
+    except AgentToolCallError as error:
+        raise AgentToolCallError(f"模型最终诊断阶段失败：{error.public_message}") from None
     result["agent_strategy"] = "model_planned_tools"
     result["model_message"] = "硅基流动模型已自主规划并调用只读取证工具完成诊断"
     return result
@@ -743,7 +752,7 @@ def _parse_siliconflow_sse(lines: Any) -> dict[str, Any]:
 
 
 def _request_siliconflow(
-    api_key: str, payload: dict[str, Any], *, timeout_seconds: float = 60.0
+    api_key: str, payload: dict[str, Any], *, timeout_seconds: float = 90.0
 ) -> dict[str, Any]:
     request = Request(
         SILICONFLOW_CHAT_COMPLETIONS_URL,
