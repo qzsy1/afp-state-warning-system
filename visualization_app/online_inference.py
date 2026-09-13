@@ -561,6 +561,34 @@ def inspect_prediction_model(
     return result
 
 
+def _load_model_compatible(model_module, config, state, preferred_class_name: str):
+    """Load a checkpoint with the architecture it was actually trained with.
+
+    Older bundled i_T_G checkpoints were produced by the ``wo_GAT`` ablation
+    and therefore contain ``baseline_gat`` weights instead of the ``gat1``
+    graph-convolution weights required by the full model.  Keep full-model
+    checkpoints on the normal path, but select the matching ablation wrapper
+    when the checkpoint clearly identifies that layout.
+    """
+    model_class = getattr(model_module, preferred_class_name)
+    model = model_class(config)
+    try:
+        model.load_state_dict(state)
+        return model
+    except RuntimeError:
+        state_keys = {str(key) for key in getattr(state, "keys", lambda: ())()}
+        is_without_gat = (
+            any(key.endswith("baseline_gat.weight") for key in state_keys)
+            and not any(".gat1." in key for key in state_keys)
+        )
+        fallback_class = getattr(model_module, "Model_wo_GAT", None)
+        if not is_without_gat or fallback_class is None:
+            raise
+        fallback = fallback_class(config)
+        fallback.load_state_dict(state)
+        return fallback
+
+
 class OnlineIModernTCN:
     """Lazy, thread-safe I-ModernTCN inference for the dashboard."""
 
@@ -649,7 +677,6 @@ class OnlineIModernTCN:
 
         device = torch.device("cpu")
         model_module = importlib.import_module(str(self._profile["model_module"]))
-        Model = getattr(model_module, str(self._profile["model_class"]))
         config = SimpleNamespace(
             enc_in=int(self._profile["enc_in"]),
             c_out=int(self._profile.get("c_out", self._profile["enc_in"])),
@@ -678,11 +705,11 @@ class OnlineIModernTCN:
         )
         if hasattr(model_module, "device"):
             model_module.device = device
-        model = Model(config).to(device)
         state = torch.load(checkpoint, map_location="cpu", weights_only=False)
         if isinstance(state, dict) and "state_dict" in state:
             state = state["state_dict"]
-        model.load_state_dict(state)
+        model = _load_model_compatible(model_module, config, state, str(self._profile["model_class"]))
+        model = model.to(device)
         model.eval()
         self._torch = torch
         self._device = device
