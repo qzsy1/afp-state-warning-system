@@ -169,16 +169,43 @@ def _diagnosis_content(
     state = str(event.get("state") or "unknown")
     cross_findings: list[str] = []
     if interface_id in {"plc_process", "abb_motion"}:
-        cause = "PLC与ABB共用网络路径未建立或网络参数不匹配"
-        actions = [
-            ("核对电脑工控网卡是否启用以及IP和子网", "两个网络设备共用同一物理网卡"),
-            ("检查网线、交换机和设备供电", "当前无法从软件区分物理链路和设备未上电"),
-            ("网络恢复后分别验证Modbus TCP与ABB RWS", "网络可达不等于协议数据有效"),
-        ]
-        cross_findings = ["PLC与ABB同时异常时，应优先检查共用网卡和网络链路，而不是认定两台设备同时损坏"]
-        unknowns = ["尚未确认是电脑网卡配置、网线、交换机还是设备未上电"]
-        confidence = 0.8
-        fault_type = "网络端点或共用链路未确认"
+        network_evidence = next(
+            (item for item in evidence if item.get("tool") == "check_network_path"),
+            {},
+        )
+        if network_evidence.get("endpoint_reachable"):
+            protocol_name = "Modbus TCP" if interface_id == "plc_process" else "ABB RWS"
+            cause = (
+                f"TCP端口可连接，但未收到有效{protocol_name}数据；"
+                "可能目标设备身份、协议参数或访问权限不匹配"
+            )
+            actions = [
+                ("确认该IP端点确实属于目标设备", "端口可连接不能确认设备身份，代理或其他服务也可能接受连接"),
+                (
+                    "核对Modbus站号、寄存器和字节序"
+                    if interface_id == "plc_process"
+                    else "核对ABB RWS服务、认证信息和robtarget路径",
+                    f"当前缺少有效{protocol_name}响应",
+                ),
+                ("取得一份有效协议响应后再判定接口正常", "TCP握手不等于采集协议验证通过"),
+            ]
+            cross_findings = [
+                "PLC与ABB的TCP端口均可连接但都没有有效采集数据时，共用网卡至少已具备基础连通性，应分别核对两个目标协议"
+            ]
+            unknowns = ["尚未确认端点设备身份、协议参数、访问权限或响应内容"]
+            confidence = 0.72
+            fault_type = "网络端口可达但目标协议数据未确认"
+        else:
+            cause = "PLC与ABB共用网络路径未建立或网络参数不匹配"
+            actions = [
+                ("核对电脑工控网卡是否启用以及IP和子网", "两个网络设备共用同一物理网卡"),
+                ("检查网线、交换机和设备供电", "当前无法从软件区分物理链路和设备未上电"),
+                ("网络恢复后分别验证Modbus TCP与ABB RWS", "网络可达不等于协议数据有效"),
+            ]
+            cross_findings = ["PLC与ABB同时异常时，应优先检查共用网卡和网络链路，而不是认定两台设备同时损坏"]
+            unknowns = ["尚未确认是电脑网卡配置、网线、交换机还是设备未上电"]
+            confidence = 0.8
+            fault_type = "网络端点或共用链路未确认"
     elif interface_id == "thermocouple_8ch":
         cause = "未识别到目标SMRF USB HID设备或设备未发送有效温度帧"
         actions = [

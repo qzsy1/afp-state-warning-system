@@ -334,6 +334,26 @@ class OfflineAgentTests(unittest.TestCase):
             self.assertIn("check_network_path", tools)
             self.assertTrue(diagnosis["cross_interface_findings"])
 
+    def test_reachable_network_ports_without_data_are_not_called_link_down(self) -> None:
+        hardware = no_sensor_hardware_result()
+        for item in hardware["interfaces"]:
+            if item["id"] in {"plc_process", "abb_motion"}:
+                item["state"] = "no_data"
+                item["message"] = "TCP端口可连接，但未收到目标协议的有效采集数据"
+        context = diagnostic_context_for(hardware)
+        context.discovery["plc_reachable"] = True
+        context.discovery["abb_reachable"] = True
+
+        result = agentic_diagnosis.run_offline_diagnosis(context, [])
+
+        for interface_id in ("plc_process", "abb_motion"):
+            diagnosis = next(
+                item for item in result["diagnoses"] if item["interface_id"] == interface_id
+            )
+            cause = diagnosis["hypotheses"][0]["cause"]
+            self.assertIn("TCP端口可连接", cause)
+            self.assertNotIn("网络路径未建立", cause)
+
     def test_serial_diagnosis_does_not_use_network_path(self) -> None:
         context = diagnostic_context_for(no_sensor_hardware_result())
 
