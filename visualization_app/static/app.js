@@ -1134,6 +1134,8 @@ function appendAgentDiagnostics(node) {
   }
   const statusText = result.execution_mode === "siliconflow_agent"
     ? "硅基流动模型已自主选用诊断工具"
+    : result.execution_mode === "siliconflow_structured"
+      ? "硅基流动模型已基于本地证据完成结构化诊断（兼容模式）"
     : result.model_status === "failed_offline_fallback"
       ? "模型工具调用失败，已完成离线测试诊断"
       : result.execution_mode === "offline_test"

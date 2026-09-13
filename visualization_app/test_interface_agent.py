@@ -448,6 +448,7 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertIn("result.diagnoses", script)
         self.assertIn('execution_mode === "offline_test"', script)
         self.assertIn('execution_mode === "siliconflow_agent"', script)
+        self.assertIn('execution_mode === "siliconflow_structured"', script)
         self.assertIn("observed_facts", script)
         self.assertIn("hypotheses", script)
         self.assertIn("evidence_sources", script)

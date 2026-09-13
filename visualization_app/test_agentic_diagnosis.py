@@ -527,6 +527,64 @@ class SiliconFlowAgentTests(unittest.TestCase):
         self.assertEqual(result["execution_mode"], "offline_test")
         self.assertEqual(result["model_status"], "offline_success")
 
+    def test_tool_unsupported_uses_plain_structured_model_fallback(self) -> None:
+        context = self._plc_context()
+        payloads = []
+
+        def transport(payload):
+            payloads.append(payload)
+            if "tools" in payload:
+                raise agentic_diagnosis.AgentToolCallError("当前模型不支持工具调用")
+            evidence_id = payload["messages"][1]["content"]
+            evidence_id = json.loads(evidence_id)["offline_evidence"][0]["evidence_id"]
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning_content": json.dumps(
+                                {
+                                    "diagnoses": [
+                                        {
+                                            "interface_id": "plc_process",
+                                            "observed_facts": [
+                                                {"text": "端点不可达", "evidence_ids": [evidence_id]}
+                                            ],
+                                            "hypotheses": [
+                                                {
+                                                    "cause": "网络路径或端点配置异常",
+                                                    "confidence": 0.7,
+                                                    "evidence_ids": [evidence_id],
+                                                }
+                                            ],
+                                            "cross_interface_findings": [],
+                                            "recommended_actions": [],
+                                            "unknowns": ["网线状态待确认"],
+                                        }
+                                    ]
+                                },
+                                ensure_ascii=False,
+                            ),
+                        }
+                    }
+                ]
+            }
+
+        result = agentic_diagnosis.run_agentic_diagnoses(
+            context,
+            [],
+            api_key="sk-test-only",
+            model_name="deepseek-ai/DeepSeek-V3",
+            transport=transport,
+        )
+
+        self.assertEqual(result["execution_mode"], "siliconflow_structured")
+        self.assertEqual(result["model_status"], "success_structured_fallback")
+        self.assertEqual(len(payloads), 2)
+        self.assertNotIn("tools", payloads[1])
+        self.assertNotIn("sk-test-only", json.dumps(payloads, ensure_ascii=False))
+
 
 if __name__ == "__main__":
     unittest.main()

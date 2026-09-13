@@ -392,6 +392,48 @@ def _build_chat_payload(model_name: str, messages: list[dict[str, Any]]) -> dict
     }
 
 
+def _build_structured_payload(
+    model_name: str, context: DiagnosticToolContext, offline_result: dict[str, Any]
+) -> dict[str, Any]:
+    """Build a no-tools compatibility request for models without function calling."""
+
+    evidence = [
+        item
+        for diagnosis in offline_result.get("diagnoses") or []
+        for item in diagnosis.get("evidence") or []
+        if isinstance(item, dict)
+    ]
+    return {
+        "model": model_name,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "你是AFP工业采集接口诊断助手。当前模型不使用工具调用；只能根据给定的本地检查证据输出诊断。"
+                    "只输出JSON对象，包含diagnoses数组，必须覆盖全部interface_id。每项包含interface_id、"
+                    "observed_facts、hypotheses、cross_interface_findings、recommended_actions和unknowns。"
+                    "observed_facts和hypotheses必须引用给定的evidence_id；没有证据不得写成已确认故障。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "case": _initial_case_payload(context),
+                        "offline_evidence": evidence,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            },
+        ],
+        "response_format": {"type": "json_object"},
+        "stream": False,
+        "temperature": 0.1,
+        "max_tokens": 4096,
+    }
+
+
 def _request_siliconflow(
     api_key: str, payload: dict[str, Any], *, timeout_seconds: float = 60.0
 ) -> dict[str, Any]:
@@ -448,6 +490,15 @@ def _content_text(content: Any) -> str:
                     parts.append(value)
         return "\n".join(parts).strip()
     return ""
+
+
+def _final_message_content(message: dict[str, Any]) -> Any:
+    """Use reasoning_content when a reasoning model leaves content empty."""
+
+    content = message.get("content")
+    if content not in (None, "", [], {}):
+        return content
+    return message.get("reasoning_content")
 
 
 def _parse_final_json(content: Any) -> dict[str, Any]:
@@ -640,7 +691,7 @@ def run_siliconflow_tool_agent(
         message = _assistant_message(response)
         calls = message.get("tool_calls") or []
         if not calls:
-            parsed = _parse_final_json(message.get("content"))
+            parsed = _parse_final_json(_final_message_content(message))
             return _validate_final_result(
                 parsed,
                 context,
@@ -675,6 +726,39 @@ def run_siliconflow_tool_agent(
     raise AgentToolCallError("模型工具诊断超过5轮限制")
 
 
+def _run_structured_fallback(
+    api_key: str,
+    model_name: str,
+    context: DiagnosticToolContext,
+    local_diagnoses: list[dict[str, Any]],
+    caller: Any,
+) -> dict[str, Any]:
+    """Ask the model for a structured result when its tool API is unavailable."""
+
+    offline_result = run_offline_diagnosis(context, local_diagnoses)
+    evidence_by_id = {
+        str(item.get("evidence_id")): item
+        for diagnosis in offline_result.get("diagnoses") or []
+        for item in diagnosis.get("evidence") or []
+        if isinstance(item, dict) and item.get("evidence_id")
+    }
+    response = caller(_build_structured_payload(model_name, context, offline_result))
+    message = _assistant_message(response)
+    parsed = _parse_final_json(_final_message_content(message))
+    result = _validate_final_result(
+        parsed,
+        context,
+        evidence_by_id,
+        local_diagnoses,
+        model_name,
+        0,
+    )
+    result["execution_mode"] = "siliconflow_structured"
+    result["model_status"] = "success_structured_fallback"
+    result["model_message"] = "当前模型不支持工具调用，已使用本地证据完成结构化模型诊断"
+    return result
+
+
 def run_agentic_diagnoses(
     context: DiagnosticToolContext,
     local_diagnoses: list[dict[str, Any]],
@@ -699,6 +783,17 @@ def run_agentic_diagnoses(
         message = error.public_message if isinstance(error, AgentToolCallError) else str(error)
     except Exception:
         message = "模型工具诊断失败，已使用内置离线测试诊断"
+    caller = transport or (lambda payload: _request_siliconflow(api_key, payload))
+    try:
+        return _run_structured_fallback(
+            str(api_key).strip(),
+            str(model_name).strip(),
+            context,
+            local_diagnoses,
+            caller,
+        )
+    except Exception:
+        pass
     result = run_offline_diagnosis(context, local_diagnoses)
     result["model_status"] = "failed_offline_fallback"
     result["model_message"] = f"{message}；已使用内置离线测试诊断"
