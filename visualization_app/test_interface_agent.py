@@ -474,6 +474,10 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertIn("timeoutMs: 20000", script)
         self.assertIn("hardwareCheckController", script)
         self.assertIn("resetButton) resetButton.disabled = false", script)
+        reset_start = script.index("async function resetAndCheckHardware()")
+        reset_block = script[reset_start : reset_start + 1600]
+        self.assertIn('state.agentFingerprint = ""', reset_block)
+        self.assertIn("state.agentEvents = []", reset_block)
 
     def test_original_frontend_groups_functional_modules_as_collapsible_sections(self) -> None:
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")

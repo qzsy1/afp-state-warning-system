@@ -1113,7 +1113,7 @@ function renderAgentGate() {
     status.textContent = state.agentBusy
       ? "诊断中"
       : !eventPresent ? "等待异常"
-        : configured ? "模型工具诊断" : (keyPresent || modelPresent) ? "离线诊断（配置不完整）" : "离线测试诊断";
+        : configured ? "模型工具诊断" : (keyPresent || modelPresent) ? "离线诊断（未调用模型）" : "离线测试诊断";
   }
   if (agentDiagnoseButton) agentDiagnoseButton.disabled = !ready;
   return ready;
@@ -3931,7 +3931,9 @@ async function resetAndCheckHardware() {
   state.agentController?.abort();
   state.agentController = null;
   state.agentBusy = false;
+  state.agentEvents = [];
   state.agentResult = null;
+  state.agentFingerprint = "";
   if (state.hardwareCheckInProgress) {
     state.hardwareCheckController?.abort();
     const deadline = Date.now() + 1000;
