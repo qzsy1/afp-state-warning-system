@@ -141,5 +141,160 @@ class NoSensorTruthTests(unittest.TestCase):
         self.assertNotIn("传感器损坏", json.dumps(normalized, ensure_ascii=False))
 
 
+def diagnostic_context_for(hardware_result: dict):
+    events = [
+        {
+            "interface_id": item["id"],
+            "interface_label": item["id"],
+            "role": item["role"],
+            "driver": item["driver"],
+            "endpoint": item["endpoint"],
+            "physical_interface_id": item["physical_interface_id"],
+            "physical_interface_kind": item["physical_interface_kind"],
+            "protocol": item["protocol"],
+            "physical_fallback": item.get("physical_fallback", False),
+            "physical_warning": item.get("physical_warning", ""),
+            "sensor_name": item["expected_channels"][0],
+            "channels": list(item["expected_channels"]),
+            "state": item["state"],
+            "message": item["message"],
+            "evidence": {
+                "expected_channels": list(item["expected_channels"]),
+                "detected_channels": [],
+                "missing_channels": list(item["expected_channels"]),
+                "invalid_channels": [],
+                "sample_counts": {},
+            },
+        }
+        for item in hardware_result["interfaces"]
+    ]
+    discovery = {
+        "physical_interfaces": [
+            {
+                "id": "ethernet:Ethernet",
+                "kind": "ethernet",
+                "endpoint": "Ethernet",
+                "addresses": ["192.168.10.20"],
+                "detected": True,
+                "shared_roles": ["plc", "robot"],
+            },
+            {
+                "id": "serial:COM8",
+                "kind": "serial",
+                "endpoint": "COM8",
+                "detected": True,
+            },
+            {
+                "id": "usb_hid:auto",
+                "kind": "usb_hid",
+                "endpoint": "SMRFCT08B",
+                "detected": False,
+                "auto_assignable": True,
+            },
+            {
+                "id": "usb_uvc:auto",
+                "kind": "usb_uvc",
+                "endpoint": "BSV UVC (WinUSB)",
+                "detected": False,
+                "auto_assignable": True,
+            },
+        ],
+        "plc_reachable": False,
+        "abb_reachable": False,
+        "uvc_dll_found": True,
+        "thermocouple_reachable": False,
+    }
+    return diagnostic_tools.DiagnosticToolContext(
+        events=tuple(events),
+        hardware_result=hardware_result,
+        discovery=discovery,
+        acquisition_status={"running": False, "sensors": hardware_result["sensors"]},
+    )
+
+
+class DiagnosticToolTests(unittest.TestCase):
+    def test_all_allowlisted_tools_return_evidence_ids(self) -> None:
+        self.assertTrue(hasattr(diagnostic_tools, "DiagnosticToolContext"))
+        context = diagnostic_context_for(no_sensor_hardware_result())
+        checks = (
+            ("inspect_interface_mapping", {"interface_id": "thermocouple_8ch"}),
+            ("recheck_interface", {"interface_id": "m3232_pressure", "duration_seconds": 1}),
+            ("get_recent_channel_stats", {"channel_names": ["薄膜压力"], "window_seconds": 30}),
+            (
+                "get_cross_interface_timeline",
+                {"interface_ids": ["plc_process", "abb_motion"], "window_seconds": 60},
+            ),
+            ("check_network_path", {"interface_id": "plc_process"}),
+            ("inspect_protocol_frame", {"interface_id": "m3232_pressure"}),
+            (
+                "lookup_device_knowledge",
+                {"device_type": "m3232_pressure", "symptom": "no_data"},
+            ),
+            (
+                "compare_related_signals",
+                {"channel_names": ["压力", "薄膜压力"], "window_seconds": 30},
+            ),
+        )
+
+        results = [
+            diagnostic_tools.execute_tool(context, name, arguments)
+            for name, arguments in checks
+        ]
+
+        self.assertEqual([item["evidence_id"] for item in results], [f"EV-{i:03d}" for i in range(1, 9)])
+        self.assertEqual([item["tool"] for item in results], [name for name, _ in checks])
+        self.assertFalse(results[5]["evidence_available"])
+        self.assertTrue(results[7]["insufficient_data"])
+
+    def test_tool_definitions_expose_only_the_eight_read_only_tools(self) -> None:
+        definitions = diagnostic_tools.tool_definitions()
+
+        names = {item["function"]["name"] for item in definitions}
+        self.assertEqual(
+            names,
+            {
+                "inspect_interface_mapping",
+                "recheck_interface",
+                "get_recent_channel_stats",
+                "get_cross_interface_timeline",
+                "check_network_path",
+                "inspect_protocol_frame",
+                "lookup_device_knowledge",
+                "compare_related_signals",
+            },
+        )
+        self.assertTrue(all(item["type"] == "function" for item in definitions))
+
+    def test_tool_registry_rejects_unknown_tool_interface_and_network_target(self) -> None:
+        context = diagnostic_context_for(no_sensor_hardware_result())
+
+        with self.assertRaisesRegex(diagnostic_tools.DiagnosticToolError, "不允许"):
+            diagnostic_tools.execute_tool(context, "run_command", {"command": "whoami"})
+        with self.assertRaisesRegex(diagnostic_tools.DiagnosticToolError, "未知接口"):
+            diagnostic_tools.execute_tool(
+                context, "check_network_path", {"interface_id": "8.8.8.8"}
+            )
+        with self.assertRaisesRegex(diagnostic_tools.DiagnosticToolError, "网络接口"):
+            diagnostic_tools.execute_tool(
+                context, "check_network_path", {"interface_id": "m3232_pressure"}
+            )
+
+    def test_tool_registry_enforces_duration_and_window_limits(self) -> None:
+        context = diagnostic_context_for(no_sensor_hardware_result())
+
+        with self.assertRaisesRegex(diagnostic_tools.DiagnosticToolError, "3 秒"):
+            diagnostic_tools.execute_tool(
+                context,
+                "recheck_interface",
+                {"interface_id": "m3232_pressure", "duration_seconds": 4},
+            )
+        with self.assertRaisesRegex(diagnostic_tools.DiagnosticToolError, "120 秒"):
+            diagnostic_tools.execute_tool(
+                context,
+                "get_recent_channel_stats",
+                {"channel_names": ["薄膜压力"], "window_seconds": 121},
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
