@@ -149,11 +149,11 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertTrue(event["physical_fallback"])
         self.assertIn("临时分配串口", event["physical_warning"])
 
-    def test_agent_defaults_use_deepseek_v3_without_exposing_key(self) -> None:
+    def test_agent_defaults_use_tool_capable_deepseek_v3_2_without_exposing_key(self) -> None:
         with patch.dict(os.environ, {"AFP_SILICONFLOW_API_KEY": "sk-test-only"}, clear=False):
             defaults = interface_agent.get_agent_defaults()
 
-        self.assertEqual(defaults["model_name"], "deepseek-ai/DeepSeek-V3")
+        self.assertEqual(defaults["model_name"], "deepseek-ai/DeepSeek-V3.2")
         self.assertTrue(defaults["default_key_available"])
         self.assertNotIn("api_key", defaults)
 
@@ -302,10 +302,10 @@ class InterfaceAgentTests(unittest.TestCase):
             model_name="",
         )
 
-        self.assertEqual(result["execution_mode"], "local_rules")
-        self.assertEqual(result["model_status"], "not_configured")
+        self.assertEqual(result["execution_mode"], "offline_test")
+        self.assertEqual(result["model_status"], "offline_success")
         self.assertEqual(len(result["diagnoses"]), 2)
-        self.assertTrue(all("model_enhancement" not in item for item in result["diagnoses"]))
+        self.assertTrue(all(item["evidence_sources"] for item in result["diagnoses"]))
 
     def test_valid_model_configuration_adds_enhancement_to_every_diagnosis(self) -> None:
         def successful_model(_api_key, _model_name, _events, _local_diagnoses):

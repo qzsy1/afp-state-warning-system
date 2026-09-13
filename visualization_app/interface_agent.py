@@ -490,7 +490,7 @@ _LOCAL_CHAIN = (
 
 
 SILICONFLOW_CHAT_COMPLETIONS_URL = "https://api.siliconflow.cn/v1/chat/completions"
-DEFAULT_SILICONFLOW_MODEL = "deepseek-ai/DeepSeek-V3"
+DEFAULT_SILICONFLOW_MODEL = "deepseek-ai/DeepSeek-V3.2"
 
 
 def get_agent_defaults() -> dict[str, Any]:
@@ -807,8 +807,12 @@ def run_interface_diagnoses(
     api_key: str,
     model_name: str,
     model_caller: Any = None,
+    hardware_result: dict[str, Any] | None = None,
+    discovery: dict[str, Any] | None = None,
+    acquisition_status: dict[str, Any] | None = None,
+    transport: Any = None,
 ) -> dict[str, Any]:
-    """Run the local LangChain flow for every reported abnormality."""
+    """Run local fallback rules, then select offline or tool-calling diagnosis."""
 
     clean_events = [
         _clean_event(event)
@@ -830,6 +834,75 @@ def run_interface_diagnoses(
             diagnoses.append(local_result["diagnosis"])
 
     clean_key, clean_model = _resolve_agent_credentials(api_key, model_name)
+    if model_caller is None:
+        from agentic_diagnosis import run_agentic_diagnoses
+        from diagnostic_tools import DiagnosticToolContext
+
+        source_result = deepcopy(hardware_result) if isinstance(hardware_result, dict) else {}
+        if not source_result:
+            interfaces = []
+            sensors = []
+            for event in clean_events:
+                evidence = event.get("evidence") if isinstance(event.get("evidence"), dict) else {}
+                channels = list(event.get("channels") or [])
+                interfaces.append(
+                    {
+                        "id": event.get("interface_id"),
+                        "role": event.get("role"),
+                        "driver": event.get("driver"),
+                        "endpoint": event.get("endpoint"),
+                        "physical_interface_id": event.get("physical_interface_id"),
+                        "physical_interface_kind": event.get("physical_interface_kind"),
+                        "protocol": event.get("protocol"),
+                        "physical_fallback": event.get("physical_fallback", False),
+                        "physical_warning": event.get("physical_warning", ""),
+                        "enabled": True,
+                        "expected_channels": channels,
+                        "detected_channels": list(evidence.get("detected_channels") or []),
+                        "missing_channels": list(evidence.get("missing_channels") or channels),
+                        "invalid_channels": list(evidence.get("invalid_channels") or []),
+                        "sample_counts": deepcopy(evidence.get("sample_counts") or {}),
+                        "invalid_sample_counts": deepcopy(evidence.get("invalid_sample_counts") or {}),
+                        "errors": [],
+                        "state": event.get("state"),
+                        "message": event.get("message"),
+                        "ok": False,
+                    }
+                )
+                sensor_states = evidence.get("sensor_states") if isinstance(evidence.get("sensor_states"), dict) else {}
+                for name in channels:
+                    state = sensor_states.get(name) if isinstance(sensor_states.get(name), dict) else {}
+                    sensors.append(
+                        {
+                            "name": name,
+                            "selected": True,
+                            "received_samples": int(state.get("received_samples") or 0),
+                            "invalid_samples": int(state.get("invalid_samples") or 0),
+                            "state": state.get("state") or "no_data",
+                            "message": state.get("message") or "未检测到数据",
+                            "ok": str(state.get("state")) == "ok",
+                        }
+                    )
+            source_result = {
+                "simulated": any(bool(item.get("simulated")) for item in clean_events),
+                "ok": False,
+                "interfaces": interfaces,
+                "sensors": sensors,
+            }
+        context = DiagnosticToolContext(
+            events=tuple(clean_events),
+            hardware_result=source_result,
+            discovery=discovery or {},
+            acquisition_status=acquisition_status or {"running": False, "sensors": source_result.get("sensors", [])},
+        )
+        return run_agentic_diagnoses(
+            context,
+            diagnoses,
+            api_key=clean_key,
+            model_name=clean_model,
+            transport=transport,
+        )
+
     if not clean_key or not clean_model:
         return {
             "execution_mode": "local_rules",

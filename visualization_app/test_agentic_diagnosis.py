@@ -359,5 +359,154 @@ class OfflineAgentTests(unittest.TestCase):
         self.assertLessEqual(len(evidence_ids), 8)
 
 
+class SiliconFlowAgentTests(unittest.TestCase):
+    def _plc_context(self):
+        context = diagnostic_context_for(no_sensor_hardware_result())
+        context.events = tuple(
+            item for item in context.events if item["interface_id"] == "plc_process"
+        )
+        return context
+
+    def test_model_selects_network_tool_then_returns_evidence_backed_result(self) -> None:
+        context = self._plc_context()
+        payloads = []
+        responses = iter(
+            [
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "check_network_path",
+                                            "arguments": '{"interface_id":"plc_process"}',
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": json.dumps(
+                                    {
+                                        "diagnoses": [
+                                            {
+                                                "interface_id": "plc_process",
+                                                "observed_facts": [
+                                                    {
+                                                        "text": "PLC目标端点不可达",
+                                                        "evidence_ids": ["EV-001"],
+                                                    }
+                                                ],
+                                                "hypotheses": [
+                                                    {
+                                                        "cause": "共用网络路径或子网配置异常",
+                                                        "confidence": 0.8,
+                                                        "evidence_ids": ["EV-001"],
+                                                    }
+                                                ],
+                                                "cross_interface_findings": [],
+                                                "recommended_actions": [
+                                                    {
+                                                        "priority": 1,
+                                                        "action": "检查工控网卡和子网",
+                                                        "reason": "目标端点不可达",
+                                                        "requires_shutdown": False,
+                                                    }
+                                                ],
+                                                "unknowns": ["未确认网线或交换机状态"],
+                                            }
+                                        ]
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            }
+                        }
+                    ]
+                },
+            ]
+        )
+
+        def transport(payload):
+            payloads.append(payload)
+            return next(responses)
+
+        result = agentic_diagnosis.run_siliconflow_tool_agent(
+            "sk-test-only",
+            "deepseek-ai/DeepSeek-V3.2",
+            context,
+            [],
+            transport=transport,
+        )
+
+        self.assertEqual(result["execution_mode"], "siliconflow_agent")
+        self.assertEqual(result["tool_call_count"], 1)
+        self.assertEqual(result["diagnoses"][0]["evidence_sources"], ["网络路径检查"])
+        self.assertEqual(result["diagnoses"][0]["hypotheses"][0]["confidence"], 0.8)
+        self.assertEqual(payloads[0]["tool_choice"], "auto")
+        self.assertEqual(len(payloads[0]["tools"]), 8)
+        self.assertEqual(payloads[1]["messages"][-1]["role"], "tool")
+        self.assertNotIn("sk-test-only", json.dumps(payloads, ensure_ascii=False))
+
+    def test_illegal_model_tool_call_falls_back_to_offline_without_secret(self) -> None:
+        context = diagnostic_context_for(no_sensor_hardware_result())
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_bad",
+                                "type": "function",
+                                "function": {
+                                    "name": "run_command",
+                                    "arguments": '{"command":"whoami"}',
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+
+        result = agentic_diagnosis.run_agentic_diagnoses(
+            context,
+            [],
+            api_key="sk-test-only",
+            model_name="deepseek-ai/DeepSeek-V3.2",
+            transport=lambda _payload: response,
+        )
+
+        self.assertEqual(result["execution_mode"], "offline_test")
+        self.assertEqual(result["model_status"], "failed_offline_fallback")
+        self.assertNotIn("sk-test-only", json.dumps(result, ensure_ascii=False))
+
+    def test_missing_credentials_uses_offline_diagnosis_without_transport(self) -> None:
+        context = diagnostic_context_for(no_sensor_hardware_result())
+
+        result = agentic_diagnosis.run_agentic_diagnoses(
+            context,
+            [],
+            api_key="",
+            model_name="",
+            transport=lambda _payload: self.fail("transport must not run"),
+        )
+
+        self.assertEqual(result["execution_mode"], "offline_test")
+        self.assertEqual(result["model_status"], "offline_success")
+
+
 if __name__ == "__main__":
     unittest.main()

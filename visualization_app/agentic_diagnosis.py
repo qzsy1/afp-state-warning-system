@@ -9,14 +9,33 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import socket
+import time
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
-from diagnostic_tools import DiagnosticToolContext, execute_tool
+from diagnostic_tools import (
+    DiagnosticToolContext,
+    DiagnosticToolError,
+    execute_tool,
+    tool_definitions,
+)
 
 
 MAX_AGENT_ROUNDS = 5
 MAX_TOOL_CALLS = 8
 OFFLINE_BOUNDARY = "离线测试诊断只验证软件流程，不等同于真实硬件故障确认"
+SILICONFLOW_CHAT_COMPLETIONS_URL = "https://api.siliconflow.cn/v1/chat/completions"
+ONLINE_BOUNDARY = "模型结论基于本次只读工具证据，仍不等同于已确认硬件损坏"
+
+
+class AgentToolCallError(RuntimeError):
+    """A sanitized failure safe to show in the local user interface."""
+
+    def __init__(self, public_message: str):
+        super().__init__(public_message)
+        self.public_message = public_message
 
 
 _TOOL_SOURCE_LABELS = {
@@ -283,3 +302,378 @@ def run_offline_diagnosis(
         "diagnoses": diagnoses,
         "evidence_boundary": OFFLINE_BOUNDARY,
     }
+
+
+def _initial_case_payload(context: DiagnosticToolContext) -> dict[str, Any]:
+    events = []
+    for item in context.events:
+        events.append(
+            {
+                key: deepcopy(item.get(key))
+                for key in (
+                    "interface_id",
+                    "interface_label",
+                    "role",
+                    "driver",
+                    "endpoint",
+                    "physical_interface_id",
+                    "physical_interface_kind",
+                    "protocol",
+                    "physical_fallback",
+                    "physical_warning",
+                    "sensor_name",
+                    "channels",
+                    "state",
+                    "message",
+                    "evidence",
+                )
+            }
+        )
+    return {
+        "task": "根据现象自主选择只读取证工具；证据充分后输出结构化诊断",
+        "events": events,
+        "limits": {
+            "max_rounds": MAX_AGENT_ROUNDS,
+            "max_tool_calls": MAX_TOOL_CALLS,
+            "read_only": True,
+        },
+    }
+
+
+def _system_prompt() -> str:
+    return (
+        "你是AFP工业采集接口诊断Agent。先根据异常现象选择必要的只读工具，"
+        "不要按固定顺序调用全部工具。你不能控制设备、修改配置或把推测写成事实。"
+        "结论必须引用工具返回的evidence_id。证据不足时继续调用工具或明确写入unknowns。"
+        "最终只输出JSON对象，包含diagnoses数组。每项必须包含interface_id、observed_facts、"
+        "hypotheses、cross_interface_findings、recommended_actions和unknowns。"
+        "observed_facts每项包含text和evidence_ids；hypotheses每项包含cause、confidence和"
+        "evidence_ids；recommended_actions每项包含priority、action、reason和requires_shutdown。"
+        "没有替换件、电气测量等独立证据时，不得宣称传感器损坏。"
+    )
+
+
+def _build_chat_payload(model_name: str, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "model": model_name,
+        "messages": deepcopy(messages),
+        "tools": tool_definitions(),
+        "tool_choice": "auto",
+        "stream": False,
+        "temperature": 0.1,
+        "max_tokens": 4096,
+    }
+
+
+def _request_siliconflow(
+    api_key: str, payload: dict[str, Any], *, timeout_seconds: float = 60.0
+) -> dict[str, Any]:
+    request = Request(
+        SILICONFLOW_CHAT_COMPLETIONS_URL,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        if error.code in {401, 403}:
+            raise AgentToolCallError("硅基流动API Key无效或没有调用权限") from None
+        if error.code in {400, 404}:
+            raise AgentToolCallError("当前硅基流动模型名称无效或不支持工具调用") from None
+        if error.code == 429:
+            raise AgentToolCallError("硅基流动调用受限或账户额度不足") from None
+        raise AgentToolCallError(f"硅基流动服务暂不可用（HTTP {error.code}）") from None
+    except (URLError, TimeoutError, socket.timeout):
+        raise AgentToolCallError("连接硅基流动超时或网络不可用") from None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise AgentToolCallError("硅基流动返回了无法解析的响应") from None
+
+
+def _assistant_message(response: dict[str, Any]) -> dict[str, Any]:
+    choices = response.get("choices") if isinstance(response, dict) else None
+    if not isinstance(choices, list) or not choices:
+        raise AgentToolCallError("模型没有返回诊断消息")
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    if not isinstance(message, dict):
+        raise AgentToolCallError("模型诊断消息格式无效")
+    return deepcopy(message)
+
+
+def _content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, dict):
+        return json.dumps(content, ensure_ascii=False)
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                value = item.get("text") or item.get("content")
+                if isinstance(value, str):
+                    parts.append(value)
+        return "\n".join(parts).strip()
+    return ""
+
+
+def _parse_final_json(content: Any) -> dict[str, Any]:
+    if isinstance(content, dict):
+        return content
+    text = _content_text(content)
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        parsed = None
+        for index, char in enumerate(text):
+            if char != "{":
+                continue
+            try:
+                candidate, _ = decoder.raw_decode(text[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                parsed = candidate
+                break
+    if not isinstance(parsed, dict):
+        raise AgentToolCallError("模型没有返回完整的结构化诊断")
+    return parsed
+
+
+def _string_list(value: Any, *, limit: int = 8, width: int = 500) -> list[str]:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip()[:width] for item in value if str(item).strip()][:limit]
+
+
+def _evidence_ids(value: Any, known: dict[str, dict[str, Any]]) -> list[str]:
+    values = _string_list(value, limit=MAX_TOOL_CALLS, width=40)
+    unknown = [item for item in values if item not in known]
+    if unknown:
+        raise AgentToolCallError("模型引用了不存在的诊断证据")
+    return list(dict.fromkeys(values))
+
+
+def _validate_final_result(
+    parsed: dict[str, Any],
+    context: DiagnosticToolContext,
+    evidence_by_id: dict[str, dict[str, Any]],
+    local_diagnoses: list[dict[str, Any]],
+    model_name: str,
+    tool_call_count: int,
+) -> dict[str, Any]:
+    items = parsed.get("diagnoses")
+    if not isinstance(items, list):
+        raise AgentToolCallError("模型结果缺少diagnoses数组")
+    expected_events = {
+        str(item.get("interface_id")): item
+        for item in context.events
+        if str(item.get("state")) not in {"ok", "healthy", "disabled", "video_only"}
+    }
+    raw_by_id = {
+        str(item.get("interface_id")): item
+        for item in items
+        if isinstance(item, dict) and str(item.get("interface_id")) in expected_events
+    }
+    if set(raw_by_id) != set(expected_events):
+        raise AgentToolCallError("模型未覆盖当前全部异常接口")
+    diagnoses = []
+    for interface_id, event in expected_events.items():
+        raw = raw_by_id[interface_id]
+        facts = []
+        referenced: list[str] = []
+        for fact in raw.get("observed_facts") or []:
+            if not isinstance(fact, dict):
+                continue
+            ids = _evidence_ids(fact.get("evidence_ids"), evidence_by_id)
+            if not ids:
+                continue
+            referenced.extend(ids)
+            facts.append({"text": str(fact.get("text") or "").strip()[:700], "evidence_ids": ids})
+        hypotheses = []
+        for hypothesis in raw.get("hypotheses") or []:
+            if not isinstance(hypothesis, dict):
+                continue
+            ids = _evidence_ids(hypothesis.get("evidence_ids"), evidence_by_id)
+            if not ids:
+                continue
+            referenced.extend(ids)
+            try:
+                confidence = float(hypothesis.get("confidence", 0.5))
+            except (TypeError, ValueError):
+                confidence = 0.5
+            hypotheses.append(
+                {
+                    "cause": str(hypothesis.get("cause") or "").strip()[:700],
+                    "confidence": max(0.0, min(confidence, 1.0)),
+                    "evidence_ids": ids,
+                }
+            )
+        referenced = list(dict.fromkeys(referenced))
+        if not facts or not hypotheses or not referenced:
+            raise AgentToolCallError("模型结论缺少可验证的工具证据")
+        evidence = [evidence_by_id[item] for item in referenced]
+        actions = []
+        for index, action in enumerate(raw.get("recommended_actions") or [], start=1):
+            if not isinstance(action, dict):
+                continue
+            try:
+                priority = int(action.get("priority", index))
+            except (TypeError, ValueError):
+                priority = index
+            actions.append(
+                {
+                    "priority": max(1, priority),
+                    "action": str(action.get("action") or "").strip()[:700],
+                    "reason": str(action.get("reason") or "").strip()[:700],
+                    "requires_shutdown": bool(action.get("requires_shutdown", False)),
+                }
+            )
+        diagnoses.append(
+            {
+                "interface_id": interface_id,
+                "interface_label": event.get("interface_label") or interface_id,
+                "sensor_name": event.get("sensor_name"),
+                "channels": list(event.get("channels") or []),
+                "state": event.get("state"),
+                "fault_type": str(raw.get("fault_type") or "模型基于工具证据的诊断")[:300],
+                "confirmed_ok": False,
+                "original_error": event.get("message"),
+                "observed_facts": facts,
+                "hypotheses": hypotheses,
+                "cross_interface_findings": _string_list(raw.get("cross_interface_findings")),
+                "recommended_actions": actions,
+                "unknowns": _string_list(raw.get("unknowns")) or ["模型未说明仍需确认的事项"],
+                "evidence_sources": list(
+                    dict.fromkeys(
+                        _TOOL_SOURCE_LABELS.get(str(item.get("tool")), str(item.get("tool")))
+                        for item in evidence
+                    )
+                ),
+                "evidence": evidence,
+                "local_fallback": _local_fallback_for(local_diagnoses, interface_id),
+                "evidence_boundary": ONLINE_BOUNDARY,
+            }
+        )
+    return {
+        "execution_mode": "siliconflow_agent",
+        "model_status": "success",
+        "model_message": "硅基流动模型已根据实际现象选择只读取证工具并完成诊断",
+        "model_name": model_name,
+        "summary": _summary(context),
+        "tool_call_count": tool_call_count,
+        "diagnoses": diagnoses,
+        "evidence_boundary": ONLINE_BOUNDARY,
+    }
+
+
+def run_siliconflow_tool_agent(
+    api_key: str,
+    model_name: str,
+    context: DiagnosticToolContext,
+    local_diagnoses: list[dict[str, Any]],
+    *,
+    transport: Any = None,
+) -> dict[str, Any]:
+    """Run a bounded OpenAI-compatible Function Calling loop."""
+
+    if not str(api_key).strip() or not str(model_name).strip():
+        raise AgentToolCallError("未配置完整的API Key和工具调用模型")
+    started = time.monotonic()
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": _system_prompt()},
+        {
+            "role": "user",
+            "content": json.dumps(_initial_case_payload(context), ensure_ascii=False, separators=(",", ":")),
+        },
+    ]
+    evidence_by_id: dict[str, dict[str, Any]] = {}
+    tool_call_count = 0
+    caller = transport or (lambda payload: _request_siliconflow(api_key, payload))
+    for _round_index in range(MAX_AGENT_ROUNDS):
+        if time.monotonic() - started > 90:
+            raise AgentToolCallError("模型工具诊断超过90秒限制")
+        response = caller(_build_chat_payload(model_name, messages))
+        message = _assistant_message(response)
+        calls = message.get("tool_calls") or []
+        if not calls:
+            parsed = _parse_final_json(message.get("content"))
+            return _validate_final_result(
+                parsed,
+                context,
+                evidence_by_id,
+                local_diagnoses,
+                model_name,
+                tool_call_count,
+            )
+        if not isinstance(calls, list):
+            raise AgentToolCallError("模型工具调用格式无效")
+        messages.append(message)
+        for call in calls:
+            if tool_call_count >= MAX_TOOL_CALLS:
+                raise AgentToolCallError("模型工具调用超过8次限制")
+            function = call.get("function") if isinstance(call, dict) else None
+            if not isinstance(function, dict):
+                raise AgentToolCallError("模型工具调用缺少函数信息")
+            try:
+                arguments = json.loads(str(function.get("arguments") or "{}"))
+            except json.JSONDecodeError:
+                raise AgentToolCallError("模型工具参数不是有效JSON") from None
+            evidence = execute_tool(context, str(function.get("name") or ""), arguments)
+            evidence_by_id[evidence["evidence_id"]] = evidence
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": str(call.get("id") or f"call_{tool_call_count + 1}"),
+                    "content": json.dumps(evidence, ensure_ascii=False, separators=(",", ":")),
+                }
+            )
+            tool_call_count += 1
+    raise AgentToolCallError("模型工具诊断超过5轮限制")
+
+
+def run_agentic_diagnoses(
+    context: DiagnosticToolContext,
+    local_diagnoses: list[dict[str, Any]],
+    *,
+    api_key: str,
+    model_name: str,
+    transport: Any = None,
+) -> dict[str, Any]:
+    """Select online tool calling when configured, otherwise run offline."""
+
+    if not str(api_key).strip() or not str(model_name).strip():
+        return run_offline_diagnosis(context, local_diagnoses)
+    try:
+        return run_siliconflow_tool_agent(
+            str(api_key).strip(),
+            str(model_name).strip(),
+            context,
+            local_diagnoses,
+            transport=transport,
+        )
+    except (AgentToolCallError, DiagnosticToolError) as error:
+        message = error.public_message if isinstance(error, AgentToolCallError) else str(error)
+    except Exception:
+        message = "模型工具诊断失败，已使用内置离线测试诊断"
+    result = run_offline_diagnosis(context, local_diagnoses)
+    result["model_status"] = "failed_offline_fallback"
+    result["model_message"] = f"{message}；已使用内置离线测试诊断"
+    result["model_name"] = str(model_name).strip()
+    return result
