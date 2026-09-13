@@ -2,6 +2,7 @@ param(
     [string]$PythonExecutable = "",
     [string]$ReferenceRelease = "F:\AFP_Integrated_Native_InterfaceMapped\AFP_Integrated_System_SMRF_HID_Restored_20260824_v1.12.1\AFP_Integrated_System",
     [string]$TargetDir = "F:\AFP_Integrated_Modular_v2\delivery\AFP_Integrated_System_Modular_v2.0.1",
+    [string]$ApplicationVersion = "2.0.2",
     [switch]$SkipExecutableBuild
 )
 
@@ -125,7 +126,7 @@ $documentation | ForEach-Object {
 }
 
 $legacyFiles = @(
-    "app.py", "interface_agent.py", "acquisition.py", "smrf_hid.py", "mysql_storage.py",
+    "app.py", "interface_agent.py", "agentic_diagnosis.py", "diagnostic_tools.py", "acquisition.py", "smrf_hid.py", "mysql_storage.py",
     "online_inference.py", "atavn.py", "online_health_features.py",
     "causal_online_runtime.py", "runtime_scaler.py", "new_collection_health.py",
     "runtime_health_primitives.py", "web_training.py", "web_training_pipeline.py",
@@ -169,15 +170,15 @@ foreach ($directory in @("logs", "runtime", "rollback", "updates", "verification
 }
 
 @{
-    application_version = "2.0.1"
-    launcher_version = "2.0.1"
+    application_version = $ApplicationVersion
+    launcher_version = $ApplicationVersion
     module_api_version = "2.0"
     baseline = "v1.12.1-r3"
     built_at = (Get-Date).ToString("o")
 } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $TargetDir "VERSION.json") -Encoding UTF8
 
 @(
-    "AFP Integrated System Modular v2.0.1",
+    "AFP Integrated System Modular v$ApplicationVersion",
     "====================================",
     "Start: AFP_Integrated_System_Modular.exe",
     "Application logic is stored in app/modules and app/legacy and can be updated without rebuilding the EXE.",
