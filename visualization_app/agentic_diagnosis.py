@@ -742,21 +742,49 @@ def _run_structured_fallback(
         for item in diagnosis.get("evidence") or []
         if isinstance(item, dict) and item.get("evidence_id")
     }
-    response = caller(_build_structured_payload(model_name, context, offline_result))
-    message = _assistant_message(response)
-    parsed = _parse_final_json(_final_message_content(message))
-    result = _validate_final_result(
-        parsed,
-        context,
-        evidence_by_id,
-        local_diagnoses,
-        model_name,
-        0,
-    )
-    result["execution_mode"] = "siliconflow_structured"
-    result["model_status"] = "success_structured_fallback"
-    result["model_message"] = "当前模型不支持工具调用，已使用本地证据完成结构化模型诊断"
-    return result
+    # Some OpenAI-compatible gateways accept the chat endpoint but reject
+    # response_format=json_object (or silently ignore it).  Keep the first
+    # request strict, then retry once without that optional parameter.  This
+    # preserves a model-generated diagnosis while avoiding a false failure for
+    # models that can return JSON in ordinary assistant content.
+    base_payload = _build_structured_payload(model_name, context, offline_result)
+    attempts = [base_payload, deepcopy(base_payload)]
+    attempts[1].pop("response_format", None)
+    last_error: AgentToolCallError | None = None
+    for index, payload in enumerate(attempts):
+        try:
+            response = caller(payload)
+            message = _assistant_message(response)
+            parsed = _parse_final_json(_final_message_content(message))
+            result = _validate_final_result(
+                parsed,
+                context,
+                evidence_by_id,
+                local_diagnoses,
+                model_name,
+                0,
+            )
+            result["execution_mode"] = "siliconflow_structured"
+            result["model_status"] = "success_structured_fallback"
+            result["model_message"] = (
+                "当前模型不支持工具调用，已使用本地证据完成结构化模型诊断"
+                if index == 0
+                else "当前模型不支持工具调用，已关闭JSON模式并使用本地证据完成结构化模型诊断"
+            )
+            return result
+        except AgentToolCallError as error:
+            last_error = error
+            # Credentials, quota and network failures will not be fixed by
+            # changing response_format; fail fast so we do not add another
+            # network timeout.  Compatibility errors continue to the second
+            # (plain-content) request.
+            public = error.public_message
+            non_retryable = ("API Key", "权限", "额度", "超时", "网络", "服务暂不可用")
+            if index == 1 or any(item in public for item in non_retryable):
+                raise
+    if last_error is not None:
+        raise last_error
+    raise AgentToolCallError("模型没有返回结构化诊断")
 
 
 def run_agentic_diagnoses(
