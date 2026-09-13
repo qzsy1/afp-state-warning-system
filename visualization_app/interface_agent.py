@@ -575,7 +575,7 @@ _LOCAL_CHAIN = (
 
 
 SILICONFLOW_CHAT_COMPLETIONS_URL = "https://api.siliconflow.cn/v1/chat/completions"
-DEFAULT_SILICONFLOW_MODEL = "deepseek-ai/DeepSeek-V3.2"
+DEFAULT_SILICONFLOW_MODEL = "deepseek-ai/DeepSeek-V3"
 
 
 def get_agent_defaults() -> dict[str, Any]:

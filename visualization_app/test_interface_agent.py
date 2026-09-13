@@ -149,11 +149,11 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertTrue(event["physical_fallback"])
         self.assertIn("临时分配串口", event["physical_warning"])
 
-    def test_agent_defaults_use_tool_capable_deepseek_v3_2_without_exposing_key(self) -> None:
+    def test_agent_defaults_use_verified_deepseek_v3_without_exposing_key(self) -> None:
         with patch.dict(os.environ, {"AFP_SILICONFLOW_API_KEY": "sk-test-only"}, clear=False):
             defaults = interface_agent.get_agent_defaults()
 
-        self.assertEqual(defaults["model_name"], "deepseek-ai/DeepSeek-V3.2")
+        self.assertEqual(defaults["model_name"], "deepseek-ai/DeepSeek-V3")
         self.assertTrue(defaults["default_key_available"])
         self.assertNotIn("api_key", defaults)
 
@@ -469,6 +469,7 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertIn("langchain-core==1.6.2", requirements)
 
     def test_frontend_requests_have_timeout_and_abort_message(self) -> None:
+        html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
         script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
         self.assertIn("AbortController", script)
         self.assertIn("请求超时", script)
@@ -479,6 +480,9 @@ class InterfaceAgentTests(unittest.TestCase):
         reset_block = script[reset_start : reset_start + 1600]
         self.assertIn('state.agentFingerprint = ""', reset_block)
         self.assertIn("state.agentEvents = []", reset_block)
+        self.assertNotIn('value="deepseek-ai/DeepSeek-V3.2"', html)
+        self.assertIn('placeholder="deepseek-ai/DeepSeek-V3"', html)
+        self.assertIn('defaults.model_name || "deepseek-ai/DeepSeek-V3"', script)
 
     def test_original_frontend_groups_functional_modules_as_collapsible_sections(self) -> None:
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")

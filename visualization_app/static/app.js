@@ -1212,7 +1212,7 @@ async function loadAgentDefaults() {
     if (!response.ok) return;
     state.agentDefaultKeyAvailable = Boolean(defaults.default_key_available);
     if (agentModelNameInput && !agentModelNameInput.value.trim()) {
-      agentModelNameInput.value = defaults.model_name || "deepseek-ai/DeepSeek-V3.2";
+      agentModelNameInput.value = defaults.model_name || "deepseek-ai/DeepSeek-V3";
     }
     handleAgentInputChange();
   } catch (_error) {
