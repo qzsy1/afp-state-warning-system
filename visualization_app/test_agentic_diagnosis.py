@@ -8,6 +8,11 @@ try:
 except ImportError:  # RED phase: the production module is added after this contract.
     diagnostic_tools = None
 
+try:
+    import agentic_diagnosis
+except ImportError:  # RED phase: added after the offline behavior is specified.
+    agentic_diagnosis = None
+
 
 INTERFACE_FIXTURES = (
     {
@@ -294,6 +299,64 @@ class DiagnosticToolTests(unittest.TestCase):
                 "get_recent_channel_stats",
                 {"channel_names": ["薄膜压力"], "window_seconds": 121},
             )
+
+
+class OfflineAgentTests(unittest.TestCase):
+    def test_no_sensor_result_matches_declared_truth(self) -> None:
+        self.assertIsNotNone(agentic_diagnosis, "agentic_diagnosis production module must exist")
+        context = diagnostic_context_for(no_sensor_hardware_result())
+
+        result = agentic_diagnosis.run_offline_diagnosis(context, [])
+
+        self.assertEqual(result["execution_mode"], "offline_test")
+        self.assertEqual(result["model_status"], "offline_success")
+        self.assertEqual(result["summary"]["confirmed_interfaces"], 0)
+        self.assertEqual(result["summary"]["total_interfaces"], 5)
+        self.assertEqual(result["summary"]["normal_channels"], 0)
+        self.assertEqual(result["summary"]["total_channels"], 17)
+        self.assertEqual(len(result["diagnoses"]), 5)
+        self.assertTrue(all(not item["confirmed_ok"] for item in result["diagnoses"]))
+        self.assertTrue(all(item["evidence_sources"] for item in result["diagnoses"]))
+        self.assertTrue(all(item["unknowns"] for item in result["diagnoses"]))
+        self.assertNotIn("传感器损坏", json.dumps(result, ensure_ascii=False))
+
+    def test_network_failures_use_shared_timeline_and_network_tools(self) -> None:
+        context = diagnostic_context_for(no_sensor_hardware_result())
+
+        result = agentic_diagnosis.run_offline_diagnosis(context, [])
+
+        for interface_id in ("plc_process", "abb_motion"):
+            diagnosis = next(
+                item for item in result["diagnoses"] if item["interface_id"] == interface_id
+            )
+            tools = {item["tool"] for item in diagnosis["evidence"]}
+            self.assertIn("get_cross_interface_timeline", tools)
+            self.assertIn("check_network_path", tools)
+            self.assertTrue(diagnosis["cross_interface_findings"])
+
+    def test_serial_diagnosis_does_not_use_network_path(self) -> None:
+        context = diagnostic_context_for(no_sensor_hardware_result())
+
+        result = agentic_diagnosis.run_offline_diagnosis(context, [])
+
+        diagnosis = next(
+            item for item in result["diagnoses"] if item["interface_id"] == "m3232_pressure"
+        )
+        tools = {item["tool"] for item in diagnosis["evidence"]}
+        self.assertEqual(tools, {"inspect_interface_mapping", "recheck_interface"})
+        self.assertLessEqual(diagnosis["hypotheses"][0]["confidence"], 0.85)
+
+    def test_offline_tool_plan_stays_within_eight_unique_calls(self) -> None:
+        context = diagnostic_context_for(no_sensor_hardware_result())
+
+        result = agentic_diagnosis.run_offline_diagnosis(context, [])
+
+        evidence_ids = {
+            item["evidence_id"]
+            for diagnosis in result["diagnoses"]
+            for item in diagnosis["evidence"]
+        }
+        self.assertLessEqual(len(evidence_ids), 8)
 
 
 if __name__ == "__main__":
