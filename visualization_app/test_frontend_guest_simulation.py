@@ -183,6 +183,15 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn("/api/acquisition/save-status?path=", text)
         self.assertIn("当前采集不保存数据", text)
 
+    def test_frontend_contains_local_helper_pairing_controls(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        index = source.with_name("index.html").read_text(encoding="utf-8")
+        self.assertIn('id="helperStatus"', index)
+        self.assertIn('id="pairHelperButton"', index)
+        self.assertIn("/api/helper/status", text)
+        self.assertIn("/api/helper/pair/start", text)
+
 
 if __name__ == "__main__":
     unittest.main()

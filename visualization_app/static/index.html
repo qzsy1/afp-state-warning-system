@@ -57,6 +57,14 @@
         <details id="acquisitionSection" class="control-section hidden">
           <summary>真实采集与保存</summary>
           <div class="control-content">
+            <div id="localHelperPanel" class="local-helper-panel">
+              <div class="local-helper-head"><strong>本机采集辅助程序</strong><span id="helperStatus" class="helper-status">未配对</span></div>
+              <p id="helperStatusNote" class="control-note">真实采集需要在访问此网页的电脑上运行本地采集辅助程序。</p>
+              <div class="path-picker-row">
+                <button id="pairHelperButton" class="secondary-button compact-button" type="button">生成配对码</button>
+                <code id="helperPairingCode" class="helper-pairing-code hidden"></code>
+              </div>
+            </div>
             <label>处理模式
               <select id="processingModeSelect">
                 <option value="capture_only">仅采集并保存（不加载模型）</option>

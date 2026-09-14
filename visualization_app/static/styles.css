@@ -376,6 +376,13 @@ output { color: var(--blue); font-weight: 800; }
 .control-note { margin: 0; padding: 7px 8px; color: #667e92; background: var(--surface-soft); border-left: 2px solid #78acd1; border-radius: 3px; font-size: 9px; line-height: 1.55; }
 .control-note.ok { color: #176646; border-left-color: #2d9b69; background: #eefaf5; }
 .control-note.error { color: #8f2f39; border-left-color: #d85b67; background: #fff0f1; }
+.local-helper-panel { margin: 0 0 10px; padding: 9px 10px; border: 1px solid #b8d4e7; border-radius: 5px; background: #f5faff; }
+.local-helper-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #174c73; font-size: 11px; }
+.helper-status { padding: 2px 7px; border-radius: 10px; font-size: 9px; background: #e8edf1; color: #5c7180; }
+.helper-status.ok { background: #e5f7ee; color: #176646; }
+.helper-status.pending { background: #fff5dc; color: #8a5b00; }
+.helper-status.error { background: #fff0f1; color: #8f2f39; }
+.helper-pairing-code { display: inline-block; padding: 4px 7px; border-radius: 3px; background: #eaf1f7; color: #16486c; font-size: 10px; }
 .mysql-settings { margin-top: 8px; padding: 8px; border: 1px solid #c9dceb; border-radius: 5px; background: #f7fbfe; }
 .mysql-settings .compact-input-grid { margin-top: 6px; }
 .mysql-settings input[type="password"], .mysql-settings input[type="text"], .mysql-settings input[type="number"] { width: 100%; box-sizing: border-box; }

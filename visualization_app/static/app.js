@@ -50,6 +50,8 @@ const state = {
   localSaveNameDirty: false,
   saveStatusTimer: null,
   simulationSourceChannels: [],
+  helperStatus: {paired: false, online: false, capabilities: {}},
+  helperPairingChallenge: "",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -108,6 +110,56 @@ async function loadAccessSession() {
   state.csrf = readCookie("afp_csrf");
   renderAccessState();
   return payload;
+}
+
+function renderHelperStatus() {
+  const badge = $("helperStatus");
+  const note = $("helperStatusNote");
+  const code = $("helperPairingCode");
+  const button = $("pairHelperButton");
+  if (!badge) return;
+  const helper = state.helperStatus || {};
+  badge.textContent = helper.online ? "已连接" : helper.paired ? "已配对，等待连接" : "未配对";
+  badge.className = `helper-status ${helper.online ? "ok" : helper.paired ? "pending" : "error"}`;
+  if (note) {
+    note.textContent = state.accessRole === "guest"
+      ? "访客模式只使用模拟数据；解锁真实模式后可配对本机采集辅助程序。"
+      : helper.online
+        ? "本机辅助程序已连接，可识别本机接口并执行真实采集。"
+        : helper.paired
+          ? "已生成配对信息，请在本机辅助程序中输入配对码并连接。"
+          : "真实采集需要在访问此网页的电脑上运行本地采集辅助程序。";
+  }
+  button?.classList.toggle("hidden", state.accessRole === "guest");
+  if (code) {
+    code.textContent = state.helperPairingChallenge ? `配对码：${state.helperPairingChallenge}` : "";
+    code.classList.toggle("hidden", !state.helperPairingChallenge);
+  }
+}
+
+async function loadHelperStatus() {
+  if (state.accessRole === "guest") {
+    state.helperStatus = {paired: false, online: false, capabilities: {}};
+    renderHelperStatus();
+    return;
+  }
+  try {
+    const result = await fetch("/api/helper/status", {cache: "no-store"}).then((response) => response.json());
+    if (result && !result.error) state.helperStatus = result;
+  } catch (_error) {
+    state.helperStatus = {paired: false, online: false, capabilities: {}, lastError: "辅助程序状态读取失败"};
+  }
+  renderHelperStatus();
+}
+
+async function pairLocalHelper() {
+  if (state.accessRole === "guest") return;
+  const result = await postJson("/api/helper/pair/start", {});
+  if (!result?.ok) throw new Error(result?.error || "配对码生成失败");
+  state.helperPairingChallenge = String(result.challenge || "");
+  state.helperStatus = {...state.helperStatus, paired: false, online: false};
+  renderHelperStatus();
+  toast("配对码已生成，请在本机采集辅助程序中输入");
 }
 
 function showRealAccessModal() {
@@ -2717,6 +2769,8 @@ async function initialize() {
       refreshLanWebStatus().catch(() => markServerDisconnected());
     }, 10000);
      await loadAccessSession();
+     renderHelperStatus();
+     await loadHelperStatus();
      await loadAgentDefaults();
     syncLocalMysqlSection();
     syncTargetMysqlSection();
@@ -2901,6 +2955,7 @@ agentApiKeyInput?.addEventListener("input", handleAgentInputChange);
 agentModelNameInput?.addEventListener("input", handleAgentInputChange);
 agentDiagnoseButton?.addEventListener("click", () => runAgentDiagnosis({automatic: false}));
 $("unlock-real-mode")?.addEventListener("click", showRealAccessModal);
+$("pairHelperButton")?.addEventListener("click", () => pairLocalHelper().catch((error) => toast(error.message)));
 $("lock-real-mode")?.addEventListener("click", lockRealMode);
 $("real-access-submit")?.addEventListener("click", unlockRealMode);
 $("real-access-cancel")?.addEventListener("click", hideRealAccessModal);
