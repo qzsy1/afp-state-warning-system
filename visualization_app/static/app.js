@@ -47,6 +47,7 @@ const state = {
   localSaveDirectoryHandle: null,
   localSaveAuthorized: false,
   localSaveBusy: false,
+  localSaveNameDirty: false,
   simulationSourceChannels: [],
 };
 
@@ -981,7 +982,7 @@ function updateLocalSaveStatus(message, error = false) {
 
 async function confirmLocalSave() {
   const requestedName = controls.saveRoot?.value.trim() || "";
-  if (!requestedName) {
+  if (!requestedName || !state.localSaveNameDirty) {
     updateLocalSaveStatus("请先填写本地文件夹名称，再确认授权；留空时不会保存到网页电脑。", true);
     toast("请先填写本地文件夹名称");
     return;
@@ -995,6 +996,7 @@ async function confirmLocalSave() {
     const handle = await window.showDirectoryPicker({mode: "readwrite"});
     state.localSaveDirectoryHandle = handle;
     state.localSaveAuthorized = true;
+    state.localSaveNameDirty = false;
     controls.saveRoot.value = handle.name || requestedName;
     updateLocalSaveStatus(`已授权本地目录“${handle.name || requestedName}”；停止并保存后按原软件规则写入。`);
     toast("本地保存目录已授权");
@@ -1002,6 +1004,7 @@ async function confirmLocalSave() {
     if (error?.name === "AbortError") return;
     state.localSaveDirectoryHandle = null;
     state.localSaveAuthorized = false;
+    state.localSaveNameDirty = false;
     updateLocalSaveStatus(`本地目录授权失败：${error.message || error}`, true);
     toast("未完成本地目录授权");
   }
@@ -1040,6 +1043,7 @@ async function saveFinishedCaptureLocally() {
     if (error?.name === "NotAllowedError") {
       state.localSaveAuthorized = false;
       state.localSaveDirectoryHandle = null;
+      state.localSaveNameDirty = false;
     }
     updateLocalSaveStatus(`本地保存失败：${error.message || error}`, true);
     toast("本地保存失败，请重新授权目录");
@@ -2707,6 +2711,7 @@ async function initialize() {
     controls.saveRoot.value = payload.acquisition.default_save_root || "";
     state.localSaveDirectoryHandle = null;
     state.localSaveAuthorized = false;
+    state.localSaveNameDirty = false;
     updateLocalSaveStatus("未确认本地目录；当前不会保存到访问网页的电脑。");
     state.simulationSourceChannels = Array.isArray(payload.acquisition.simulation_source_channels)
       ? payload.acquisition.simulation_source_channels : [];
@@ -2873,6 +2878,14 @@ controls.mysqlDatabase?.addEventListener("change", () => {
 });
 $("selectSaveRootButton").addEventListener("click", selectSaveRoot);
 controls.confirmLocalSave?.addEventListener("click", confirmLocalSave);
+controls.saveRoot?.addEventListener("input", () => {
+  state.localSaveNameDirty = true;
+  if (state.localSaveAuthorized) {
+    state.localSaveAuthorized = false;
+    state.localSaveDirectoryHandle = null;
+    updateLocalSaveStatus("保存位置已改变，请重新确认并授权本地保存。", true);
+  }
+});
 $("selectPredictionModelButton").addEventListener("click", selectPredictionModel);
 controls.predictionModel.addEventListener("change", () => {
   if (!controls.bestPredictionOverride.checked) {
