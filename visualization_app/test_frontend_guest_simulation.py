@@ -114,6 +114,24 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn("allowSerialFallback = true", text)
         self.assertIn("allowSerialFallback: false", text)
 
+    def test_switching_to_simulation_rebuilds_logical_catalog_instead_of_reusing_real_bindings(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        self.assertIn(
+            "function buildSimulationInterfaceCatalog",
+            text,
+            "simulation mode must have an isolated logical interface catalog",
+        )
+        start = text.index("function updateSimulationSettings()")
+        end = text.index("function updateIntegrationSource", start)
+        body = text[start:end]
+        self.assertIn("buildSimulationInterfaceCatalog()", body)
+        self.assertNotIn(
+            "state.interfaceCatalog?.length",
+            body,
+            "real-mode physical bindings must not leak into simulation mode",
+        )
+
     def test_local_save_picker_does_not_require_a_prior_name_and_refreshes_status(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")

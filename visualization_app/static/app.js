@@ -3679,6 +3679,20 @@ function defaultInterfaceCatalog() {
   ];
 }
 
+// Simulation owns its logical interface configuration.  Physical bindings
+// are only a read-only display aid and must never carry real-mode state back
+// into the simulation form when the operator switches modes.
+function buildSimulationInterfaceCatalog() {
+  return defaultInterfaceCatalog().map((item) => ({
+    ...item,
+    enabled: true,
+    physical_interface_id: "",
+    physical_interface_kind: "",
+    physical_verified: false,
+    physical_fallback: false,
+  }));
+}
+
 function renderInterfacePanel(configs) {
   if (!controls.interfacePanel) return;
   const defaults = Array.isArray(configs) ? configs : [];
@@ -3904,13 +3918,13 @@ function updateSimulationSettings() {
   }
   updateRealAcquisitionVisibility();
   if (simulation) {
-    const current = state.interfaceCatalog?.length
-      ? state.interfaceCatalog.map((item) => ({...item}))
-      : defaultInterfaceCatalog();
+    const current = buildSimulationInterfaceCatalog();
     if (state.physicalInterfaces.length) {
       state.interfaceCatalog = autoAssignPhysicalInterfaces(current, {allowSerialFallback: false});
-      renderInterfacePanel(state.interfaceCatalog);
+    } else {
+      state.interfaceCatalog = current;
     }
+    renderInterfacePanel(state.interfaceCatalog);
   } else {
     discoverInterfaces();
   }
