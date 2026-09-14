@@ -42,6 +42,8 @@ from acquisition import (
     NEW_COLLECTION_SENSOR_COLUMNS,
     SENSOR_COLUMNS,
     integrate_capture_sources,
+    default_capture_interfaces,
+    sensor_interface_profiles,
     select_capture_folder,
     select_simulation_source,
 )
@@ -4438,6 +4440,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 }
                 acquisition = bootstrap.get("acquisition") or {}
                 acquisition["interface_discovery"] = {}
+                acquisition["interface_defaults"] = default_capture_interfaces()
+                acquisition["sensor_types"] = sensor_interface_profiles()
                 acquisition["default_save_root"] = ""
                 source_status = self.guest_manager.source_status(identity.guest_id)
                 acquisition["simulation_source_type"] = source_status.get("source_type", "single_csv")
