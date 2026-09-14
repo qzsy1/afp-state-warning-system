@@ -192,6 +192,14 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn("/api/helper/status", text)
         self.assertIn("/api/helper/pair/start", text)
 
+    def test_real_capture_routes_through_online_local_helper(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        self.assertIn("requestLocalHelper(\"discover\"", text)
+        self.assertIn("requestLocalHelper(\"check_capture\"", text)
+        self.assertIn("requestLocalHelper(\"start_capture\"", text)
+        self.assertIn("requestLocalHelper(\"stop_capture\"", text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -52,6 +52,7 @@ const state = {
   simulationSourceChannels: [],
   helperStatus: {paired: false, online: false, capabilities: {}},
   helperPairingChallenge: "",
+  helperStatusTimer: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -621,6 +622,36 @@ async function discoverInterfaces() {
     }
     return;
   }
+  if (state.accessRole === "authorized") {
+    if (!state.helperStatus?.paired) {
+      state.interfaceCatalog = buildSimulationInterfaceCatalog().map((item) => ({...item, enabled: false, physical_interface_id: "", physical_verified: false}));
+      renderInterfacePanel(state.interfaceCatalog);
+      if (controls.interfaceDiscoveryStatus) controls.interfaceDiscoveryStatus.textContent = "真实采集等待本机采集辅助程序配对；未读取服务器电脑接口";
+      return;
+    }
+    try {
+      const helper = await requestLocalHelper("discover", {}, {timeoutMs: 15000});
+      const physical = Array.isArray(helper.interfaces) ? helper.interfaces : [];
+      const defaults = Array.isArray(helper.raw_discovery?.defaults) && helper.raw_discovery.defaults.length
+        ? helper.raw_discovery.defaults : defaultInterfaceCatalog();
+      const bindings = new Map((helper.sensor_bindings || []).map((item) => [String(item.role || ""), item]));
+      state.physicalInterfaces = physical;
+      state.availableInterfaces = recognizedInterfacePortsFrom(helper.raw_discovery?.ports || []);
+      state.interfaceCatalog = defaults.map((item) => {
+        const binding = bindings.get(String(item.role || ""));
+        return {...item, physical_interface_id: binding?.physical_interface_id || "", physical_interface_kind: binding?.physical_kind || "", physical_verified: Boolean(binding?.interface_detected || binding?.driver_available)};
+      });
+      renderInterfacePanel(state.interfaceCatalog);
+      markHardwareCheckStale("本机辅助程序接口识别结果已更新");
+      if (controls.interfaceDiscoveryStatus) controls.interfaceDiscoveryStatus.textContent = physical.length
+        ? `已由本机辅助程序识别 ${physical.length} 个实际接口并完成传感器映射`
+        : "本机辅助程序未发现兼容接口";
+      return;
+    } catch (error) {
+      if (controls.interfaceDiscoveryStatus) controls.interfaceDiscoveryStatus.textContent = `本机辅助程序识别失败：${error.message}`;
+      return;
+    }
+  }
   try {
     const result = await fetch("/api/acquisition/discover", {cache: "no-store"}).then((response) => response.json());
     const firstDefault = result.defaults?.[0];
@@ -738,6 +769,26 @@ async function postJson(url, payload = {}, {timeoutMs = 30000, controller = null
   } finally {
     window.clearTimeout(timer);
   }
+}
+
+async function requestLocalHelper(command, payload = {}, {timeoutMs = 30000} = {}) {
+  if (state.accessRole !== "authorized" || !state.helperStatus?.paired) {
+    throw new Error("尚未配对访问者电脑上的本地采集辅助程序");
+  }
+  const queued = await postJson("/api/helper/command", {command, payload});
+  if (!queued?.ok || !queued?.queued) {
+    throw new Error(queued?.error === "helper_offline"
+      ? "本地采集辅助程序未连接"
+      : queued?.error || "本地辅助程序命令发送失败");
+  }
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const response = await fetch(`/api/helper/result?request_id=${encodeURIComponent(queued.request_id)}`, {cache: "no-store"});
+    const result = await response.json();
+    if (result?.ok && result.payload !== null && result.payload !== undefined) return result.payload;
+    await new Promise((resolve) => window.setTimeout(resolve, 250));
+  }
+  throw new Error("本地采集辅助程序响应超时");
 }
 
 function renderAcquisitionStatus(status) {
@@ -1754,7 +1805,9 @@ async function startAcquisition() {
       resetLiveEvidenceDisplay();
     }
     state.liveScopeKey = nextScope;
-    const result = await postJson("/api/acquisition/start", acquisitionConfig());
+    const result = state.accessRole === "authorized" && controls.acquisitionMode?.value !== "simulation"
+      ? await requestLocalHelper("start_capture", acquisitionConfig(), {timeoutMs: 30000})
+      : await postJson("/api/acquisition/start", acquisitionConfig());
     if (controls.processingMode.value !== "capture_only") {
       applyPredictionModelProfile(result.prediction_model, false);
     }
@@ -1779,10 +1832,12 @@ async function stopAcquisition() {
       ? controls.newLayer
       : controls.liveLayer;
     const completedLayer = Number(layerControl.value) || 0;
-    const result = await postJson(
-      state.accessRole === "guest" ? "/api/simulation/stop" : "/api/acquisition/stop",
-      {},
-    );
+    const result = state.accessRole === "authorized" && controls.acquisitionMode?.value !== "simulation"
+      ? await requestLocalHelper("stop_capture", {}, {timeoutMs: 30000})
+      : await postJson(
+        state.accessRole === "guest" ? "/api/simulation/stop" : "/api/acquisition/stop",
+        {},
+      );
     if (state.accessRole === "guest") {
       state.guestSimulationStarted = false;
       state.guestSimulationStoppedByUser = true;
@@ -2771,6 +2826,8 @@ async function initialize() {
      await loadAccessSession();
      renderHelperStatus();
      await loadHelperStatus();
+     window.clearInterval(state.helperStatusTimer);
+     state.helperStatusTimer = window.setInterval(() => { loadHelperStatus().catch(() => {}); }, 5000);
      await loadAgentDefaults();
     syncLocalMysqlSection();
     syncTargetMysqlSection();
@@ -4613,6 +4670,34 @@ async function testSensorConnection({automatic = false} = {}) {
     renderHardwareCheckResult(result, {automatic});
     updateAgentFromHardwareResult(result, {automatic});
     return result;
+  }
+  if (state.accessRole === "authorized" && controls.acquisitionMode?.value !== "simulation") {
+    state.hardwareCheckInProgress = true;
+    const node = controls.hardwareCheckStatus;
+    const button = $("testSensorsButton");
+    if (button) button.disabled = true;
+    if (node) {
+      node.className = "hardware-check-status checking";
+      node.textContent = `${automatic ? "正在自动检查" : "正在检查"}访问者电脑上的接口和传感器…`;
+    }
+    try {
+      const result = await requestLocalHelper("check_capture", acquisitionConfig(), {timeoutMs: 30000});
+      state.hardwareCheck = result;
+      state.hardwareCheckFingerprint = hardwareConfigFingerprint();
+      renderHardwareCheckResult(result, {automatic});
+      updateAgentFromHardwareResult(result, {automatic});
+      return result;
+    } catch (error) {
+      if (node) {
+        node.className = "hardware-check-status error";
+        node.textContent = `本机辅助程序检查失败：${error.message}`;
+      }
+      if (!automatic) toast(error.message);
+      return null;
+    } finally {
+      state.hardwareCheckInProgress = false;
+      if (button) button.disabled = false;
+    }
   }
   state.hardwareCheckInProgress = true;
   const node = controls.hardwareCheckStatus;
