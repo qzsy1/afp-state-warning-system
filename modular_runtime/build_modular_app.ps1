@@ -148,7 +148,8 @@ $legacyFiles = @(
     "runtime_health_primitives.py", "web_training.py", "web_training_pipeline.py",
     "training_data.py", "training_center.py", "training_center_cli.py",
     "native_integrated_app.py", "fit_new_collection_health.py",
-    "remote_mysql_setup.py", "generate_pressure_simulation.py"
+    "remote_mysql_setup.py", "generate_pressure_simulation.py",
+    "web_auth.py", "web_access.py", "public_status.py", "guest_simulation.py", "control_lease.py"
 )
 foreach ($name in $legacyFiles) {
     $source = Join-Path $LegacySource $name
@@ -156,6 +157,12 @@ foreach ($name in $legacyFiles) {
         throw "Legacy compatibility source missing: $source"
     }
     Copy-Item -LiteralPath $source -Destination $legacyTarget -Force
+}
+foreach ($name in @("web_auth.py", "web_access.py", "public_status.py", "guest_simulation.py", "control_lease.py")) {
+    $copied = Join-Path $legacyTarget $name
+    if (-not (Test-Path -LiteralPath $copied)) {
+        throw "Public-web compatibility source was not copied: $copied"
+    }
 }
 Get-ChildItem -LiteralPath (Join-Path $LegacySource "static") -Force | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination $uiTarget -Recurse -Force
@@ -190,6 +197,22 @@ Get-ChildItem -LiteralPath (Join-Path $LegacySource "hardware_dlls") -File | For
 
 foreach ($directory in @("logs", "runtime", "rollback", "updates", "verification")) {
     New-Item -ItemType Directory -Force -Path (Join-Path $TargetDir $directory) | Out-Null
+}
+
+# Delivery trees must never contain runtime credentials or tunnel secrets.
+$forbiddenNames = Get-ChildItem -LiteralPath $TargetDir -Recurse -File | Where-Object {
+    $_.Name -in @("public_web_security.sqlite3", "cert.pem") -or
+    $_.Name -like "*.cfargotunnel.com.json"
+}
+if ($forbiddenNames) {
+    throw "Delivery contains a forbidden public-web secret file: $($forbiddenNames[0].FullName)"
+}
+$textExtensions = @(".py", ".ps1", ".json", ".txt", ".md", ".html", ".js", ".css", ".toml", ".yaml", ".yml")
+foreach ($file in (Get-ChildItem -LiteralPath $TargetDir -Recurse -File | Where-Object { $textExtensions -contains $_.Extension.ToLowerInvariant() })) {
+    $text = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction Stop
+    if ($text -match 'sk-[A-Za-z0-9_-]{20,}') {
+        throw "Delivery text contains a SiliconFlow-style API key: $($file.FullName)"
+    }
 }
 
 @{

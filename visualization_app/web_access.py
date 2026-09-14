@@ -65,10 +65,13 @@ AUTHORIZED_POST = {
 AUTHORIZED_PREFIXES = ("/api/acquisition/", "/api/training/", "/api/mysql/", "/api/real/")
 AUTHORIZED_EXACT = {"/api/agent/diagnose", "/api/auth/logout"}
 LOCAL_ADMIN_PREFIX = "/api/admin/"
-LOCAL_ADMIN_GET = {"/api/admin/status"}
+LOCAL_ADMIN_GET = {"/api/admin/status", "/api/admin/security/settings"}
 LOCAL_ADMIN_POST = {
+    "/api/admin/security/settings",
     "/api/admin/security/configure",
     "/api/admin/security/revoke-all",
+    "/api/admin/security/revoke",
+    "/api/admin/simulation/cleanup",
     "/api/admin/real-control/takeover",
 }
 

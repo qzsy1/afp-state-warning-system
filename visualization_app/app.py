@@ -4170,6 +4170,14 @@ class AppHandler(BaseHTTPRequestHandler):
         )
         self._send_json(payload)
 
+    def _cloudflared_status(self) -> dict[str, object]:
+        try:
+            from public_web import inspect_cloudflared_service
+            config = dict(getattr(self, "public_web_config", {}) or {})
+            return inspect_cloudflared_service(str(config.get("cloudflared_service", "cloudflared")))
+        except Exception:
+            return {"installed": False, "running": False, "service_name": "cloudflared", "error_code": "inspection_unavailable"}
+
     def _send_json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
         raw = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
         self.send_response(status)
@@ -4290,6 +4298,18 @@ class AppHandler(BaseHTTPRequestHandler):
                     "security": self.security_store.safe_status(),
                     "real_control": self.control_lease.status(),
                     "network": dict(self.network_status or {}),
+                }
+            )
+            return
+        if parsed.path == "/api/admin/security/settings":
+            config = dict(getattr(self, "public_web_config", {}) or {})
+            self._send_json(
+                {
+                    "security": self.security_store.safe_status(),
+                    "hostname": str(config.get("hostname", config.get("domain", ""))),
+                    "guest_session_quota_mb": int(config.get("guest_session_quota_mb", 256)),
+                    "guest_total_quota_mb": int(config.get("guest_total_quota_mb", 2048)),
+                    "cloudflared": self._cloudflared_status(),
                 }
             )
             return
@@ -4574,6 +4594,28 @@ class AppHandler(BaseHTTPRequestHandler):
                         "security": self.security_store.safe_status(),
                     }
                 )
+                return
+            if parsed.path == "/api/admin/security/settings":
+                password = str(payload.get("password") or "")
+                model_name = str(payload.get("model_name") or "")
+                clear_key = bool(payload.get("clear_api_key", False))
+                if "api_key" in payload and not clear_key:
+                    api_key = str(payload.get("api_key") or "")
+                elif clear_key:
+                    api_key = ""
+                else:
+                    api_key, _previous_model = self.security_store.model_credentials()
+                if not model_name:
+                    _previous_key, model_name = self.security_store.model_credentials()
+                self.security_store.configure_owner(password, api_key, model_name)
+                self._send_json({"security": self.security_store.safe_status()})
+                return
+            if parsed.path == "/api/admin/security/revoke":
+                self.security_store.revoke(str(payload.get("session_id") or ""))
+                self._send_json({"revoked": True, "security": self.security_store.safe_status()})
+                return
+            if parsed.path == "/api/admin/simulation/cleanup":
+                self._send_json({"cleanup": self.guest_manager.cleanup_stopped()})
                 return
             if parsed.path == "/api/admin/security/revoke-all":
                 self.security_store.revoke_all()
@@ -4946,6 +4988,7 @@ def create_server(
     guest_manager: GuestSimulationManager | None = None,
     control_lease: RealControlLease | None = None,
     access_context: str = "public",
+    public_web_config: dict[str, Any] | None = None,
 ) -> ThreadingHTTPServer:
     active_dashboard = dashboard or DashboardData()
     runtime_root = (APP_DIR.parent / "runtime").resolve()
@@ -4985,6 +5028,7 @@ def create_server(
             "model_limiter": model_limiter,
             "model_call_lock": model_call_lock,
             "access_context": str(access_context),
+            "public_web_config": dict(public_web_config or {}),
             "login_limiter": SlidingWindowLimiter(),
             "network_status": dict(network_status or {}),
             "service_started_at": time.time(),
@@ -4998,6 +5042,7 @@ def create_server(
     server.guest_manager = active_guest_manager
     server.control_lease = active_control_lease
     server.access_context = handler.access_context
+    server.public_web_config = dict(public_web_config or {})
     return server
 
 

@@ -502,6 +502,7 @@ def _launch_public_web(context: Any, manager: Any) -> None:
         {"enabled": True, "urls": urls["public"], "public": True},
         **common,
         access_context="public",
+        public_web_config=context.config.get("public_web", {}),
     )
     admin_server = legacy_app.create_server(
         config.local_admin_bind_host,
@@ -509,6 +510,7 @@ def _launch_public_web(context: Any, manager: Any) -> None:
         {"enabled": True, "urls": [urls["local_admin"]], "local_admin": True},
         **common,
         access_context="local_admin",
+        public_web_config=context.config.get("public_web", {}),
     )
     servers = (public_server, admin_server)
     threads = [
