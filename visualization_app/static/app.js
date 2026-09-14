@@ -61,6 +61,7 @@ function renderAccessState() {
   const badge = $("access-mode-badge");
   const unlock = $("unlock-real-mode");
   const lock = $("lock-real-mode");
+  const adminSettings = $("admin-security-settings");
   const acquisitionMode = $("acquisitionModeSelect");
   const agentAccess = $("agent-model-access");
   const note = $("real-access-transport-note");
@@ -71,6 +72,7 @@ function renderAccessState() {
   }
   unlock?.classList.toggle("hidden", state.accessRole !== "guest");
   lock?.classList.toggle("hidden", state.accessRole === "guest");
+  adminSettings?.classList.toggle("hidden", state.accessRole !== "local_admin");
   if (acquisitionMode && state.accessRole === "guest") {
     acquisitionMode.value = "simulation";
     acquisitionMode.disabled = true;
@@ -110,6 +112,47 @@ function showRealAccessModal() {
 }
 
 function hideRealAccessModal() { $("real-access-modal")?.classList.add("hidden"); }
+
+async function showAdminSecuritySettings() {
+  if (state.accessRole !== "local_admin") return;
+  const modal = $("admin-security-modal");
+  const status = $("admin-security-status");
+  try {
+    const response = await fetch("/api/admin/security/settings", {cache: "no-store", credentials: "same-origin"});
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "无法读取安全设置");
+    $("admin-model-name").value = payload.security?.model_name || "deepseek-ai/DeepSeek-V3";
+    $("admin-api-key").value = "";
+    $("admin-clear-api-key").checked = false;
+    if (status) status.textContent = payload.security?.configured
+      ? `已配置：${payload.security.model_configured ? "模型 Key 可用" : "仅密码授权"}`
+      : "尚未配置，请设置授权密码。";
+    modal?.classList.remove("hidden");
+    $("admin-password")?.focus();
+  } catch (error) { toast(error.message); }
+}
+
+function hideAdminSecuritySettings() { $("admin-security-modal")?.classList.add("hidden"); }
+
+async function saveAdminSecuritySettings() {
+  const password = $("admin-password")?.value || "";
+  const modelName = $("admin-model-name")?.value.trim() || "";
+  const key = $("admin-api-key")?.value || "";
+  const clearKey = Boolean($("admin-clear-api-key")?.checked);
+  if (password.length < 12) { toast("授权密码至少需要 12 个字符"); return; }
+  if (!modelName) { toast("模型名称不能为空"); return; }
+  const status = $("admin-security-status");
+  try {
+    if (status) status.textContent = "正在保存安全设置……";
+    await postJson("/api/admin/security/settings", {
+      password, model_name: modelName, ...(clearKey ? {clear_api_key: true} : key ? {api_key: key} : {}),
+    });
+    if (status) status.textContent = "保存成功；公共网页现在可以使用新密码解锁。";
+    $("admin-password").value = "";
+    $("admin-api-key").value = "";
+    toast("安全设置已保存");
+  } catch (error) { if (status) status.textContent = error.message; }
+}
 
 async function unlockRealMode() {
   if (!state.secureTransport) {
@@ -2678,6 +2721,9 @@ $("real-access-cancel")?.addEventListener("click", hideRealAccessModal);
 $("real-access-password")?.addEventListener("keydown", (event) => {
   if (event.key === "Enter") unlockRealMode();
 });
+$("admin-security-settings")?.addEventListener("click", showAdminSecuritySettings);
+$("admin-security-save")?.addEventListener("click", saveAdminSecuritySettings);
+$("admin-security-cancel")?.addEventListener("click", hideAdminSecuritySettings);
 $("lan-web-copy")?.addEventListener("click", copyLanWebUrl);
 controls.resetSensorCheck?.addEventListener("click", resetAndCheckHardware);
 controls.autoHardwareCheck?.addEventListener("change", () => {

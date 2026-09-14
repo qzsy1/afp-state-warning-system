@@ -33,6 +33,7 @@
         <span id="real-control-owner" class="real-control-owner"></span>
         <button id="unlock-real-mode" class="secondary-button compact-button" type="button">解锁真实模式</button>
         <button id="lock-real-mode" class="secondary-button compact-button hidden" type="button">退出真实模式</button>
+        <button id="admin-security-settings" class="secondary-button compact-button hidden" type="button">安全设置</button>
       </div>
     </header>
 
@@ -455,6 +456,18 @@
       <p id="real-access-transport-note" class="control-note">请输入管理员授权密码。密码仅通过 HTTPS 提交。</p>
       <label>授权密码<input id="real-access-password" type="password" autocomplete="current-password"></label>
       <div class="modal-actions"><button id="real-access-submit" class="primary-button" type="button">确认解锁</button><button id="real-access-cancel" class="secondary-button" type="button">取消</button></div>
+    </div>
+  </div>
+  <div id="admin-security-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="admin-security-title">
+    <div class="modal-card admin-security-card">
+      <h2 id="admin-security-title">本地管理员安全设置</h2>
+      <p class="control-note">仅在本机管理员页面保存。密码至少 12 个字符；API Key 只保存在服务器，不会返回给浏览器。</p>
+      <label>授权密码<input id="admin-password" type="password" autocomplete="new-password" placeholder="至少 12 个字符"></label>
+      <label>硅基流动 API Key<input id="admin-api-key" type="password" autocomplete="off" placeholder="sk-…（可留空保持原 Key）"></label>
+      <label>模型名称<input id="admin-model-name" type="text" value="deepseek-ai/DeepSeek-V3" autocomplete="off"></label>
+      <label class="checkbox-row"><input id="admin-clear-api-key" type="checkbox">清除服务器中已保存的 API Key</label>
+      <div class="modal-actions"><button id="admin-security-save" class="primary-button" type="button">保存设置</button><button id="admin-security-cancel" class="secondary-button" type="button">取消</button></div>
+      <p id="admin-security-status" class="control-note"></p>
     </div>
   </div>
   <script src="/mysql_visibility.js?v=20260909-mysql-toggle-2"></script>
