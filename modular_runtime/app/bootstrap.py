@@ -480,9 +480,12 @@ def _launch_public_web(context: Any, manager: Any) -> None:
         context.paths.runtime_dir / "public_web_security.sqlite3"
     )
     capture_root = Path(getattr(dashboard.acquisition, "capture_root", context.paths.runtime_dir / "capture"))
-    source = context.paths.legacy_dir / "new_collection_demo_v11_3" / "simulator_stream.csv"
-    if not source.is_file():
-        source = context.paths.data_dir / "dashboard_candidate_catalog.csv"
+    source_candidates = [
+        Path(r"F:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv"),
+        context.paths.legacy_dir / "new_collection_demo_v11_3" / "simulator_stream.csv",
+        context.paths.data_dir / "dashboard_candidate_catalog.csv",
+    ]
+    source = next((item for item in source_candidates if item.is_file()), source_candidates[-1])
     guest_manager = legacy_app.GuestSimulationManager(
         capture_root / "public_simulation",
         {"builtin": {"source_type": "single_csv", "path": str(source)}},
