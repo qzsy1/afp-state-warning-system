@@ -958,6 +958,10 @@ async function selectPredictionModel() {
 }
 
 async function selectSaveRoot() {
+  if (state.accessRole === "guest") {
+    await confirmLocalSave();
+    return;
+  }
   if (state.accessRole !== "local_admin" && state.accessRole !== "authorized") {
     toast("网页本地保存请先填写目录名称，再点击“确认并授权本地保存”");
     return;
@@ -968,6 +972,7 @@ async function selectSaveRoot() {
     });
     if (result.selected) {
       controls.saveRoot.value = result.path;
+      await refreshSaveRootStatus(result.path);
       toast(`保存位置已选择：${result.path}`);
     }
   } catch (error) {
@@ -986,7 +991,24 @@ function updateLocalSaveStatus(message, error = false) {
 function renderSaveRootStatus(status) {
   const node = controls.saveRootStatus;
   if (!node) return;
-  const payload = status || {};
+  let payload = status || {};
+  // Guest acquisition always has a writable server session directory, but
+  // that is not the visitor's local folder.  Never let that server status
+  // make an empty/un-authorized local path appear green.
+  if (state.accessRole === "guest") {
+    const localPath = controls.saveRoot?.value.trim() || "";
+    payload = state.localSaveAuthorized && state.localSaveDirectoryHandle
+      ? {
+        ok: true,
+        message: `已授权本地目录“${state.localSaveDirectoryHandle.name || localPath}”，采集完成后可保存到本机`,
+      }
+      : {
+        ok: false,
+        message: localPath
+          ? "已填写保存位置，但尚未授权本机文件夹；当前采集不保存到本机"
+          : "保存位置为空，当前采集不保存数据",
+      };
+  }
   node.textContent = payload.message || "保存位置为空，当前采集不保存数据";
   node.classList.toggle("error", !payload.ok);
   node.classList.toggle("ok", Boolean(payload.ok));
@@ -997,8 +1019,15 @@ async function refreshSaveRootStatus(path = controls.saveRoot?.value.trim() || "
     renderSaveRootStatus({ok: false, message: "保存位置为空，当前采集不保存数据"});
     return;
   }
+  if (state.localSaveAuthorized && state.localSaveDirectoryHandle) {
+    renderSaveRootStatus({
+      ok: true,
+      message: `已授权本地目录“${state.localSaveDirectoryHandle.name || path}”，采集完成后可保存到本机`,
+    });
+    return;
+  }
   if (state.accessRole === "guest") {
-    renderSaveRootStatus({ok: false, message: "访客模拟数据保存在服务器会话目录；本机文件需另行授权"});
+    renderSaveRootStatus({ok: false, message: "已填写保存位置，但尚未授权本机文件夹；当前采集不保存到本机"});
     return;
   }
   try {
@@ -1015,11 +1044,6 @@ async function refreshSaveRootStatus(path = controls.saveRoot?.value.trim() || "
 
 async function confirmLocalSave() {
   const requestedName = controls.saveRoot?.value.trim() || "";
-  if (!requestedName || !state.localSaveNameDirty) {
-    updateLocalSaveStatus("请先填写本地文件夹名称，再确认授权；留空时不会保存到网页电脑。", true);
-    toast("请先填写本地文件夹名称");
-    return;
-  }
   if (typeof window.showDirectoryPicker !== "function" || !window.isSecureContext) {
     updateLocalSaveStatus("当前浏览器不支持本地目录授权；请使用 HTTPS 或 localhost/127.0.0.1 访问。", true);
     toast("当前地址不支持浏览器本地目录授权");
@@ -1032,6 +1056,10 @@ async function confirmLocalSave() {
     state.localSaveNameDirty = false;
     controls.saveRoot.value = handle.name || requestedName;
     updateLocalSaveStatus(`已授权本地目录“${handle.name || requestedName}”；停止并保存后按原软件规则写入。`);
+    renderSaveRootStatus({
+      ok: true,
+      message: `已授权本地目录“${handle.name || requestedName}”，采集完成后可保存到本机`,
+    });
     toast("本地保存目录已授权");
   } catch (error) {
     if (error?.name === "AbortError") return;
@@ -2709,14 +2737,25 @@ async function initialize() {
     ensureFirstInterfaceSummary();
     placeSecondInterfaceAfterFirst();
     renderInterfacePanel(payload.acquisition.interface_defaults || []);
-     if (state.accessRole !== "guest") {
-       await discoverInterfaces();
-     } else {
-       state.physicalInterfaces = [];
-       if (controls.interfaceDiscoveryStatus) {
-         controls.interfaceDiscoveryStatus.textContent = "访客模拟模式：真实接口状态只读，采集使用服务器模拟数据源";
-       }
-     }
+      if (state.accessRole !== "guest") {
+        await discoverInterfaces();
+      } else {
+        const discovery = payload.acquisition?.interface_discovery || {};
+        state.physicalInterfaces = Array.isArray(discovery.physical_interfaces)
+          ? discovery.physical_interfaces : [];
+        state.interfaceCatalog = autoAssignPhysicalInterfaces(
+          (payload.acquisition?.interface_defaults || defaultInterfaceCatalog()).map((item) => ({...item}))
+        );
+        renderInterfacePanel(state.interfaceCatalog);
+        const assigned = (state.interfaceCatalog || [])
+          .filter((item) => item.enabled && item.physical_interface_id)
+          .map((item) => `${item.id}→${item.physical_interface_id}`);
+        if (controls.interfaceDiscoveryStatus) {
+          controls.interfaceDiscoveryStatus.textContent = assigned.length
+            ? `访客模拟模式：已读取服务器接口映射（只识别接口，不检查传感器连接）：${assigned.join("、")}`
+            : "访客模拟模式：暂无服务器接口清单，使用逻辑模拟接口映射";
+        }
+      }
     controls.datasetSchema.replaceChildren(
       ...payload.acquisition.schemas.map((item) =>
         option(item.id, item.label)
@@ -3544,20 +3583,32 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
   const current = preferredId || select.value;
   const profile = sensorTypeProfile(role);
   if (controls.acquisitionMode?.value === "simulation") {
-    const expected = Array.isArray(profile.channels) ? profile.channels : [];
-    const available = expected.filter((channel) => state.simulationSourceChannels.includes(channel));
-    const label = available.length
-      ? `模拟数据源 · 已匹配 ${available.length} 个通道`
-      : state.simulationSourceChannels.length
-        ? "模拟数据源 · 未匹配该接口通道"
-        : "模拟数据源 · 尚未读取表头";
-    select.replaceChildren(option("simulation_source", label));
-    select.value = "simulation_source";
-    select.disabled = true;
+    const options = candidates.map((item) => {
+      const node = option(item.id, `${item.label || item.endpoint || item.id} · 模拟映射`);
+      node.dataset.kind = item.kind || "";
+      node.dataset.detected = String(item.detected !== false);
+      node.dataset.assignable = String(Boolean(item.auto_assignable || item.driver_available));
+      node.dataset.fallback = String(item.kind === "serial" && profile.physical_kind !== "serial");
+      node.dataset.endpoint = item.endpoint || "";
+      return node;
+    });
+    if (options.length) {
+      select.replaceChildren(...options);
+      select.value = options.some((node) => node.value === current)
+        ? current : options[0].value;
+      select.disabled = false;
+    } else {
+      select.replaceChildren(option("simulation_source", "逻辑模拟接口（未发现实际接口）"));
+      select.value = "simulation_source";
+      select.disabled = false;
+    }
     const enabled = row.querySelector(".interface-enabled");
     if (enabled) {
       enabled.disabled = false;
-      enabled.checked = available.length > 0;
+      // Simulation mode validates the imported data mapping, not whether a
+      // physical sensor is plugged in.  All logical interface slots remain
+      // enabled so the supplied CSV can be replayed normally.
+      enabled.checked = true;
     }
     let warning = row.querySelector(".interface-physical-warning");
     if (!warning) {
@@ -3565,9 +3616,10 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
       warning.className = "interface-physical-warning control-note";
       row.append(warning);
     }
-    warning.textContent = available.length
-      ? `模拟可用：${available.join("、")}`
-      : "模拟数据中没有该接口预期通道；导入包含对应列的数据后会显示可用";
+    const selected = select.selectedOptions?.[0];
+    warning.textContent = selected?.value === "simulation_source"
+      ? "模拟采集：未检查传感器是否接入，使用逻辑模拟接口和导入数据"
+      : `模拟映射：${selected.textContent}；不检查传感器是否接入`;
     warning.classList.remove("hidden");
     return;
   }

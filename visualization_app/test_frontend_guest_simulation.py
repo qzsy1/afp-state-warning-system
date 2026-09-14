@@ -73,8 +73,8 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         start = text.index("function refreshPhysicalInterfaceOptions")
         end = text.index("function itemEnabledForSimulation", start)
         body = text[start:end]
-        self.assertIn("enabled.checked = available.length > 0;", body)
-        self.assertIn("模拟可用：${available.join", body)
+        self.assertIn("enabled.checked = true;", body)
+        self.assertIn("不检查传感器是否接入", body)
 
     def test_simulation_channels_present_in_source_are_auto_enabled_for_collection(self):
         source = Path(__file__).with_name("static") / "app.js"
@@ -93,6 +93,41 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         helper = text[helper_start:helper_end]
         self.assertIn("save-sensor-checkbox", helper)
         self.assertIn("available.has", helper)
+
+    def test_guest_simulation_keeps_server_physical_mapping_read_only(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        self.assertIn("payload.acquisition?.interface_discovery", text)
+        self.assertIn("autoAssignPhysicalInterfaces", text)
+        self.assertIn("只识别接口，不检查传感器连接", text)
+
+    def test_guest_bootstrap_includes_only_read_only_interface_inventory(self):
+        source = Path(__file__).with_name("app.py")
+        text = source.read_text(encoding="utf-8")
+        self.assertIn("bootstrap = self.dashboard.bootstrap(include_discovery=True)", text)
+        self.assertIn('acquisition["interface_discovery"] = {', text)
+        self.assertIn('"physical_interfaces": physical_interfaces', text)
+
+    def test_local_save_picker_does_not_require_a_prior_name_and_refreshes_status(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("async function confirmLocalSave()")
+        end = text.index("async function saveFinishedCaptureLocally", start)
+        body = text[start:end]
+        self.assertNotIn("!requestedName || !state.localSaveNameDirty", body)
+        self.assertIn("renderSaveRootStatus({", body)
+        self.assertIn("ok: true", body)
+        self.assertIn("showDirectoryPicker", body)
+
+    def test_guest_server_session_save_status_cannot_turn_empty_local_path_green(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("function renderSaveRootStatus")
+        end = text.index("async function refreshSaveRootStatus", start)
+        body = text[start:end]
+        self.assertIn('state.accessRole === "guest"', body)
+        self.assertIn("state.localSaveAuthorized", body)
+        self.assertIn("保存位置为空，当前采集不保存数据", body)
 
     def test_save_directory_status_is_checked_against_server_folder(self):
         source = Path(__file__).with_name("static") / "app.js"

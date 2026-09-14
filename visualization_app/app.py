@@ -4431,9 +4431,10 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/bootstrap":
             identity = self._identity()
-            bootstrap = self.dashboard.bootstrap(
-                include_discovery=identity.role in {"authorized", "local_admin"}
-            )
+            # The simulation UI needs the same interface-to-physical mapping in
+            # guest mode as it does locally.  This is an interface inventory
+            # only; guest requests never receive permission to open hardware.
+            bootstrap = self.dashboard.bootstrap(include_discovery=True)
             acquisition = bootstrap.get("acquisition") or {}
             demo = acquisition.get("new_collection_demo") or {}
             # Use the same administrator-approved CSV as the initial source in
@@ -4452,7 +4453,23 @@ class AppHandler(BaseHTTPRequestHandler):
                     if key not in {"result_dir", "split_root", "output_root"}
                 }
                 acquisition = bootstrap.get("acquisition") or {}
-                acquisition["interface_discovery"] = {}
+                discovery = acquisition.get("interface_discovery") or {}
+                physical_interfaces = []
+                for item in discovery.get("physical_interfaces") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    physical_interfaces.append({
+                        key: item.get(key)
+                        for key in (
+                            "id", "kind", "protocol", "endpoint", "label",
+                            "description", "detected", "driver_available",
+                            "auto_assignable", "shared_roles",
+                        )
+                        if key in item
+                    })
+                acquisition["interface_discovery"] = {
+                    "physical_interfaces": physical_interfaces,
+                }
                 acquisition["interface_defaults"] = default_capture_interfaces()
                 acquisition["sensor_types"] = sensor_interface_profiles()
                 acquisition["default_save_root"] = ""
