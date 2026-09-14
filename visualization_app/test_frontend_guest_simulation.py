@@ -62,6 +62,12 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn('const simulation = acquisition.config?.acquisition_mode === "simulation";', body)
         self.assertIn('simulation ? "模拟采集" : "真实采集"', body)
 
+    def test_simulation_source_is_bootstrapped_for_authorized_and_guest_flows(self):
+        source = Path(__file__).with_name("app.py")
+        text = source.read_text(encoding="utf-8")
+        self.assertIn("SUPPLIED_SIMULATION_SOURCE", text)
+        self.assertIn('acquisition["simulation_source_name"] = default_source', text)
+
 
 if __name__ == "__main__":
     unittest.main()

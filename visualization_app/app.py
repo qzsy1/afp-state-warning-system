@@ -413,7 +413,14 @@ LIVE_SENSOR_UNITS = {
 NEW_DEMO_ROOT = Path(
     os.environ.get("AFP_NEW_DEMO_DIR") or APP_DIR / "new_collection_demo_v11_3"
 ).resolve()
-NEW_DEMO_SOURCE = NEW_DEMO_ROOT / "simulator_stream.csv"
+SUPPLIED_SIMULATION_SOURCE = Path(
+    r"F:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv"
+).resolve()
+NEW_DEMO_SOURCE = (
+    SUPPLIED_SIMULATION_SOURCE
+    if SUPPLIED_SIMULATION_SOURCE.is_file()
+    else NEW_DEMO_ROOT / "simulator_stream.csv"
+)
 NEW_DEMO_CHECKPOINT = RUNTIME_MODEL_DIR / "new" / "i_T_G" / "checkpoint.pth"
 
 
@@ -4401,6 +4408,16 @@ class AppHandler(BaseHTTPRequestHandler):
             bootstrap = self.dashboard.bootstrap(
                 include_discovery=identity.role in {"authorized", "local_admin"}
             )
+            acquisition = bootstrap.get("acquisition") or {}
+            demo = acquisition.get("new_collection_demo") or {}
+            # Use the same administrator-approved CSV as the initial source in
+            # both guest playback and the unlocked desktop-style simulation.
+            # Guests receive only the display name below; authorized users need
+            # the full local path so the original chooser/start flow can read it.
+            default_source = str(demo.get("source_file") or "")
+            if default_source:
+                acquisition["simulation_source_type"] = "single_csv"
+                acquisition["simulation_source_name"] = default_source
             if identity.role == "guest":
                 bootstrap = deepcopy(bootstrap)
                 bootstrap["manifest"] = {
