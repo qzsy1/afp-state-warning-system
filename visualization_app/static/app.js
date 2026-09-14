@@ -54,8 +54,8 @@ const state = {
 
 const $ = (id) => document.getElementById(id);
 
-const agentApiKeyInput = null;
-const agentModelNameInput = null;
+const agentApiKeyInput = $("agentApiKeyInput");
+const agentModelNameInput = $("agentModelNameInput");
 const agentDiagnoseButton = $("agentDiagnoseButton");
 
 function readCookie(name) {
@@ -1457,8 +1457,10 @@ function buildAgentEvents(hardwareResult) {
 }
 
 function renderAgentGate() {
-  const keyPresent = state.modelAccess;
-  const modelPresent = state.modelAccess;
+  const explicitKey = agentApiKeyInput?.value.trim() || "";
+  const explicitModel = agentModelNameInput?.value.trim() || "";
+  const keyPresent = state.accessRole !== "guest" && (Boolean(explicitKey) || state.modelAccess);
+  const modelPresent = state.accessRole !== "guest" && (Boolean(explicitModel) || state.modelAccess);
   const eventPresent = state.agentEvents.length > 0;
   const ready = eventPresent && !state.agentBusy;
   const status = $("agentGateStatus");
@@ -1547,8 +1549,10 @@ function appendAgentDiagnostics(node) {
 function handleAgentInputChange() {
   renderAgentGate();
   const autoStatus = $("agentAutoStatus");
-  const keyPresent = state.modelAccess;
-  const modelPresent = state.modelAccess;
+  const keyPresent = state.accessRole !== "guest"
+    && (Boolean(agentApiKeyInput?.value.trim()) || state.modelAccess);
+  const modelPresent = state.accessRole !== "guest"
+    && Boolean(agentModelNameInput?.value.trim() || state.modelAccess);
   if (autoStatus && state.agentEvents.length) {
     autoStatus.textContent = keyPresent && modelPresent
       ? "已授权；服务器模型会按异常现象自主选择只读取证工具。"
@@ -1565,6 +1569,7 @@ async function loadAgentDefaults() {
     const configuredModel = defaults.model_name || "deepseek-ai/DeepSeek-V3";
     state.modelAccess = Boolean(defaults.model_access);
     state.agentModelName = configuredModel;
+    if (agentModelNameInput) agentModelNameInput.value = configuredModel;
     handleAgentInputChange();
   } catch (_error) {
     // The UI remains usable with explicit fields and local-rule fallback.
@@ -1605,6 +1610,8 @@ async function runAgentDiagnosis({automatic = false} = {}) {
   if (autoStatus) autoStatus.textContent = automatic ? "新异常已触发 LangChain 诊断……" : "正在重新诊断全部异常……";
   try {
     const result = await postJson("/api/agent/diagnose", {
+      api_key: state.accessRole === "guest" ? "" : (agentApiKeyInput?.value.trim() || ""),
+      model_name: state.accessRole === "guest" ? "" : (agentModelNameInput?.value.trim() || ""),
       events: state.agentEvents,
       hardware_result: state.hardwareCheck,
     }, {timeoutMs: 210000, controller});

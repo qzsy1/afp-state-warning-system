@@ -249,7 +249,10 @@
               </summary>
               <div class="collapsible-subsection-content">
                <div id="agent-model-access" class="agent-model-access">服务器模型：未授权</div>
-               <input id="agentModelNameInput" type="hidden" placeholder="deepseek-ai/DeepSeek-V3" aria-hidden="true">
+               <div class="compact-input-grid agent-input-grid">
+                <label>硅基流动 API Key<input id="agentApiKeyInput" type="password" autocomplete="off" placeholder="sk-…（仅授权模式调用）"></label>
+                <label>模型名称<input id="agentModelNameInput" type="text" value="deepseek-ai/DeepSeek-V3" placeholder="deepseek-ai/DeepSeek-V3" autocomplete="off"></label>
+               </div>
               <div class="agent-actions">
                 <span id="agentAutoStatus" class="control-note">未配置时使用内置离线测试诊断；配置正确时由模型按现象选择只读取证工具。</span>
                 <button id="agentDiagnoseButton" class="secondary-button" type="button" disabled>重新诊断全部异常</button>

@@ -526,6 +526,7 @@ class InterfaceAgentTests(unittest.TestCase):
         requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
 
         for element_id in (
+            "agentApiKeyInput",
             "agentModelNameInput",
             "agentGateStatus",
             "agentDiagnoseButton",
@@ -534,7 +535,10 @@ class InterfaceAgentTests(unittest.TestCase):
             self.assertIn(f'id="{element_id}"', html)
         self.assertNotIn('id="agentDiagnosisPanel"', html)
         self.assertIn("/api/agent/diagnose", script)
-        self.assertNotIn("api_key: agentApiKeyInput.value.trim()", script)
+        self.assertIn("api_key: state.accessRole === \"guest\" ? \"\" :", script)
+        self.assertIn("agentApiKeyInput?.value.trim()", script)
+        self.assertIn("model_name: state.accessRole === \"guest\" ? \"\" :", script)
+        self.assertIn("agentModelNameInput?.value.trim()", script)
         self.assertIn("hardware_result: state.hardwareCheck", script)
         self.assertNotIn("api_key_present", script)
         self.assertIn("buildAgentEvents", script)
@@ -576,6 +580,7 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertIn("state.agentEvents = []", reset_block)
         self.assertNotIn('value="deepseek-ai/DeepSeek-V3.2"', html)
         self.assertIn('placeholder="deepseek-ai/DeepSeek-V3"', html)
+        self.assertIn('type="password"', html)
         self.assertIn('defaults.model_name || "deepseek-ai/DeepSeek-V3"', script)
 
     def test_original_frontend_groups_functional_modules_as_collapsible_sections(self) -> None:

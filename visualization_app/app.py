@@ -4822,11 +4822,20 @@ class AppHandler(BaseHTTPRequestHandler):
                 identity = self._identity()
                 if identity.role in {"authorized", "local_admin"}:
                     try:
-                        api_key, model_name = self.security_store.model_credentials()
+                        stored_key, stored_model = self.security_store.model_credentials()
                     except Exception:
-                        api_key, model_name = "", DEFAULT_SILICONFLOW_MODEL
+                        stored_key, stored_model = "", DEFAULT_SILICONFLOW_MODEL
+                    # The web form mirrors the desktop model settings.  An
+                    # explicitly supplied pair is used for this diagnosis;
+                    # leaving both fields blank falls back to the protected
+                    # credentials configured by the local administrator.
+                    api_key = request_data["api_key"] or stored_key
+                    model_name = request_data["model_name"] or stored_model
                     use_environment = False
                 else:
+                    # Public visitors can view and run local diagnostics, but
+                    # their browser cannot turn this endpoint into a proxy for
+                    # arbitrary provider keys.
                     api_key, model_name = "", DEFAULT_SILICONFLOW_MODEL
                     use_environment = False
 
@@ -4846,7 +4855,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 if not api_key or not model_name:
                     result = run_local()
                 else:
-                    session_key = str(identity.session_id or "")
+                    session_key = str(identity.session_id or identity.guest_id or "public")
                     if self.model_limiter.count("model", session_key, 60.0) >= 3:
                         self.security_store.append_audit(
                             "model_rate_limited",

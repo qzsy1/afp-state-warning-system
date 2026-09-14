@@ -598,7 +598,7 @@ class ModelCredentialTests(PublicWebHttpTests):
         )
         self.assertFalse(payload["model_used"])
 
-    def test_authorized_model_call_uses_store_but_never_returns_key(self):
+    def test_authorized_model_call_accepts_explicit_page_credentials_without_returning_key(self):
         self.request_json("GET", "/api/auth/session")
         self.request_json(
             "POST",
@@ -614,18 +614,16 @@ class ModelCredentialTests(PublicWebHttpTests):
                 "POST",
                 "/api/agent/diagnose",
                 {
-                    "api_key": "sk-attacker",
-                    "model_name": "attacker/model",
+                    "api_key": "sk-page-value",
+                    "model_name": "page/model",
                     "events": [self._event()],
                     "hardware_result": {},
                 },
                 headers={"X-Forwarded-Proto": "https"},
             )
         self.assertEqual(status, 200)
-        self.assertEqual(run.call_args.kwargs["api_key"], "sk-private-value")
-        self.assertEqual(
-            run.call_args.kwargs["model_name"], "deepseek-ai/DeepSeek-V3"
-        )
+        self.assertEqual(run.call_args.kwargs["api_key"], "sk-page-value")
+        self.assertEqual(run.call_args.kwargs["model_name"], "page/model")
         self.assertTrue(payload["model_used"])
         self.assertNotIn("sk-private-value", json.dumps(payload, ensure_ascii=False))
         self.assertNotIn("sk-private-value", json.dumps(headers))
