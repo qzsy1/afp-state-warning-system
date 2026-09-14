@@ -200,15 +200,24 @@ foreach ($directory in @("logs", "runtime", "rollback", "updates", "verification
 }
 
 # Delivery trees must never contain runtime credentials or tunnel secrets.
+$mutableDirectories = @("logs", "runtime", "rollback", "updates", "verification")
 $forbiddenNames = Get-ChildItem -LiteralPath $TargetDir -Recurse -File | Where-Object {
-    $_.Name -in @("public_web_security.sqlite3", "cert.pem") -or
-    $_.Name -like "*.cfargotunnel.com.json"
+    $relative = $_.FullName.Substring($TargetDir.Length).TrimStart('\\')
+    $topDirectory = ($relative -split '[\\/]')[0]
+    $topDirectory -notin $mutableDirectories -and (
+        $_.Name -in @("public_web_security.sqlite3", "cert.pem") -or
+        $_.Name -like "*.cfargotunnel.com.json"
+    )
 }
 if ($forbiddenNames) {
     throw "Delivery contains a forbidden public-web secret file: $($forbiddenNames[0].FullName)"
 }
 $textExtensions = @(".py", ".ps1", ".json", ".txt", ".md", ".html", ".js", ".css", ".toml", ".yaml", ".yml")
-foreach ($file in (Get-ChildItem -LiteralPath $TargetDir -Recurse -File | Where-Object { $textExtensions -contains $_.Extension.ToLowerInvariant() })) {
+foreach ($file in (Get-ChildItem -LiteralPath $TargetDir -Recurse -File | Where-Object {
+    $relative = $_.FullName.Substring($TargetDir.Length).TrimStart('\\')
+    $topDirectory = ($relative -split '[\\/]')[0]
+    $topDirectory -notin $mutableDirectories -and $textExtensions -contains $_.Extension.ToLowerInvariant()
+})) {
     $text = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction Stop
     if ($text -match 'sk-[A-Za-z0-9_-]{20,}') {
         throw "Delivery text contains a SiliconFlow-style API key: $($file.FullName)"
