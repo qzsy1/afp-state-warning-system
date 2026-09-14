@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.error import HTTPError
 from unittest.mock import patch
@@ -198,6 +200,38 @@ class InterfaceAgentTests(unittest.TestCase):
 
         self.assertEqual(result["model_status"], "success")
         self.assertEqual(captured, [("sk-test-only", "deepseek-ai/DeepSeek-V3")])
+
+    def test_identical_concurrent_diagnoses_share_one_model_call(self) -> None:
+        calls = 0
+        calls_lock = threading.Lock()
+        release = threading.Event()
+
+        def slow_model(_api_key, _model_name, _events, _local_diagnoses):
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            release.wait(2)
+            return [{
+                "analysis": "共享调用完成",
+                "possible_causes": ["待确认"],
+                "recommended_actions": ["继续检查"],
+            }]
+
+        event = interface_agent.build_agent_event(m3232_result())
+        kwargs = {
+            "api_key": "sk-test-only",
+            "model_name": "deepseek-ai/DeepSeek-V3",
+            "model_caller": slow_model,
+        }
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(interface_agent.run_interface_diagnoses, [event], **kwargs)
+            second = pool.submit(interface_agent.run_interface_diagnoses, [event], **kwargs)
+            threading.Event().wait(0.05)
+            release.set()
+            results = [first.result(timeout=3), second.result(timeout=3)]
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(results[0], results[1])
 
     def test_model_alias_fields_are_normalized_into_enhancement(self) -> None:
         result = interface_agent.run_interface_diagnoses(

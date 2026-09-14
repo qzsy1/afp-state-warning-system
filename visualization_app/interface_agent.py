@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import socket
+import threading
 from contextlib import contextmanager
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -905,7 +907,7 @@ def _clean_model_enhancements(
     return cleaned
 
 
-def run_interface_diagnoses(
+def _run_interface_diagnoses_uncached(
     events: list[dict[str, Any]] | None,
     *,
     api_key: str,
@@ -1054,6 +1056,104 @@ def run_interface_diagnoses(
         "model_name": clean_model,
         "diagnoses": diagnoses,
     }
+
+
+_DIAGNOSIS_SINGLE_FLIGHT_LOCK = threading.Lock()
+_DIAGNOSIS_SINGLE_FLIGHT: dict[str, dict[str, Any]] = {}
+
+
+def _diagnosis_request_key(
+    events: list[dict[str, Any]] | None,
+    api_key: str,
+    model_name: str,
+) -> str:
+    clean_key, clean_model = _resolve_agent_credentials(api_key, model_name)
+    if not clean_key or not clean_model:
+        return ""
+    signatures = []
+    for event in events or []:
+        if not isinstance(event, dict):
+            continue
+        signatures.append(
+            {
+                "interface_id": str(event.get("interface_id") or ""),
+                "driver": str(event.get("driver") or ""),
+                "endpoint": str(event.get("endpoint") or ""),
+                "physical_interface_id": str(event.get("physical_interface_id") or ""),
+                "protocol": str(event.get("protocol") or ""),
+                "channels": sorted(str(value) for value in event.get("channels") or []),
+                "state": str(event.get("state") or ""),
+            }
+        )
+    signatures.sort(key=lambda item: (item["interface_id"], item["endpoint"]))
+    identity = {
+        "model": clean_model,
+        "key_hash": hashlib.sha256(clean_key.encode("utf-8")).hexdigest(),
+        "events": signatures,
+    }
+    return hashlib.sha256(
+        json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def run_interface_diagnoses(
+    events: list[dict[str, Any]] | None,
+    *,
+    api_key: str,
+    model_name: str,
+    model_caller: Any = None,
+    hardware_result: dict[str, Any] | None = None,
+    discovery: dict[str, Any] | None = None,
+    acquisition_status: dict[str, Any] | None = None,
+    transport: Any = None,
+) -> dict[str, Any]:
+    """Collapse identical concurrent UI requests into one external model call."""
+
+    request_key = _diagnosis_request_key(events, api_key, model_name)
+    if not request_key:
+        return _run_interface_diagnoses_uncached(
+            events,
+            api_key=api_key,
+            model_name=model_name,
+            model_caller=model_caller,
+            hardware_result=hardware_result,
+            discovery=discovery,
+            acquisition_status=acquisition_status,
+            transport=transport,
+        )
+    with _DIAGNOSIS_SINGLE_FLIGHT_LOCK:
+        job = _DIAGNOSIS_SINGLE_FLIGHT.get(request_key)
+        owner = job is None
+        if owner:
+            job = {"event": threading.Event(), "result": None, "error": None}
+            _DIAGNOSIS_SINGLE_FLIGHT[request_key] = job
+    if not owner:
+        if not job["event"].wait(220):
+            raise AgentGateError("等待同一批接口异常的模型诊断超时")
+        if job["error"] is not None:
+            raise job["error"]
+        return deepcopy(job["result"])
+    try:
+        result = _run_interface_diagnoses_uncached(
+            events,
+            api_key=api_key,
+            model_name=model_name,
+            model_caller=model_caller,
+            hardware_result=hardware_result,
+            discovery=discovery,
+            acquisition_status=acquisition_status,
+            transport=transport,
+        )
+        job["result"] = deepcopy(result)
+        return result
+    except BaseException as error:
+        job["error"] = error
+        raise
+    finally:
+        job["event"].set()
+        with _DIAGNOSIS_SINGLE_FLIGHT_LOCK:
+            if _DIAGNOSIS_SINGLE_FLIGHT.get(request_key) is job:
+                _DIAGNOSIS_SINGLE_FLIGHT.pop(request_key, None)
 
 
 def run_interface_diagnosis(
