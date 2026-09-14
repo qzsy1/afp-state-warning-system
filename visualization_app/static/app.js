@@ -3562,7 +3562,9 @@ function autoAssignPhysicalInterfaces(configs, {allowSerialFallback = true} = {}
       fallback = Boolean(selected);
     }
     if (!selected) {
-      selected = candidates.find((candidate) => compatible(candidate, profile) && candidate.auto_assignable && !used.has(candidate.id));
+      selected = candidates.find((candidate) => compatible(candidate, profile)
+        && (candidate.auto_assignable || candidate.driver_available)
+        && !used.has(candidate.id));
     }
     if (!selected) return;
     item.physical_interface_id = selected.id;

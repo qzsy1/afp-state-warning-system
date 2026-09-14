@@ -126,6 +126,18 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
             "real discovery must keep USB HID/UVC roles on protocol-compatible interfaces",
         )
 
+    def test_real_mapping_accepts_protocol_driver_placeholder_without_sensor_data(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("function autoAssignPhysicalInterfaces")
+        end = text.index("function refreshPhysicalInterfaceOptions", start)
+        body = text[start:end]
+        self.assertIn(
+            "candidate.auto_assignable || candidate.driver_available",
+            body,
+            "a detected protocol driver can be mapped before sensor data is streamed",
+        )
+
     def test_switching_to_simulation_rebuilds_logical_catalog_instead_of_reusing_real_bindings(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
