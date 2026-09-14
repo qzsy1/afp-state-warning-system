@@ -636,10 +636,21 @@ def run_siliconflow_planned_agent(
     """Use a model-selected JSON tool plan when native tool calls are slow."""
 
     caller = transport or (lambda payload: _request_siliconflow(api_key, payload))
-    try:
-        response = caller(_build_tool_plan_payload(model_name, context))
-    except AgentToolCallError as error:
-        raise AgentToolCallError(f"模型工具规划阶段失败：{error.public_message}") from None
+    plan_payload = _build_tool_plan_payload(model_name, context)
+    initial_connection_retried = False
+    for attempt in range(2):
+        try:
+            response = caller(plan_payload)
+            break
+        except AgentToolCallError as error:
+            retryable = any(
+                marker in error.public_message
+                for marker in ("超时", "网络", "服务暂不可用")
+            )
+            if attempt == 0 and retryable:
+                initial_connection_retried = True
+                continue
+            raise AgentToolCallError(f"模型工具规划阶段失败：{error.public_message}") from None
     message = _assistant_message(response)
     parsed = _parse_final_json(_final_message_content(message))
     calls = parsed.get("tool_calls")
@@ -706,6 +717,7 @@ def run_siliconflow_planned_agent(
     except AgentToolCallError as error:
         raise AgentToolCallError(f"模型最终诊断阶段失败：{error.public_message}") from None
     result["agent_strategy"] = "model_planned_tools"
+    result["initial_connection_retried"] = initial_connection_retried
     result["model_message"] = "硅基流动模型已自主规划并调用只读取证工具完成诊断"
     return result
 

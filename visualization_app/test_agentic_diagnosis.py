@@ -500,6 +500,49 @@ class SiliconFlowAgentTests(unittest.TestCase):
         synthesis_input = json.loads(payloads[1]["messages"][1]["content"])
         self.assertNotIn("evidence", synthesis_input["case"]["events"][0])
 
+    def test_planned_agent_retries_first_network_timeout_once(self) -> None:
+        context = self._plc_context()
+        calls = 0
+
+        def transport(_payload):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise agentic_diagnosis.AgentToolCallError("连接硅基流动超时或网络不可用")
+            if calls == 2:
+                return {"choices": [{"message": {"role": "assistant", "content": json.dumps({
+                    "tool_calls": [{
+                        "name": "check_network_path",
+                        "arguments": {"interface_id": "plc_process"},
+                    }]
+                }, ensure_ascii=False)}}]}
+            return {"choices": [{"message": {"role": "assistant", "content": json.dumps({
+                "diagnoses": [{
+                    "interface_id": "plc_process",
+                    "observed_facts": [{"text": "PLC端点不可达", "evidence_ids": ["EV-001"]}],
+                    "hypotheses": [{
+                        "cause": "网络路径待确认",
+                        "confidence": 0.7,
+                        "evidence_ids": ["EV-001"],
+                    }],
+                    "cross_interface_findings": [],
+                    "recommended_actions": [],
+                    "unknowns": ["网线状态待确认"],
+                }]
+            }, ensure_ascii=False)}}]}
+
+        result = agentic_diagnosis.run_siliconflow_planned_agent(
+            "sk-test-only",
+            "deepseek-ai/DeepSeek-V3",
+            context,
+            [],
+            transport=transport,
+        )
+
+        self.assertEqual(calls, 3)
+        self.assertEqual(result["model_status"], "success")
+        self.assertTrue(result["initial_connection_retried"])
+
     def test_model_selects_network_tool_then_returns_evidence_backed_result(self) -> None:
         context = self._plc_context()
         payloads = []
