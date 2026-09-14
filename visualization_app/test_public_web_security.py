@@ -630,15 +630,16 @@ class ModelCredentialTests(PublicWebHttpTests):
 
 
 class FrontendAccessContractTests(unittest.TestCase):
-    def test_frontend_contains_access_state_controls_without_key_field(self):
+    def test_frontend_contains_access_state_controls_and_model_fields(self):
         root = Path(__file__).resolve().parent / "static"
         html = (root / "index.html").read_text(encoding="utf-8")
         script = (root / "app.js").read_text(encoding="utf-8")
         self.assertIn('id="access-mode-badge"', html)
         self.assertIn('id="unlock-real-mode"', html)
         self.assertIn('id="real-access-password"', html)
-        self.assertNotIn('id="agentApiKeyInput"', html)
-        self.assertNotIn("api_key: controls", script)
+        self.assertIn('id="agentApiKeyInput"', html)
+        self.assertIn('id="agentModelNameInput"', html)
+        self.assertIn("agentApiKeyInput?.value.trim()", script)
         self.assertIn("/api/auth/session", script)
 
 
