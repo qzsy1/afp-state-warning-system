@@ -2575,6 +2575,9 @@ async function initialize() {
     controls.realtimePrediction.checked = Boolean(payload.defaults.realtime_prediction);
     controls.optimizedWarning.checked = Boolean(payload.defaults.use_optimized_warning);
     controls.saveRoot.value = payload.acquisition.default_save_root || "";
+    if (controls.simulationSourcePath && payload.acquisition.simulation_source_name) {
+      controls.simulationSourcePath.value = payload.acquisition.simulation_source_name;
+    }
     controls.threshold.value = payload.defaults.threshold;
     controls.rho.value = payload.defaults.rho;
     controls.indicator.value = payload.defaults.indicator;
@@ -3661,12 +3664,15 @@ async function selectSimulationSource() {
   const sourceType = controls.simulationSourceType?.value || "single_csv";
   if (sourceType === "mysql") return;
   try {
-    const result = await postJson("/api/acquisition/select-source", {
+    const endpoint = state.accessRole === "guest"
+      ? "/api/simulation/select-source"
+      : "/api/acquisition/select-source";
+    const result = await postJson(endpoint, {
       source_type: sourceType,
       initial_path: controls.simulationSourcePath?.value.trim() || "",
     });
     if (result.selected) {
-      controls.simulationSourcePath.value = result.path;
+      controls.simulationSourcePath.value = result.path || result.name || "";
       toast("模拟采集数据源已选择");
     }
   } catch (error) { toast(`无法选择模拟数据源：${error.message}`); }

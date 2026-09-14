@@ -4406,6 +4406,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 acquisition["interface_defaults"] = []
                 acquisition["sensor_types"] = []
                 acquisition["default_save_root"] = ""
+                profiles = getattr(self.guest_manager, "source_profiles", {})
+                builtin_profile = profiles.get("builtin", {}) if isinstance(profiles, dict) else {}
+                source_path = str(builtin_profile.get("path") or "")
+                acquisition["simulation_source_name"] = Path(source_path).name if source_path else ""
                 demo = acquisition.get("new_collection_demo") or {}
                 demo["source_file"] = ""
                 demo["prediction_model"] = None
@@ -4699,6 +4703,15 @@ class AppHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/simulation/start":
                 self._send_json(
                     self.guest_manager.start(self._identity().guest_id, payload)
+                )
+                return
+            if parsed.path == "/api/simulation/select-source":
+                self._send_json(
+                    self.guest_manager.select_source(
+                        self._identity().guest_id,
+                        str(payload.get("source_type") or "single_csv"),
+                        str(payload.get("initial_path") or ""),
+                    )
                 )
                 return
             if parsed.path == "/api/simulation/stop":
@@ -4995,9 +5008,12 @@ def create_server(
     active_security_store = security_store or SecurityStore(
         runtime_root / "public_web_security.sqlite3"
     )
-    simulation_source = APP_DIR / "new_collection_demo_v11_3" / "simulator_stream.csv"
-    if not simulation_source.is_file():
-        simulation_source = DATA_DIR / "dashboard_candidate_catalog.csv"
+    simulation_candidates = [
+        Path(r"F:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv"),
+        APP_DIR / "new_collection_demo_v11_3" / "simulator_stream.csv",
+        DATA_DIR / "dashboard_candidate_catalog.csv",
+    ]
+    simulation_source = next((item for item in simulation_candidates if item.is_file()), simulation_candidates[-1])
     capture_root = Path(
         getattr(active_dashboard.acquisition, "capture_root", runtime_root / "capture")
     ).resolve()

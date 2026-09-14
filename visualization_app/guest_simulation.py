@@ -155,6 +155,33 @@ class GuestSimulationManager:
             )
         return profile
 
+    def select_source(self, session_id: str, source_type: str = "single_csv", initial_path: str = "") -> dict[str, Any]:
+        """Open the same local chooser used by the desktop UI and approve it as the guest source.
+
+        The chooser runs on the acquisition host; the browser receives only the
+        selected filename.  The selected source remains simulator-only.
+        """
+        self.ensure_session(session_id)
+        from acquisition import select_simulation_source
+
+        clean_type = str(source_type or "single_csv").strip().lower()
+        if clean_type not in {"single_csv", "folder_csv"}:
+            raise GuestSimulationError("guest_source_not_allowed", "只允许选择 CSV 文件或采集数据文件夹")
+        selected = str(select_simulation_source(clean_type, str(initial_path or "")) or "").strip()
+        if not selected:
+            return {"selected": False, "path": "", "name": ""}
+        path = Path(selected).resolve()
+        if clean_type == "single_csv" and path.suffix.lower() != ".csv":
+            raise GuestSimulationError("guest_source_not_allowed", "模拟数据必须是 CSV 文件")
+        if clean_type == "folder_csv" and not path.is_dir():
+            raise GuestSimulationError("guest_source_not_allowed", "模拟数据文件夹无效")
+        self.source_profiles["builtin"] = {
+            **self.source_profiles.get("builtin", {}),
+            "source_type": clean_type,
+            "path": str(path),
+        }
+        return {"selected": True, "path": str(path), "name": path.name}
+
     def safe_config(self, session_id: str, payload: dict[str, Any]) -> AcquisitionConfig:
         session = self.ensure_session(session_id)
         profile = self._profile(payload)
