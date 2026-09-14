@@ -2744,7 +2744,8 @@ async function initialize() {
         state.physicalInterfaces = Array.isArray(discovery.physical_interfaces)
           ? discovery.physical_interfaces : [];
         state.interfaceCatalog = autoAssignPhysicalInterfaces(
-          (payload.acquisition?.interface_defaults || defaultInterfaceCatalog()).map((item) => ({...item}))
+          (payload.acquisition?.interface_defaults || defaultInterfaceCatalog()).map((item) => ({...item})),
+          {allowSerialFallback: false},
         );
         renderInterfacePanel(state.interfaceCatalog);
         const assigned = (state.interfaceCatalog || [])
@@ -3531,7 +3532,7 @@ function physicalCandidatesForRole(role) {
   return [...candidates, ...serialFallbacks];
 }
 
-function autoAssignPhysicalInterfaces(configs) {
+function autoAssignPhysicalInterfaces(configs, {allowSerialFallback = true} = {}) {
   const candidates = Array.isArray(state.physicalInterfaces) ? state.physicalInterfaces : [];
   const used = new Set();
   const assigned = {};
@@ -3553,7 +3554,7 @@ function autoAssignPhysicalInterfaces(configs) {
     if (!selected) {
       selected = candidates.find((candidate) => compatible(candidate, profile) && candidate.detected !== false && !used.has(candidate.id));
     }
-    if (!selected) {
+    if (!selected && allowSerialFallback) {
       selected = candidates.find((candidate) => (normalizedKind(candidate) === "serial" || normalizedKind(candidate) === "com") && candidate.detected !== false && !used.has(candidate.id));
       fallback = Boolean(selected);
     }
@@ -3902,7 +3903,17 @@ function updateSimulationSettings() {
       : "选择单个 CSV 文件";
   }
   updateRealAcquisitionVisibility();
-  if (!simulation) discoverInterfaces();
+  if (simulation) {
+    const current = state.interfaceCatalog?.length
+      ? state.interfaceCatalog.map((item) => ({...item}))
+      : defaultInterfaceCatalog();
+    if (state.physicalInterfaces.length) {
+      state.interfaceCatalog = autoAssignPhysicalInterfaces(current, {allowSerialFallback: false});
+      renderInterfacePanel(state.interfaceCatalog);
+    }
+  } else {
+    discoverInterfaces();
+  }
 }
 
 function updateIntegrationSource() {

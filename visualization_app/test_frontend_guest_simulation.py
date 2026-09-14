@@ -108,6 +108,12 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn('acquisition["interface_discovery"] = {', text)
         self.assertIn('"physical_interfaces": physical_interfaces', text)
 
+    def test_simulation_mapping_does_not_cross_assign_serial_to_usb_profiles(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        self.assertIn("allowSerialFallback = true", text)
+        self.assertIn("allowSerialFallback: false", text)
+
     def test_local_save_picker_does_not_require_a_prior_name_and_refreshes_status(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
