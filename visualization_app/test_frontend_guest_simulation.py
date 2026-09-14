@@ -76,6 +76,24 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn("enabled.checked = available.length > 0;", body)
         self.assertIn("模拟可用：${available.join", body)
 
+    def test_simulation_channels_present_in_source_are_auto_enabled_for_collection(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        self.assertIn(
+            "function autoEnableSimulationChannels",
+            text,
+            "simulation source channels must drive the sensor collection checkboxes",
+        )
+        start = text.index("async function uploadSimulationSource()")
+        end = text.index("function acquisitionConfig()", start)
+        body = text[start:end]
+        self.assertIn("autoEnableSimulationChannels(state.simulationSourceChannels);", body)
+        helper_start = text.index("function autoEnableSimulationChannels")
+        helper_end = text.index("function isTemperatureChannel", helper_start)
+        helper = text[helper_start:helper_end]
+        self.assertIn("save-sensor-checkbox", helper)
+        self.assertIn("available.has", helper)
+
     def test_save_directory_status_is_checked_against_server_folder(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")

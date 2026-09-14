@@ -1922,6 +1922,9 @@ function configureDatasetSchema(useDefaults = true) {
   document.querySelector(".save-rule-note").textContent =
     "文件夹按工况与独立重复命名；每层保留分层文件，完整试样始终覆盖为同一份当前数据文件。";
   buildSensorChecklist(schema.sensors);
+  if (controls.acquisitionMode?.value === "simulation" && state.simulationSourceChannels.length) {
+    autoEnableSimulationChannels(state.simulationSourceChannels);
+  }
   controls.sensor.replaceChildren(...schema.sensors.map((name, index) =>
     option(index, name)
   ));
@@ -3980,6 +3983,7 @@ async function uploadSimulationSource() {
     state.guestSimulationStarted = false;
     state.guestSimulationStoppedByUser = false;
     document.querySelectorAll(".interface-config-row").forEach((row) => refreshPhysicalInterfaceOptions(row));
+    autoEnableSimulationChannels(state.simulationSourceChannels);
     toast("模拟数据已载入");
   } catch (error) {
     if (controls.simulationSourceNote) controls.simulationSourceNote.textContent = `模拟数据上传失败：${error.message}`;
@@ -4097,6 +4101,35 @@ function selectedAcquisitionChannelsForInterfaces() {
     return state.bootstrap?.acquisition?.schemas?.find((item) => item.id === schemaId)?.sensors || [];
   }
   return checks.filter((node) => node.checked).map((node) => node.value);
+}
+
+// In simulation mode the imported file is the source of truth for which
+// sensor channels are available.  Match those channels to the collection
+// checklist once a source is loaded; users can still manually uncheck any
+// channel afterwards.
+function autoEnableSimulationChannels(sourceChannels = []) {
+  if (controls.acquisitionMode?.value !== "simulation") return;
+  const available = new Set((Array.isArray(sourceChannels) ? sourceChannels : [])
+    .map((channel) => String(channel || "").trim())
+    .filter(Boolean));
+  const rows = [...document.querySelectorAll("#liveSensorChecklist .sensor-checklist-row")];
+  if (!rows.length) return;
+  rows.forEach((row) => {
+    const collect = row.querySelector(".save-sensor-checkbox");
+    if (!collect) return;
+    const present = available.has(String(collect.value || "").trim());
+    collect.checked = present;
+    const modelInput = row.querySelector(".model-input-sensor-checkbox");
+    const outputInput = row.querySelector(".predict-sensor-checkbox");
+    if (!present) {
+      if (modelInput) modelInput.checked = false;
+      if (outputInput) outputInput.checked = false;
+    }
+    const captureOnly = controls.processingMode?.value === "capture_only";
+    if (modelInput) modelInput.disabled = !present || captureOnly;
+    if (outputInput) outputInput.disabled = !present || captureOnly;
+  });
+  refreshInterfaceCardsForSelection();
 }
 
 function isTemperatureChannel(channel) {
