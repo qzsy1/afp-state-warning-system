@@ -277,18 +277,18 @@ class GuestSimulationManager:
         if source_type == "single_csv" and path.is_file():
             try:
                 with path.open("r", encoding="utf-8-sig", newline="") as handle:
-                    channels = list(next(csv.reader(handle), []))
+                    channels = [item.strip() for item in next(csv.reader(handle), []) if item.strip()]
             except (OSError, UnicodeDecodeError):
                 try:
                     with path.open("r", encoding="gb18030", newline="") as handle:
-                        channels = list(next(csv.reader(handle), []))
+                        channels = [item.strip() for item in next(csv.reader(handle), []) if item.strip()]
                 except (OSError, UnicodeDecodeError):
                     channels = []
         elif source_type == "folder_csv" and path.is_dir():
             for file in sorted(path.rglob("*.csv")):
                 try:
                     with file.open("r", encoding="utf-8-sig", newline="") as handle:
-                        channels.extend(next(csv.reader(handle), []))
+                        channels.extend(item.strip() for item in next(csv.reader(handle), []) if item.strip())
                 except (OSError, UnicodeDecodeError):
                     continue
             channels = list(dict.fromkeys(channels))
