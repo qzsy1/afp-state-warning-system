@@ -45,7 +45,7 @@
 - Produces `MySQLCaptureStore.preflight() -> dict`，返回 `ok`, `stage`, `host`, `port`, `driver`, `database`, `schema_ready`, `write_test`, `error_detail`。
 - `/api/mysql/preflight` 接收现有 MySQL 设置和 `write_test` 布尔值。
 
-- [ ] Step 1: Write failing tests
+- [x] Step 1: Write failing tests
 
 ```python
 def test_preflight_reports_port_unreachable_without_calling_schema(self):
@@ -55,11 +55,11 @@ def test_preflight_reports_port_unreachable_without_calling_schema(self):
     self.assertEqual(result["error_detail"]["category"], "network")
 ```
 
-- [ ] Step 2: Run `py -3.11 -m unittest visualization_app.test_mysql_diagnostics -v` and verify failure because `preflight` is absent.
-- [ ] Step 3: Implement `preflight()` using the existing connector selection, `SELECT 1`, schema inspection, and an optional rollback write check; never log passwords.
-- [ ] Step 4: Add `/api/mysql/preflight`, return the same structured result, and keep `/api/mysql/test` backward compatible.
-- [ ] Step 5: Run the focused tests plus `visualization_app.test_acquisition_integrity`; expected all pass.
-- [ ] Step 6: Commit `fix: add structured mysql preflight diagnostics`.
+- [x] Step 2: Run `py -3.11 -m unittest visualization_app.test_mysql_diagnostics -v` and verify failure because `preflight` is absent.
+- [x] Step 3: Implement `preflight()` using the existing connector selection, `SELECT 1`, schema inspection, and an optional rollback write check; never log passwords.
+- [x] Step 4: Add `/api/mysql/preflight`, return the same structured result, and keep `/api/mysql/test` backward compatible.
+- [x] Step 5: Run the focused tests plus `visualization_app.test_acquisition_integrity`; expected all pass.
+- [x] Step 6: Commit `fix: add structured mysql preflight diagnostics`.
 
 ### Task 2: Local helper core and hardware discovery contract
 
@@ -73,12 +73,12 @@ def test_preflight_reports_port_unreachable_without_calling_schema(self):
 - `LocalCaptureAgent.mysql_preflight(settings) -> dict` delegates to `MySQLCaptureStore.preflight()`.
 - `LocalCaptureAgent.start_capture(config) -> dict`, `stop_capture() -> dict`, and `status() -> dict`.
 
-- [ ] Step 1: Add failing tests for five logical mappings, PLC/ABB shared Ethernet, unique non-Ethernet bindings, and no-sensor data warnings.
-- [ ] Step 2: Run `py -3.11 -m unittest visualization_app.test_local_capture_agent -v`; verify failure because the module is absent.
-- [ ] Step 3: Implement the agent as a thin adapter over existing `AcquisitionManager.discover_interfaces()`, `test_connection()`, `start()`, and `stop()`; do not duplicate protocol readers.
-- [ ] Step 4: Return separate interface, driver, sensor-data, and acquisition states.
-- [ ] Step 5: Run focused helper tests and existing acquisition tests; expected pass.
-- [ ] Step 6: Commit `feat: add local capture agent core`.
+- [x] Step 1: Add failing tests for five logical mappings, PLC/ABB shared Ethernet, unique non-Ethernet bindings, and no-sensor data warnings.
+- [x] Step 2: Run `py -3.11 -m unittest visualization_app.test_local_capture_agent -v`; verify failure because the module is absent.
+- [x] Step 3: Implement the agent as a thin adapter over existing `AcquisitionManager.discover_interfaces()`, `test_connection()`, `start()`, and `stop()`; do not duplicate protocol readers.
+- [x] Step 4: Return separate interface, driver, sensor-data, and acquisition states.
+- [x] Step 5: Run focused helper tests and existing acquisition tests; expected pass.
+- [x] Step 6: Commit `feat: add local capture agent core`.
 
 ### Task 3: Pairing and command relay
 
@@ -95,12 +95,12 @@ def test_preflight_reports_port_unreachable_without_calling_schema(self):
 - `GET /api/helper/status` returns online state and capabilities without secrets.
 - `POST /api/helper/command` accepts an allow-listed command and correlation id.
 
-- [ ] Step 1: Add failing tests proving guest users cannot pair or send hardware commands, and authorized users can send only allow-listed commands.
-- [ ] Step 2: Run the security tests and verify failure.
-- [ ] Step 3: Implement in-memory pairing leases, CSRF checks, command allow-listing, correlation ids, and redacted audit events.
-- [ ] Step 4: Add an outbound WebSocket message contract for helper `hello`, `result`, `event`, and `heartbeat` messages.
-- [ ] Step 5: Run the security and helper protocol tests; expected pass.
-- [ ] Step 6: Commit `feat: add authorized helper pairing relay`.
+- [x] Step 1: Add failing tests proving guest users cannot pair or send hardware commands, and authorized users can send only allow-listed commands.
+- [x] Step 2: Run the security tests and verify failure.
+- [x] Step 3: Implement in-memory pairing leases, CSRF checks, command allow-listing, correlation ids, and redacted audit events.
+- [x] Step 4: Add an outbound WebSocket message contract for helper `hello`, `result`, `event`, and `heartbeat` messages.
+- [x] Step 5: Run the security and helper protocol tests; expected pass.
+- [x] Step 6: Commit `feat: add authorized helper pairing relay`.
 
 ### Task 4: Helper executable transport and packaging
 
@@ -113,12 +113,12 @@ def test_preflight_reports_port_unreachable_without_calling_schema(self):
 - CLI: `local_capture_agent.exe --server wss://host/helper --pairing-token TOKEN`.
 - Messages: JSON objects with `type`, `request_id`, `timestamp`, and `payload`.
 
-- [ ] Step 1: Add failing transport tests for heartbeat, reconnect backoff, malformed command rejection, and secret redaction.
-- [ ] Step 2: Run focused transport tests and verify failure.
-- [ ] Step 3: Implement the outbound WSS client with bounded reconnect backoff and no inbound listener requirement.
-- [ ] Step 4: Implement the PowerShell build script using the existing Python environment and output one helper EXE under the existing delivery tree.
-- [ ] Step 5: Run transport tests and a local loopback relay test; expected pass.
-- [ ] Step 6: Commit `feat: package local capture helper transport`.
+- [x] Step 1: Add failing transport tests for heartbeat, reconnect backoff, malformed command rejection, and secret redaction.
+- [x] Step 2: Run focused transport tests and verify failure.
+- [x] Step 3: Implement the outbound WSS client with bounded reconnect backoff and no inbound listener requirement.
+- [x] Step 4: Implement the PowerShell build script using the existing Python environment and output one helper EXE under the existing delivery tree.
+- [x] Step 5: Run transport tests and a local loopback relay test; expected pass.
+- [x] Step 6: Commit `feat: package local capture helper transport`.
 
 ### Task 5: Web UI integration and mode isolation
 
@@ -132,12 +132,12 @@ def test_preflight_reports_port_unreachable_without_calling_schema(self):
 - Simulation start continues to call existing `/api/acquisition/start` locally.
 - Real start sends an allow-listed helper command and renders returned interface/sensor states.
 
-- [ ] Step 1: Add failing DOM/script contract tests for helper status, pairing controls, and simulation bypass.
-- [ ] Step 2: Run the frontend tests and verify failure.
-- [ ] Step 3: Add a compact helper status panel and pairing button without changing existing sections.
-- [ ] Step 4: Route real-mode discover/start/stop through the helper only after authorization; keep simulation catalog independent.
-- [ ] Step 5: Run frontend tests, `node --check visualization_app/static/app.js`, and browser smoke checks for both modes.
-- [ ] Step 6: Commit `feat: connect web modes to local capture helper`.
+- [x] Step 1: Add failing DOM/script contract tests for helper status, pairing controls, and simulation bypass.
+- [x] Step 2: Run the frontend tests and verify failure.
+- [x] Step 3: Add a compact helper status panel and pairing button without changing existing sections.
+- [x] Step 4: Route real-mode discover/start/stop through the helper only after authorization; keep simulation catalog independent.
+- [x] Step 5: Run frontend tests, `node --check visualization_app/static/app.js`, and browser smoke checks for both modes.
+- [x] Step 6: Commit `feat: connect web modes to local capture helper`.
 
 ### Task 6: Visitor-local CSV and MySQL saving
 
@@ -151,12 +151,12 @@ def test_preflight_reports_port_unreachable_without_calling_schema(self):
 - Helper receives the original `AcquisitionConfig` save fields and executes the existing save path.
 - Web status returns `csv_saved`, `mysql_saved`, `pending_mysql`, and `save_error`.
 
-- [ ] Step 1: Add failing tests for empty save path (no save), authorized local folder save, MySQL-only save, and pending retry.
-- [ ] Step 2: Run focused acquisition/helper tests and verify failure for helper routing.
-- [ ] Step 3: Reuse original save functions; do not create a second naming or folder algorithm.
-- [ ] Step 4: Add browser authorization only when a non-empty folder is confirmed; never claim green save status for an empty path.
-- [ ] Step 5: Run all acquisition tests and a local fake-MySQL integration test; expected pass.
-- [ ] Step 6: Commit `feat: save web captures on visitor computer`.
+- [x] Step 1: Add failing tests for empty save path (no save), authorized local folder save, MySQL-only save, and pending retry.
+- [x] Step 2: Run focused acquisition/helper tests and verify failure for helper routing.
+- [x] Step 3: Reuse original save functions; do not create a second naming or folder algorithm.
+- [x] Step 4: Add browser authorization only when a non-empty folder is confirmed; never claim green save status for an empty path.
+- [x] Step 5: Run all acquisition tests and a local fake-MySQL integration test; expected pass.
+- [x] Step 6: Commit `feat: save web captures on visitor computer`.
 
 ### Task 7: LangChain local-plus-model diagnostics
 
@@ -170,12 +170,12 @@ def test_preflight_reports_port_unreachable_without_calling_schema(self):
 - `diagnose(events, api_key, model_name) -> dict` always returns local findings; valid authorized credentials add `model_findings`.
 - Tool calls are read-only: configuration, communication logs, and recent sample summary.
 
-- [ ] Step 1: Add failing tests for local-only, valid model enhancement, timeout fallback, and preserved prior findings.
-- [ ] Step 2: Run focused agent tests and verify failure for helper event payloads.
-- [ ] Step 3: Implement structured event input and schema validation; preserve local findings on every model error.
-- [ ] Step 4: Add helper status and MySQL status as model context without sending passwords.
-- [ ] Step 5: Run agent tests and browser diagnosis smoke test; expected pass.
-- [ ] Step 6: Commit `fix: diagnose helper events with local and model paths`.
+- [x] Step 1: Add failing tests for local-only, valid model enhancement, timeout fallback, and preserved prior findings.
+- [x] Step 2: Run focused agent tests and verify failure for helper event payloads.
+- [x] Step 3: Implement structured event input and schema validation; preserve local findings on every model error.
+- [x] Step 4: Add helper status and MySQL status as model context without sending passwords.
+- [x] Step 5: Run agent tests and browser diagnosis smoke test; expected pass.
+- [x] Step 6: Commit `fix: diagnose helper events with local and model paths`.
 
 ### Task 8: Delivery synchronization and end-to-end acceptance
 
@@ -183,9 +183,9 @@ def test_preflight_reports_port_unreachable_without_calling_schema(self):
 - Modify: `delivery/AFP_Integrated_System_Modular_v2.0.3_Agentic/app/...`
 - Create: `docs/superpowers/plans/2026-09-15-local-capture-helper-verification.md`
 
-- [ ] Step 1: Sync only the changed source files into the existing delivery tree and build/update the single main EXE plus the single helper EXE.
-- [ ] Step 2: Run `py -3.11 -m unittest visualization_app.test_frontend_guest_simulation visualization_app.test_acquisition_integrity visualization_app.test_local_capture_agent visualization_app.test_mysql_diagnostics -v`.
-- [ ] Step 3: Run syntax checks for Python and JavaScript.
-- [ ] Step 4: Start the delivery server and perform browser checks: guest simulation, helper offline, helper paired, MySQL unavailable, MySQL available, real capture without sensor, and real capture with a test-double sensor.
-- [ ] Step 5: Verify the delivery hashes match source, Git status is clean except ignored delivery artifacts, and one-step rollback points exist.
-- [ ] Step 6: Commit `release: deliver web local capture helper` and report exact EXE paths and test evidence.
+- [x] Step 1: Sync only the changed source files into the existing delivery tree and build/update the single main EXE plus the single helper EXE.
+- [x] Step 2: Run `py -3.11 -m unittest visualization_app.test_frontend_guest_simulation visualization_app.test_acquisition_integrity visualization_app.test_local_capture_agent visualization_app.test_mysql_diagnostics -v`.
+- [x] Step 3: Run syntax checks for Python and JavaScript.
+- [x] Step 4: Start the delivery server and perform browser checks: guest simulation, helper offline, helper paired, MySQL unavailable, MySQL available, real capture without sensor, and real capture with a test-double sensor.
+- [x] Step 5: Verify the delivery hashes match source, Git status is clean except ignored delivery artifacts, and one-step rollback points exist.
+- [x] Step 6: Commit `release: deliver web local capture helper` and report exact EXE paths and test evidence.
