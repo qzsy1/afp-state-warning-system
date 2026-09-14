@@ -22,6 +22,7 @@ thesis_draft/*
 *.joblib
 
 # Generated desktop distribution and acquisition records
+/AFP_Capture/
 visualization_app/desktop_build/
 visualization_app/release/
 visualization_app/captured_data/
