@@ -66,6 +66,7 @@ from web_access import (
     is_secure_request,
 )
 from web_auth import AuthenticationError, SecurityStore
+from control_lease import RealControlLease
 
 
 APP_DIR = Path(os.environ.get("AFP_LEGACY_APP_DIR") or Path(__file__).resolve().parent).resolve()
@@ -3908,6 +3909,9 @@ class AppHandler(BaseHTTPRequestHandler):
     dashboard: DashboardData
     security_store: SecurityStore
     guest_manager: GuestSimulationManager
+    control_lease: RealControlLease
+    replay_cache: dict[str, tuple[int, dict]]
+    replay_lock: threading.Lock
     access_context: str = "public"
     permission_policy = PermissionPolicy()
     login_limiter = SlidingWindowLimiter()
@@ -4075,6 +4079,55 @@ class AppHandler(BaseHTTPRequestHandler):
         self._send_json({"error": "csrf_failed"}, HTTPStatus.FORBIDDEN)
         return False
 
+    def _control_owner_id(self) -> str:
+        identity = self._identity()
+        return str(identity.session_id or "")
+
+    def _require_real_control(self) -> bool:
+        identity = self._identity()
+        if identity.role not in {"authorized", "local_admin"}:
+            self._send_json({"error": "real_access_required"}, HTTPStatus.FORBIDDEN)
+            return False
+        owner_id = self._control_owner_id()
+        current = self.control_lease.status()
+        if identity.role == "local_admin" and current.get("owner_id") in {
+            None,
+            "local-admin",
+        }:
+            if current.get("owner_id") is None:
+                self.control_lease.acquire("local-admin", "本机软件")
+            return True
+        if current.get("owner_id") != owner_id:
+            self._send_json(
+                {
+                    "error": "real_control_required",
+                    "control": current,
+                },
+                HTTPStatus.CONFLICT,
+            )
+            return False
+        return True
+
+    def _replay_key(self, path: str) -> str:
+        request_id = str(self.headers.get("X-AFP-Request-ID", "")).strip()
+        if not request_id or len(request_id) > 128:
+            return ""
+        return f"{path}:{request_id}"
+
+    def _replay_get(self, key: str) -> tuple[int, dict] | None:
+        if not key:
+            return None
+        with self.replay_lock:
+            return self.replay_cache.get(key)
+
+    def _replay_put(self, key: str, status: HTTPStatus, payload: dict) -> None:
+        if not key:
+            return
+        with self.replay_lock:
+            self.replay_cache[key] = (int(status), dict(payload))
+            while len(self.replay_cache) > 256:
+                self.replay_cache.pop(next(iter(self.replay_cache)))
+
     def _send_security_headers(self) -> None:
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "same-origin")
@@ -4222,6 +4275,9 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/network/status":
             self._send_network_status()
+            return
+        if parsed.path == "/api/real/control/status":
+            self._send_json(self.control_lease.status())
             return
         if parsed.path == "/api/auth/session":
             identity = self._identity()
@@ -4410,6 +4466,52 @@ class AppHandler(BaseHTTPRequestHandler):
             payload = json.loads(body.decode("utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("请求体必须是JSON对象")
+            if parsed.path in {
+                "/api/real/control/acquire",
+                "/api/real/control/heartbeat",
+                "/api/real/control/release",
+            }:
+                owner_id = self._control_owner_id()
+                if parsed.path.endswith("/acquire"):
+                    decision = self.control_lease.acquire(
+                        owner_id,
+                        str(self.headers.get("User-Agent", "访客浏览器")),
+                    )
+                    self._send_json(
+                        {
+                            "granted": decision.granted,
+                            "error": decision.error,
+                            "control": self.control_lease.status(),
+                        },
+                        HTTPStatus.OK if decision.granted else HTTPStatus.CONFLICT,
+                    )
+                elif parsed.path.endswith("/heartbeat"):
+                    decision = self.control_lease.heartbeat(owner_id)
+                    self._send_json(
+                        {
+                            "granted": decision.granted,
+                            "error": decision.error,
+                            "control": self.control_lease.status(),
+                        },
+                        HTTPStatus.OK if decision.granted else HTTPStatus.CONFLICT,
+                    )
+                else:
+                    self._send_json(
+                        {
+                            "released": self.control_lease.release(owner_id),
+                            "control": self.control_lease.status(),
+                        }
+                    )
+                return
+            if parsed.path == "/api/admin/real-control/takeover":
+                decision = self.control_lease.force_takeover()
+                self._send_json(
+                    {
+                        "granted": decision.granted,
+                        "control": self.control_lease.status(),
+                    }
+                )
+                return
             if parsed.path == "/api/auth/login":
                 remote_key = self._remote_label() or "unknown"
                 if self.login_limiter.blocked("login", remote_key) or (
@@ -4454,6 +4556,24 @@ class AppHandler(BaseHTTPRequestHandler):
                         "model_access": bool(safe_status.get("model_configured")),
                     }
                 )
+                return
+            controlled_paths = {
+                "/api/acquisition/test",
+                "/api/acquisition/reset-check",
+                "/api/acquisition/start",
+                "/api/acquisition/stop",
+                "/api/acquisition/integrate",
+                "/api/training/import",
+                "/api/training/start",
+                "/api/training/stop",
+                "/api/mysql/relation-map",
+            }
+            if parsed.path in controlled_paths and not self._require_real_control():
+                return
+            replay_key = self._replay_key(parsed.path)
+            replayed = self._replay_get(replay_key)
+            if replayed is not None:
+                self._send_json(replayed[1], HTTPStatus(replayed[0]))
                 return
             if parsed.path == "/api/auth/logout":
                 token = str(self._request_cookies().get("afp_session") or "")
@@ -4650,10 +4770,13 @@ class AppHandler(BaseHTTPRequestHandler):
                 )
                 result = self.dashboard.acquisition.start(config)
                 result["prediction_model"] = model_validation
+                self._replay_put(replay_key, HTTPStatus.OK, result)
                 self._send_json(result)
                 return
             if parsed.path == "/api/acquisition/stop":
-                self._send_json(self.dashboard.acquisition.stop())
+                result = self.dashboard.acquisition.stop()
+                self._replay_put(replay_key, HTTPStatus.OK, result)
+                self._send_json(result)
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
         except GuestSimulationError as exc:
@@ -4679,6 +4802,7 @@ def create_server(
     dashboard: DashboardData | None = None,
     security_store: SecurityStore | None = None,
     guest_manager: GuestSimulationManager | None = None,
+    control_lease: RealControlLease | None = None,
     access_context: str = "public",
 ) -> ThreadingHTTPServer:
     active_dashboard = dashboard or DashboardData()
@@ -4701,6 +4825,9 @@ def create_server(
             }
         },
     )
+    active_control_lease = control_lease or RealControlLease()
+    replay_cache: dict[str, tuple[int, dict]] = {}
+    replay_lock = threading.Lock()
     handler = type(
         "ConfiguredAppHandler",
         (AppHandler,),
@@ -4708,6 +4835,9 @@ def create_server(
             "dashboard": active_dashboard,
             "security_store": active_security_store,
             "guest_manager": active_guest_manager,
+            "control_lease": active_control_lease,
+            "replay_cache": replay_cache,
+            "replay_lock": replay_lock,
             "access_context": str(access_context),
             "login_limiter": SlidingWindowLimiter(),
             "network_status": dict(network_status or {}),
@@ -4720,6 +4850,7 @@ def create_server(
     server.dashboard = active_dashboard
     server.security_store = active_security_store
     server.guest_manager = active_guest_manager
+    server.control_lease = active_control_lease
     server.access_context = handler.access_context
     return server
 

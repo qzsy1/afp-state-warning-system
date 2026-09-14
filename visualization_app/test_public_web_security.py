@@ -236,7 +236,10 @@ class PublicWebHttpTests(unittest.TestCase):
                 self.hardware_start_calls += 1
                 raise AssertionError("guest request must not start hardware")
 
-        dashboard = SimpleNamespace(acquisition=FakeAcquisition())
+        dashboard = SimpleNamespace(
+            acquisition=FakeAcquisition(),
+            validate_prediction_setup=lambda config, load_model=False: {},
+        )
         store = SecurityStore(root / "security.sqlite3", ReversibleTestProtector())
         store.configure_owner(
             "Correct-Horse-2026",
@@ -421,6 +424,87 @@ class PublicWebHttpTests(unittest.TestCase):
 
         self.assertEqual(status, 404)
         self.assertEqual(payload["error"], "route_not_found")
+
+    def test_authorized_session_must_acquire_real_control_lease(self):
+        self.request_json("GET", "/api/auth/session")
+        self.request_json(
+            "POST",
+            "/api/auth/login",
+            {"password": "Correct-Horse-2026"},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+
+        status, payload, _ = self.request_json(
+            "POST", "/api/real/control/acquire", {}, headers={"X-Forwarded-Proto": "https"}
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["granted"])
+
+        status, payload, _ = self.request_json(
+            "GET", "/api/real/control/status", headers={"X-Forwarded-Proto": "https"}
+        )
+        self.assertEqual(status, 200)
+        self.assertIsNotNone(payload["owner_id"])
+
+    def test_duplicate_real_start_request_is_replayed_without_second_hardware_call(self):
+        self.request_json("GET", "/api/auth/session")
+        self.request_json(
+            "POST",
+            "/api/auth/login",
+            {"password": "Correct-Horse-2026"},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        self.request_json(
+            "POST", "/api/real/control/acquire", {}, headers={"X-Forwarded-Proto": "https"}
+        )
+        payload = {"acquisition_mode": "simulation", "driver": "simulator"}
+        with patch.object(
+            self.server.dashboard.acquisition,
+            "start",
+            return_value={"running": True},
+        ) as start:
+            headers = {
+                "X-Forwarded-Proto": "https",
+                "X-AFP-Request-ID": "start-001",
+            }
+            first_status, first, _ = self.request_json(
+                "POST", "/api/acquisition/start", payload, headers=headers
+            )
+            second_status, second, _ = self.request_json(
+                "POST", "/api/acquisition/start", payload, headers=headers
+            )
+        self.assertEqual(first_status, 200)
+        self.assertEqual(second_status, 200)
+        self.assertEqual(first, second)
+        self.assertEqual(start.call_count, 1)
+
+
+class RealControlLeaseTests(unittest.TestCase):
+    def test_only_one_authorized_session_controls_real_acquisition(self):
+        from control_lease import RealControlLease
+
+        lease = RealControlLease(heartbeat_timeout_seconds=30)
+        self.assertTrue(lease.acquire("session-a", "Chrome", now=0).granted)
+        denied = lease.acquire("session-b", "Edge", now=10)
+        self.assertFalse(denied.granted)
+        self.assertEqual(denied.error, "real_control_busy")
+        self.assertTrue(lease.acquire("session-b", "Edge", now=31).granted)
+
+    def test_local_admin_can_take_over_without_expiring_login(self):
+        from control_lease import RealControlLease
+
+        lease = RealControlLease()
+        lease.acquire("session-a", "Chrome", now=0)
+        self.assertTrue(lease.force_takeover().granted)
+        self.assertEqual(lease.status(now=1)["owner_id"], "local-admin")
+
+    def test_lease_expiry_only_releases_control_owner(self):
+        from control_lease import RealControlLease
+
+        lease = RealControlLease(heartbeat_timeout_seconds=30)
+        lease.acquire("session-a", "Chrome", now=0)
+        self.assertIsNone(lease.status(now=31)["owner_id"])
+        self.assertFalse(lease.heartbeat("session-a", now=31).granted)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ PUBLIC_POST = {
     "/api/simulation/stop",
 }
 AUTHORIZED_GET = {
+    "/api/real/control/status",
     "/api/agent/defaults",
     "/api/training/status",
     "/api/training/defaults",
@@ -37,6 +38,9 @@ AUTHORIZED_GET = {
     "/api/realtime",
 }
 AUTHORIZED_POST = {
+    "/api/real/control/acquire",
+    "/api/real/control/heartbeat",
+    "/api/real/control/release",
     "/api/agent/diagnose",
     "/api/auth/logout",
     "/api/acquisition/test",
