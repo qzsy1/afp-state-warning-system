@@ -17,6 +17,7 @@ import sys
 import urllib.request
 import uuid
 from collections import deque
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -2107,6 +2108,11 @@ class AcquisitionManager:
             "ok": False,
             "saved_rows": 0,
         }
+        self._latest_check_result: dict[str, Any] = {
+            "checked_at": None,
+            "interfaces": [],
+            "sensors": [],
+        }
 
     @staticmethod
     def _public_config(config: AcquisitionConfig) -> dict[str, Any]:
@@ -2554,11 +2560,21 @@ class AcquisitionManager:
         ok = bool(selected) and not errors and interface_ok
         if config.acquisition_mode == "simulation":
             ok = ok and all(item["ok"] for item in sensors)
-        return {
+        result = {
             "ok": ok, "driver": config.driver, "endpoint": config.endpoint,
             "elapsed_seconds": time.time() - check_started, "errors": errors,
             "sensors": sensors, "interfaces": interface_results,
         }
+        result["checked_at"] = time.time()
+        with self.lock:
+            self._latest_check_result = deepcopy(result)
+        return result
+
+    def latest_check_result(self) -> dict[str, Any]:
+        """Return the last completed interface check without probing hardware."""
+
+        with self.lock:
+            return deepcopy(self._latest_check_result)
 
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any]:
