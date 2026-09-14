@@ -8,6 +8,7 @@ import secrets
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -38,6 +39,8 @@ class _Helper:
     online: bool = False
     last_seen: float | None = None
     sender: Callable[[dict[str, Any]], None] | None = None
+    queue: deque[dict[str, Any]] = field(default_factory=deque)
+    results: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 class HelperRegistry:
@@ -124,6 +127,50 @@ class HelperRegistry:
                 helper.online = False
                 helper.sender = None
 
+    def authenticate(self, device_id: str, pairing_token: str) -> str | None:
+        """Return the owning session for a helper bearer token."""
+        with self._lock:
+            for session_id, helper in self._helpers.items():
+                if helper.device_id == str(device_id) and hmac.compare_digest(
+                    helper.token_hash, _hash(pairing_token)
+                ):
+                    helper.online = True
+                    helper.last_seen = time.time()
+                    return session_id
+        return None
+
+    def poll(self, device_id: str, pairing_token: str) -> dict[str, Any]:
+        session_id = self.authenticate(device_id, pairing_token)
+        if session_id is None:
+            return {"ok": False, "error": "helper_authentication_failed"}
+        with self._lock:
+            helper = self._helpers[session_id]
+            if helper.queue:
+                return {"ok": True, "command": helper.queue.popleft()}
+            return {"ok": True, "command": None, "heartbeat": True}
+
+    def accept_result(
+        self,
+        device_id: str,
+        pairing_token: str,
+        request_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        session_id = self.authenticate(device_id, pairing_token)
+        if session_id is None:
+            return {"ok": False, "error": "helper_authentication_failed"}
+        with self._lock:
+            helper = self._helpers[session_id]
+            helper.results[str(request_id)] = dict(payload)
+        return {"ok": True, "request_id": str(request_id)}
+
+    def pop_result(self, session_id: str, request_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            helper = self._helpers.get(session_id)
+            if helper is None:
+                return None
+            return helper.results.pop(str(request_id), None)
+
     def status(self, session_id: str) -> dict[str, Any]:
         with self._lock:
             helper = self._helpers.get(session_id)
@@ -161,6 +208,10 @@ class HelperRegistry:
                 helper.sender(request)
                 request["queued"] = True
             else:
-                request["queued"] = False
-                request["error"] = "helper_offline"
+                if not helper.online:
+                    request["queued"] = False
+                    request["error"] = "helper_offline"
+                else:
+                    helper.queue.append(request)
+                    request["queued"] = True
             return request

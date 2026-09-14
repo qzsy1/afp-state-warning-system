@@ -41,6 +41,18 @@ class HelperRelayTests(unittest.TestCase):
             "command_not_allowed",
         )
 
+    def test_http_poll_and_result_use_pairing_token(self):
+        registry = HelperRegistry()
+        challenge = registry.start_pairing("session-a")
+        paired = registry.complete_pairing(challenge["challenge"], "device-a", {})
+        token = paired["pairing_token"]
+        self.assertTrue(registry.authenticate("device-a", token))
+        request = registry.command("session-a", "discover", {})
+        polled = registry.poll("device-a", token)
+        self.assertEqual(polled["command"]["request_id"], request["request_id"])
+        registry.accept_result("device-a", token, request["request_id"], {"ok": True})
+        self.assertEqual(registry.pop_result("session-a", request["request_id"]), {"ok": True})
+
 
 if __name__ == "__main__":
     unittest.main()

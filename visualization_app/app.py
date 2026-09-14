@@ -4497,6 +4497,12 @@ class AppHandler(BaseHTTPRequestHandler):
                 )
             )
             return
+        if parsed.path == "/api/helper/result":
+            request_id = self._one(parse_qs(parsed.query), "request_id", "")
+            session_id = str(self._identity().session_id or "")
+            result = self.dashboard.helper_registry.pop_result(session_id, request_id)
+            self._send_json({"ok": result is not None, "request_id": request_id, "payload": result})
+            return
         if parsed.path == "/api/acquisition/status":
             self._send_json(self.dashboard.acquisition.status())
             return
@@ -4597,7 +4603,12 @@ class AppHandler(BaseHTTPRequestHandler):
         self._ensure_browser_cookies()
         if not self._require_permission("POST", parsed.path):
             return
-        if not self._require_csrf():
+        helper_transport_path = parsed.path in {
+            "/api/helper/pair/complete",
+            "/api/helper/poll",
+            "/api/helper/result",
+        }
+        if not helper_transport_path and not self._require_csrf():
             return
         if parsed.path == "/api/auth/login" and not self._is_secure_transport():
             self._send_json({"error": "https_required"}, HTTPStatus.UPGRADE_REQUIRED)
@@ -4635,6 +4646,31 @@ class AppHandler(BaseHTTPRequestHandler):
             payload = json.loads(body.decode("utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("请求体必须是JSON对象")
+            if parsed.path == "/api/helper/pair/complete":
+                result = self.dashboard.helper_registry.complete_pairing(
+                    str(payload.get("challenge") or ""),
+                    str(payload.get("device_id") or ""),
+                    payload.get("capabilities")
+                    if isinstance(payload.get("capabilities"), dict)
+                    else {},
+                )
+                self._send_json(result)
+                return
+            if parsed.path in {"/api/helper/poll", "/api/helper/result"}:
+                authorization = str(self.headers.get("Authorization", ""))
+                token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+                device_id = str(payload.get("device_id") or "")
+                if parsed.path == "/api/helper/poll":
+                    result = self.dashboard.helper_registry.poll(device_id, token)
+                else:
+                    result = self.dashboard.helper_registry.accept_result(
+                        device_id,
+                        token,
+                        str(payload.get("request_id") or ""),
+                        payload.get("payload") if isinstance(payload.get("payload"), dict) else {},
+                    )
+                self._send_json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.UNAUTHORIZED)
+                return
             if parsed.path in {
                 "/api/real/control/acquire",
                 "/api/real/control/heartbeat",
@@ -4975,17 +5011,6 @@ class AppHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
                     return
                 self._send_json(self.dashboard.helper_registry.start_pairing(session_id))
-                return
-            if parsed.path == "/api/helper/pair/complete":
-                self._send_json(
-                    self.dashboard.helper_registry.complete_pairing(
-                        str(payload.get("challenge") or ""),
-                        str(payload.get("device_id") or ""),
-                        payload.get("capabilities")
-                        if isinstance(payload.get("capabilities"), dict)
-                        else {},
-                    )
-                )
                 return
             if parsed.path == "/api/helper/command":
                 session_id = str(self._identity().session_id or "")

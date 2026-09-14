@@ -30,6 +30,9 @@ PUBLIC_POST = {
     "/api/simulation/select-source",
     "/api/simulation/upload-source",
     "/api/agent/diagnose",
+    "/api/helper/pair/complete",
+    "/api/helper/poll",
+    "/api/helper/result",
 }
 AUTHORIZED_GET = {
     "/api/real/control/status",
@@ -41,6 +44,7 @@ AUTHORIZED_GET = {
     "/api/acquisition/save-status",
     "/api/acquisition/discover",
     "/api/helper/status",
+    "/api/helper/result",
     "/api/live",
     "/api/view",
     "/api/realtime",
