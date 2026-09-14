@@ -30,6 +30,8 @@ def dispatch_command(agent: LocalCaptureAgent, raw: str | bytes) -> dict[str, An
             MySQLSettings.from_mapping(payload),
             write_test=bool(payload.get("write_test", False)),
         )
+    elif name == "check_capture":
+        result = agent.check_capture(_config_from_payload(payload))
     elif name == "start_capture":
         result = agent.start_capture(_config_from_payload(payload))
     elif name == "stop_capture":

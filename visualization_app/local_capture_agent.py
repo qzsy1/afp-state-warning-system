@@ -122,6 +122,9 @@ class LocalCaptureAgent:
     def start_capture(self, config: Any) -> dict[str, Any]:
         return self.manager.start(config)
 
+    def check_capture(self, config: Any) -> dict[str, Any]:
+        return self.manager.test_connection(config)
+
     def stop_capture(self) -> dict[str, Any]:
         return self.manager.stop()
 

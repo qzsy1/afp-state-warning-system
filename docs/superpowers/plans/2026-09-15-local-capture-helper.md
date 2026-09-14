@@ -23,7 +23,10 @@
 - Modify: `visualization_app/mysql_storage.py` — 增加连接预检和错误分类所需的结构化字段。
 - Modify: `visualization_app/app.py` — 增加 MySQL 诊断接口、辅助程序配对与命令中继接口。
 - Create: `visualization_app/local_capture_agent.py` — 本地辅助程序核心：配对、发现、采集、保存、MySQL 预检。
+- Create: `visualization_app/local_capture_helper_entry.py` — 辅助程序命令分发和 WSS 运行入口。
 - Create: `visualization_app/test_local_capture_agent.py` — 辅助程序单元和协议测试。
+- Create: `visualization_app/test_helper_relay.py` — 配对租约和命令白名单测试。
+- Create: `visualization_app/test_helper_transport.py` — 辅助程序传输命令测试。
 - Modify: `visualization_app/static/app.js` — 网页配对、辅助程序状态、真实采集路由和 MySQL 本地目标。
 - Modify: `visualization_app/static/index.html` — 辅助程序连接状态、配对控制和本地 MySQL 诊断区域。
 - Modify: `visualization_app/test_public_web_security.py` — 访问权限、配对和凭据不落日志测试。
