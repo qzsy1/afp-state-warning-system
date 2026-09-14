@@ -233,6 +233,33 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertEqual(calls, 1)
         self.assertEqual(results[0], results[1])
 
+    def test_backend_rebuilds_events_from_hardware_result(self) -> None:
+        captured_ids = []
+
+        def successful_model(_api_key, _model_name, events, local_diagnoses):
+            captured_ids.extend(item["interface_id"] for item in events)
+            return [
+                {"event_index": index, "analysis": "后端标准事件"}
+                for index in range(len(local_diagnoses))
+            ]
+
+        result = interface_agent.run_interface_diagnoses(
+            [{
+                "interface_id": "frontend_stale_event",
+                "sensor_name": "错误前端事件",
+                "channels": ["错误通道"],
+                "state": "no_data",
+                "message": "不应交给模型",
+            }],
+            api_key="sk-test-only",
+            model_name="deepseek-ai/DeepSeek-V3",
+            model_caller=successful_model,
+            hardware_result=mixed_interface_result(),
+        )
+
+        self.assertEqual(captured_ids, ["plc_process", "m3232_pressure"])
+        self.assertEqual(len(result["diagnoses"]), 2)
+
     def test_model_alias_fields_are_normalized_into_enhancement(self) -> None:
         result = interface_agent.run_interface_diagnoses(
             interface_agent.build_agent_events(mixed_interface_result()),

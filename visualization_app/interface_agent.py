@@ -1109,10 +1109,16 @@ def run_interface_diagnoses(
 ) -> dict[str, Any]:
     """Collapse identical concurrent UI requests into one external model call."""
 
-    request_key = _diagnosis_request_key(events, api_key, model_name)
+    backend_events = (
+        build_agent_events(hardware_result)
+        if isinstance(hardware_result, dict) and hardware_result.get("interfaces")
+        else []
+    )
+    effective_events = backend_events or events
+    request_key = _diagnosis_request_key(effective_events, api_key, model_name)
     if not request_key:
         return _run_interface_diagnoses_uncached(
-            events,
+            effective_events,
             api_key=api_key,
             model_name=model_name,
             model_caller=model_caller,
@@ -1135,7 +1141,7 @@ def run_interface_diagnoses(
         return deepcopy(job["result"])
     try:
         result = _run_interface_diagnoses_uncached(
-            events,
+            effective_events,
             api_key=api_key,
             model_name=model_name,
             model_caller=model_caller,
