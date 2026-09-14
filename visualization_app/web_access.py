@@ -19,6 +19,7 @@ PUBLIC_GET = {
     "/api/simulation/live",
     "/api/simulation/download",
     "/api/agent/defaults",
+    "/api/bootstrap",
 }
 PUBLIC_POST = {
     "/api/auth/login",
@@ -64,6 +65,12 @@ AUTHORIZED_POST = {
 AUTHORIZED_PREFIXES = ("/api/acquisition/", "/api/training/", "/api/mysql/", "/api/real/")
 AUTHORIZED_EXACT = {"/api/agent/diagnose", "/api/auth/logout"}
 LOCAL_ADMIN_PREFIX = "/api/admin/"
+LOCAL_ADMIN_GET = {"/api/admin/status"}
+LOCAL_ADMIN_POST = {
+    "/api/admin/security/configure",
+    "/api/admin/security/revoke-all",
+    "/api/admin/real-control/takeover",
+}
 
 
 @dataclass(frozen=True, slots=True)

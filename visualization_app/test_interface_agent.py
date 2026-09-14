@@ -526,7 +526,6 @@ class InterfaceAgentTests(unittest.TestCase):
         requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8")
 
         for element_id in (
-            "agentApiKeyInput",
             "agentModelNameInput",
             "agentGateStatus",
             "agentDiagnoseButton",
@@ -535,7 +534,7 @@ class InterfaceAgentTests(unittest.TestCase):
             self.assertIn(f'id="{element_id}"', html)
         self.assertNotIn('id="agentDiagnosisPanel"', html)
         self.assertIn("/api/agent/diagnose", script)
-        self.assertIn("api_key: agentApiKeyInput.value.trim()", script)
+        self.assertNotIn("api_key: agentApiKeyInput.value.trim()", script)
         self.assertIn("hardware_result: state.hardwareCheck", script)
         self.assertNotIn("api_key_present", script)
         self.assertIn("buildAgentEvents", script)

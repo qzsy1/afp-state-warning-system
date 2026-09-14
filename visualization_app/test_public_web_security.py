@@ -239,6 +239,21 @@ class PublicWebHttpTests(unittest.TestCase):
         dashboard = SimpleNamespace(
             acquisition=FakeAcquisition(),
             validate_prediction_setup=lambda config, load_model=False: {},
+            bootstrap=lambda **kwargs: {
+                "manifest": {
+                    "result_dir": "C:\\private\\results",
+                    "version": "test",
+                },
+                "specimens": [],
+                "sensors": [],
+                "indicators": [],
+                "defaults": {},
+                "acquisition": {
+                    "drivers": [],
+                    "new_collection_demo": {"source_file": "C:\\private\\demo.csv"},
+                    "default_save_root": "C:\\private\\capture",
+                },
+            },
         )
         store = SecurityStore(root / "security.sqlite3", ReversibleTestProtector())
         store.configure_owner(
@@ -425,6 +440,14 @@ class PublicWebHttpTests(unittest.TestCase):
         self.assertEqual(status, 404)
         self.assertEqual(payload["error"], "route_not_found")
 
+    def test_guest_bootstrap_masks_local_paths(self):
+        status, payload, _ = self.request_json("GET", "/api/bootstrap")
+
+        self.assertEqual(status, 200)
+        encoded = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("C:\\private", encoded)
+        self.assertEqual(payload["acquisition"]["default_save_root"], "")
+
     def test_authorized_session_must_acquire_real_control_lease(self):
         self.request_json("GET", "/api/auth/session")
         self.request_json(
@@ -575,6 +598,19 @@ class ModelCredentialTests(PublicWebHttpTests):
         self.assertTrue(payload["model_used"])
         self.assertNotIn("sk-private-value", json.dumps(payload, ensure_ascii=False))
         self.assertNotIn("sk-private-value", json.dumps(headers))
+
+
+class FrontendAccessContractTests(unittest.TestCase):
+    def test_frontend_contains_access_state_controls_without_key_field(self):
+        root = Path(__file__).resolve().parent / "static"
+        html = (root / "index.html").read_text(encoding="utf-8")
+        script = (root / "app.js").read_text(encoding="utf-8")
+        self.assertIn('id="access-mode-badge"', html)
+        self.assertIn('id="unlock-real-mode"', html)
+        self.assertIn('id="real-access-password"', html)
+        self.assertNotIn('id="agentApiKeyInput"', html)
+        self.assertNotIn("api_key: controls", script)
+        self.assertIn("/api/auth/session", script)
 
 
 if __name__ == "__main__":

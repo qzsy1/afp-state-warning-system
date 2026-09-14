@@ -406,6 +406,13 @@ def functional_smoke(context: Any, manager: Any) -> dict[str, Any]:
 def launch(context: Any, manager: Any) -> None:
     from lan_web import LanWebConfig, discover_lan_urls, safe_network_status
 
+    # The public-web deployment uses one shared dashboard and two explicitly
+    # separated listeners: guest/public on 8770 and loopback administration on
+    # 8771.  Keep the legacy single-listener path below for older configs and
+    # for rollback compatibility.
+    if context.config.get("public_web"):
+        return _launch_public_web(context, manager)
+
     config = LanWebConfig.from_mapping(context.config.get("lan_web", {}))
     bind_host = config.bind_host if config.enabled else "127.0.0.1"
     urls = discover_lan_urls(config.port, bind_host) if config.enabled else []
@@ -458,6 +465,95 @@ def launch(context: Any, manager: Any) -> None:
     finally:
         server.shutdown()
         server.server_close()
+
+
+def _launch_public_web(context: Any, manager: Any) -> None:
+    from lan_web import discover_lan_urls
+    from public_web import PublicWebConfig, public_web_urls
+
+    config = PublicWebConfig.from_mapping(context.config.get("public_web", {}))
+    if not config.enabled:
+        return
+    legacy_app = _legacy_module("app", context)
+    dashboard = legacy_app.DashboardData()
+    security_store = legacy_app.SecurityStore(
+        context.paths.runtime_dir / "public_web_security.sqlite3"
+    )
+    capture_root = Path(getattr(dashboard.acquisition, "capture_root", context.paths.runtime_dir / "capture"))
+    source = context.paths.legacy_dir / "new_collection_demo_v11_3" / "simulator_stream.csv"
+    if not source.is_file():
+        source = context.paths.data_dir / "dashboard_candidate_catalog.csv"
+    guest_manager = legacy_app.GuestSimulationManager(
+        capture_root / "public_simulation",
+        {"builtin": {"source_type": "single_csv", "path": str(source)}},
+    )
+    lease = legacy_app.RealControlLease()
+    addresses = discover_lan_urls(config.public_port, config.public_bind_host)
+    urls = public_web_urls(config, [url.split("://", 1)[-1].rsplit(":", 1)[0] for url in addresses])
+    common = {
+        "dashboard": dashboard,
+        "security_store": security_store,
+        "guest_manager": guest_manager,
+        "control_lease": lease,
+    }
+    public_server = legacy_app.create_server(
+        config.public_bind_host,
+        config.public_port,
+        {"enabled": True, "urls": urls["public"], "public": True},
+        **common,
+        access_context="public",
+    )
+    admin_server = legacy_app.create_server(
+        config.local_admin_bind_host,
+        config.local_admin_port,
+        {"enabled": True, "urls": [urls["local_admin"]], "local_admin": True},
+        **common,
+        access_context="local_admin",
+    )
+    servers = (public_server, admin_server)
+    threads = [
+        threading.Thread(
+            target=server.serve_forever,
+            name=name,
+            daemon=True,
+        )
+        for server, name in zip(servers, ("AFP-public-web", "AFP-local-admin"))
+    ]
+    for thread in threads:
+        thread.start()
+    status = {
+        "enabled": True,
+        "public_urls": urls["public"],
+        "local_admin_url": urls["local_admin"],
+        "public_port": config.public_port,
+        "local_admin_port": config.local_admin_port,
+        "cloudflare_tunnel_enabled": config.cloudflare_tunnel_enabled,
+        "domain": config.domain,
+        "application_version": str(context.config.get("application_version", APP_VERSION)),
+    }
+    _persist_lan_web_status(context, status)
+    try:
+        if not config.open_desktop_window:
+            threads[1].join()
+            return
+        try:
+            import webview
+        except ImportError as exc:
+            raise RuntimeError("桌面界面组件缺失，请使用已打包的软件或安装 pywebview。") from exc
+        ui_config = context.config.get("ui", {})
+        webview.create_window(
+            str(ui_config.get("title", "AFP 实时预测、状态预警与模型训练系统（模块化版）")),
+            urls["local_admin"],
+            width=int(ui_config.get("width", 1660)),
+            height=int(ui_config.get("height", 1040)),
+            min_size=(1180, 760),
+            text_select=True,
+        )
+        webview.start(debug=False)
+    finally:
+        for server in servers:
+            server.shutdown()
+            server.server_close()
 
 
 def main(root: Path, arguments: list[str] | None = None) -> None:

@@ -28,6 +28,12 @@
         <button id="lan-web-copy" class="lan-web-copy" type="button" title="复制局域网访问网址">复制网址</button>
         <span id="lan-web-url" class="lan-web-url">等待服务地址</span>
       </div>
+      <div class="access-status" role="status" aria-live="polite">
+        <span id="access-mode-badge" class="access-mode-badge">访客模拟模式</span>
+        <span id="real-control-owner" class="real-control-owner"></span>
+        <button id="unlock-real-mode" class="secondary-button compact-button" type="button">解锁真实模式</button>
+        <button id="lock-real-mode" class="secondary-button compact-button hidden" type="button">退出真实模式</button>
+      </div>
     </header>
 
     <div class="workspace-grid">
@@ -233,10 +239,8 @@
                 <span id="agentGateStatus" class="agent-gate-status">离线测试诊断</span>
               </summary>
               <div class="collapsible-subsection-content">
-              <div class="compact-input-grid agent-input-grid">
-                <label>硅基流动 API Key（仅本次运行）<input id="agentApiKeyInput" type="password" autocomplete="off" placeholder="sk-..."></label>
-                <label>模型名称<input id="agentModelNameInput" type="text" autocomplete="off" value="" placeholder="deepseek-ai/DeepSeek-V3"></label>
-              </div>
+               <div id="agent-model-access" class="agent-model-access">服务器模型：未授权</div>
+               <input id="agentModelNameInput" type="hidden" placeholder="deepseek-ai/DeepSeek-V3" aria-hidden="true">
               <div class="agent-actions">
                 <span id="agentAutoStatus" class="control-note">未配置时使用内置离线测试诊断；配置正确时由模型按现象选择只读取证工具。</span>
                 <button id="agentDiagnoseButton" class="secondary-button" type="button" disabled>重新诊断全部异常</button>
@@ -445,6 +449,14 @@
     </div>
   </div>
   <div id="toast" class="toast"></div>
+  <div id="real-access-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="real-access-title">
+    <div class="modal-card">
+      <h2 id="real-access-title">解锁真实采集模式</h2>
+      <p id="real-access-transport-note" class="control-note">请输入管理员授权密码。密码仅通过 HTTPS 提交。</p>
+      <label>授权密码<input id="real-access-password" type="password" autocomplete="current-password"></label>
+      <div class="modal-actions"><button id="real-access-submit" class="primary-button" type="button">确认解锁</button><button id="real-access-cancel" class="secondary-button" type="button">取消</button></div>
+    </div>
+  </div>
   <script src="/mysql_visibility.js?v=20260909-mysql-toggle-2"></script>
   <script src="/app.js?v=20260914-agentic-diagnosis-2"></script>
 </body>

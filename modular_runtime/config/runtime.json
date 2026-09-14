@@ -29,5 +29,17 @@
     "bind_host": "0.0.0.0",
     "port": 8770,
     "open_desktop_window": true
+  },
+  "public_web": {
+    "enabled": true,
+    "public_bind_host": "0.0.0.0",
+    "public_port": 8770,
+    "local_admin_bind_host": "127.0.0.1",
+    "local_admin_port": 8771,
+    "open_desktop_window": true,
+    "domain": "",
+    "cloudflare_tunnel_enabled": false,
+    "cloudflared_path": "cloudflared",
+    "cloudflare_tunnel_name": ""
   }
 }

@@ -35,13 +35,118 @@ const state = {
   agentDefaultKeyAvailable: false,
   physicalInterfaces: [],
   lanStatusTimer: null,
+  accessRole: "guest",
+  authenticated: false,
+  secureTransport: false,
+  csrf: "",
+  modelAccess: false,
+  realControlOwner: null,
+  realHeartbeatTimer: null,
+  guestSimulationStarted: false,
 };
 
 const $ = (id) => document.getElementById(id);
 
-const agentApiKeyInput = $("agentApiKeyInput");
-const agentModelNameInput = $("agentModelNameInput");
+const agentApiKeyInput = null;
+const agentModelNameInput = null;
 const agentDiagnoseButton = $("agentDiagnoseButton");
+
+function readCookie(name) {
+  const prefix = `${name}=`;
+  return document.cookie.split(";").map((item) => item.trim())
+    .find((item) => item.startsWith(prefix))?.slice(prefix.length) || "";
+}
+
+function renderAccessState() {
+  const badge = $("access-mode-badge");
+  const unlock = $("unlock-real-mode");
+  const lock = $("lock-real-mode");
+  const acquisitionMode = $("acquisitionModeSelect");
+  const agentAccess = $("agent-model-access");
+  const note = $("real-access-transport-note");
+  if (badge) {
+    badge.textContent = state.accessRole === "local_admin" ? "本机管理模式"
+      : state.accessRole === "authorized" ? "真实模式已解锁" : "访客模拟模式";
+    badge.className = `access-mode-badge ${state.accessRole}`;
+  }
+  unlock?.classList.toggle("hidden", state.accessRole !== "guest");
+  lock?.classList.toggle("hidden", state.accessRole === "guest");
+  if (acquisitionMode && state.accessRole === "guest") {
+    acquisitionMode.value = "simulation";
+    acquisitionMode.disabled = true;
+  } else if (acquisitionMode) {
+    acquisitionMode.disabled = false;
+  }
+  if (agentAccess) {
+    agentAccess.textContent = state.modelAccess ? "服务器模型：已授权可用" : "服务器模型：未授权（本地规则）";
+  }
+  if (note) note.textContent = state.secureTransport
+    ? "请输入管理员授权密码。密码仅通过 HTTPS 提交。"
+    : "当前不是 HTTPS 公网地址，不能提交密码；可继续使用访客模拟模式。";
+  renderAgentGate();
+}
+
+async function loadAccessSession() {
+  const response = await fetch("/api/auth/session", {
+    cache: "no-store", credentials: "same-origin",
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || "授权状态读取失败");
+  state.accessRole = payload.role || "guest";
+  state.authenticated = Boolean(payload.authenticated);
+  state.modelAccess = Boolean(payload.model_access);
+  state.secureTransport = Boolean(payload.secure_transport);
+  state.csrf = readCookie("afp_csrf");
+  renderAccessState();
+  return payload;
+}
+
+function showRealAccessModal() {
+  const modal = $("real-access-modal");
+  if (!modal) return;
+  modal.classList.remove("hidden");
+  const input = $("real-access-password");
+  if (input) { input.value = ""; input.focus(); }
+}
+
+function hideRealAccessModal() { $("real-access-modal")?.classList.add("hidden"); }
+
+async function unlockRealMode() {
+  if (!state.secureTransport) {
+    toast("请使用公网 HTTPS 地址登录，局域网 HTTP 不提交密码");
+    return;
+  }
+  const password = $("real-access-password")?.value || "";
+  if (!password) { toast("请输入授权密码"); return; }
+  try {
+    const result = await postJson("/api/auth/login", {password});
+    hideRealAccessModal();
+    await loadAccessSession();
+    toast(result.model_access ? "真实模式已解锁，服务器模型可用" : "真实模式已解锁，将使用本地规则");
+  } catch (error) { toast(error.message); }
+}
+
+async function lockRealMode() {
+  try { await postJson("/api/auth/logout", {}); } catch (error) { toast(error.message); }
+  state.realControlOwner = null;
+  state.guestSimulationStarted = false;
+  window.clearInterval(state.realHeartbeatTimer);
+  state.realHeartbeatTimer = null;
+  await loadAccessSession().catch(() => {});
+}
+
+async function acquireRealControl() {
+  if (state.accessRole === "guest") { showRealAccessModal(); return false; }
+  if (state.accessRole === "local_admin") return true;
+  const result = await postJson("/api/real/control/acquire", {});
+  if (!result.granted) throw new Error("真实采集控制权正在被其他会话占用");
+  state.realControlOwner = result.control?.owner_id || true;
+  window.clearInterval(state.realHeartbeatTimer);
+  state.realHeartbeatTimer = window.setInterval(() => {
+    postJson("/api/real/control/heartbeat", {}).catch(() => {});
+  }, 10000);
+  return true;
+}
 
 function setLanWebStatus(mode, url = "", stateClass = "") {
   const panel = $("lan-web-status");
@@ -508,8 +613,12 @@ async function postJson(url, payload = {}, {timeoutMs = 30000, controller = null
   try {
     const response = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-AFP-CSRF": state.csrf || readCookie("afp_csrf"),
+      },
       body: JSON.stringify(payload),
+      credentials: "same-origin",
       ...(requestController ? {signal: requestController.signal} : {}),
     });
     const result = await response.json();
@@ -1149,8 +1258,8 @@ function buildAgentEvents(hardwareResult) {
 }
 
 function renderAgentGate() {
-  const keyPresent = Boolean(agentApiKeyInput?.value.trim()) || state.agentDefaultKeyAvailable;
-  const modelPresent = Boolean(agentModelNameInput?.value.trim());
+  const keyPresent = state.modelAccess;
+  const modelPresent = state.modelAccess;
   const eventPresent = state.agentEvents.length > 0;
   const ready = eventPresent && !state.agentBusy;
   const status = $("agentGateStatus");
@@ -1239,16 +1348,12 @@ function appendAgentDiagnostics(node) {
 function handleAgentInputChange() {
   renderAgentGate();
   const autoStatus = $("agentAutoStatus");
-  const keyPresent = Boolean(agentApiKeyInput?.value.trim()) || state.agentDefaultKeyAvailable;
-  const modelPresent = Boolean(agentModelNameInput?.value.trim());
+  const keyPresent = state.modelAccess;
+  const modelPresent = state.modelAccess;
   if (autoStatus && state.agentEvents.length) {
     autoStatus.textContent = keyPresent && modelPresent
-      ? state.agentDefaultKeyAvailable && !agentApiKeyInput?.value.trim()
-        ? "已检测到本机默认 API Key；模型会按异常现象自主选择只读取证工具。"
-        : "配置完整；模型会按异常现象自主选择只读取证工具。"
-      : (keyPresent || modelPresent)
-        ? "API Key 与模型名称需同时有效；当前使用内置离线测试诊断。"
-        : "当前使用内置离线测试诊断，不调用外部服务。";
+      ? "已授权；服务器模型会按异常现象自主选择只读取证工具。"
+      : "当前使用内置本地规则诊断，不调用外部服务。";
   }
 }
 
@@ -1258,9 +1363,9 @@ async function loadAgentDefaults() {
     const defaults = await response.json();
     if (!response.ok) return;
     state.agentDefaultKeyAvailable = Boolean(defaults.default_key_available);
-    if (agentModelNameInput && !agentModelNameInput.value.trim()) {
-      agentModelNameInput.value = defaults.model_name || "deepseek-ai/DeepSeek-V3";
-    }
+    const configuredModel = defaults.model_name || "deepseek-ai/DeepSeek-V3";
+    state.modelAccess = Boolean(defaults.model_access);
+    state.agentModelName = configuredModel;
     handleAgentInputChange();
   } catch (_error) {
     // The UI remains usable with explicit fields and local-rule fallback.
@@ -1301,8 +1406,6 @@ async function runAgentDiagnosis({automatic = false} = {}) {
   if (autoStatus) autoStatus.textContent = automatic ? "新异常已触发 LangChain 诊断……" : "正在重新诊断全部异常……";
   try {
     const result = await postJson("/api/agent/diagnose", {
-      api_key: agentApiKeyInput.value.trim(),
-      model_name: agentModelNameInput.value.trim(),
       events: state.agentEvents,
       hardware_result: state.hardwareCheck,
     }, {timeoutMs: 210000, controller});
@@ -1363,6 +1466,16 @@ async function testSensorConnection({automatic = false} = {}) {
 
 async function startAcquisition() {
   try {
+    if (state.accessRole === "guest") {
+      const guestResult = await postJson("/api/simulation/start", acquisitionConfig());
+      state.guestSimulationStarted = true;
+      renderAcquisitionStatus(guestResult);
+      controls.dataMode.value = "live";
+      configureDataMode();
+      await loadRealtime();
+      return;
+    }
+    await acquireRealControl();
     if (state.hardwareCheckInProgress) {
       throw new Error("接口与传感器通道检查正在进行，请等待检查完成");
     }
@@ -1407,7 +1520,11 @@ async function stopAcquisition() {
       ? controls.newLayer
       : controls.liveLayer;
     const completedLayer = Number(layerControl.value) || 0;
-    const result = await postJson("/api/acquisition/stop", {});
+    const result = await postJson(
+      state.accessRole === "guest" ? "/api/simulation/stop" : "/api/acquisition/stop",
+      {},
+    );
+    if (state.accessRole === "guest") state.guestSimulationStarted = false;
     renderAcquisitionStatus(result);
     renderMysqlStatus(result.mysql);
     if (
@@ -1745,7 +1862,18 @@ async function loadRealtime() {
   }
   state.busy = true;
   try {
-    const endpoint = controls.dataMode.value === "live" ? "/api/live" : "/api/realtime";
+    if (state.accessRole === "guest" && controls.dataMode.value === "live" && !state.guestSimulationStarted) {
+      const simulationStatus = await fetch("/api/simulation/status", {
+        cache: "no-store", credentials: "same-origin",
+      }).then((response) => response.json());
+      if (!simulationStatus.running) {
+        await postJson("/api/simulation/start", acquisitionConfig(), {timeoutMs: 20000});
+      }
+      state.guestSimulationStarted = true;
+    }
+    const endpoint = controls.dataMode.value === "live"
+      ? (state.accessRole === "guest" ? "/api/simulation/live" : "/api/live")
+      : "/api/realtime";
     const response = await fetch(`${endpoint}?${queryString()}`, { cache: "no-store" });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || "实时数据请求失败");
@@ -2383,7 +2511,8 @@ async function initialize() {
     state.lanStatusTimer = window.setInterval(() => {
       refreshLanWebStatus().catch(() => markServerDisconnected());
     }, 10000);
-    await loadAgentDefaults();
+     await loadAccessSession();
+     await loadAgentDefaults();
     syncLocalMysqlSection();
     syncTargetMysqlSection();
     await loadMysqlDefaults();
@@ -2410,7 +2539,14 @@ async function initialize() {
     ensureFirstInterfaceSummary();
     placeSecondInterfaceAfterFirst();
     renderInterfacePanel(payload.acquisition.interface_defaults || []);
-    await discoverInterfaces();
+     if (state.accessRole !== "guest") {
+       await discoverInterfaces();
+     } else {
+       state.physicalInterfaces = [];
+       if (controls.interfaceDiscoveryStatus) {
+         controls.interfaceDiscoveryStatus.textContent = "访客模拟模式：真实接口状态只读，采集使用服务器模拟数据源";
+       }
+     }
     controls.datasetSchema.replaceChildren(
       ...payload.acquisition.schemas.map((item) =>
         option(item.id, item.label)
@@ -2532,6 +2668,13 @@ $("testSensorsButton").addEventListener("click", () => testSensorConnection({aut
 agentApiKeyInput?.addEventListener("input", handleAgentInputChange);
 agentModelNameInput?.addEventListener("input", handleAgentInputChange);
 agentDiagnoseButton?.addEventListener("click", () => runAgentDiagnosis({automatic: false}));
+$("unlock-real-mode")?.addEventListener("click", showRealAccessModal);
+$("lock-real-mode")?.addEventListener("click", lockRealMode);
+$("real-access-submit")?.addEventListener("click", unlockRealMode);
+$("real-access-cancel")?.addEventListener("click", hideRealAccessModal);
+$("real-access-password")?.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") unlockRealMode();
+});
 $("lan-web-copy")?.addEventListener("click", copyLanWebUrl);
 controls.resetSensorCheck?.addEventListener("click", resetAndCheckHardware);
 controls.autoHardwareCheck?.addEventListener("change", () => {
@@ -3951,7 +4094,12 @@ async function testSensorConnection({automatic = false} = {}) {
     node.textContent = `${automatic ? "正在自动检查" : "正在检查"}，将逐一读取每个接口的全部已选通道…`;
   }
   try {
-    const result = await postJson("/api/acquisition/test", acquisitionConfig(), {timeoutMs: 20000, controller});
+    const result = await postJson(
+      state.accessRole === "guest" ? "/api/simulation/start" : "/api/acquisition/test",
+      acquisitionConfig(),
+      {timeoutMs: 20000, controller},
+    );
+    if (state.accessRole === "guest") state.guestSimulationStarted = true;
     if (controls.processingMode.value !== "capture_only") {
       applyPredictionModelProfile(result.prediction_model, false);
     }
@@ -3998,7 +4146,11 @@ async function resetAndCheckHardware() {
     }
   }
   try {
-    await postJson("/api/acquisition/reset-check", {});
+    if (state.accessRole !== "guest") {
+      await postJson("/api/acquisition/reset-check", {});
+    } else {
+      state.guestSimulationStarted = false;
+    }
     state.hardwareCheck = null;
     state.hardwareCheckFingerprint = "";
     clearHardwareRowStates();

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from copy import deepcopy
 import hmac
 import inspect
 import io
@@ -801,8 +802,10 @@ class DashboardData:
             for key, group in self.layers.groupby("full_specimen_id", sort=False)
         }
 
-    def bootstrap(self) -> dict:
-        interface_discovery = self.acquisition.discover_interfaces()
+    def bootstrap(self, *, include_discovery: bool = True) -> dict:
+        interface_discovery = (
+            self.acquisition.discover_interfaces() if include_discovery else {}
+        )
         specimens = []
         for _, row in self.specimens.iterrows():
             specimens.append(
@@ -4281,6 +4284,15 @@ class AppHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/real/control/status":
             self._send_json(self.control_lease.status())
             return
+        if parsed.path == "/api/admin/status":
+            self._send_json(
+                {
+                    "security": self.security_store.safe_status(),
+                    "real_control": self.control_lease.status(),
+                    "network": dict(self.network_status or {}),
+                }
+            )
+            return
         if parsed.path == "/api/auth/session":
             identity = self._identity()
             safe_status = self.security_store.safe_status()
@@ -4358,7 +4370,27 @@ class AppHandler(BaseHTTPRequestHandler):
             self._send_json(self.dashboard.web_training.defaults(self._one(query, "mode", "new")))
             return
         if parsed.path == "/api/bootstrap":
-            self._send_json(self.dashboard.bootstrap())
+            identity = self._identity()
+            bootstrap = self.dashboard.bootstrap(
+                include_discovery=identity.role in {"authorized", "local_admin"}
+            )
+            if identity.role == "guest":
+                bootstrap = deepcopy(bootstrap)
+                bootstrap["manifest"] = {
+                    key: value
+                    for key, value in (bootstrap.get("manifest") or {}).items()
+                    if key not in {"result_dir", "split_root", "output_root"}
+                }
+                acquisition = bootstrap.get("acquisition") or {}
+                acquisition["interface_discovery"] = {}
+                acquisition["interface_defaults"] = []
+                acquisition["sensor_types"] = []
+                acquisition["default_save_root"] = ""
+                demo = acquisition.get("new_collection_demo") or {}
+                demo["source_file"] = ""
+                demo["prediction_model"] = None
+                bootstrap["acquisition"] = acquisition
+            self._send_json(bootstrap)
             return
         if parsed.path == "/api/mysql/defaults":
             self._send_json(local_mysql_profile())
@@ -4530,6 +4562,22 @@ class AppHandler(BaseHTTPRequestHandler):
                         "control": self.control_lease.status(),
                     }
                 )
+                return
+            if parsed.path == "/api/admin/security/configure":
+                password = str(payload.get("password") or "")
+                api_key = str(payload.get("api_key") or "")
+                model_name = str(payload.get("model_name") or "")
+                self.security_store.configure_owner(password, api_key, model_name)
+                self._send_json(
+                    {
+                        "configured": True,
+                        "security": self.security_store.safe_status(),
+                    }
+                )
+                return
+            if parsed.path == "/api/admin/security/revoke-all":
+                self.security_store.revoke_all()
+                self._send_json({"revoked": True, "security": self.security_store.safe_status()})
                 return
             if parsed.path == "/api/auth/login":
                 remote_key = self._remote_label() or "unknown"
