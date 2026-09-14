@@ -507,5 +507,75 @@ class RealControlLeaseTests(unittest.TestCase):
         self.assertFalse(lease.heartbeat("session-a", now=31).granted)
 
 
+class ModelCredentialTests(PublicWebHttpTests):
+    def _event(self):
+        return {
+            "interface_id": "thermocouple",
+            "interface_label": "SMRF八通道热电偶",
+            "role": "thermocouple",
+            "driver": "smrf_hid",
+            "endpoint": "COM-secret",
+            "protocol": "USB HID",
+            "channels": ["温度1"],
+            "state": "no_data",
+            "message": "未收到数据",
+        }
+
+    def test_guest_cannot_smuggle_an_api_key_in_request(self):
+        self.request_json("GET", "/api/auth/session")
+        with patch(
+            "interface_agent.run_interface_diagnoses",
+            return_value={"diagnoses": [], "model_status": "offline"},
+        ) as run:
+            status, payload, _ = self.request_json(
+                "POST",
+                "/api/agent/diagnose",
+                {
+                    "api_key": "sk-attacker",
+                    "model_name": "attacker/model",
+                    "events": [self._event()],
+                    "hardware_result": {},
+                },
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(run.call_args.kwargs["api_key"], "")
+        self.assertNotEqual(
+            run.call_args.kwargs["model_name"], "attacker/model"
+        )
+        self.assertFalse(payload["model_used"])
+
+    def test_authorized_model_call_uses_store_but_never_returns_key(self):
+        self.request_json("GET", "/api/auth/session")
+        self.request_json(
+            "POST",
+            "/api/auth/login",
+            {"password": "Correct-Horse-2026"},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        with patch(
+            "interface_agent.run_interface_diagnoses",
+            return_value={"diagnoses": [], "model_status": "success"},
+        ) as run:
+            status, payload, headers = self.request_json(
+                "POST",
+                "/api/agent/diagnose",
+                {
+                    "api_key": "sk-attacker",
+                    "model_name": "attacker/model",
+                    "events": [self._event()],
+                    "hardware_result": {},
+                },
+                headers={"X-Forwarded-Proto": "https"},
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(run.call_args.kwargs["api_key"], "sk-private-value")
+        self.assertEqual(
+            run.call_args.kwargs["model_name"], "deepseek-ai/DeepSeek-V3"
+        )
+        self.assertTrue(payload["model_used"])
+        self.assertNotIn("sk-private-value", json.dumps(payload, ensure_ascii=False))
+        self.assertNotIn("sk-private-value", json.dumps(headers))
+
+
 if __name__ == "__main__":
     unittest.main()

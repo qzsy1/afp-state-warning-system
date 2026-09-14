@@ -18,15 +18,16 @@ PUBLIC_GET = {
     "/api/simulation/status",
     "/api/simulation/live",
     "/api/simulation/download",
+    "/api/agent/defaults",
 }
 PUBLIC_POST = {
     "/api/auth/login",
     "/api/simulation/start",
     "/api/simulation/stop",
+    "/api/agent/diagnose",
 }
 AUTHORIZED_GET = {
     "/api/real/control/status",
-    "/api/agent/defaults",
     "/api/training/status",
     "/api/training/defaults",
     "/api/bootstrap",
@@ -41,7 +42,6 @@ AUTHORIZED_POST = {
     "/api/real/control/acquire",
     "/api/real/control/heartbeat",
     "/api/real/control/release",
-    "/api/agent/diagnose",
     "/api/auth/logout",
     "/api/acquisition/test",
     "/api/acquisition/reset-check",

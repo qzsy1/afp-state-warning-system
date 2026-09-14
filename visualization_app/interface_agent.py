@@ -609,12 +609,17 @@ def get_agent_defaults() -> dict[str, Any]:
     }
 
 
-def _resolve_agent_credentials(api_key: str, model_name: str) -> tuple[str, str]:
+def _resolve_agent_credentials(
+    api_key: str, model_name: str, *, use_environment: bool = True
+) -> tuple[str, str]:
     """Use request values first, then optional machine-local environment defaults."""
 
-    clean_key = str(api_key or "").strip() or _environment_setting("AFP_SILICONFLOW_API_KEY")
+    clean_key = str(api_key or "").strip()
+    if use_environment and not clean_key:
+        clean_key = _environment_setting("AFP_SILICONFLOW_API_KEY")
     clean_model = str(model_name or "").strip() or (
-        _environment_setting("AFP_SILICONFLOW_MODEL") or DEFAULT_SILICONFLOW_MODEL
+        (_environment_setting("AFP_SILICONFLOW_MODEL") if use_environment else "")
+        or DEFAULT_SILICONFLOW_MODEL
     )
     return clean_key, clean_model or DEFAULT_SILICONFLOW_MODEL
 
@@ -917,6 +922,7 @@ def _run_interface_diagnoses_uncached(
     discovery: dict[str, Any] | None = None,
     acquisition_status: dict[str, Any] | None = None,
     transport: Any = None,
+    use_environment_credentials: bool = True,
 ) -> dict[str, Any]:
     """Run local fallback rules, then select offline or tool-calling diagnosis."""
 
@@ -930,7 +936,9 @@ def _run_interface_diagnoses_uncached(
         raise AgentGateError("当前没有可诊断的接口异常")
 
     diagnoses: list[dict[str, Any]] = []
-    _, display_model = _resolve_agent_credentials(api_key, model_name)
+    _, display_model = _resolve_agent_credentials(
+        api_key, model_name, use_environment=use_environment_credentials
+    )
     with tracing_context(enabled=False):
         for event in clean_events:
             local_result = _LOCAL_CHAIN.invoke(
@@ -939,7 +947,9 @@ def _run_interface_diagnoses_uncached(
             )
             diagnoses.append(local_result["diagnosis"])
 
-    clean_key, clean_model = _resolve_agent_credentials(api_key, model_name)
+    clean_key, clean_model = _resolve_agent_credentials(
+        api_key, model_name, use_environment=use_environment_credentials
+    )
     if model_caller is None:
         from agentic_diagnosis import run_agentic_diagnoses
         from diagnostic_tools import DiagnosticToolContext
@@ -1066,8 +1076,12 @@ def _diagnosis_request_key(
     events: list[dict[str, Any]] | None,
     api_key: str,
     model_name: str,
+    *,
+    use_environment_credentials: bool = True,
 ) -> str:
-    clean_key, clean_model = _resolve_agent_credentials(api_key, model_name)
+    clean_key, clean_model = _resolve_agent_credentials(
+        api_key, model_name, use_environment=use_environment_credentials
+    )
     if not clean_key or not clean_model:
         return ""
     signatures = []
@@ -1106,6 +1120,7 @@ def run_interface_diagnoses(
     discovery: dict[str, Any] | None = None,
     acquisition_status: dict[str, Any] | None = None,
     transport: Any = None,
+    use_environment_credentials: bool = True,
 ) -> dict[str, Any]:
     """Collapse identical concurrent UI requests into one external model call."""
 
@@ -1115,7 +1130,12 @@ def run_interface_diagnoses(
         else []
     )
     effective_events = backend_events or events
-    request_key = _diagnosis_request_key(effective_events, api_key, model_name)
+    request_key = _diagnosis_request_key(
+        effective_events,
+        api_key,
+        model_name,
+        use_environment_credentials=use_environment_credentials,
+    )
     if not request_key:
         return _run_interface_diagnoses_uncached(
             effective_events,
@@ -1126,6 +1146,7 @@ def run_interface_diagnoses(
             discovery=discovery,
             acquisition_status=acquisition_status,
             transport=transport,
+            use_environment_credentials=use_environment_credentials,
         )
     with _DIAGNOSIS_SINGLE_FLIGHT_LOCK:
         job = _DIAGNOSIS_SINGLE_FLIGHT.get(request_key)
@@ -1149,6 +1170,7 @@ def run_interface_diagnoses(
             discovery=discovery,
             acquisition_status=acquisition_status,
             transport=transport,
+            use_environment_credentials=use_environment_credentials,
         )
         job["result"] = deepcopy(result)
         return result

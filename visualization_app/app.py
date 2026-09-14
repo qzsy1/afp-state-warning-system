@@ -3912,6 +3912,8 @@ class AppHandler(BaseHTTPRequestHandler):
     control_lease: RealControlLease
     replay_cache: dict[str, tuple[int, dict]]
     replay_lock: threading.Lock
+    model_limiter: SlidingWindowLimiter
+    model_call_lock: threading.Lock
     access_context: str = "public"
     permission_policy = PermissionPolicy()
     login_limiter = SlidingWindowLimiter()
@@ -4326,9 +4328,26 @@ class AppHandler(BaseHTTPRequestHandler):
             self._send_download(raw, filename, "application/zip")
             return
         if parsed.path == "/api/agent/defaults":
-            from interface_agent import get_agent_defaults
+            from interface_agent import DEFAULT_SILICONFLOW_MODEL
 
-            self._send_json(get_agent_defaults())
+            identity = self._identity()
+            if identity.role in {"authorized", "local_admin"}:
+                _api_key, model_name = self.security_store.model_credentials()
+                self._send_json(
+                    {
+                        "model_name": model_name or DEFAULT_SILICONFLOW_MODEL,
+                        "model_access": bool(_api_key and model_name),
+                        "default_key_available": bool(_api_key),
+                    }
+                )
+            else:
+                self._send_json(
+                    {
+                        "model_name": DEFAULT_SILICONFLOW_MODEL,
+                        "model_access": False,
+                        "default_key_available": False,
+                    }
+                )
             return
         if parsed.path == "/api/training/status":
             query = parse_qs(parsed.query)
@@ -4598,17 +4617,92 @@ class AppHandler(BaseHTTPRequestHandler):
                 )
                 return
             if parsed.path == "/api/agent/diagnose":
-                from interface_agent import run_interface_diagnoses
+                from interface_agent import (
+                    DEFAULT_SILICONFLOW_MODEL,
+                    run_interface_diagnoses,
+                )
 
                 request_data = _validate_agent_payload(payload)
-                result = run_interface_diagnoses(
-                    request_data["events"],
-                    api_key=request_data["api_key"],
-                    model_name=request_data["model_name"],
-                    hardware_result=request_data["hardware_result"],
-                    discovery=self.dashboard.acquisition.discover_interfaces(),
-                    acquisition_status=self.dashboard.acquisition.status(),
-                )
+                identity = self._identity()
+                if identity.role in {"authorized", "local_admin"}:
+                    try:
+                        api_key, model_name = self.security_store.model_credentials()
+                    except Exception:
+                        api_key, model_name = "", DEFAULT_SILICONFLOW_MODEL
+                    use_environment = False
+                else:
+                    api_key, model_name = "", DEFAULT_SILICONFLOW_MODEL
+                    use_environment = False
+
+                def run_local() -> dict:
+                    local_result = run_interface_diagnoses(
+                        request_data["events"],
+                        api_key="",
+                        model_name=DEFAULT_SILICONFLOW_MODEL,
+                        hardware_result=request_data["hardware_result"],
+                        discovery=self.dashboard.acquisition.discover_interfaces(),
+                        acquisition_status=self.dashboard.acquisition.status(),
+                        use_environment_credentials=False,
+                    )
+                    local_result["model_used"] = False
+                    return local_result
+
+                if not api_key or not model_name:
+                    result = run_local()
+                else:
+                    session_key = str(identity.session_id or "")
+                    if self.model_limiter.count("model", session_key, 60.0) >= 3:
+                        self.security_store.append_audit(
+                            "model_rate_limited",
+                            session_id=identity.session_id,
+                            remote_label=self._remote_label(),
+                            details={"model_name": model_name},
+                        )
+                        result = run_local()
+                        result["error"] = "model_rate_limited"
+                        self._send_json(result, HTTPStatus.TOO_MANY_REQUESTS)
+                        return
+                    if not self.model_call_lock.acquire(blocking=False):
+                        self.security_store.append_audit(
+                            "model_rate_limited",
+                            session_id=identity.session_id,
+                            remote_label=self._remote_label(),
+                            details={"model_name": model_name},
+                        )
+                        result = run_local()
+                        result["error"] = "model_rate_limited"
+                        self._send_json(result, HTTPStatus.TOO_MANY_REQUESTS)
+                        return
+                    started = time.monotonic()
+                    self.model_limiter.allow("model", session_key, 3, 60.0)
+                    try:
+                        result = run_interface_diagnoses(
+                            request_data["events"],
+                            api_key=api_key,
+                            model_name=model_name,
+                            hardware_result=request_data["hardware_result"],
+                            discovery=self.dashboard.acquisition.discover_interfaces(),
+                            acquisition_status=self.dashboard.acquisition.status(),
+                            use_environment_credentials=use_environment,
+                        )
+                        result["model_used"] = str(
+                            result.get("model_status") or ""
+                        ).startswith("success")
+                        self.security_store.append_audit(
+                            "model_success"
+                            if result["model_used"]
+                            else "model_failure",
+                            session_id=identity.session_id,
+                            remote_label=self._remote_label(),
+                            details={
+                                "model_name": model_name,
+                                "elapsed_seconds": round(
+                                    max(0.0, time.monotonic() - started), 3
+                                ),
+                            },
+                        )
+                    finally:
+                        self.model_call_lock.release()
                 self._send_json(result)
                 return
             if parsed.path == "/api/acquisition/test":
@@ -4828,6 +4922,8 @@ def create_server(
     active_control_lease = control_lease or RealControlLease()
     replay_cache: dict[str, tuple[int, dict]] = {}
     replay_lock = threading.Lock()
+    model_limiter = SlidingWindowLimiter()
+    model_call_lock = threading.Lock()
     handler = type(
         "ConfiguredAppHandler",
         (AppHandler,),
@@ -4838,6 +4934,8 @@ def create_server(
             "control_lease": active_control_lease,
             "replay_cache": replay_cache,
             "replay_lock": replay_lock,
+            "model_limiter": model_limiter,
+            "model_call_lock": model_call_lock,
             "access_context": str(access_context),
             "login_limiter": SlidingWindowLimiter(),
             "network_status": dict(network_status or {}),
