@@ -8,9 +8,11 @@ from the five logical AFP sensors to discovered physical interfaces.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from acquisition import AcquisitionManager, MySQLSettings
+from helper_relay import ALLOWED_HELPER_COMMANDS
 from mysql_storage import MySQLCaptureStore
 
 
@@ -125,3 +127,69 @@ class LocalCaptureAgent:
 
     def status(self) -> dict[str, Any]:
         return self.manager.status()
+
+
+class HelperTransport:
+    """Small, dependency-optional JSON/WSS transport contract.
+
+    The pairing token is intentionally kept out of JSON messages.  A real
+    WSS client supplies it as an authorization header during connection; the
+    message methods here remain safe to log and easy to test.
+    """
+
+    def __init__(self, server_url: str, pairing_token: str, *, device_id: str = "") -> None:
+        self.server_url = str(server_url).strip()
+        self.pairing_token = str(pairing_token)
+        self.device_id = str(device_id or "local-helper")
+
+    def hello(self, *, capabilities: dict[str, Any] | None = None) -> dict[str, Any]:
+        return {
+            "type": "hello",
+            "device_id": self.device_id,
+            "capabilities": dict(capabilities or {}),
+        }
+
+    @staticmethod
+    def decode_command(raw: str | bytes) -> dict[str, Any]:
+        try:
+            value = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+        except (TypeError, ValueError, UnicodeDecodeError) as exc:
+            raise ValueError("helper命令不是有效JSON") from exc
+        if not isinstance(value, dict) or value.get("type") != "command":
+            raise ValueError("helper命令类型无效")
+        command = str(value.get("command") or "").strip().lower()
+        if command not in ALLOWED_HELPER_COMMANDS:
+            raise ValueError("helper命令不在允许列表")
+        payload = value.get("payload")
+        return {
+            "type": "command",
+            "request_id": str(value.get("request_id") or ""),
+            "command": command,
+            "payload": dict(payload) if isinstance(payload, dict) else {},
+        }
+
+    @staticmethod
+    def encode_result(request_id: str, payload: dict[str, Any]) -> str:
+        return json.dumps(
+            {
+                "type": "result",
+                "request_id": str(request_id),
+                "payload": dict(payload),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    def connect_once(self):
+        """Open one WSS connection when websocket-client is installed."""
+        if not self.server_url.startswith("wss://"):
+            raise ValueError("本地辅助程序只允许使用wss://服务地址")
+        try:
+            import websocket  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError("缺少websocket-client依赖，无法连接公网辅助服务") from exc
+        return websocket.create_connection(
+            self.server_url,
+            timeout=10,
+            header=[f"Authorization: Bearer {self.pairing_token}"],
+        )

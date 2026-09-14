@@ -8,9 +8,26 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from local_capture_agent import LocalCaptureAgent  # noqa: E402
+from local_capture_agent import HelperTransport  # noqa: E402
 
 
 class LocalCaptureAgentTests(unittest.TestCase):
+    def test_transport_builds_hello_without_secrets(self):
+        transport = HelperTransport(
+            "wss://example.test/helper", "pairing-secret", device_id="device-a"
+        )
+        message = transport.hello(capabilities={"real_capture": True})
+        self.assertEqual(message["type"], "hello")
+        self.assertEqual(message["device_id"], "device-a")
+        self.assertNotIn("pairing-secret", str(message))
+
+    def test_transport_rejects_non_json_or_unknown_command(self):
+        transport = HelperTransport("wss://example.test/helper", "pairing-secret")
+        with self.assertRaises(ValueError):
+            transport.decode_command("not-json")
+        with self.assertRaises(ValueError):
+            transport.decode_command('{"type":"command","command":"shell"}')
+
     @patch("local_capture_agent.AcquisitionManager.discover_interfaces")
     def test_discover_returns_five_logical_sensor_bindings(self, discover):
         discover.return_value = {
