@@ -198,6 +198,12 @@ class PublicWebAccessTests(unittest.TestCase):
                 "public",
             )
         )
+        self.assertTrue(
+            is_secure_request("127.0.0.1", {"Host": "127.0.0.1:8770"}, "public")
+        )
+        self.assertFalse(
+            is_secure_request("192.168.1.50", {"Host": "127.0.0.1:8770"}, "public")
+        )
 
 
 class PublicWebHttpTests(unittest.TestCase):
@@ -332,13 +338,13 @@ class PublicWebHttpTests(unittest.TestCase):
         self.assertEqual(payload["error"], "real_access_required")
         self.assertEqual(self.hardware_start_calls, 0)
 
-    def test_raw_http_login_is_rejected_but_forwarded_https_login_succeeds(self):
+    def test_loopback_login_and_forwarded_https_login_succeed(self):
         self.request_json("GET", "/api/auth/session")
         status, payload, _ = self.request_json(
             "POST", "/api/auth/login", {"password": "Correct-Horse-2026"}
         )
-        self.assertEqual(status, 426)
-        self.assertEqual(payload["error"], "https_required")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["role"], "authorized")
 
         status, payload, response_headers = self.request_json(
             "POST",

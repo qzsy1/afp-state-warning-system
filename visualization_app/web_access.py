@@ -135,6 +135,12 @@ def is_secure_request(
     loopback = peer in {"127.0.0.1", "::1", "localhost"}
     if str(access_context) == "local_admin" and loopback:
         return True
+    # A browser running on the acquisition PC may use the public listener via
+    # loopback for setup/testing.  This does not extend to LAN clients: their
+    # peer address is non-loopback and still requires Cloudflare HTTPS.
+    host = str(headers.get("Host", "")).split(":", 1)[0].strip().lower()
+    if loopback and host in {"127.0.0.1", "localhost", "::1"}:
+        return True
     forwarded = str(headers.get("X-Forwarded-Proto", "")).split(",", 1)[0]
     return bool(loopback and forwarded.strip().lower() == "https")
 
