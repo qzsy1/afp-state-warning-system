@@ -128,6 +128,12 @@ MYSQL_PREVIEW_LIMIT = 200
 MYSQL_EXPORT_LIMIT = 200_000
 _OPERATION_LOCKS: dict[str, threading.Lock] = {}
 _OPERATION_LOCKS_GUARD = threading.Lock()
+_OPERATION_LOCK_STARTED: dict[str, float] = {}
+# A crashed native probe or a client that disconnects cannot run the normal
+# ``finally`` release path.  Reclaim only locks that have been held well past
+# the normal probe duration; the old worker still owns its original lock and
+# will safely release it when/if it returns.
+OPERATION_LOCK_TTL_SECONDS = 30.0
 _MYSQL_FORBIDDEN_TOKENS = {
     "ALTER", "ANALYZE", "CALL", "CREATE", "DELETE", "DO", "DROP",
     "GRANT", "HANDLER", "INSERT", "LOAD", "LOCK", "OPTIMIZE",
@@ -3936,14 +3942,24 @@ class AppHandler(BaseHTTPRequestHandler):
         return True
 
     def _begin_operation(self, name: str) -> threading.Lock | None:
-        lock = _operation_lock(name)
-        if not lock.acquire(blocking=False):
-            self._send_json(
-                {"error": "operation_in_progress", "operation": name},
-                HTTPStatus.CONFLICT,
-            )
-            return None
-        return lock
+        now = time.monotonic()
+        with _OPERATION_LOCKS_GUARD:
+            lock = _OPERATION_LOCKS.setdefault(name, threading.Lock())
+            if lock.acquire(blocking=False):
+                _OPERATION_LOCK_STARTED[name] = now
+                return lock
+            started = _OPERATION_LOCK_STARTED.get(name)
+            if started is not None and now - started > OPERATION_LOCK_TTL_SECONDS:
+                replacement = threading.Lock()
+                replacement.acquire()
+                _OPERATION_LOCKS[name] = replacement
+                _OPERATION_LOCK_STARTED[name] = now
+                return replacement
+        self._send_json(
+            {"error": "operation_in_progress", "operation": name},
+            HTTPStatus.CONFLICT,
+        )
+        return None
 
     def _send_network_status(self) -> None:
         payload = dict(self.network_status or {})
@@ -4165,9 +4181,13 @@ class AppHandler(BaseHTTPRequestHandler):
         if parsed.path in {
             "/api/acquisition/test",
             "/api/acquisition/reset-check",
-            "/api/agent/diagnose",
         }:
             operation_name = "acquisition-check"
+        elif parsed.path == "/api/agent/diagnose":
+            # Model diagnosis may legitimately take longer than a hardware
+            # probe.  Keep its mutex independent so a timed-out/slow model
+            # request cannot block reset/recheck of the physical interfaces.
+            operation_name = "agent-diagnose"
         elif parsed.path in {"/api/acquisition/start", "/api/acquisition/stop"}:
             operation_name = "acquisition-control"
         elif parsed.path in {"/api/training/start", "/api/training/stop"}:
@@ -4366,6 +4386,9 @@ class AppHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         finally:
             if operation_lock is not None:
+                with _OPERATION_LOCKS_GUARD:
+                    if _OPERATION_LOCKS.get(operation_name) is operation_lock:
+                        _OPERATION_LOCK_STARTED.pop(operation_name, None)
                 operation_lock.release()
 
 

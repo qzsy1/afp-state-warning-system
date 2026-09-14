@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -27,6 +28,7 @@ from app import (
     NEW_DEMO_SOURCE,
     cap_pool,
     _operation_lock,
+    _OPERATION_LOCK_STARTED,
     create_server,
 )
 from online_inference import inspect_prediction_model
@@ -681,6 +683,10 @@ class LanServerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         fake_dashboard = type("FakeDashboard", (), {})()
+        fake_dashboard.acquisition = SimpleNamespace(
+            discover_interfaces=lambda: {},
+            status=lambda: {"running": False, "sensors": []},
+        )
         with patch("app.DashboardData", return_value=fake_dashboard):
             cls.server = create_server(
                 "127.0.0.1",
@@ -741,6 +747,33 @@ class LanServerTests(unittest.TestCase):
             lock.release()
         self.assertEqual(status, 409)
         self.assertEqual(payload["error"], "operation_in_progress")
+
+    def test_agent_diagnosis_does_not_block_hardware_check_lock(self):
+        lock = _operation_lock("acquisition-check")
+        self.assertTrue(lock.acquire(blocking=False))
+        try:
+            event = {"interface_id": "uvc_temperature", "state": "no_data", "channels": ["ROI平均温度"]}
+            with patch("interface_agent.run_interface_diagnoses", return_value={"diagnoses": []}):
+                status, payload = self.request(
+                    "POST", "/api/agent/diagnose",
+                    {"api_key": "", "model_name": "", "events": [event], "hardware_result": {}},
+                )
+        finally:
+            lock.release()
+        self.assertNotEqual(status, 409)
+        self.assertNotEqual(payload.get("error"), "operation_in_progress")
+
+    def test_stale_hardware_check_lock_can_be_reclaimed(self):
+        lock = _operation_lock("acquisition-check")
+        self.assertTrue(lock.acquire(blocking=False))
+        try:
+            _OPERATION_LOCK_STARTED["acquisition-check"] = time.monotonic() - 1
+            with patch("app.OPERATION_LOCK_TTL_SECONDS", 0.0, create=True):
+                status, payload = self.request("POST", "/api/acquisition/reset-check", {})
+        finally:
+            lock.release()
+        self.assertNotEqual(status, 409)
+        self.assertNotEqual(payload.get("error"), "operation_in_progress")
 
 
 if __name__ == "__main__":

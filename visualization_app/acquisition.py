@@ -2438,6 +2438,35 @@ class AcquisitionManager:
                     "ok": True,
                 })
                 continue
+            # A serial fallback is deliberately a test-only binding.  The
+            # selected protocol driver (for example UVC or SMRF HID) may call
+            # a vendor DLL/API that blocks when the real device is absent.
+            # Do not invoke that driver on an unverified fallback; report a
+            # deterministic not-connected result so the remaining interfaces
+            # and the diagnostic agent can continue.
+            if physical_fallback or item.get("physical_verified") is False:
+                state = "not_connected"
+                if physical_fallback:
+                    message = (
+                        "未识别到匹配协议，已临时分配串口，仅用于测试；"
+                        "跳过真实协议探测，请连接设备后重新检查"
+                    )
+                else:
+                    message = "实际物理接口尚未验证，跳过真实协议探测；请重新识别接口后检查"
+                errors.append(f"{endpoint}：{message}")
+                interface_results.append({
+                    "id": interface_id, "role": item.get("role", "custom"),
+                    "driver": item.get("driver", ""), "endpoint": endpoint,
+                    "physical_interface_id": physical_id, "physical_interface_kind": physical_kind,
+                    "protocol": protocol, "physical_fallback": physical_fallback,
+                    "physical_warning": physical_warning,
+                    "enabled": True, "expected_channels": expected,
+                    "detected_channels": [], "missing_channels": expected,
+                    "invalid_channels": [], "sample_counts": {}, "invalid_sample_counts": {},
+                    "errors": [message], "auxiliary_only": auxiliary_only,
+                    "state": state, "message": message, "ok": False,
+                })
+                continue
             detected: dict[str, int] = {}
             invalid: dict[str, int] = {}
             probe_errors: list[str] = []

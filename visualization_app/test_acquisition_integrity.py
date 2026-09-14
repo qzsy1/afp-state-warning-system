@@ -100,6 +100,49 @@ class AcquisitionIntegrityTests(unittest.TestCase):
         )
         self.assertTrue(config.interfaces[0]["physical_fallback"])
 
+    def test_connection_skips_unverified_protocol_driver_on_serial_fallback(self) -> None:
+        """A temporary COM fallback must not invoke a blocking USB/UVC driver."""
+        config = AcquisitionConfig(
+            acquisition_mode="real", dataset_schema="new_collection_v11_3",
+            selected_sensors=["ROI平均温度"],
+            interfaces=[
+                {
+                    "id": "uvc_temperature", "enabled": True,
+                    "role": "thermal_uvc", "driver": "uvc_thermal",
+                    "endpoint": "COM1", "physical_interface_id": "serial:COM1",
+                    "physical_interface_kind": "serial", "physical_fallback": True,
+                },
+            ],
+            interface_channel_assignments={"uvc_temperature": ["ROI平均温度"]},
+        )
+        manager = AcquisitionManager()
+        with patch("acquisition.MultiInterfaceDriver") as driver:
+            result = manager.test_connection(config, timeout_seconds=0.1)
+        driver.assert_not_called()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["interfaces"][0]["state"], "not_connected")
+        self.assertIn("临时分配串口", result["interfaces"][0]["message"])
+
+    def test_connection_skips_driver_when_physical_interface_is_unverified(self) -> None:
+        config = AcquisitionConfig(
+            acquisition_mode="real", dataset_schema="new_collection_v11_3",
+            selected_sensors=["ROI平均温度"],
+            interfaces=[
+                {
+                    "id": "uvc_temperature", "enabled": True,
+                    "role": "thermal_uvc", "driver": "uvc_thermal",
+                    "endpoint": "BSV UVC (WinUSB)", "physical_interface_id": "uvc:bsv",
+                    "physical_interface_kind": "usb_uvc", "physical_verified": False,
+                },
+            ],
+            interface_channel_assignments={"uvc_temperature": ["ROI平均温度"]},
+        )
+        manager = AcquisitionManager()
+        with patch("acquisition.MultiInterfaceDriver") as driver:
+            result = manager.test_connection(config, timeout_seconds=0.1)
+        driver.assert_not_called()
+        self.assertEqual(result["interfaces"][0]["state"], "not_connected")
+
     def test_discovery_reports_physical_interface_metadata(self) -> None:
         hid = SimpleNamespace(
             label="SMRFCT08B (Serial=SMRF-01)", product="SMRFCT08B",
