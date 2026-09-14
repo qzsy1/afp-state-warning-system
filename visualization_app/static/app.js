@@ -1223,7 +1223,18 @@ async function testMysqlConnection(local = false) {
   try {
     status.textContent = `正在检查${label} MySQL 数据库（不会创建或修改表）……`;
     const settings = local ? unifiedLocalMysqlSettings() : unifiedMysqlSettings();
-    const result = await postJson("/api/mysql/test", {...settings, read_only: true});
+    const result = local && state.accessRole === "authorized"
+      ? await requestLocalHelper("mysql_preflight", {
+        mysql_enabled: true,
+        mysql_host: settings.mysql_local_host,
+        mysql_port: settings.mysql_local_port,
+        mysql_user: settings.mysql_local_user,
+        mysql_password: settings.mysql_local_password,
+        mysql_database: settings.mysql_local_database,
+        require_schema: true,
+        write_test: false,
+      }, {timeoutMs: 20000})
+      : await postJson("/api/mysql/test", {...settings, read_only: true});
     state.mysqlConnectionTests[scope] = result;
     status.classList.toggle("ok", Boolean(result.ok));
     status.classList.toggle("error", !result.ok);
@@ -1256,7 +1267,17 @@ async function refreshRelationMap(scope) {
   const status = local ? $("mysqlLocalStatus") : $("mysqlTargetStatus");
   try {
     if (status) status.textContent = `正在读取${label}数据库 ${settings.mysql_host}/${database} 的关系表……`;
-    const result = await postJson("/api/mysql/relation-map", {...settings, limit: 1000});
+    const result = local && state.accessRole === "authorized"
+      ? await requestLocalHelper("mysql_relation_map", {
+        mysql_enabled: true,
+        mysql_host: settings.mysql_local_host,
+        mysql_port: settings.mysql_local_port,
+        mysql_user: settings.mysql_local_user,
+        mysql_password: settings.mysql_local_password,
+        mysql_database: settings.mysql_local_database,
+        limit: 1000,
+      }, {timeoutMs: 20000})
+      : await postJson("/api/mysql/relation-map", {...settings, limit: 1000});
     body.replaceChildren();
     if (!result.ok || !result.rows?.length) {
       const row = document.createElement("tr");

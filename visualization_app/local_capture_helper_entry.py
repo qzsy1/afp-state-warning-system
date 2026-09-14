@@ -32,6 +32,11 @@ def dispatch_command(agent: LocalCaptureAgent, raw: str | bytes) -> dict[str, An
         )
     elif name == "check_capture":
         result = agent.check_capture(_config_from_payload(payload))
+    elif name == "mysql_relation_map":
+        result = agent.mysql_relation_map(
+            MySQLSettings.from_mapping(payload),
+            limit=int(payload.get("limit", 1000)),
+        )
     elif name == "start_capture":
         result = agent.start_capture(_config_from_payload(payload))
     elif name == "stop_capture":
@@ -43,6 +48,35 @@ def dispatch_command(agent: LocalCaptureAgent, raw: str | bytes) -> dict[str, An
         "request_id": command["request_id"],
         "payload": result if isinstance(result, dict) else {"result": result},
     }
+
+
+def run_http_forever(server_url: str, pairing_token: str, device_id: str) -> None:
+    agent = LocalCaptureAgent()
+    transport = HelperTransport(server_url, pairing_token, device_id=device_id)
+    delay = 1.0
+    while True:
+        try:
+            polled = transport.http_json("api/helper/poll", {"device_id": device_id})
+            if not polled.get("ok"):
+                raise RuntimeError(polled.get("error") or "辅助服务拒绝连接")
+            command = polled.get("command")
+            if command:
+                response = dispatch_command(agent, json.dumps(command, ensure_ascii=False))
+                transport.http_json(
+                    "api/helper/result",
+                    {
+                        "device_id": device_id,
+                        "request_id": response["request_id"],
+                        "payload": response["payload"],
+                    },
+                )
+            delay = 1.0
+            time.sleep(0.25)
+        except KeyboardInterrupt:
+            return
+        except Exception:
+            time.sleep(delay)
+            delay = min(delay * 2.0, 30.0)
 
 
 def run_forever(server_url: str, pairing_token: str, device_id: str) -> None:
@@ -84,10 +118,29 @@ def run_forever(server_url: str, pairing_token: str, device_id: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="AFP本地采集辅助程序")
     parser.add_argument("--server", required=True, help="wss://辅助服务地址")
-    parser.add_argument("--pairing-token", required=True)
+    parser.add_argument("--pairing-token", default="")
+    parser.add_argument("--pairing-challenge", default="")
     parser.add_argument("--device-id", default="local-helper")
+    parser.add_argument("--transport", choices=("https", "wss"), default="https")
     args = parser.parse_args()
-    run_forever(args.server, args.pairing_token, args.device_id)
+    if not args.pairing_token and not args.pairing_challenge:
+        parser.error("必须提供 --pairing-token 或 --pairing-challenge")
+    if args.pairing_challenge:
+        bootstrap = HelperTransport(args.server, "", device_id=args.device_id)
+        paired = bootstrap.http_json(
+            "api/helper/pair/complete",
+            {"challenge": args.pairing_challenge, "device_id": args.device_id, "capabilities": {
+                "hardware_discovery": True, "real_capture": True, "local_csv_save": True, "local_mysql_save": True,
+            }},
+            authorized=False,
+        )
+        if not paired.get("ok"):
+            parser.error(paired.get("error") or "辅助程序配对失败")
+        args.pairing_token = str(paired.get("pairing_token") or "")
+    if args.transport == "https":
+        run_http_forever(args.server, args.pairing_token, args.device_id)
+    else:
+        run_forever(args.server, args.pairing_token, args.device_id)
 
 
 if __name__ == "__main__":

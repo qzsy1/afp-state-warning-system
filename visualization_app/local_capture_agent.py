@@ -9,6 +9,8 @@ from the five logical AFP sensors to discovered physical interfaces.
 from __future__ import annotations
 
 import json
+import urllib.error
+import urllib.request
 from typing import Any
 
 from acquisition import AcquisitionManager, MySQLSettings
@@ -119,6 +121,9 @@ class LocalCaptureAgent:
     ) -> dict[str, Any]:
         return MySQLCaptureStore(settings).preflight(write_test=write_test)
 
+    def mysql_relation_map(self, settings: MySQLSettings, *, limit: int = 1000) -> dict[str, Any]:
+        return MySQLCaptureStore(settings).relation_map(max(1, min(int(limit), 1000)), auto_initialize=False)
+
     def start_capture(self, config: Any) -> dict[str, Any]:
         return self.manager.start(config)
 
@@ -196,3 +201,24 @@ class HelperTransport:
             timeout=10,
             header=[f"Authorization: Bearer {self.pairing_token}"],
         )
+
+    def http_json(self, path: str, payload: dict[str, Any], *, authorized: bool = True) -> dict[str, Any]:
+        """Send one outbound HTTPS helper request (Cloudflare-compatible)."""
+        base = self.server_url.replace("wss://", "https://").replace("ws://", "http://")
+        url = base.rstrip("/") + "/" + path.lstrip("/")
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if authorized:
+            headers["Authorization"] = f"Bearer {self.pairing_token}"
+        request = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers=headers,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                value = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+            raise RuntimeError(f"辅助服务连接失败：{exc}") from exc
+        return value if isinstance(value, dict) else {"ok": False, "error": "响应格式无效"}

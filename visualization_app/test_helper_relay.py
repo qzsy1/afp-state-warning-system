@@ -53,6 +53,14 @@ class HelperRelayTests(unittest.TestCase):
         registry.accept_result("device-a", token, request["request_id"], {"ok": True})
         self.assertEqual(registry.pop_result("session-a", request["request_id"]), {"ok": True})
 
+    def test_mysql_relation_map_is_allowlisted(self):
+        registry = HelperRegistry()
+        challenge = registry.start_pairing("session-a")
+        registry.complete_pairing(challenge["challenge"], "device-a", {})
+        request = registry.command("session-a", "mysql_relation_map", {})
+        self.assertTrue(request["ok"])
+        self.assertEqual(request["command"], "mysql_relation_map")
+
 
 if __name__ == "__main__":
     unittest.main()
