@@ -68,6 +68,7 @@ from web_access import (
 )
 from web_auth import AuthenticationError, SecurityStore
 from control_lease import RealControlLease
+from json_safety import json_safe_value
 
 
 APP_DIR = Path(os.environ.get("AFP_LEGACY_APP_DIR") or Path(__file__).resolve().parent).resolve()
@@ -4183,7 +4184,9 @@ class AppHandler(BaseHTTPRequestHandler):
             return {"installed": False, "running": False, "service_name": "cloudflared", "error_code": "inspection_unavailable"}
 
     def _send_json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
-        raw = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        raw = json.dumps(
+            json_safe_value(payload), ensure_ascii=False, allow_nan=False
+        ).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
@@ -4410,10 +4413,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 acquisition["interface_defaults"] = []
                 acquisition["sensor_types"] = []
                 acquisition["default_save_root"] = ""
-                profiles = getattr(self.guest_manager, "source_profiles", {})
-                builtin_profile = profiles.get("builtin", {}) if isinstance(profiles, dict) else {}
-                source_path = str(builtin_profile.get("path") or "")
-                acquisition["simulation_source_name"] = Path(source_path).name if source_path else ""
+                source_status = self.guest_manager.source_status(identity.guest_id)
+                acquisition["simulation_source_type"] = source_status.get("source_type", "single_csv")
+                acquisition["simulation_source_name"] = source_status.get("name", "")
                 demo = acquisition.get("new_collection_demo") or {}
                 demo["source_file"] = ""
                 demo["prediction_model"] = None
@@ -4715,6 +4717,16 @@ class AppHandler(BaseHTTPRequestHandler):
                         self._identity().guest_id,
                         str(payload.get("source_type") or "single_csv"),
                         str(payload.get("initial_path") or ""),
+                    )
+                )
+                return
+            if parsed.path == "/api/simulation/upload-source":
+                files = payload.get("files")
+                self._send_json(
+                    self.guest_manager.upload_source(
+                        self._identity().guest_id,
+                        str(payload.get("source_type") or "single_csv"),
+                        files if isinstance(files, list) else [],
                     )
                 )
                 return

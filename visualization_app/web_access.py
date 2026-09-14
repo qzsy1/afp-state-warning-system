@@ -26,6 +26,7 @@ PUBLIC_POST = {
     "/api/simulation/start",
     "/api/simulation/stop",
     "/api/simulation/select-source",
+    "/api/simulation/upload-source",
     "/api/agent/diagnose",
 }
 AUTHORIZED_GET = {

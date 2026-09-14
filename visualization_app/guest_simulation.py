@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import io
 import re
+import shutil
 import threading
 import time
 import zipfile
@@ -15,6 +18,7 @@ from acquisition import AcquisitionConfig, AcquisitionManager
 DEFAULT_PER_SESSION_BYTES = 256 * 1024 * 1024
 DEFAULT_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_MAX_RUNNING = 4
+DEFAULT_MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 _SESSION_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,64}$")
 
 
@@ -31,6 +35,7 @@ class GuestSimulationSession:
     save_root: Path
     created_at: float
     last_access_at: float
+    selected_source: dict[str, Any] | None = None
 
 
 class GuestSimulationManager:
@@ -175,16 +180,108 @@ class GuestSimulationManager:
             raise GuestSimulationError("guest_source_not_allowed", "模拟数据必须是 CSV 文件")
         if clean_type == "folder_csv" and not path.is_dir():
             raise GuestSimulationError("guest_source_not_allowed", "模拟数据文件夹无效")
-        self.source_profiles["builtin"] = {
+        self.ensure_session(session_id).selected_source = {
             **self.source_profiles.get("builtin", {}),
             "source_type": clean_type,
             "path": str(path),
         }
-        return {"selected": True, "path": str(path), "name": path.name}
+        return {"selected": True, "path": "", "name": path.name}
+
+    @staticmethod
+    def _safe_upload_name(name: str) -> Path:
+        raw = str(name or "").replace("\\", "/").strip()
+        relative = Path(raw)
+        if not raw or relative.is_absolute() or any(
+            part in {"", ".", ".."} for part in relative.parts
+        ):
+            raise ValueError("上传文件名无效")
+        if relative.suffix.lower() != ".csv":
+            raise ValueError("模拟数据只支持 CSV 文件")
+        return relative
+
+    def upload_source(
+        self,
+        session_id: str,
+        source_type: str,
+        files: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Store browser-selected CSV files in the current guest session."""
+        session = self.ensure_session(session_id)
+        clean_type = str(source_type or "single_csv").strip().lower()
+        if clean_type not in {"single_csv", "folder_csv"}:
+            raise ValueError("访客模式只支持单 CSV 或 CSV 文件夹上传")
+        if not isinstance(files, list) or not files:
+            raise ValueError("请选择至少一个 CSV 文件")
+        if clean_type == "single_csv" and len(files) != 1:
+            raise ValueError("单 CSV 模式只能选择一个文件")
+
+        source_root = (session.save_root / ".simulation_source").resolve()
+        if session.save_root not in source_root.parents:
+            raise GuestSimulationError(
+                "invalid_guest_session", "模拟数据目录越过允许范围"
+            )
+        shutil.rmtree(source_root, ignore_errors=True)
+        source_root.mkdir(parents=True, exist_ok=True)
+        total = 0
+        names: list[str] = []
+        try:
+            for item in files:
+                if not isinstance(item, dict):
+                    raise ValueError("上传文件描述无效")
+                relative = self._safe_upload_name(str(item.get("name") or ""))
+                destination = (source_root / relative).resolve()
+                if source_root not in destination.parents:
+                    raise ValueError("上传文件路径无效")
+                if relative.as_posix() in names:
+                    raise ValueError("上传文件名重复")
+                encoded = str(item.get("data") or "")
+                try:
+                    content = base64.b64decode(encoded, validate=True)
+                except (ValueError, binascii.Error) as exc:
+                    raise ValueError("上传文件内容不是有效的 Base64") from exc
+                total += len(content)
+                if total > DEFAULT_MAX_UPLOAD_BYTES:
+                    raise ValueError("上传文件总大小超过 64 MB 限制")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(content)
+                names.append(relative.as_posix())
+        except Exception:
+            shutil.rmtree(source_root, ignore_errors=True)
+            raise
+        selected_path = (
+            source_root if clean_type == "folder_csv"
+            else source_root / Path(names[0])
+        ).resolve()
+        session.selected_source = {
+            "source_type": clean_type,
+            "path": str(selected_path),
+        }
+        return {
+            "selected": True,
+            "source_type": clean_type,
+            "path": "",
+            "name": names[0] if clean_type == "single_csv" else f"已上传 {len(names)} 个 CSV",
+            "files": names,
+            "bytes": total,
+        }
+
+    def source_status(self, session_id: str) -> dict[str, str]:
+        session = self.ensure_session(session_id)
+        profile = session.selected_source or self._profile({})
+        path = Path(str(profile.get("path") or ""))
+        source_type = str(profile.get("source_type") or "single_csv")
+        return {
+            "source_type": source_type,
+            "name": (
+                f"已上传 {len(list(path.rglob('*.csv')))} 个 CSV"
+                if source_type == "folder_csv" and path.is_dir()
+                else path.name
+            ),
+        }
 
     def safe_config(self, session_id: str, payload: dict[str, Any]) -> AcquisitionConfig:
         session = self.ensure_session(session_id)
-        profile = self._profile(payload)
+        profile = session.selected_source or self._profile(payload)
         source_type = str(profile.get("source_type") or "single_csv").lower()
         if source_type not in {"single_csv", "folder_csv", "mysql"}:
             raise GuestSimulationError(

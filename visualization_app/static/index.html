@@ -84,6 +84,7 @@
                   <button id="selectSimulationSourceButton" class="secondary-button compact-button" type="button">选择</button>
                 </span>
               </label>
+              <input id="simulationSourceFileInput" class="hidden" type="file" accept=".csv,text/csv" multiple>
               <div id="simulationMysqlSettings" class="simulation-mysql-settings hidden">
                 <p class="control-note shared-mysql-note">使用“真实采集与保存”中的统一 MySQL 连接信息。</p>
                 <div class="compact-input-grid shared-mysql-legacy-fields hidden" aria-hidden="true">
@@ -97,7 +98,8 @@
                   <textarea id="simulationMysqlQueryInput" rows="2">SELECT * FROM afp_flat_all ORDER BY specimen_key, layer_no, sample_index</textarea>
                 </label>
               </div>
-              <p class="control-note">模拟模式使用所选文件夹、CSV或MySQL数据逐行读取；真实接口模式不会读取本地文件。</p>
+              <p id="simulationSourceNote" class="control-note">模拟模式使用所选文件夹、CSV或MySQL数据逐行读取；访客网页可直接上传本机 CSV，真实接口模式不会读取本地文件。</p>
+              <button id="downloadSimulationButton" class="secondary-button full-button hidden" type="button">下载本次模拟采集数据</button>
             </div>
             <label>采集驱动<select id="driverSelect"></select></label>
             <label>模拟采集数据文件<input id="sourceFileInput" type="text" placeholder="模拟驱动的数据 CSV；真实驱动可留空"></label>

@@ -4,6 +4,7 @@ import importlib
 import importlib.util
 import io
 import json
+import base64
 import tempfile
 import unittest
 import zipfile
@@ -178,6 +179,34 @@ class GuestSimulationTests(unittest.TestCase):
         self.assertEqual(config.simulation_source_type, "single_csv")
         self.assertEqual(config.simulation_mysql_password, "")
         self.assertFalse(config.mysql_enabled)
+
+    def test_uploaded_csv_becomes_the_source_for_only_that_guest_session(self):
+        manager = self._manager()
+        first_id = "a" * 32
+        second_id = "b" * 32
+        encoded = base64.b64encode("温度,压力\n351,401\n".encode("utf-8")).decode("ascii")
+
+        result = manager.upload_source(
+            first_id,
+            "single_csv",
+            [{"name": "client.csv", "data": encoded}],
+        )
+
+        self.assertTrue(result["selected"])
+        first = manager.safe_config(first_id, {})
+        second = manager.safe_config(second_id, {})
+        self.assertEqual(Path(first.simulation_source_path).name, "client.csv")
+        self.assertEqual(Path(second.simulation_source_path), self.source)
+
+    def test_uploaded_folder_requires_csv_files(self):
+        manager = self._manager()
+        encoded = base64.b64encode(b"not csv").decode("ascii")
+        with self.assertRaises(ValueError):
+            manager.upload_source(
+                "a" * 32,
+                "folder_csv",
+                [{"name": "notes.txt", "data": encoded}],
+            )
 
     def test_invalid_guest_session_id_is_rejected_before_path_creation(self):
         module = self._module()

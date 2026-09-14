@@ -43,6 +43,7 @@ const state = {
   realControlOwner: null,
   realHeartbeatTimer: null,
   guestSimulationStarted: false,
+  guestSimulationStoppedByUser: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -173,6 +174,7 @@ async function lockRealMode() {
   try { await postJson("/api/auth/logout", {}); } catch (error) { toast(error.message); }
   state.realControlOwner = null;
   state.guestSimulationStarted = false;
+  state.guestSimulationStoppedByUser = false;
   window.clearInterval(state.realHeartbeatTimer);
   state.realHeartbeatTimer = null;
   await loadAccessSession().catch(() => {});
@@ -678,6 +680,7 @@ async function postJson(url, payload = {}, {timeoutMs = 30000, controller = null
 }
 
 function renderAcquisitionStatus(status) {
+  state.acquisitionStatus = status;
   const node = $("acquisitionStatus");
   const selected = (status.sensors || []).filter((item) => item.selected);
   // The backend applies the authoritative interface-to-channel routing.  In
@@ -1512,6 +1515,7 @@ async function startAcquisition() {
     if (state.accessRole === "guest") {
       const guestResult = await postJson("/api/simulation/start", acquisitionConfig());
       state.guestSimulationStarted = true;
+      state.guestSimulationStoppedByUser = false;
       renderAcquisitionStatus(guestResult);
       controls.dataMode.value = "live";
       configureDataMode();
@@ -1567,7 +1571,10 @@ async function stopAcquisition() {
       state.accessRole === "guest" ? "/api/simulation/stop" : "/api/acquisition/stop",
       {},
     );
-    if (state.accessRole === "guest") state.guestSimulationStarted = false;
+    if (state.accessRole === "guest") {
+      state.guestSimulationStarted = false;
+      state.guestSimulationStoppedByUser = true;
+    }
     renderAcquisitionStatus(result);
     renderMysqlStatus(result.mysql);
     if (
@@ -1905,7 +1912,7 @@ async function loadRealtime() {
   }
   state.busy = true;
   try {
-    if (state.accessRole === "guest" && controls.dataMode.value === "live" && !state.guestSimulationStarted) {
+    if (state.accessRole === "guest" && controls.dataMode.value === "live" && !state.guestSimulationStarted && !state.guestSimulationStoppedByUser) {
       const simulationStatus = await fetch("/api/simulation/status", {
         cache: "no-store", credentials: "same-origin",
       }).then((response) => response.json());
@@ -2618,6 +2625,9 @@ async function initialize() {
     controls.realtimePrediction.checked = Boolean(payload.defaults.realtime_prediction);
     controls.optimizedWarning.checked = Boolean(payload.defaults.use_optimized_warning);
     controls.saveRoot.value = payload.acquisition.default_save_root || "";
+    if (controls.simulationSourceType && payload.acquisition.simulation_source_type) {
+      controls.simulationSourceType.value = payload.acquisition.simulation_source_type;
+    }
     if (controls.simulationSourcePath && payload.acquisition.simulation_source_name) {
       controls.simulationSourcePath.value = payload.acquisition.simulation_source_name;
     }
@@ -2638,6 +2648,7 @@ async function initialize() {
     $("acquisitionSection").classList.toggle(
       "hidden", controls.dataMode.value !== "live"
     );
+    updateSimulationSettings();
     await loadRealtime();
     scheduleAutomaticHardwareCheck(800);
   } catch (error) {
@@ -3596,6 +3607,9 @@ Object.assign(controls, {
   simulationSourceType: $("simulationSourceTypeSelect"),
   simulationSourcePath: $("simulationSourcePathInput"),
   selectSimulationSource: $("selectSimulationSourceButton"),
+  simulationSourceFile: $("simulationSourceFileInput"),
+  simulationSourceNote: $("simulationSourceNote"),
+  downloadSimulation: $("downloadSimulationButton"),
   simulationSourcePathLabel: $("simulationSourcePathLabel"),
   simulationMysqlSettings: $("simulationMysqlSettings"),
   simulationMysqlHost: $("simulationMysqlHostInput"),
@@ -3637,6 +3651,9 @@ function updateSimulationSettings() {
       "文件夹按工况与独立重复命名；每层保留分层文件，完整试样始终覆盖为同一份当前数据文件。";
   }
   controls.simulationSettings?.classList.toggle("hidden", !simulation);
+  controls.downloadSimulation?.classList.toggle(
+    "hidden", !simulation || state.accessRole !== "guest"
+  );
   if (controls.interfaceDiscoveryStatus && simulation) {
     controls.interfaceDiscoveryStatus.textContent =
       "模拟采集不需要识别物理接口；仅使用当前选择的 CSV/文件夹/MySQL 数据源";
@@ -3650,6 +3667,13 @@ function updateSimulationSettings() {
   const mysql = controls.simulationSourceType?.value === "mysql";
   controls.simulationMysqlSettings?.classList.toggle("hidden", !simulation || !mysql);
   controls.simulationSourcePathLabel?.classList.toggle("hidden", !simulation || mysql);
+  if (controls.simulationSourceNote) {
+    controls.simulationSourceNote.textContent = state.accessRole === "guest"
+      ? (mysql
+        ? "访客 MySQL 使用本机管理员预先配置的数据源；如需导入本机文件，请切换为单 CSV或CSV文件夹并点击“选择”。"
+        : "访客网页可直接选择本机 CSV 上传；数据仅进入当前访客模拟会话，停止后可下载。")
+      : "模拟模式使用所选文件夹、CSV或MySQL数据逐行读取；真实接口模式不会读取本地文件。";
+  }
   if (controls.simulationSourcePath) {
     controls.simulationSourcePath.placeholder = controls.simulationSourceType?.value === "folder_csv"
       ? "选择采集保存格式的数据文件夹"
@@ -3708,6 +3732,21 @@ async function runIntegration() {
 
 async function selectSimulationSource() {
   const sourceType = controls.simulationSourceType?.value || "single_csv";
+  if (state.accessRole === "guest") {
+    if (sourceType === "mysql") {
+      toast("访客模式的 MySQL 使用本机管理员配置；请在本机管理页面设置数据源");
+      return;
+    }
+    const picker = controls.simulationSourceFile;
+    if (!picker) return;
+    picker.multiple = sourceType === "folder_csv";
+    picker.setAttribute("accept", ".csv,text/csv");
+    if (sourceType === "folder_csv") picker.setAttribute("webkitdirectory", "");
+    else picker.removeAttribute("webkitdirectory");
+    picker.value = "";
+    picker.click();
+    return;
+  }
   if (sourceType === "mysql") return;
   try {
     const endpoint = state.accessRole === "guest"
@@ -3722,6 +3761,66 @@ async function selectSimulationSource() {
       toast("模拟采集数据源已选择");
     }
   } catch (error) { toast(`无法选择模拟数据源：${error.message}`); }
+}
+
+function readSimulationFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error(`无法读取 ${file.name}`));
+    reader.onload = () => {
+      const value = String(reader.result || "");
+      const comma = value.indexOf(",");
+      resolve({
+        name: file.webkitRelativePath || file.name,
+        data: comma >= 0 ? value.slice(comma + 1) : value,
+      });
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+async function uploadSimulationSource() {
+  const picker = controls.simulationSourceFile;
+  const files = [...(picker?.files || [])];
+  if (!files.length) return;
+  const sourceType = controls.simulationSourceType?.value || "single_csv";
+  if (sourceType === "single_csv" && files.length !== 1) {
+    toast("单 CSV 模式只能选择一个文件");
+    return;
+  }
+  if (files.some((file) => !file.name.toLowerCase().endsWith(".csv"))) {
+    toast("模拟数据只支持 CSV 文件");
+    return;
+  }
+  const button = controls.selectSimulationSource;
+  if (button) button.disabled = true;
+  try {
+    if (controls.simulationSourceNote) controls.simulationSourceNote.textContent = "正在上传并校验模拟数据……";
+    const uploaded = await Promise.all(files.map(readSimulationFile));
+    const result = await postJson("/api/simulation/upload-source", {
+      source_type: sourceType,
+      files: uploaded,
+    }, {timeoutMs: 120000});
+    controls.simulationSourcePath.value = result.name || result.path || "已上传模拟数据";
+    if (controls.simulationSourceNote) controls.simulationSourceNote.textContent =
+      `已载入 ${result.name || "模拟数据"}；点击“停止并保存”后可下载本次结果。`;
+    toast("模拟数据已载入");
+  } catch (error) {
+    if (controls.simulationSourceNote) controls.simulationSourceNote.textContent = `模拟数据上传失败：${error.message}`;
+    toast(`无法上传模拟数据：${error.message}`);
+  } finally {
+    if (button) button.disabled = false;
+    picker.value = "";
+  }
+}
+
+function downloadSimulationSource() {
+  const link = document.createElement("a");
+  link.href = "/api/simulation/download";
+  link.download = "afp_simulation.zip";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
 }
 
 function acquisitionConfig() {
@@ -3816,6 +3915,8 @@ controls.acquisitionMode?.addEventListener("change", () => {
 });
 controls.simulationSourceType?.addEventListener("change", updateSimulationSettings);
 controls.selectSimulationSource?.addEventListener("click", selectSimulationSource);
+controls.simulationSourceFile?.addEventListener("change", uploadSimulationSource);
+controls.downloadSimulation?.addEventListener("click", downloadSimulationSource);
 controls.integrationSourceType?.addEventListener("change", updateIntegrationSource);
 controls.selectIntegrationFolder?.addEventListener("click", selectIntegrationFolder);
 controls.runIntegration?.addEventListener("click", runIntegration);
@@ -4151,7 +4252,10 @@ async function testSensorConnection({automatic = false} = {}) {
       acquisitionConfig(),
       {timeoutMs: 20000, controller},
     );
-    if (state.accessRole === "guest") state.guestSimulationStarted = true;
+    if (state.accessRole === "guest") {
+      state.guestSimulationStarted = true;
+      state.guestSimulationStoppedByUser = false;
+    }
     if (controls.processingMode.value !== "capture_only") {
       applyPredictionModelProfile(result.prediction_model, false);
     }
@@ -4202,6 +4306,7 @@ async function resetAndCheckHardware() {
       await postJson("/api/acquisition/reset-check", {});
     } else {
       state.guestSimulationStarted = false;
+      state.guestSimulationStoppedByUser = false;
     }
     state.hardwareCheck = null;
     state.hardwareCheckFingerprint = "";
