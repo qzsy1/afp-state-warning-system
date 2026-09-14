@@ -49,7 +49,7 @@ def test_preflight_reports_port_unreachable_without_calling_schema(self):
     result = MySQLCaptureStore(unreachable_settings()).preflight()
     self.assertFalse(result["ok"])
     self.assertEqual(result["stage"], "connect")
-    self.assertEqual(result["error_detail"]["category"], "service_unavailable")
+    self.assertEqual(result["error_detail"]["category"], "network")
 ```
 
 - [ ] Step 2: Run `py -3.11 -m unittest visualization_app.test_mysql_diagnostics -v` and verify failure because `preflight` is absent.
