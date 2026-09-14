@@ -82,6 +82,7 @@ def test_preflight_reports_port_unreachable_without_calling_schema(self):
 **Files:**
 - Modify: `visualization_app/app.py`
 - Modify: `visualization_app/web_access.py`
+- Create: `visualization_app/helper_relay.py` — in-memory pairing leases and command allow-list.
 - Modify: `visualization_app/test_public_web_security.py`
 - Test: `visualization_app/test_local_capture_agent.py`
 

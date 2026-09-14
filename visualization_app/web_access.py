@@ -40,6 +40,7 @@ AUTHORIZED_GET = {
     "/api/acquisition/status",
     "/api/acquisition/save-status",
     "/api/acquisition/discover",
+    "/api/helper/status",
     "/api/live",
     "/api/view",
     "/api/realtime",
@@ -67,6 +68,9 @@ AUTHORIZED_POST = {
     "/api/mysql/relation-map",
     "/api/mysql/query",
     "/api/mysql/export-csv",
+    "/api/helper/pair/start",
+    "/api/helper/pair/complete",
+    "/api/helper/command",
     "/api/prediction-model/select-file",
     "/api/prediction-model/inspect",
 }

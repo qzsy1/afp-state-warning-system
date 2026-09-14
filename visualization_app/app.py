@@ -62,6 +62,8 @@ from new_collection_health import (
 )
 from web_training import WebTrainingManager
 from guest_simulation import GuestSimulationError, GuestSimulationManager
+from helper_relay import HelperRegistry
+from local_capture_agent import LocalCaptureAgent
 from public_status import build_public_device_status
 from web_access import (
     PermissionPolicy,
@@ -748,6 +750,8 @@ class DashboardData:
             transformers=online_artifact["transformers"],
         )
         self.acquisition = AcquisitionManager()
+        self.local_capture_agent = LocalCaptureAgent(manager=self.acquisition)
+        self.helper_registry = HelperRegistry()
         self.causal_online_optimizer = CausalOnlineConsistency(
                 (
                     DATA_DIR / "causal_online_consistency_artifact.joblib"
@@ -4486,6 +4490,13 @@ class AppHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/mysql/defaults":
             self._send_json(local_mysql_profile())
             return
+        if parsed.path == "/api/helper/status":
+            self._send_json(
+                self.dashboard.helper_registry.status(
+                    str(self._identity().session_id or self._identity().guest_id)
+                )
+            )
+            return
         if parsed.path == "/api/acquisition/status":
             self._send_json(self.dashboard.acquisition.status())
             return
@@ -4957,6 +4968,39 @@ class AppHandler(BaseHTTPRequestHandler):
                 if not result.get("ok"):
                     result["error_detail"] = classify_mysql_error(result.get("error"))
                 self._send_json(result)
+                return
+            if parsed.path == "/api/helper/pair/start":
+                session_id = str(self._identity().session_id or "")
+                if not session_id:
+                    self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
+                    return
+                self._send_json(self.dashboard.helper_registry.start_pairing(session_id))
+                return
+            if parsed.path == "/api/helper/pair/complete":
+                self._send_json(
+                    self.dashboard.helper_registry.complete_pairing(
+                        str(payload.get("challenge") or ""),
+                        str(payload.get("device_id") or ""),
+                        payload.get("capabilities")
+                        if isinstance(payload.get("capabilities"), dict)
+                        else {},
+                    )
+                )
+                return
+            if parsed.path == "/api/helper/command":
+                session_id = str(self._identity().session_id or "")
+                if not session_id:
+                    self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
+                    return
+                self._send_json(
+                    self.dashboard.helper_registry.command(
+                        session_id,
+                        str(payload.get("command") or ""),
+                        payload.get("payload")
+                        if isinstance(payload.get("payload"), dict)
+                        else {},
+                    )
+                )
                 return
             if parsed.path == "/api/mysql/preflight":
                 settings = mysql_settings_from_mapping(payload)
