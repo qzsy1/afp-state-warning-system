@@ -50,6 +50,15 @@ class HelperTransportTests(unittest.TestCase):
         self.assertEqual(result.pairing_challenge, "challenge-1")
         self.assertTrue(any("配对码" in prompt for prompt in prompts))
 
+    def test_helper_cli_normalizes_displayed_pairing_code_label(self):
+        result = resolve_runtime_args(
+            ["--server", "http://127.0.0.1:8770"],
+            input_fn=lambda _prompt: "配对码：challenge-1",
+            output_fn=lambda _line: None,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.pairing_challenge, "challenge-1")
+
 
 if __name__ == "__main__":
     unittest.main()

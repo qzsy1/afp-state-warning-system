@@ -22,6 +22,16 @@ def _hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def normalize_pairing_code(value: str) -> str:
+    """Accept the raw code or the complete label copied from the webpage."""
+
+    clean = str(value or "").strip()
+    for prefix in ("配对码：", "配对码:", "Pairing code:", "Pairing code："):
+        if clean.lower().startswith(prefix.lower()):
+            return clean[len(prefix):].strip()
+    return clean
+
+
 @dataclass
 class _Pairing:
     session_id: str
@@ -74,6 +84,7 @@ class HelperRegistry:
         device_id: str,
         capabilities: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        challenge = normalize_pairing_code(challenge)
         now = time.time()
         with self._lock:
             matched_session = None

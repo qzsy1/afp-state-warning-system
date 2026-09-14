@@ -61,6 +61,13 @@ class HelperRelayTests(unittest.TestCase):
         self.assertTrue(request["ok"])
         self.assertEqual(request["command"], "mysql_relation_map")
 
+    def test_pairing_accepts_code_copied_with_display_label(self):
+        registry = HelperRegistry()
+        challenge = registry.start_pairing("session-a")
+        displayed = f"配对码：{challenge['challenge']}"
+        result = registry.complete_pairing(displayed, "device-a", {})
+        self.assertTrue(result["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,7 @@ from dataclasses import fields
 from typing import Any
 
 from acquisition import AcquisitionConfig, MySQLSettings
+from helper_relay import normalize_pairing_code
 from local_capture_agent import HelperTransport, LocalCaptureAgent
 
 
@@ -157,6 +158,7 @@ def resolve_runtime_args(
         if not args.pairing_challenge:
             output_fn("未输入配对码，辅助程序未启动。")
             return None
+    args.pairing_challenge = normalize_pairing_code(args.pairing_challenge)
     return args
 
 
@@ -178,7 +180,13 @@ def main() -> None:
             authorized=False,
         )
         if not paired.get("ok"):
-            parser.error(paired.get("error") or "辅助程序配对失败")
+            error_code = str(paired.get("error") or "")
+            if error_code == "pairing_invalid_or_expired":
+                raise RuntimeError(
+                    "配对码无效或已过期：请确认辅助程序填写的是生成配对码的同一个网页地址，"
+                    "并在5分钟内重新生成后输入。可直接粘贴网页显示的“配对码：xxxx”。"
+                )
+            raise RuntimeError(error_code or "辅助程序配对失败")
         args.pairing_token = str(paired.get("pairing_token") or "")
     if args.transport == "https":
         run_http_forever(args.server, args.pairing_token, args.device_id)
