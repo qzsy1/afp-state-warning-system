@@ -685,7 +685,7 @@ canvas { display: block; width: 100%; }
   .column-resizer, .vertical-panel-resizer { display: none; }
   .sidebar { height: auto; max-height: none; }
   .main-content { height: auto; overflow: visible; }
-  .warning-rail { position: static; max-height: none; grid-template-columns: repeat(2,1fr); overflow: visible; }
+  .warning-rail { position: static; height: auto; max-height: none; grid-template-columns: repeat(2,1fr); overflow: visible; }
   .evidence-dock { height: auto; overflow: visible; margin-top: 0; }
   .rail-title, .rail-block { grid-column: 1 / -1; }
   .evidence-dock { grid-template-columns: 1fr; }
@@ -701,7 +701,7 @@ canvas { display: block; width: 100%; }
   .workspace-grid { display: block; padding: 7px; }
   .sidebar, .warning-rail { position: static; max-height: none; margin-bottom: 8px; overflow: visible; }
   .main-content, .evidence-dock { margin-bottom: 8px; }
-  .warning-rail { display: grid; }
+  .warning-rail { display: grid; height: auto; }
   .sensor-grid, .guide-grid { grid-template-columns: 1fr; }
   .layer-progress { grid-template-columns: repeat(2,1fr); }
   .panel-header { display: block; }
