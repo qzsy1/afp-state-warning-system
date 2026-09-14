@@ -591,7 +591,14 @@ canvas { display: block; width: 100%; }
 .collapsible-rail-block { padding: 0; overflow: hidden; }
 .collapsible-rail-block > .mini-panel-header { margin: 0; padding: 10px 34px 10px 11px; }
 .collapsible-rail-block[open] > .mini-panel-header { border-bottom: 1px solid var(--line); }
-.collapsible-rail-content { padding: 0 11px 10px; }
+.collapsible-rail-content {
+  max-height: 220px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 0 11px 10px;
+  scrollbar-color: #8bb7d3 #edf6fc;
+  scrollbar-width: thin;
+}
 .probability-bars { display: grid; gap: 6px; }
 .probability-row { display: grid; grid-template-columns: 53px 1fr 30px; align-items: center; gap: 5px; color: #506a7e; font-size: 8px; }
 .probability-track { height: 7px; overflow: hidden; background: #e8eef3; border-radius: 99px; }

@@ -409,7 +409,7 @@
           <div id="processParameterGrid" class="parameter-grid"><div><span>等待识别</span><strong>—</strong></div></div>
           <div id="parameterDetail" class="status-detail">—</div>
         </article>
-        <details class="rail-block collapsible-rail-block">
+        <details class="rail-block collapsible-rail-block" open>
           <summary class="mini-panel-header"><div><p class="panel-kicker">ANOMALY TYPE</p><h2>异常类型概率</h2></div></summary>
           <div class="collapsible-rail-content"><div id="probabilityBars" class="probability-bars"></div></div>
         </details>
@@ -422,14 +422,14 @@
       </div>
 
       <section id="evidenceDock" class="evidence-dock">
-        <details id="layerEvidencePanel" class="panel layer-panel collapsible-panel">
+        <details id="layerEvidencePanel" class="panel layer-panel collapsible-panel" open>
           <summary class="panel-header compact collapsible-panel-summary">
             <div><p class="panel-kicker">LAYER EVIDENCE</p><h2>铺层证据形成进度</h2></div>
             <span id="layerPreviewBadge" class="preview-badge">等待完整窗口</span>
           </summary>
           <div class="collapsible-panel-content"><div id="layerProgress" class="layer-progress"></div></div>
         </details>
-        <details id="timelineEvidencePanel" class="panel timeline-panel collapsible-panel">
+        <details id="timelineEvidencePanel" class="panel timeline-panel collapsible-panel" open>
           <summary class="panel-header compact collapsible-panel-summary"><div><p class="panel-kicker">CAUSAL WINDOW EVIDENCE</p><h2>当前层窗口健康指标</h2></div></summary>
           <div class="collapsible-panel-content">
             <canvas id="timelineChart" height="160"></canvas>
