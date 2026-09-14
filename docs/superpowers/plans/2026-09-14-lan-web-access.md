@@ -303,7 +303,7 @@ Expected: exit code `0` and zero failures.
 
 - [ ] **Step 2: Build in a temporary PyInstaller workspace, then update only the existing delivery directory.**
 
-Use the existing `modular_runtime/build_modular_app.ps1` with the current reference release and a staging output under `%TEMP%`. Before replacing the delivery EXE, verify the target directory is exactly `F:\AFP_Integrated_Modular_v2\delivery\AFP_Integrated_System_Modular_v2.0.3_Agentic`; do not pass a new version folder. Copy the verified executable and synchronized external `app`, `config`, `docs`, `models`, and `native_dll` files into that existing directory.
+Use the existing `modular_runtime/build_modular_app.ps1` with the current reference release and a staging output under `%TEMP%`. Before replacing the delivery EXE, verify the target directory is exactly `F:\AFP_Integrated_Modular_v2\delivery\AFP_Integrated_System_Modular_v2.0.3_Agentic`; do not pass a new version folder. Copy the verified executable and synchronized external `app`, `config`, `docs`, `models`, and `native_dll` files into that existing directory. The launcher is a stable external-runtime shell; if the machine's PyInstaller environment cannot rebuild it safely, pass the previously verified same-directory executable through `-ExistingExecutable` and still refresh the external runtime and configuration in place.
 
 - [ ] **Step 3: Start the EXE and verify both local and LAN HTTP paths.**
 
