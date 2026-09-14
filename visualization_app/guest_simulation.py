@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import csv
 import io
 import re
 import shutil
@@ -256,6 +257,7 @@ class GuestSimulationManager:
             "source_type": clean_type,
             "path": str(selected_path),
         }
+        status = self.source_status(session_id)
         return {
             "selected": True,
             "source_type": clean_type,
@@ -263,13 +265,33 @@ class GuestSimulationManager:
             "name": names[0] if clean_type == "single_csv" else f"已上传 {len(names)} 个 CSV",
             "files": names,
             "bytes": total,
+            "channels": status.get("channels", []),
         }
 
-    def source_status(self, session_id: str) -> dict[str, str]:
+    def source_status(self, session_id: str) -> dict[str, Any]:
         session = self.ensure_session(session_id)
         profile = session.selected_source or self._profile({})
         path = Path(str(profile.get("path") or ""))
         source_type = str(profile.get("source_type") or "single_csv")
+        channels: list[str] = []
+        if source_type == "single_csv" and path.is_file():
+            try:
+                with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                    channels = list(next(csv.reader(handle), []))
+            except (OSError, UnicodeDecodeError):
+                try:
+                    with path.open("r", encoding="gb18030", newline="") as handle:
+                        channels = list(next(csv.reader(handle), []))
+                except (OSError, UnicodeDecodeError):
+                    channels = []
+        elif source_type == "folder_csv" and path.is_dir():
+            for file in sorted(path.rglob("*.csv")):
+                try:
+                    with file.open("r", encoding="utf-8-sig", newline="") as handle:
+                        channels.extend(next(csv.reader(handle), []))
+                except (OSError, UnicodeDecodeError):
+                    continue
+            channels = list(dict.fromkeys(channels))
         return {
             "source_type": source_type,
             "name": (
@@ -277,6 +299,7 @@ class GuestSimulationManager:
                 if source_type == "folder_csv" and path.is_dir()
                 else path.name
             ),
+            "channels": channels,
         }
 
     def safe_config(self, session_id: str, payload: dict[str, Any]) -> AcquisitionConfig:
@@ -409,6 +432,16 @@ class GuestSimulationManager:
                 archive.write(resolved, resolved.relative_to(session.save_root).as_posix())
         session.last_access_at = time.time()
         return output.getvalue(), f"afp_simulation_{session.session_id}.zip"
+
+    def export_manifest(self, session_id: str) -> dict[str, Any]:
+        session = self.ensure_session(session_id)
+        session.last_access_at = time.time()
+        return session.acquisition.export_manifest()
+
+    def export_file(self, session_id: str, relative_path: str) -> tuple[bytes, str]:
+        session = self.ensure_session(session_id)
+        session.last_access_at = time.time()
+        return session.acquisition.export_file(relative_path)
 
     def cleanup_stopped(self) -> dict[str, int]:
         removed_sessions = 0

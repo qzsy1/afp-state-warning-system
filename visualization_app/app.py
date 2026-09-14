@@ -4373,6 +4373,17 @@ class AppHandler(BaseHTTPRequestHandler):
             )
             self._send_download(raw, filename, "application/zip")
             return
+        if parsed.path == "/api/simulation/export-manifest":
+            self._send_json(self.guest_manager.export_manifest(self._identity().guest_id))
+            return
+        if parsed.path == "/api/simulation/export-file":
+            try:
+                relative_path = self._one(parse_qs(parsed.query), "path", "")
+                raw, _name = self.guest_manager.export_file(self._identity().guest_id, relative_path)
+                self._send_download(raw, Path(relative_path).name)
+            except (FileNotFoundError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+            return
         if parsed.path == "/api/agent/defaults":
             from interface_agent import DEFAULT_SILICONFLOW_MODEL
 
@@ -4427,12 +4438,11 @@ class AppHandler(BaseHTTPRequestHandler):
                 }
                 acquisition = bootstrap.get("acquisition") or {}
                 acquisition["interface_discovery"] = {}
-                acquisition["interface_defaults"] = []
-                acquisition["sensor_types"] = []
                 acquisition["default_save_root"] = ""
                 source_status = self.guest_manager.source_status(identity.guest_id)
                 acquisition["simulation_source_type"] = source_status.get("source_type", "single_csv")
                 acquisition["simulation_source_name"] = source_status.get("name", "")
+                acquisition["simulation_source_channels"] = source_status.get("channels", [])
                 demo = acquisition.get("new_collection_demo") or {}
                 demo["source_file"] = ""
                 demo["prediction_model"] = None
@@ -4444,6 +4454,17 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/acquisition/status":
             self._send_json(self.dashboard.acquisition.status())
+            return
+        if parsed.path == "/api/acquisition/export-manifest":
+            self._send_json(self.dashboard.acquisition.export_manifest())
+            return
+        if parsed.path == "/api/acquisition/export-file":
+            try:
+                relative_path = self._one(parse_qs(parsed.query), "path", "")
+                raw, _name = self.dashboard.acquisition.export_file(relative_path)
+                self._send_download(raw, Path(relative_path).name)
+            except (FileNotFoundError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
             return
         if parsed.path == "/api/acquisition/discover":
             self._send_json(self.dashboard.acquisition.discover_interfaces())

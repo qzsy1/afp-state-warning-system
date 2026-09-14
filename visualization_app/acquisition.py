@@ -3856,6 +3856,43 @@ class AcquisitionManager:
                 "mysql": dict(self.mysql_status),
             }
 
+    def export_manifest(self) -> dict[str, Any]:
+        """Return a browser-safe manifest for the completed capture folder.
+
+        The manifest deliberately exposes only paths relative to the specimen
+        folder.  This lets the web client recreate the same folder hierarchy
+        and filenames as the desktop capture without leaking host paths.
+        """
+        with self.lock:
+            if self.session_dir is None or not self.session_dir.is_dir():
+                return {"ready": False, "root_name": "", "files": []}
+            root = self.session_dir.resolve()
+            files: list[dict[str, Any]] = []
+            for path in sorted(root.rglob("*")):
+                if not path.is_file() or path.is_symlink():
+                    continue
+                resolved = path.resolve()
+                if root not in resolved.parents:
+                    continue
+                relative = resolved.relative_to(root).as_posix()
+                files.append({"path": f"{root.name}/{relative}", "size": int(resolved.stat().st_size)})
+            return {"ready": bool(files), "root_name": root.name, "files": files}
+
+    def export_file(self, relative_path: str) -> tuple[bytes, str]:
+        """Read one manifest path while preventing traversal outside the session."""
+        with self.lock:
+            if self.session_dir is None:
+                raise FileNotFoundError("当前没有可导出的采集会话")
+            root = self.session_dir.resolve()
+            clean = str(relative_path or "").replace("\\", "/").strip("/")
+            parts = clean.split("/")
+            if len(parts) < 2 or parts[0] != root.name or any(part in {"", ".", ".."} for part in parts):
+                raise ValueError("导出文件路径无效")
+            target = (root.joinpath(*parts[1:])).resolve()
+            if root not in target.parents or not target.is_file() or target.is_symlink():
+                raise FileNotFoundError("导出文件不存在")
+            return target.read_bytes(), "/".join(parts)
+
     def reset_check_state(self) -> dict:
         """Reset interface/channel observations without deleting saved files."""
         with self.lock:

@@ -15,7 +15,7 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
             "the guest auto-check guard needs the latest acquisition status",
         )
 
-    def test_guest_auto_start_is_suppressed_after_explicit_stop(self):
+    def test_guest_simulation_does_not_auto_start_on_refresh(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
         self.assertIn(
@@ -23,11 +23,9 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
             text,
             "an explicit stop must prevent loadRealtime from starting a new guest run",
         )
-        self.assertIn(
-            "!state.guestSimulationStoppedByUser",
-            text,
-            "guest auto-start must honor the explicit-stop latch",
-        )
+        start = text.index("async function loadRealtime()")
+        end = text.index("function scheduleLoad", start)
+        self.assertNotIn('postJson("/api/simulation/start"', text[start:end])
 
     def test_initialize_refreshes_simulation_controls_after_guest_mode_is_applied(self):
         source = Path(__file__).with_name("static") / "app.js"
@@ -41,14 +39,15 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
             "guest access changes the acquisition mode after the initial control setup",
         )
 
-    def test_guest_upload_restarts_simulation_without_download_ui(self):
+    def test_guest_upload_waits_for_explicit_start_without_download_ui(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
         start = text.index("async function uploadSimulationSource()")
         end = text.index("function acquisitionConfig()", start)
         body = text[start:end]
-        self.assertIn('"/api/simulation/start"', body)
-        self.assertIn("正在用新数据重新开始模拟采集", body)
+        self.assertNotIn('"/api/simulation/start"', body)
+        self.assertIn("请点击“开始采集”后才开始读取", body)
+        self.assertIn("确认并授权本地保存", text)
         index = source.with_name("index.html").read_text(encoding="utf-8")
         self.assertNotIn("downloadSimulationButton", index)
         self.assertNotIn("downloadSimulationSource", text)

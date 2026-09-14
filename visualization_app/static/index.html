@@ -117,6 +117,12 @@
                 <button id="selectSaveRootButton" class="secondary-button compact-button" type="button">选择</button>
               </span>
             </label>
+            <div id="browserLocalSavePanel" class="browser-local-save-panel">
+              <div class="path-picker-row">
+                <button id="confirmLocalSaveButton" class="secondary-button" type="button">确认并授权本地保存</button>
+              </div>
+              <p id="localSaveStatus" class="control-note">未确认本地目录；当前不会保存到访问网页的电脑。</p>
+            </div>
             <p class="control-note save-rule-note">自动建立“试样名_p功率_v速度_pr压实力”文件夹，同时保存每层文件、完整试样快照和采集记录。</p>
             <div class="mysql-settings">
               <label class="toggle"><input id="mysqlLocalEnabledInput" type="checkbox"> 保存到打开软件这台电脑的 MySQL</label>
@@ -472,6 +478,6 @@
     </div>
   </div>
   <script src="/mysql_visibility.js?v=20260909-mysql-toggle-2"></script>
-  <script src="/app.js?v=20260914-simulation-source-1"></script>
+  <script src="/app.js?v=20260914-local-save-1"></script>
 </body>
 </html>

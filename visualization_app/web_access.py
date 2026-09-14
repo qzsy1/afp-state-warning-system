@@ -17,6 +17,8 @@ PUBLIC_GET = {
     "/api/public/device-status",
     "/api/simulation/status",
     "/api/simulation/live",
+    "/api/simulation/export-manifest",
+    "/api/simulation/export-file",
     "/api/simulation/download",
     "/api/agent/defaults",
     "/api/bootstrap",
@@ -40,6 +42,8 @@ AUTHORIZED_GET = {
     "/api/live",
     "/api/view",
     "/api/realtime",
+    "/api/acquisition/export-manifest",
+    "/api/acquisition/export-file",
 }
 AUTHORIZED_POST = {
     "/api/real/control/acquire",

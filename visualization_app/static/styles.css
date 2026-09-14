@@ -364,6 +364,10 @@ output { color: var(--blue); font-weight: 800; }
 .full-button { width: 100%; }
 .path-picker-row { display: flex !important; gap: 6px; }
 .path-picker-row input { min-width: 0; }
+.browser-local-save-panel { margin-top: 6px; padding: 7px; border: 1px solid #c9dceb; border-radius: 5px; background: #f7fbfe; }
+.browser-local-save-panel .path-picker-row { justify-content: flex-start; }
+.browser-local-save-panel button { width: 100%; }
+.browser-local-save-panel .control-note { margin-top: 6px; }
 .range-number-row { display: grid; grid-template-columns: 18px 1fr 25px; align-items: center; gap: 5px; color: var(--muted); font-size: 9px; text-align: center; }
 .range-number-row input { text-align: center; }
 .checkbox-row, .toggle { display: flex !important; grid-template-columns: none !important; align-items: center; gap: 6px !important; color: #425c72 !important; line-height: 1.35; }
