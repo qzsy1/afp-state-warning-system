@@ -3997,7 +3997,11 @@ class AppHandler(BaseHTTPRequestHandler):
             parts.append("HttpOnly")
         if max_age is not None:
             parts.append(f"Max-Age={int(max_age)}")
-        use_secure = self._is_secure_transport() if secure is None else bool(secure)
+        # Loopback HTTP is accepted for local setup, but a Secure cookie would
+        # then never be returned by the browser.  Mark cookies Secure only when
+        # the request is actually HTTPS (or Cloudflare forwarded HTTPS).
+        forwarded_proto = str(self.headers.get("X-Forwarded-Proto", "")).split(",", 1)[0].strip().lower()
+        use_secure = (forwarded_proto == "https") if secure is None else bool(secure)
         if use_secure:
             parts.append("Secure")
         pending = getattr(self, "_pending_cookies", None)
