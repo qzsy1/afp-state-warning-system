@@ -63,10 +63,15 @@ def discover_lan_urls(port: int, bind_host: str = "0.0.0.0") -> list[str]:
             address = ipaddress.ip_address(value)
         except ValueError:
             continue
-        if address.version != 4 or address.is_loopback or address.is_link_local:
+        if (
+            address.version != 4
+            or address.is_loopback
+            or address.is_link_local
+            or not address.is_private
+        ):
             continue
         candidates.append(address)
-    candidates.sort(key=lambda address: (not address.is_private, int(address)))
+    candidates.sort(key=int)
     return [f"http://{address}:{int(port)}/" for address in candidates]
 
 

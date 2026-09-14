@@ -3,7 +3,9 @@ param(
     [string]$ReferenceRelease = "F:\AFP_Integrated_Native_InterfaceMapped\AFP_Integrated_System_SMRF_HID_Restored_20260824_v1.12.1\AFP_Integrated_System",
     [string]$TargetDir = "F:\AFP_Integrated_Modular_v2\delivery\AFP_Integrated_System_Modular_v2.0.1",
     [string]$ApplicationVersion = "2.0.2",
-    [switch]$SkipExecutableBuild
+    [switch]$SkipExecutableBuild,
+    [switch]$AllowExistingTarget,
+    [string]$ExistingExecutable = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -49,14 +51,14 @@ if (-not $resolvedBuild.StartsWith($resolvedTemp + '\', [StringComparison]::Ordi
 if (Test-Path -LiteralPath $BuildRoot) {
     Remove-Item -LiteralPath $BuildRoot -Recurse -Force
 }
-if (Test-Path -LiteralPath $TargetDir) {
+if ((Test-Path -LiteralPath $TargetDir) -and -not $AllowExistingTarget) {
     throw "Target already exists; choose a new directory: $TargetDir"
 }
 New-Item -ItemType Directory -Force -Path $DistRoot, $WorkRoot | Out-Null
 
-if (-not $SkipExecutableBuild) {
+if (-not $SkipExecutableBuild -and -not $ExistingExecutable) {
     $arguments = @(
-        "-m", "PyInstaller", "--noconfirm", "--clean", "--onedir", "--noconsole",
+        "-m", "PyInstaller", "--noconfirm", "--clean", "--onedir", "--noconsole", "--log-level", "WARN",
         "--name", "AFP_Integrated_System_Modular",
         "--collect-all", "torch_geometric",
         "--collect-all", "openpyxl", "--collect-all", "xlrd",
@@ -82,6 +84,8 @@ if (-not $SkipExecutableBuild) {
         "--exclude-module", "matplotlib", "--exclude-module", "tensorflow",
         "--exclude-module", "tensorboard", "--exclude-module", "keras",
         "--exclude-module", "paddle", "--exclude-module", "cv2",
+        "--exclude-module", "kivy", "--exclude-module", "kivy_deps",
+        "--exclude-module", "clr_loader", "--exclude-module", "pythonnet",
         "--exclude-module", "torchaudio", "--exclude-module", "torchvision",
         "--distpath", $DistRoot, "--workpath", $WorkRoot, "--specpath", $WorkRoot,
         (Join-Path $ScriptDir "launcher_entry.py")
@@ -93,15 +97,26 @@ if (-not $SkipExecutableBuild) {
 }
 
 $built = Join-Path $DistRoot "AFP_Integrated_System_Modular"
-if ($SkipExecutableBuild) {
+if ($ExistingExecutable) {
+    if (-not (Test-Path -LiteralPath $ExistingExecutable)) {
+        throw "Existing executable is missing: $ExistingExecutable"
+    }
+    $built = Join-Path $BuildRoot "prebuilt_launcher"
+    New-Item -ItemType Directory -Force -Path $built | Out-Null
+    Copy-Item -LiteralPath $ExistingExecutable -Destination (Join-Path $built "AFP_Integrated_System_Modular.exe") -Force
+} elseif ($SkipExecutableBuild) {
     $built = Join-Path $ScriptDir "prebuilt_launcher"
 }
 if (-not (Test-Path -LiteralPath (Join-Path $built "AFP_Integrated_System_Modular.exe"))) {
     throw "Modular launcher output is missing: $built"
 }
 
-New-Item -ItemType Directory -Force -Path (Split-Path -Parent $TargetDir) | Out-Null
-Copy-Item -LiteralPath $built -Destination $TargetDir -Recurse
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $TargetDir), $TargetDir | Out-Null
+if ($AllowExistingTarget) {
+    Copy-Item -Path (Join-Path $built "*") -Destination $TargetDir -Recurse -Force
+} else {
+    Copy-Item -LiteralPath $built -Destination $TargetDir -Recurse
+}
 
 $appTarget = Join-Path $TargetDir "app"
 $legacyTarget = Join-Path $appTarget "legacy"
@@ -114,8 +129,9 @@ foreach ($path in @($appTarget, $legacyTarget, $uiTarget, $configTarget, $native
 }
 
 Copy-Item -LiteralPath (Join-Path $ScriptDir "app\bootstrap.py") -Destination $appTarget -Force
-Copy-Item -LiteralPath (Join-Path $ScriptDir "app\core") -Destination $appTarget -Recurse
-Copy-Item -LiteralPath (Join-Path $ScriptDir "app\modules") -Destination $appTarget -Recurse
+New-Item -ItemType Directory -Force -Path (Join-Path $appTarget "core"), (Join-Path $appTarget "modules") | Out-Null
+Copy-Item -Path (Join-Path $ScriptDir "app\core\*") -Destination (Join-Path $appTarget "core") -Recurse -Force
+Copy-Item -Path (Join-Path $ScriptDir "app\modules\*") -Destination (Join-Path $appTarget "modules") -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $ScriptDir "config\runtime.delivery.json") -Destination (Join-Path $configTarget "runtime.json") -Force
 $documentation = Get-ChildItem -LiteralPath (Join-Path $RepoRoot "docs") -Filter "*.md" -File
 if (-not $documentation) {
@@ -145,21 +161,28 @@ Get-ChildItem -LiteralPath (Join-Path $LegacySource "static") -Force | ForEach-O
     Copy-Item -LiteralPath $_.FullName -Destination $uiTarget -Recurse -Force
 }
 
-Copy-Item -LiteralPath (Join-Path $ReferenceRelease "models") -Destination $TargetDir -Recurse
-Copy-Item -LiteralPath $referenceData -Destination $legacyTarget -Recurse
+New-Item -ItemType Directory -Force -Path (Join-Path $TargetDir "models"), (Join-Path $legacyTarget "data") | Out-Null
+Copy-Item -Path (Join-Path $ReferenceRelease "models\*") -Destination (Join-Path $TargetDir "models") -Recurse -Force
+Copy-Item -Path (Join-Path $referenceData "*") -Destination (Join-Path $legacyTarget "data") -Recurse -Force
 if (Test-Path -LiteralPath (Join-Path $referenceData "new_collection_demo_v11_3")) {
-    Copy-Item -LiteralPath (Join-Path $referenceData "new_collection_demo_v11_3") -Destination $legacyTarget -Recurse
+    New-Item -ItemType Directory -Force -Path (Join-Path $legacyTarget "new_collection_demo_v11_3") | Out-Null
+    Copy-Item -Path (Join-Path $referenceData "new_collection_demo_v11_3\*") -Destination (Join-Path $legacyTarget "new_collection_demo_v11_3") -Recurse -Force
 } elseif (Test-Path -LiteralPath (Join-Path $referenceLegacy "new_collection_demo_v11_3")) {
-    Copy-Item -LiteralPath (Join-Path $referenceLegacy "new_collection_demo_v11_3") -Destination $legacyTarget -Recurse
+    New-Item -ItemType Directory -Force -Path (Join-Path $legacyTarget "new_collection_demo_v11_3") | Out-Null
+    Copy-Item -Path (Join-Path $referenceLegacy "new_collection_demo_v11_3\*") -Destination (Join-Path $legacyTarget "new_collection_demo_v11_3") -Recurse -Force
 } else {
-    Copy-Item -LiteralPath (Join-Path $LegacySource "new_collection_demo_v11_3") -Destination $legacyTarget -Recurse
+    New-Item -ItemType Directory -Force -Path (Join-Path $legacyTarget "new_collection_demo_v11_3") | Out-Null
+    Copy-Item -Path (Join-Path $LegacySource "new_collection_demo_v11_3\*") -Destination (Join-Path $legacyTarget "new_collection_demo_v11_3") -Recurse -Force
 }
 if (Test-Path -LiteralPath (Join-Path $referenceData "model_runtime")) {
-    Copy-Item -LiteralPath (Join-Path $referenceData "model_runtime") -Destination $legacyTarget -Recurse
+    New-Item -ItemType Directory -Force -Path (Join-Path $legacyTarget "model_runtime") | Out-Null
+    Copy-Item -Path (Join-Path $referenceData "model_runtime\*") -Destination (Join-Path $legacyTarget "model_runtime") -Recurse -Force
 } elseif (Test-Path -LiteralPath (Join-Path $referenceLegacy "model_runtime")) {
-    Copy-Item -LiteralPath (Join-Path $referenceLegacy "model_runtime") -Destination $legacyTarget -Recurse
+    New-Item -ItemType Directory -Force -Path (Join-Path $legacyTarget "model_runtime") | Out-Null
+    Copy-Item -Path (Join-Path $referenceLegacy "model_runtime\*") -Destination (Join-Path $legacyTarget "model_runtime") -Recurse -Force
 } else {
-    Copy-Item -LiteralPath (Join-Path $LegacySource "model_runtime") -Destination $legacyTarget -Recurse
+    New-Item -ItemType Directory -Force -Path (Join-Path $legacyTarget "model_runtime") | Out-Null
+    Copy-Item -Path (Join-Path $LegacySource "model_runtime\*") -Destination (Join-Path $legacyTarget "model_runtime") -Recurse -Force
 }
 Get-ChildItem -LiteralPath (Join-Path $LegacySource "hardware_dlls") -File | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination $nativeTarget -Force
