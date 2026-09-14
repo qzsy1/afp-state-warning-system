@@ -2620,10 +2620,12 @@ class DashboardData:
         forecast_lead: int = 1,
         dataset_schema: str | None = None,
         prediction_model_type: str | None = None,
+        acquisition: AcquisitionManager | None = None,
     ) -> dict:
         """Real acquisition -> live model -> live HI features -> warning."""
-        status = self.acquisition.status()
-        rows, timestamps = self.acquisition.numeric_matrix()
+        active_acquisition = acquisition or self.acquisition
+        status = active_acquisition.status()
+        rows, timestamps = active_acquisition.numeric_matrix()
         config = status.get("config") or {}
         requested_schema = (
             dataset_schema

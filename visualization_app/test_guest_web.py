@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import io
 import json
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from acquisition import AcquisitionManager
@@ -104,6 +107,154 @@ class PublicDeviceStatusTests(unittest.TestCase):
             self.assertEqual(
                 manager.latest_check_result()["interfaces"][0]["state"], "ok"
             )
+
+
+class GuestSimulationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name).resolve()
+        self.source = self.root / "source.csv"
+        self.source.write_text("温度,压力\n350,400\n", encoding="utf-8")
+        self.profile = {
+            "source_type": "single_csv",
+            "path": str(self.source),
+        }
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def _module(self):
+        spec = importlib.util.find_spec("guest_simulation")
+        self.assertIsNotNone(
+            spec, "guest_simulation must isolate anonymous acquisition sessions"
+        )
+        return importlib.import_module("guest_simulation")
+
+    def _manager(self, **overrides):
+        module = self._module()
+        options = {
+            "root": self.root / "public_simulation",
+            "source_profiles": {"builtin": self.profile},
+            "per_session_bytes": 256 * 1024 * 1024,
+            "total_bytes": 2 * 1024 * 1024 * 1024,
+            "max_running": 4,
+        }
+        options.update(overrides)
+        return module.GuestSimulationManager(**options)
+
+    def test_two_guest_sessions_use_distinct_managers_and_save_roots(self):
+        manager = self._manager()
+        first_id = "a" * 32
+        second_id = "b" * 32
+
+        first = manager.ensure_session(first_id)
+        second = manager.ensure_session(second_id)
+
+        self.assertIsNot(first.acquisition, second.acquisition)
+        self.assertEqual(first.save_root, manager.root / first_id)
+        self.assertEqual(second.save_root, manager.root / second_id)
+
+    def test_guest_payload_cannot_select_real_driver_or_arbitrary_path(self):
+        manager = self._manager()
+        session_id = "a" * 32
+
+        config = manager.safe_config(
+            session_id,
+            {
+                "acquisition_mode": "real",
+                "driver": "m3232_pressure",
+                "save_root": "C:\\Windows",
+                "simulation_source_type": "mysql",
+                "simulation_mysql_password": "attacker-password",
+                "mysql_enabled": True,
+                "source_profile": "builtin",
+                "selected_sensors": ["温度", "压力"],
+            },
+        )
+
+        self.assertEqual(config.acquisition_mode, "simulation")
+        self.assertEqual(config.driver, "simulator")
+        self.assertEqual(config.save_root, str(manager.root / session_id))
+        self.assertEqual(config.simulation_source_type, "single_csv")
+        self.assertEqual(config.simulation_mysql_password, "")
+        self.assertFalse(config.mysql_enabled)
+
+    def test_invalid_guest_session_id_is_rejected_before_path_creation(self):
+        module = self._module()
+        manager = self._manager()
+
+        with self.assertRaises(module.GuestSimulationError) as raised:
+            manager.ensure_session("../outside")
+
+        self.assertEqual(raised.exception.code, "invalid_guest_session")
+        self.assertFalse((self.root / "outside").exists())
+
+    def test_per_session_quota_is_checked_before_start(self):
+        module = self._module()
+        manager = self._manager(per_session_bytes=8)
+        session_id = "a" * 32
+        session = manager.ensure_session(session_id)
+        (session.save_root / "existing.bin").write_bytes(b"123456789")
+
+        with self.assertRaises(module.GuestSimulationError) as raised:
+            manager.start(session_id, {"source_profile": "builtin"})
+
+        self.assertEqual(raised.exception.code, "guest_quota_exceeded")
+        self.assertFalse(session.acquisition.status()["running"])
+
+    def test_download_contains_only_current_guest_directory(self):
+        manager = self._manager()
+        first_id = "a" * 32
+        second_id = "b" * 32
+        first = manager.ensure_session(first_id)
+        second = manager.ensure_session(second_id)
+        (first.save_root / "result.csv").write_bytes(b"x\n1\n")
+        (second.save_root / "secret.csv").write_bytes(b"secret")
+
+        raw, name = manager.download_archive(first_id)
+
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            self.assertEqual(archive.namelist(), ["result.csv"])
+            self.assertEqual(archive.read("result.csv"), b"x\n1\n")
+        self.assertNotIn(b"secret", raw)
+        self.assertEqual(name, f"afp_simulation_{first_id}.zip")
+
+    def test_dashboard_live_uses_the_guest_acquisition_argument(self):
+        from app import DashboardData
+
+        def source(marker):
+            return SimpleNamespace(
+                status=lambda: {
+                    "marker": marker,
+                    "config": {
+                        "processing_mode": "capture_only",
+                        "dataset_schema": "legacy_original",
+                        "selected_sensors": ["温度"],
+                    },
+                },
+                numeric_matrix=lambda: ([{"温度": 350.0}], [0.0]),
+            )
+
+        dashboard = DashboardData.__new__(DashboardData)
+        dashboard.acquisition = source("real")
+        dashboard._capture_only_live = lambda **kwargs: {
+            "source_marker": kwargs["status"]["marker"]
+        }
+
+        payload = dashboard.live(
+            sensor_id=0,
+            history=48,
+            step=1,
+            threshold=0.5,
+            rho=0.5,
+            indicator="TC-HI",
+            model_kind="random_forest",
+            prediction_horizon=24,
+            processing_mode="capture_only",
+            acquisition=source("guest"),
+        )
+
+        self.assertEqual(payload["source_marker"], "guest")
 
 
 if __name__ == "__main__":
