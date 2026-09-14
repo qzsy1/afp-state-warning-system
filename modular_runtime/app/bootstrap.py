@@ -75,6 +75,11 @@ def _emit_command_result(context: Any, command: str, result: dict[str, Any]) -> 
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
+def _persist_lan_web_status(context: Any, status: dict[str, Any]) -> None:
+    path = context.paths.runtime_dir / "lan_web_status.json"
+    path.write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def self_test(context: Any, manager: Any) -> dict[str, Any]:
     required = [
         context.paths.legacy_dir / "app.py",
@@ -399,22 +404,51 @@ def functional_smoke(context: Any, manager: Any) -> dict[str, Any]:
 
 
 def launch(context: Any, manager: Any) -> None:
-    try:
-        import webview
-    except ImportError as exc:
-        raise RuntimeError("桌面界面组件缺失，请使用已打包的软件或安装 pywebview。") from exc
+    from lan_web import LanWebConfig, discover_lan_urls, safe_network_status
+
+    config = LanWebConfig.from_mapping(context.config.get("lan_web", {}))
+    bind_host = config.bind_host if config.enabled else "127.0.0.1"
+    urls = discover_lan_urls(config.port, bind_host) if config.enabled else []
     legacy_app = _legacy_module("app", context)
-    server = legacy_app.create_server("127.0.0.1", 0)
+    initial_status = safe_network_status(config, urls, started_at=None)
+    try:
+        server = legacy_app.create_server(bind_host, config.port, initial_status)
+    except OSError as exc:
+        failed_status = safe_network_status(
+            config,
+            urls,
+            started_at=None,
+            error=f"无法绑定局域网端口 {config.port}：{exc}",
+        )
+        _persist_lan_web_status(context, failed_status)
+        raise RuntimeError(
+            f"局域网服务启动失败：端口 {config.port} 可能已被占用，请关闭占用程序后重试。"
+        ) from exc
+    _persist_lan_web_status(
+        context,
+        safe_network_status(
+            config,
+            urls,
+            started_at=getattr(server, "service_started_at", time.time()),
+        ),
+    )
     thread = threading.Thread(target=server.serve_forever, name="AFP-local-ui", daemon=True)
     thread.start()
     deadline = time.time() + 10.0
     while not thread.is_alive() and time.time() < deadline:
         time.sleep(0.02)
     try:
+        if not config.open_desktop_window:
+            thread.join()
+            return
+        try:
+            import webview
+        except ImportError as exc:
+            raise RuntimeError("桌面界面组件缺失，请使用已打包的软件或安装 pywebview。") from exc
         ui_config = context.config.get("ui", {})
         webview.create_window(
             str(ui_config.get("title", "AFP 实时预测、状态预警与模型训练系统（模块化版）")),
-            f"http://127.0.0.1:{server.server_port}/",
+            f"http://127.0.0.1:{config.port}/",
             width=int(ui_config.get("width", 1660)),
             height=int(ui_config.get("height", 1040)),
             min_size=(1180, 760),

@@ -4,9 +4,13 @@ import hashlib
 import json
 import sys
 import tempfile
+import threading
+import time
+import types
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 
 RUNTIME_ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +21,7 @@ for path in (CORE_DIR, RUNTIME_ROOT / "app"):
 
 from contracts import PredictionFrame, SampleFrame  # noqa: E402
 from context import RuntimeContext  # noqa: E402
+import bootstrap  # noqa: E402
 from update_manager import UpdateManager  # noqa: E402
 
 
@@ -122,6 +127,69 @@ class UpdateTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 UpdateManager(context).install(archive)
             self.assertFalse((root.parent / "outside.txt").exists())
+
+
+class LaunchTests(unittest.TestCase):
+    def test_launch_uses_configured_fixed_port_and_lan_bind(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "config").mkdir()
+            (root / "config" / "runtime.json").write_text(
+                json.dumps(
+                    {
+                        "api_version": "2.0",
+                        "paths": {"runtime_dir": "runtime"},
+                        "lan_web": {
+                            "enabled": True,
+                            "bind_host": "0.0.0.0",
+                            "port": 8770,
+                            "open_desktop_window": True,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            context = RuntimeContext.load(root)
+            context.prepare()
+            fake_server = _FakeServer(8770)
+            legacy = types.SimpleNamespace(create_server=MagicMock(return_value=fake_server))
+            webview = types.SimpleNamespace(
+                create_window=MagicMock(),
+                start=MagicMock(side_effect=KeyboardInterrupt),
+            )
+            with patch.object(bootstrap, "_legacy_module", return_value=legacy), patch.dict(
+                sys.modules, {"webview": webview}
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    bootstrap.launch(context, MagicMock())
+            legacy.create_server.assert_called_once()
+            self.assertEqual(
+                legacy.create_server.call_args.args[:2], ("0.0.0.0", 8770)
+            )
+            self.assertTrue(
+                webview.create_window.call_args.args[1].endswith("127.0.0.1:8770/")
+            )
+            status = json.loads(
+                (root / "runtime" / "lan_web_status.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(status["port"], 8770)
+
+
+class _FakeServer:
+    def __init__(self, port: int) -> None:
+        self.server_port = port
+        self.service_started_at = time.time()
+        self._stopped = threading.Event()
+
+    def serve_forever(self) -> None:
+        while not self._stopped.wait(0.01):
+            pass
+
+    def shutdown(self) -> None:
+        self._stopped.set()
+
+    def server_close(self) -> None:
+        self._stopped.set()
 
 
 if __name__ == "__main__":
