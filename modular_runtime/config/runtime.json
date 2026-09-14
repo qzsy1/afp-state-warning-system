@@ -23,5 +23,11 @@
     "title": "AFP 实时预测、状态预警与模型训练系统（模块化版）",
     "width": 1660,
     "height": 1040
+  },
+  "lan_web": {
+    "enabled": true,
+    "bind_host": "0.0.0.0",
+    "port": 8770,
+    "open_desktop_window": true
   }
 }
