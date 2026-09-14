@@ -560,7 +560,8 @@ def _build_tool_plan_payload(model_name: str, context: DiagnosticToolContext) ->
                     "你是AFP工业采集接口诊断Agent的工具规划器。根据异常现象自主选择必要的"
                     "只读取证工具，覆盖每个异常接口，但不要机械调用全部工具。只输出JSON对象："
                     '{"tool_calls":[{"name":"工具名","arguments":{}}]}。'
-                    "只能使用available_tools中的名称和参数；最多12次调用，不得输出诊断结论。"
+                    "不要解释和展开推理，立即输出工具计划。只能使用available_tools中的名称和参数；"
+                    "最多8次调用，不得输出诊断结论。"
                 ),
             },
             {
@@ -570,7 +571,7 @@ def _build_tool_plan_payload(model_name: str, context: DiagnosticToolContext) ->
                         "case": {
                             "task": "按异常现象选择只读取证工具",
                             "events": compact_events,
-                            "limits": {"max_tool_calls": 12, "read_only": True},
+                            "limits": {"max_tool_calls": 8, "read_only": True},
                         },
                         "available_tools": available_tools,
                     },
@@ -582,7 +583,7 @@ def _build_tool_plan_payload(model_name: str, context: DiagnosticToolContext) ->
         "response_format": {"type": "json_object"},
         "stream": True,
         "temperature": 0.1,
-        "max_tokens": 1536,
+        "max_tokens": 768,
     }
 
 
@@ -653,7 +654,7 @@ def run_siliconflow_planned_agent(
     covered_interface_ids: set[str] = set()
     seen_calls: set[str] = set()
     tool_call_count = 0
-    for raw_call in calls[:12]:
+    for raw_call in calls[:8]:
         if not isinstance(raw_call, dict):
             continue
         tool_name = str(raw_call.get("name") or "")
