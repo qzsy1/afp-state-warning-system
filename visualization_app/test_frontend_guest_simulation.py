@@ -52,6 +52,16 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertNotIn("downloadSimulationButton", index)
         self.assertNotIn("downloadSimulationSource", text)
 
+    def test_pairing_feedback_is_rendered_in_helper_panel(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("async function pairLocalHelper()")
+        end = text.index("function showRealAccessModal", start)
+        body = text[start:end]
+        self.assertIn("正在生成配对码", body)
+        self.assertIn("配对码生成失败：", body)
+        self.assertIn("button.disabled = false", body)
+
     def test_runtime_status_identifies_simulation_streams(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")

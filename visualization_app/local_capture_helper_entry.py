@@ -115,16 +115,59 @@ def run_forever(server_url: str, pairing_token: str, device_id: str) -> None:
                     pass
 
 
-def main() -> None:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AFP本地采集辅助程序")
-    parser.add_argument("--server", required=True, help="wss://辅助服务地址")
+    parser.add_argument("--server", default="", help="网页服务地址，例如 https://afp.example.com")
     parser.add_argument("--pairing-token", default="")
     parser.add_argument("--pairing-challenge", default="")
     parser.add_argument("--device-id", default="local-helper")
     parser.add_argument("--transport", choices=("https", "wss"), default="https")
-    args = parser.parse_args()
+    return parser
+
+
+def resolve_runtime_args(
+    argv: list[str] | None = None,
+    *,
+    input_fn=input,
+    output_fn=print,
+) -> argparse.Namespace | None:
+    """Resolve CLI arguments without silently exiting when double-clicked.
+
+    A console EXE launched from Explorer has no command-line arguments.  In
+    that case we provide a small pairing prompt instead of letting argparse
+    terminate the process before the user can read the reason.
+    """
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if not args.server:
+        output_fn("本地采集辅助程序需要网页地址和配对码。")
+        output_fn("网页地址示例：http://127.0.0.1:8770 或 https://你的域名")
+        try:
+            args.server = str(input_fn("请输入网页地址：")).strip()
+        except (EOFError, OSError):
+            return None
+        if not args.server:
+            output_fn("未输入网页地址，辅助程序未启动。")
+            return None
     if not args.pairing_token and not args.pairing_challenge:
-        parser.error("必须提供 --pairing-token 或 --pairing-challenge")
+        try:
+            args.pairing_challenge = str(input_fn("请输入网页端生成的配对码：")).strip()
+        except (EOFError, OSError):
+            return None
+        if not args.pairing_challenge:
+            output_fn("未输入配对码，辅助程序未启动。")
+            return None
+    return args
+
+
+def main() -> None:
+    args = resolve_runtime_args()
+    if args is None:
+        try:
+            input("按回车关闭窗口……")
+        except (EOFError, OSError):
+            pass
+        return
     if args.pairing_challenge:
         bootstrap = HelperTransport(args.server, "", device_id=args.device_id)
         paired = bootstrap.http_json(

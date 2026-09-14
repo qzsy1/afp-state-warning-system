@@ -154,13 +154,36 @@ async function loadHelperStatus() {
 }
 
 async function pairLocalHelper() {
-  if (state.accessRole === "guest") return;
-  const result = await postJson("/api/helper/pair/start", {});
-  if (!result?.ok) throw new Error(result?.error || "配对码生成失败");
-  state.helperPairingChallenge = String(result.challenge || "");
-  state.helperStatus = {...state.helperStatus, paired: false, online: false};
-  renderHelperStatus();
-  toast("配对码已生成，请在本机采集辅助程序中输入");
+  const button = $("pairHelperButton");
+  const note = $("helperStatusNote");
+  if (state.accessRole === "guest") {
+    if (note) note.textContent = "当前是访客模式；请先在 HTTPS 公网地址解锁真实模式，再生成配对码。";
+    return;
+  }
+  if (button) {
+    button.disabled = true;
+    button.textContent = "正在生成配对码…";
+  }
+  if (note) note.textContent = "正在生成一次性配对码，请稍候……";
+  try {
+    const result = await postJson("/api/helper/pair/start", {});
+    if (!result?.ok) throw new Error(result?.error || "配对码生成失败");
+    state.helperPairingChallenge = String(result.challenge || "");
+    state.helperStatus = {...state.helperStatus, paired: false, online: false, lastError: ""};
+    renderHelperStatus();
+    if (note) note.textContent = "配对码已生成；请将下方代码输入本机辅助程序，保持辅助程序运行。";
+    toast("配对码已生成，请在本机采集辅助程序中输入");
+  } catch (error) {
+    state.helperStatus = {...state.helperStatus, lastError: error.message || String(error)};
+    renderHelperStatus();
+    if (note) note.textContent = `配对码生成失败：${error.message || error}`;
+    throw error;
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "重新生成配对码";
+    }
+  }
 }
 
 function showRealAccessModal() {
