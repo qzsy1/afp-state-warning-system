@@ -150,6 +150,32 @@ def is_secure_request(
     return bool(loopback and forwarded.strip().lower() == "https")
 
 
+def is_trusted_quick_tunnel_request(
+    peer_host: str,
+    host: str,
+    headers: Mapping[str, str],
+) -> bool:
+    """Accept a random Quick Tunnel host only from a local HTTPS proxy.
+
+    Quick Tunnels use a new ``*.trycloudflare.com`` hostname on each run and
+    therefore cannot be preconfigured in the application's host allow-list.
+    ``cloudflared`` connects to the origin over loopback and forwards HTTPS;
+    requiring both properties prevents a remote client from spoofing the
+    forwarded headers to bypass the allow-list.
+    """
+
+    peer = str(peer_host or "").strip().lower()
+    normalized_host = str(host or "").strip().lower().split(":", 1)[0].rstrip(".")
+    forwarded = str(headers.get("X-Forwarded-Proto", "")).split(",", 1)[0]
+    has_cloudflare_ip = bool(str(headers.get("CF-Connecting-IP", "")).strip())
+    return (
+        peer in {"127.0.0.1", "::1", "localhost"}
+        and normalized_host.endswith(".trycloudflare.com")
+        and forwarded.strip().lower() == "https"
+        and has_cloudflare_ip
+    )
+
+
 class SlidingWindowLimiter:
     """Thread-safe fixed-count limiter with an optional temporary block."""
 

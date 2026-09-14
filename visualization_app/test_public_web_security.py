@@ -205,6 +205,31 @@ class PublicWebAccessTests(unittest.TestCase):
             is_secure_request("192.168.1.50", {"Host": "127.0.0.1:8770"}, "public")
         )
 
+    def test_quick_tunnel_host_requires_cloudflare_https_from_loopback(self):
+        from web_access import is_trusted_quick_tunnel_request
+
+        self.assertTrue(
+            is_trusted_quick_tunnel_request(
+                "127.0.0.1",
+                "temporary-check.trycloudflare.com",
+                {"X-Forwarded-Proto": "https", "CF-Connecting-IP": "203.0.113.10"},
+            )
+        )
+        self.assertFalse(
+            is_trusted_quick_tunnel_request(
+                "192.168.1.50",
+                "temporary-check.trycloudflare.com",
+                {"X-Forwarded-Proto": "https", "CF-Connecting-IP": "203.0.113.10"},
+            )
+        )
+        self.assertFalse(
+            is_trusted_quick_tunnel_request(
+                "127.0.0.1",
+                "attacker.example.com",
+                {"X-Forwarded-Proto": "https", "CF-Connecting-IP": "203.0.113.10"},
+            )
+        )
+
 
 class PublicWebHttpTests(unittest.TestCase):
     def setUp(self) -> None:

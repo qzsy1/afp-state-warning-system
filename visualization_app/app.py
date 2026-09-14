@@ -67,6 +67,7 @@ from web_access import (
     RequestIdentity,
     SlidingWindowLimiter,
     is_secure_request,
+    is_trusted_quick_tunnel_request,
 )
 from web_auth import AuthenticationError, SecurityStore
 from control_lease import RealControlLease
@@ -3956,7 +3957,18 @@ class AppHandler(BaseHTTPRequestHandler):
             host = urlsplit(f"http://{host_header}").hostname
         except ValueError:
             return False
-        return bool(host and host.lower() in self._allowed_hosts())
+        if not host:
+            return False
+        normalized_host = host.lower()
+        if normalized_host in self._allowed_hosts():
+            return True
+        # Quick Tunnels receive a random trycloudflare.com hostname, so it
+        # cannot be listed in runtime.json ahead of time.  Trust it only when
+        # cloudflared is the loopback HTTPS proxy, never from a LAN client.
+        peer_host = str(self.client_address[0] if self.client_address else "")
+        return is_trusted_quick_tunnel_request(
+            peer_host, normalized_host, self.headers
+        )
 
     def _is_allowed_origin(self) -> bool:
         if not self._is_allowed_host():
