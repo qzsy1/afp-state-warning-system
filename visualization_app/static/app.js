@@ -34,6 +34,7 @@ const state = {
   agentRequestId: 0,
   agentDefaultKeyAvailable: false,
   physicalInterfaces: [],
+  lanStatusTimer: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -41,6 +42,52 @@ const $ = (id) => document.getElementById(id);
 const agentApiKeyInput = $("agentApiKeyInput");
 const agentModelNameInput = $("agentModelNameInput");
 const agentDiagnoseButton = $("agentDiagnoseButton");
+
+function setLanWebStatus(mode, url = "", stateClass = "") {
+  const panel = $("lan-web-status");
+  const modeNode = $("lan-web-mode");
+  const urlNode = $("lan-web-url");
+  if (modeNode) modeNode.textContent = mode;
+  if (urlNode) urlNode.textContent = url || "请查看采集电脑网络设置";
+  panel?.classList.toggle("connected", stateClass === "connected");
+  panel?.classList.toggle("error", stateClass === "error");
+}
+
+async function refreshLanWebStatus() {
+  const response = await fetch("/api/network/status", {cache: "no-store"});
+  const status = await response.json();
+  if (!response.ok) throw new Error(status.error || "局域网状态读取失败");
+  const urls = Array.isArray(status.urls) ? status.urls : [];
+  const mode = status.error ? "启动失败" : status.enabled ? "局域网已开启" : "仅本机";
+  setLanWebStatus(mode, urls[0] || status.desktop_url, status.error ? "error" : "connected");
+  return status;
+}
+
+function markServerDisconnected() {
+  setLanWebStatus("服务器连接中断，采集仍在服务器运行", "", "error");
+}
+
+async function copyLanWebUrl() {
+  const url = $("lan-web-url")?.textContent?.trim();
+  if (!url || url.startsWith("请查看")) {
+    toast("当前还没有可复制的局域网网址");
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(url);
+    toast("局域网网址已复制");
+  } catch (_error) {
+    const fallback = document.createElement("textarea");
+    fallback.value = url;
+    fallback.style.position = "fixed";
+    fallback.style.opacity = "0";
+    document.body.appendChild(fallback);
+    fallback.select();
+    document.execCommand("copy");
+    fallback.remove();
+    toast("局域网网址已复制");
+  }
+}
 
 // Keep the alignment control beside the horizon control even when an older
 // cached index.html is opened by the browser or an older packaged build.
@@ -1722,6 +1769,7 @@ async function loadRealtime() {
   } catch (error) {
     stopPlayback();
     toast(error.message);
+    markServerDisconnected();
     $("connectionStatus").textContent = "实时数据服务连接失败";
     $("streamStatus").textContent = "数据服务异常";
     document.querySelector(".live-dot")?.classList.remove("active");
@@ -2330,6 +2378,11 @@ function renderLayerProgress(layers) {
 
 async function initialize() {
   try {
+    refreshLanWebStatus().catch(() => markServerDisconnected());
+    window.clearInterval(state.lanStatusTimer);
+    state.lanStatusTimer = window.setInterval(() => {
+      refreshLanWebStatus().catch(() => markServerDisconnected());
+    }, 10000);
     await loadAgentDefaults();
     syncLocalMysqlSection();
     syncTargetMysqlSection();
@@ -2479,6 +2532,7 @@ $("testSensorsButton").addEventListener("click", () => testSensorConnection({aut
 agentApiKeyInput?.addEventListener("input", handleAgentInputChange);
 agentModelNameInput?.addEventListener("input", handleAgentInputChange);
 agentDiagnoseButton?.addEventListener("click", () => runAgentDiagnosis({automatic: false}));
+$("lan-web-copy")?.addEventListener("click", copyLanWebUrl);
 controls.resetSensorCheck?.addEventListener("click", resetAndCheckHardware);
 controls.autoHardwareCheck?.addEventListener("change", () => {
   if (!controls.autoHardwareCheck.checked && state.hardwareCheckTimer) {

@@ -23,6 +23,11 @@
         <div class="system-status-item wide"><div><small>数据位置</small><b id="streamPosition">等待开始</b></div></div>
         <div class="system-status-item meta"><div><small>数据集 / 模型信息</small><b id="datasetMeta">正在加载数据流信息……</b></div></div>
       </div>
+      <div id="lan-web-status" class="lan-web-status" role="status" aria-live="polite">
+        <div><small>局域网访问</small><b id="lan-web-mode">正在检测</b></div>
+        <button id="lan-web-copy" class="lan-web-copy" type="button" title="复制局域网访问网址">复制网址</button>
+        <span id="lan-web-url" class="lan-web-url">等待服务地址</span>
+      </div>
     </header>
 
     <div class="workspace-grid">

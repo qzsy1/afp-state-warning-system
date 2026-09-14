@@ -78,6 +78,15 @@ def mixed_interface_result() -> dict:
 
 
 class InterfaceAgentTests(unittest.TestCase):
+    def test_existing_ui_exposes_lan_access_status(self) -> None:
+        html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn('id="lan-web-status"', html)
+        self.assertIn('id="lan-web-url"', html)
+        self.assertIn('id="lan-web-copy"', html)
+        self.assertIn("/api/network/status", script)
+        self.assertIn("markServerDisconnected", script)
+
     def test_interface_ui_exposes_physical_binding_and_shared_nic_rules(self) -> None:
         html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
         script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")

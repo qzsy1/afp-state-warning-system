@@ -230,7 +230,7 @@ git commit -m "feat: launch modular app on fixed LAN port"
 - Modify: `visualization_app/static/index.html`
 - Modify: `visualization_app/static/app.js`
 - Modify: `visualization_app/static/styles.css`
-- Modify: `interface_monitor_demo/tests/test_frontend_contract.py` if the existing contract covers the page markers
+- Modify: `visualization_app/test_interface_agent.py`
 
 **Interfaces:**
 - Adds a compact status element with id `lan-web-status` and child elements `lan-web-mode`, `lan-web-url`, `lan-web-copy`.
@@ -250,7 +250,7 @@ def test_lan_status_controls_are_present(self):
 
 - [ ] **Step 2: Run the frontend contract test and verify it fails.**
 
-Run: `python -m unittest interface_monitor_demo.tests.test_frontend_contract -v`
+Run: `python -m unittest visualization_app.test_interface_agent.InterfaceAgentTests.test_existing_ui_exposes_lan_access_status -v`
 Expected: missing LAN status marker failure.
 
 - [ ] **Step 3: Add the status markup and minimal styles.**
@@ -276,7 +276,7 @@ function markServerDisconnected() {
 
 - [ ] **Step 5: Run frontend tests and commit.**
 
-Run: `python -m unittest interface_monitor_demo.tests.test_frontend_contract -v`
+Run: `python -m unittest visualization_app.test_interface_agent.InterfaceAgentTests.test_existing_ui_exposes_lan_access_status -v`
 Expected: all frontend contract tests pass.
 
 ```text
