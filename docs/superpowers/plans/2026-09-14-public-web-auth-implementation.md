@@ -1053,10 +1053,10 @@ Run:
 ```powershell
 git status --short
 git log -1 --oneline
-git tag public-web-implementation-baseline c991623
+git tag public-web-implementation-baseline
 ```
 
-Expected: clean working tree before tagging; baseline tag points to the approved design/plan history.
+Expected: clean working tree before tagging; baseline tag points to the approved design and implementation plan immediately before production-code changes.
 
 - [ ] **Step 2: Run all focused and existing regression suites**
 
