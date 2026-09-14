@@ -41,6 +41,27 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
             "guest access changes the acquisition mode after the initial control setup",
         )
 
+    def test_guest_upload_restarts_simulation_without_download_ui(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("async function uploadSimulationSource()")
+        end = text.index("function acquisitionConfig()", start)
+        body = text[start:end]
+        self.assertIn('"/api/simulation/start"', body)
+        self.assertIn("正在用新数据重新开始模拟采集", body)
+        index = source.with_name("index.html").read_text(encoding="utf-8")
+        self.assertNotIn("downloadSimulationButton", index)
+        self.assertNotIn("downloadSimulationSource", text)
+
+    def test_runtime_status_identifies_simulation_streams(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("function renderRuntimeStatus(payload = state.payload)")
+        end = text.index("function renderRemoteMysqlPreview", start)
+        body = text[start:end]
+        self.assertIn('const simulation = acquisition.config?.acquisition_mode === "simulation";', body)
+        self.assertIn('simulation ? "模拟采集" : "真实采集"', body)
+
 
 if __name__ == "__main__":
     unittest.main()

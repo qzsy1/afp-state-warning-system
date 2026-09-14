@@ -784,6 +784,7 @@ function renderRuntimeStatus(payload = state.payload) {
   const acquisition = payload?.acquisition || {};
   const captureOnly = acquisition.config?.processing_mode === "capture_only"
     || controls.processingMode.value === "capture_only";
+  const simulation = acquisition.config?.acquisition_mode === "simulation";
   const windowData = payload?.window || {};
   const warningState = windowData.state_label || "等待窗口证据";
   let label;
@@ -791,9 +792,9 @@ function renderRuntimeStatus(payload = state.payload) {
     label = `采集错误：${acquisition.last_error}`;
   } else if (acquisition.running) {
     if (captureOnly) {
-      label = `真实采集中（仅保存） · ${acquisition.sample_count || 0}点`;
+      label = `${simulation ? "模拟采集" : "真实采集"}中（仅保存） · ${acquisition.sample_count || 0}点`;
     } else if (!acquisition.model_ready) {
-      label = `真实采集中（等待预测输入） · ${acquisition.sample_count || 0}点`;
+      label = `${simulation ? "模拟采集" : "真实采集"}中（等待预测输入） · ${acquisition.sample_count || 0}点`;
     } else if (windowData.complete) {
       label = `采集＋预测预警运行中 · 窗口${warningState}`;
     } else {
@@ -3609,7 +3610,6 @@ Object.assign(controls, {
   selectSimulationSource: $("selectSimulationSourceButton"),
   simulationSourceFile: $("simulationSourceFileInput"),
   simulationSourceNote: $("simulationSourceNote"),
-  downloadSimulation: $("downloadSimulationButton"),
   simulationSourcePathLabel: $("simulationSourcePathLabel"),
   simulationMysqlSettings: $("simulationMysqlSettings"),
   simulationMysqlHost: $("simulationMysqlHostInput"),
@@ -3651,9 +3651,6 @@ function updateSimulationSettings() {
       "文件夹按工况与独立重复命名；每层保留分层文件，完整试样始终覆盖为同一份当前数据文件。";
   }
   controls.simulationSettings?.classList.toggle("hidden", !simulation);
-  controls.downloadSimulation?.classList.toggle(
-    "hidden", !simulation || state.accessRole !== "guest"
-  );
   if (controls.interfaceDiscoveryStatus && simulation) {
     controls.interfaceDiscoveryStatus.textContent =
       "模拟采集不需要识别物理接口；仅使用当前选择的 CSV/文件夹/MySQL 数据源";
@@ -3671,7 +3668,7 @@ function updateSimulationSettings() {
     controls.simulationSourceNote.textContent = state.accessRole === "guest"
       ? (mysql
         ? "访客 MySQL 使用本机管理员预先配置的数据源；如需导入本机文件，请切换为单 CSV或CSV文件夹并点击“选择”。"
-        : "访客网页可直接选择本机 CSV 上传；数据仅进入当前访客模拟会话，停止后可下载。")
+        : "访客模式已自动载入管理员提供的模拟 CSV；数据直接用于采集、预测和预警。点击“选择”可导入本机 CSV或文件夹，导入后立即重新开始模拟采集。")
       : "模拟模式使用所选文件夹、CSV或MySQL数据逐行读取；真实接口模式不会读取本地文件。";
   }
   if (controls.simulationSourcePath) {
@@ -3801,9 +3798,28 @@ async function uploadSimulationSource() {
       source_type: sourceType,
       files: uploaded,
     }, {timeoutMs: 120000});
-    controls.simulationSourcePath.value = result.name || result.path || "已上传模拟数据";
+    controls.simulationSourcePath.value = result.name || result.path || "已导入模拟数据";
     if (controls.simulationSourceNote) controls.simulationSourceNote.textContent =
-      `已载入 ${result.name || "模拟数据"}；点击“停止并保存”后可下载本次结果。`;
+      `已导入 ${result.name || "模拟数据"}，正在用新数据重新开始模拟采集……`;
+    if (state.accessRole === "guest") {
+      const wasRunning = Boolean(state.acquisitionStatus?.running);
+      if (wasRunning) {
+        await postJson("/api/simulation/stop", {}, {timeoutMs: 30000});
+        state.guestSimulationStarted = false;
+      }
+      const restarted = await postJson(
+        "/api/simulation/start",
+        acquisitionConfig(),
+        {timeoutMs: 30000},
+      );
+      state.guestSimulationStarted = true;
+      state.guestSimulationStoppedByUser = false;
+      renderAcquisitionStatus(restarted);
+      controls.dataMode.value = "live";
+      configureDataMode();
+      if (controls.simulationSourceNote) controls.simulationSourceNote.textContent =
+        `已使用 ${result.name || "导入数据"} 开始模拟采集；预测、预警和保存均基于该数据。`;
+    }
     toast("模拟数据已载入");
   } catch (error) {
     if (controls.simulationSourceNote) controls.simulationSourceNote.textContent = `模拟数据上传失败：${error.message}`;
@@ -3812,15 +3828,6 @@ async function uploadSimulationSource() {
     if (button) button.disabled = false;
     picker.value = "";
   }
-}
-
-function downloadSimulationSource() {
-  const link = document.createElement("a");
-  link.href = "/api/simulation/download";
-  link.download = "afp_simulation.zip";
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
 }
 
 function acquisitionConfig() {
@@ -3916,7 +3923,6 @@ controls.acquisitionMode?.addEventListener("change", () => {
 controls.simulationSourceType?.addEventListener("change", updateSimulationSettings);
 controls.selectSimulationSource?.addEventListener("click", selectSimulationSource);
 controls.simulationSourceFile?.addEventListener("change", uploadSimulationSource);
-controls.downloadSimulation?.addEventListener("click", downloadSimulationSource);
 controls.integrationSourceType?.addEventListener("change", updateIntegrationSource);
 controls.selectIntegrationFolder?.addEventListener("click", selectIntegrationFolder);
 controls.runIntegration?.addEventListener("click", runIntegration);
