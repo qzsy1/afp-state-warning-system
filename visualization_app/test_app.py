@@ -698,6 +698,7 @@ class LanServerTests(unittest.TestCase):
                     "urls": ["http://127.0.0.1:8770/"],
                     "api_key": "must-not-leak",
                 },
+                access_context="local_admin",
             )
         cls.thread = __import__("threading").Thread(
             target=cls.server.serve_forever, daemon=True

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hmac
 import inspect
 import io
 import json
@@ -9,10 +10,12 @@ import math
 import mimetypes
 import os
 import re
+import secrets
 import sys
 import threading
 import time
 import webbrowser
+from http.cookies import SimpleCookie
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -54,6 +57,15 @@ from new_collection_health import (
     NewCollectionHealthEngine,
 )
 from web_training import WebTrainingManager
+from guest_simulation import GuestSimulationError, GuestSimulationManager
+from public_status import build_public_device_status
+from web_access import (
+    PermissionPolicy,
+    RequestIdentity,
+    SlidingWindowLimiter,
+    is_secure_request,
+)
+from web_auth import AuthenticationError, SecurityStore
 
 
 APP_DIR = Path(os.environ.get("AFP_LEGACY_APP_DIR") or Path(__file__).resolve().parent).resolve()
@@ -3894,6 +3906,11 @@ class DashboardData:
 
 class AppHandler(BaseHTTPRequestHandler):
     dashboard: DashboardData
+    security_store: SecurityStore
+    guest_manager: GuestSimulationManager
+    access_context: str = "public"
+    permission_policy = PermissionPolicy()
+    login_limiter = SlidingWindowLimiter()
     network_status: dict[str, Any] = {}
     service_started_at: float = 0.0
 
@@ -3943,6 +3960,128 @@ class AppHandler(BaseHTTPRequestHandler):
         self._send_json({"error": "请求来源或 Host 不被允许"}, HTTPStatus.FORBIDDEN)
         return True
 
+    def _request_cookies(self) -> dict[str, str]:
+        if hasattr(self, "_parsed_cookies"):
+            return self._parsed_cookies
+        parsed: dict[str, str] = {}
+        try:
+            jar = SimpleCookie()
+            jar.load(str(self.headers.get("Cookie", "")))
+            parsed = {name: morsel.value for name, morsel in jar.items()}
+        except Exception:
+            parsed = {}
+        self._parsed_cookies = parsed
+        return parsed
+
+    def _queue_cookie(
+        self,
+        name: str,
+        value: str,
+        *,
+        http_only: bool,
+        same_site: str,
+        max_age: int | None = None,
+        secure: bool | None = None,
+    ) -> None:
+        parts = [f"{name}={value}", "Path=/", f"SameSite={same_site}"]
+        if http_only:
+            parts.append("HttpOnly")
+        if max_age is not None:
+            parts.append(f"Max-Age={int(max_age)}")
+        use_secure = self._is_secure_transport() if secure is None else bool(secure)
+        if use_secure:
+            parts.append("Secure")
+        pending = getattr(self, "_pending_cookies", None)
+        if pending is None:
+            pending = []
+            self._pending_cookies = pending
+        pending.append("; ".join(parts))
+
+    def _ensure_browser_cookies(self) -> None:
+        cookies = self._request_cookies()
+        guest_id = str(cookies.get("afp_guest") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{32,64}", guest_id):
+            guest_id = secrets.token_urlsafe(24)
+            cookies["afp_guest"] = guest_id
+            self._queue_cookie(
+                "afp_guest", guest_id, http_only=True, same_site="Lax"
+            )
+        csrf = str(cookies.get("afp_csrf") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{32,64}", csrf):
+            csrf = secrets.token_urlsafe(32)
+            cookies["afp_csrf"] = csrf
+            self._queue_cookie(
+                "afp_csrf", csrf, http_only=False, same_site="Strict"
+            )
+
+    def _is_secure_transport(self) -> bool:
+        peer_host = str(self.client_address[0] if self.client_address else "")
+        return is_secure_request(peer_host, self.headers, self.access_context)
+
+    def _remote_label(self) -> str:
+        peer_host = str(self.client_address[0] if self.client_address else "")
+        if peer_host in {"127.0.0.1", "::1"}:
+            forwarded = str(self.headers.get("CF-Connecting-IP", "")).strip()
+            if re.fullmatch(r"[0-9A-Fa-f:.]{2,64}", forwarded):
+                return forwarded
+        return peer_host[:200]
+
+    def _identity(self) -> RequestIdentity:
+        cached = getattr(self, "_request_identity", None)
+        if cached is not None:
+            return cached
+        self._ensure_browser_cookies()
+        cookies = self._request_cookies()
+        guest_id = str(cookies["afp_guest"])
+        peer_host = str(self.client_address[0] if self.client_address else "")
+        if self.access_context == "local_admin" and peer_host in {
+            "127.0.0.1",
+            "::1",
+        }:
+            identity = RequestIdentity("local_admin", "local-admin", guest_id)
+        else:
+            token = str(cookies.get("afp_session") or "")
+            session = self.security_store.resolve_session(token) if token else None
+            if session is None:
+                identity = RequestIdentity("guest", None, guest_id)
+            else:
+                identity = RequestIdentity(
+                    "authorized", session.session_id, guest_id
+                )
+                self._queue_cookie(
+                    "afp_session",
+                    token,
+                    http_only=True,
+                    same_site="Strict",
+                    max_age=2147483647,
+                )
+        self._request_identity = identity
+        return identity
+
+    def _require_permission(self, method: str, path: str) -> bool:
+        decision = self.permission_policy.authorize(method, path, self._identity())
+        if decision.allowed:
+            return True
+        self._send_json({"error": decision.error}, HTTPStatus(decision.status))
+        return False
+
+    def _require_csrf(self) -> bool:
+        if self._identity().role == "local_admin":
+            return True
+        expected = str(self._request_cookies().get("afp_csrf") or "")
+        supplied = str(self.headers.get("X-AFP-CSRF", ""))
+        if expected and supplied and hmac.compare_digest(expected, supplied):
+            return True
+        self._send_json({"error": "csrf_failed"}, HTTPStatus.FORBIDDEN)
+        return False
+
+    def _send_security_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "same-origin")
+        for value in getattr(self, "_pending_cookies", []):
+            self.send_header("Set-Cookie", value)
+        self._pending_cookies = []
+
     def _begin_operation(self, name: str) -> threading.Lock | None:
         now = time.monotonic()
         with _OPERATION_LOCKS_GUARD:
@@ -3979,6 +4118,7 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "no-store")
+        self._send_security_headers()
         self.end_headers()
         self.wfile.write(raw)
 
@@ -3991,6 +4131,7 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", f"{mime or 'application/octet-stream'}; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
+        self._send_security_headers()
         self.end_headers()
         self.wfile.write(raw)
 
@@ -4007,6 +4148,7 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Disposition", f'attachment; filename="{safe_name}"')
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "no-store")
+        self._send_security_headers()
         self.end_headers()
         self.wfile.write(raw)
 
@@ -4014,11 +4156,65 @@ class AppHandler(BaseHTTPRequestHandler):
     def _one(query: dict[str, list[str]], key: str, default: str) -> str:
         return query.get(key, [default])[0]
 
+    def _live_payload(
+        self,
+        query: dict[str, list[str]],
+        acquisition: AcquisitionManager | None = None,
+    ) -> dict:
+        return self.dashboard.live(
+            sensor_id=int(self._one(query, "sensor", "2")),
+            history=int(self._one(query, "history", "240")),
+            step=int(self._one(query, "step", "1")),
+            threshold=float(self._one(query, "threshold", "0.5")),
+            rho=float(self._one(query, "rho", "0.5")),
+            indicator=self._one(query, "indicator", "TC-HI"),
+            model_kind=self._one(query, "model", "random_forest"),
+            prediction_horizon=int(
+                self._one(query, "prediction_horizon", "24")
+            ),
+            forecast_lead=int(self._one(query, "forecast_lead", "1")),
+            use_optimized_warning=self._one(
+                query, "use_optimized_warning", "true"
+            ).lower()
+            in {"1", "true", "yes", "on"},
+            prediction_sensors=(
+                (
+                    []
+                    if self._one(query, "prediction_sensors", "__none__")
+                    == "__none__"
+                    else [
+                        name
+                        for name in self._one(
+                            query, "prediction_sensors", ""
+                        ).split(",")
+                        if name in ALL_SENSOR_COLUMNS
+                    ]
+                )
+                if "prediction_sensors" in query
+                else None
+            ),
+            processing_mode=self._one(
+                query, "processing_mode", "prediction_warning"
+            ),
+            dataset_schema=self._one(
+                query, "dataset_schema", "legacy_original"
+            ),
+            prediction_model_type=self._one(
+                query, "prediction_model_type", "i_T_G"
+            ),
+            acquisition=acquisition,
+        )
+
     def do_GET(self) -> None:  # noqa: N802
         if not self._is_allowed_host():
             self._send_json({"error": "请求 Host 不被允许"}, HTTPStatus.FORBIDDEN)
             return
         parsed = urlparse(self.path)
+        self._ensure_browser_cookies()
+        if parsed.path.startswith("/api/") and not self._require_permission(
+            "GET", parsed.path
+        ):
+            return
         if parsed.path == "/api/health":
             self._send_json(
                 {"status": "ok", "version": APP_VERSION, "build_id": BUILD_ID}
@@ -4026,6 +4222,52 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/network/status":
             self._send_network_status()
+            return
+        if parsed.path == "/api/auth/session":
+            identity = self._identity()
+            safe_status = self.security_store.safe_status()
+            self._send_json(
+                {
+                    "authenticated": identity.role in {"authorized", "local_admin"},
+                    "role": identity.role,
+                    "model_access": bool(
+                        identity.role in {"authorized", "local_admin"}
+                        and safe_status.get("model_configured")
+                    ),
+                    "secure_transport": self._is_secure_transport(),
+                    "csrf_ready": bool(self._request_cookies().get("afp_csrf")),
+                }
+            )
+            return
+        if parsed.path == "/api/public/device-status":
+            self._send_json(
+                build_public_device_status(
+                    None,
+                    self.dashboard.acquisition.latest_check_result(),
+                    self.dashboard.acquisition.status(),
+                )
+            )
+            return
+        if parsed.path == "/api/simulation/status":
+            self._send_json(self.guest_manager.status(self._identity().guest_id))
+            return
+        if parsed.path == "/api/simulation/live":
+            try:
+                query = parse_qs(parsed.query)
+                self._send_json(
+                    self._live_payload(
+                        query,
+                        self.guest_manager.acquisition(self._identity().guest_id),
+                    )
+                )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/simulation/download":
+            raw, filename = self.guest_manager.download_archive(
+                self._identity().guest_id
+            )
+            self._send_download(raw, filename, "application/zip")
             return
         if parsed.path == "/api/agent/defaults":
             from interface_agent import get_agent_defaults
@@ -4055,52 +4297,7 @@ class AppHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/live":
             try:
                 query = parse_qs(parsed.query)
-                payload = self.dashboard.live(
-                    sensor_id=int(self._one(query, "sensor", "2")),
-                    history=int(self._one(query, "history", "240")),
-                    step=int(self._one(query, "step", "1")),
-                    threshold=float(self._one(query, "threshold", "0.5")),
-                    rho=float(self._one(query, "rho", "0.5")),
-                    indicator=self._one(query, "indicator", "TC-HI"),
-                    model_kind=self._one(
-                        query, "model", "random_forest"
-                    ),
-                    prediction_horizon=int(
-                        self._one(query, "prediction_horizon", "24")
-                    ),
-                    forecast_lead=int(
-                        self._one(query, "forecast_lead", "1")
-                    ),
-                    use_optimized_warning=self._one(
-                        query, "use_optimized_warning", "true"
-                    ).lower() in {"1", "true", "yes", "on"},
-                    prediction_sensors=(
-                        (
-                            []
-                            if self._one(
-                                query, "prediction_sensors", "__none__"
-                            ) == "__none__"
-                            else [
-                                name
-                                for name in self._one(
-                                    query, "prediction_sensors", ""
-                                ).split(",")
-                                if name in ALL_SENSOR_COLUMNS
-                            ]
-                        )
-                        if "prediction_sensors" in query
-                        else None
-                    ),
-                    processing_mode=self._one(
-                        query, "processing_mode", "prediction_warning"
-                    ),
-                    dataset_schema=self._one(
-                        query, "dataset_schema", "legacy_original"
-                    ),
-                    prediction_model_type=self._one(
-                        query, "prediction_model_type", "i_T_G"
-                    ),
-                )
+                payload = self._live_payload(query)
                 self._send_json(payload)
             except Exception as exc:
                 self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
@@ -4172,6 +4369,14 @@ class AppHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if self._reject_unsafe_request():
             return
+        self._ensure_browser_cookies()
+        if not self._require_permission("POST", parsed.path):
+            return
+        if not self._require_csrf():
+            return
+        if parsed.path == "/api/auth/login" and not self._is_secure_transport():
+            self._send_json({"error": "https_required"}, HTTPStatus.UPGRADE_REQUIRED)
+            return
         content_type = str(self.headers.get("Content-Type", "")).lower()
         if not content_type.startswith("application/json"):
             self._send_json(
@@ -4205,6 +4410,73 @@ class AppHandler(BaseHTTPRequestHandler):
             payload = json.loads(body.decode("utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("请求体必须是JSON对象")
+            if parsed.path == "/api/auth/login":
+                remote_key = self._remote_label() or "unknown"
+                if self.login_limiter.blocked("login", remote_key) or (
+                    self.login_limiter.count("login", remote_key, 600.0) >= 5
+                ):
+                    self._send_json(
+                        {"error": "login_rate_limited"},
+                        HTTPStatus.TOO_MANY_REQUESTS,
+                    )
+                    return
+                try:
+                    token, session = self.security_store.authenticate(
+                        str(payload.get("password") or ""),
+                        str(self.headers.get("User-Agent", "")),
+                        remote_key,
+                    )
+                except AuthenticationError:
+                    self.login_limiter.allow("login", remote_key, 5, 600.0)
+                    if self.login_limiter.count("login", remote_key, 600.0) >= 5:
+                        self.login_limiter.block("login", remote_key, 900.0)
+                    self._send_json(
+                        {"error": "authentication_failed"},
+                        HTTPStatus.UNAUTHORIZED,
+                    )
+                    return
+                self.login_limiter.clear("login", remote_key)
+                self._queue_cookie(
+                    "afp_session",
+                    token,
+                    http_only=True,
+                    same_site="Strict",
+                    max_age=2147483647,
+                )
+                self._request_identity = RequestIdentity(
+                    "authorized", session.session_id, self._identity().guest_id
+                )
+                safe_status = self.security_store.safe_status()
+                self._send_json(
+                    {
+                        "authenticated": True,
+                        "role": "authorized",
+                        "model_access": bool(safe_status.get("model_configured")),
+                    }
+                )
+                return
+            if parsed.path == "/api/auth/logout":
+                token = str(self._request_cookies().get("afp_session") or "")
+                self.security_store.logout(token)
+                self._queue_cookie(
+                    "afp_session",
+                    "",
+                    http_only=True,
+                    same_site="Strict",
+                    max_age=0,
+                )
+                self._send_json({"authenticated": False, "role": "guest"})
+                return
+            if parsed.path == "/api/simulation/start":
+                self._send_json(
+                    self.guest_manager.start(self._identity().guest_id, payload)
+                )
+                return
+            if parsed.path == "/api/simulation/stop":
+                self._send_json(
+                    self.guest_manager.stop(self._identity().guest_id)
+                )
+                return
             if parsed.path == "/api/agent/diagnose":
                 from interface_agent import run_interface_diagnoses
 
@@ -4384,6 +4656,11 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._send_json(self.dashboard.acquisition.stop())
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
+        except GuestSimulationError as exc:
+            self._send_json(
+                {"error": exc.code, "message": str(exc)},
+                HTTPStatus.BAD_REQUEST,
+            )
         except Exception as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         finally:
@@ -4398,13 +4675,41 @@ def create_server(
     host: str = "127.0.0.1",
     port: int = 8765,
     network_status: dict[str, Any] | None = None,
+    *,
+    dashboard: DashboardData | None = None,
+    security_store: SecurityStore | None = None,
+    guest_manager: GuestSimulationManager | None = None,
+    access_context: str = "public",
 ) -> ThreadingHTTPServer:
-    dashboard = DashboardData()
+    active_dashboard = dashboard or DashboardData()
+    runtime_root = (APP_DIR.parent / "runtime").resolve()
+    active_security_store = security_store or SecurityStore(
+        runtime_root / "public_web_security.sqlite3"
+    )
+    simulation_source = APP_DIR / "new_collection_demo_v11_3" / "simulator_stream.csv"
+    if not simulation_source.is_file():
+        simulation_source = DATA_DIR / "dashboard_candidate_catalog.csv"
+    capture_root = Path(
+        getattr(active_dashboard.acquisition, "capture_root", runtime_root / "capture")
+    ).resolve()
+    active_guest_manager = guest_manager or GuestSimulationManager(
+        capture_root / "public_simulation",
+        {
+            "builtin": {
+                "source_type": "single_csv",
+                "path": str(simulation_source),
+            }
+        },
+    )
     handler = type(
         "ConfiguredAppHandler",
         (AppHandler,),
         {
-            "dashboard": dashboard,
+            "dashboard": active_dashboard,
+            "security_store": active_security_store,
+            "guest_manager": active_guest_manager,
+            "access_context": str(access_context),
+            "login_limiter": SlidingWindowLimiter(),
             "network_status": dict(network_status or {}),
             "service_started_at": time.time(),
         },
@@ -4412,6 +4717,10 @@ def create_server(
     server = ThreadingHTTPServer((host, port), handler)
     server.network_status = handler.network_status
     server.service_started_at = handler.service_started_at
+    server.dashboard = active_dashboard
+    server.security_store = active_security_store
+    server.guest_manager = active_guest_manager
+    server.access_context = handler.access_context
     return server
 
 
