@@ -7,6 +7,12 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 
+_NON_LAN_NETWORKS = tuple(
+    ipaddress.ip_network(value)
+    for value in ("198.18.0.0/15", "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")
+)
+
+
 @dataclass(frozen=True, slots=True)
 class LanWebConfig:
     enabled: bool = True
@@ -68,6 +74,7 @@ def discover_lan_urls(port: int, bind_host: str = "0.0.0.0") -> list[str]:
             or address.is_loopback
             or address.is_link_local
             or not address.is_private
+            or any(address in network for network in _NON_LAN_NETWORKS)
         ):
             continue
         candidates.append(address)

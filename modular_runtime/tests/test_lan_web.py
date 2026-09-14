@@ -28,7 +28,13 @@ class LanWebConfigTests(unittest.TestCase):
     def test_filters_loopback_and_apipa(self):
         with patch(
             "lan_web._iter_ipv4_addresses",
-            return_value=["127.0.0.1", "169.254.20.3", "192.168.1.20", "10.0.0.8"],
+            return_value=[
+                "127.0.0.1",
+                "169.254.20.3",
+                "192.168.1.20",
+                "10.0.0.8",
+                "198.18.0.1",
+            ],
         ):
             self.assertEqual(
                 discover_lan_urls(8770),
