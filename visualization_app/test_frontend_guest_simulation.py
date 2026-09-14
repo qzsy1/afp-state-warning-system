@@ -114,6 +114,18 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn("allowSerialFallback = true", text)
         self.assertIn("allowSerialFallback: false", text)
 
+    def test_real_mapping_never_uses_serial_fallback_for_usb_profiles(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("function autoAssignPhysicalInterfaces")
+        end = text.index("function refreshPhysicalInterfaceOptions", start)
+        body = text[start:end]
+        self.assertIn(
+            "allowSerialFallback && profile.physical_kind === \"serial\"",
+            body,
+            "real discovery must keep USB HID/UVC roles on protocol-compatible interfaces",
+        )
+
     def test_switching_to_simulation_rebuilds_logical_catalog_instead_of_reusing_real_bindings(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")

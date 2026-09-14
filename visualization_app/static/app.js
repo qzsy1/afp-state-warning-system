@@ -3554,7 +3554,10 @@ function autoAssignPhysicalInterfaces(configs, {allowSerialFallback = true} = {}
     if (!selected) {
       selected = candidates.find((candidate) => compatible(candidate, profile) && candidate.detected !== false && !used.has(candidate.id));
     }
-    if (!selected && allowSerialFallback) {
+    // A serial fallback is only meaningful for serial protocols.  In real
+    // mode a missing USB HID/UVC device must remain unassigned instead of
+    // silently binding to an unrelated COM port.
+    if (!selected && allowSerialFallback && profile.physical_kind === "serial") {
       selected = candidates.find((candidate) => (normalizedKind(candidate) === "serial" || normalizedKind(candidate) === "com") && candidate.detected !== false && !used.has(candidate.id));
       fallback = Boolean(selected);
     }
