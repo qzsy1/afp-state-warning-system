@@ -4958,6 +4958,14 @@ class AppHandler(BaseHTTPRequestHandler):
                     result["error_detail"] = classify_mysql_error(result.get("error"))
                 self._send_json(result)
                 return
+            if parsed.path == "/api/mysql/preflight":
+                settings = mysql_settings_from_mapping(payload)
+                result = MySQLCaptureStore(settings).preflight(
+                    require_schema=bool(payload.get("require_schema", True)),
+                    write_test=bool(payload.get("write_test", False)),
+                )
+                self._send_json(result)
+                return
             if parsed.path == "/api/mysql/relation-map":
                 settings = mysql_settings_from_mapping(payload)
                 result = MySQLCaptureStore(settings).relation_map(

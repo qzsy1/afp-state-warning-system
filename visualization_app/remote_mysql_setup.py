@@ -89,6 +89,12 @@ def classify_mysql_error(error: Any) -> dict[str, str]:
 
     text = str(error or "未知错误")
     lowered = text.lower()
+    if "mysql driver" in lowered or "mysql 驱动" in lowered or "mysql 驱动" in text:
+        return {
+            "category": "driver",
+            "code": "",
+            "message": "当前运行环境没有可用的MySQL驱动，请安装mysql-connector-python或PyMySQL",
+        }
     code = ""
     match = re.search(r"\b(10(?:44|45|49)|1130|1146|2003|2005|2061)\b", text)
     if match:

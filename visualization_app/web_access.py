@@ -63,6 +63,7 @@ AUTHORIZED_POST = {
     "/api/training/stop",
     "/api/training/select-file",
     "/api/mysql/test",
+    "/api/mysql/preflight",
     "/api/mysql/relation-map",
     "/api/mysql/query",
     "/api/mysql/export-csv",

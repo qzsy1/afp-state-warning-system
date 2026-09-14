@@ -718,6 +718,104 @@ class MySQLCaptureStore:
             if connection is not None:
                 connection.close()
 
+    def preflight(
+        self,
+        *,
+        require_schema: bool = True,
+        write_test: bool = False,
+    ) -> dict[str, Any]:
+        """Return a staged, actionable MySQL readiness diagnosis.
+
+        Unlike :meth:`test_connection`, this method never creates a database
+        or alters the schema.  ``write_test`` inserts one harmless row into
+        the upload log inside a transaction and rolls it back, proving that
+        the configured account can perform the operation used by capture
+        saving without leaving test data behind.
+        """
+        started = time.time()
+        base: dict[str, Any] = {
+            "ok": False,
+            "enabled": bool(self.settings.enabled),
+            "stage": "disabled",
+            "host": self.settings.host,
+            "port": self.settings.port,
+            "database": self.settings.database,
+            "driver": "",
+            "schema_ready": False,
+            "missing_objects": [],
+            "write_test": False,
+            "elapsed_seconds": 0.0,
+        }
+        if not self.settings.enabled:
+            base["error"] = "MySQL保存未启用"
+            base["error_detail"] = {
+                "category": "disabled",
+                "code": "",
+                "message": "请先启用MySQL保存",
+            }
+            return base
+
+        # Keep error wording consistent with the existing web diagnostics
+        # without importing the HTTP application module (which would cycle).
+        from remote_mysql_setup import classify_mysql_error
+
+        connection = None
+        cursor = None
+        try:
+            base["stage"] = "connect"
+            driver, connection = self._connect(self.settings.database)
+            base["driver"] = driver
+            cursor = self._cursor(connection)
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+
+            base["stage"] = "schema"
+            missing: list[str] = []
+            if require_schema:
+                names = sorted(REQUIRED_SCHEMA_OBJECTS)
+                placeholders = ",".join(["%s"] * len(names))
+                cursor.execute(
+                    "SELECT TABLE_NAME FROM information_schema.TABLES "
+                    f"WHERE TABLE_SCHEMA=%s AND TABLE_NAME IN ({placeholders})",
+                    (self.settings.database, *names),
+                )
+                existing = {str(row[0]).lower() for row in cursor.fetchall()}
+                missing = [name for name in names if name.lower() not in existing]
+            base["missing_objects"] = missing
+            base["schema_ready"] = not missing
+            if missing:
+                base["error"] = "AFP数据库表结构不完整"
+                base["error_detail"] = {
+                    "category": "database",
+                    "code": "",
+                    "message": "数据库已连接，但缺少AFP关系表",
+                }
+                return base | {"elapsed_seconds": round(time.time() - started, 3)}
+
+            if write_test:
+                base["stage"] = "write"
+                cursor.execute(
+                    "INSERT INTO afp_mysql_upload_log "
+                    "(specimen_key, layer_no, success, row_count, created_at) "
+                    "VALUES (%s, %s, %s, %s, NOW(3))",
+                    ("__afp_preflight__", 0, 0, 0),
+                )
+                connection.rollback()
+                base["write_test"] = True
+
+            base["stage"] = "ready"
+            base["ok"] = True
+            return base | {"elapsed_seconds": round(time.time() - started, 3)}
+        except Exception as exc:
+            base["error"] = str(exc)
+            base["error_detail"] = classify_mysql_error(exc)
+            return base | {"elapsed_seconds": round(time.time() - started, 3)}
+        finally:
+            if cursor is not None:
+                cursor.close()
+            if connection is not None:
+                connection.close()
+
     def test_connection(self) -> dict[str, Any]:
         """Compatibility entry point: verify first, initialize only if needed."""
         if not self.settings.enabled:

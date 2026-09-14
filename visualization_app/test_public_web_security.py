@@ -168,6 +168,19 @@ class PublicWebAccessTests(unittest.TestCase):
         self.assertFalse(denied.allowed)
         self.assertEqual(denied.error, "real_access_required")
 
+    def test_mysql_preflight_requires_authorized_session(self):
+        from web_access import PermissionPolicy, RequestIdentity
+
+        policy = PermissionPolicy()
+        guest = RequestIdentity("guest", None, "guest-a")
+        authorized = RequestIdentity("authorized", "session-a", "guest-a")
+
+        denied = policy.authorize("POST", "/api/mysql/preflight", guest)
+        self.assertFalse(denied.allowed)
+        self.assertTrue(
+            policy.authorize("POST", "/api/mysql/preflight", authorized).allowed
+        )
+
     def test_authorized_session_can_use_real_routes_but_not_admin_routes(self):
         from web_access import PermissionPolicy, RequestIdentity
 
