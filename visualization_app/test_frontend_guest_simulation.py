@@ -67,6 +67,21 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn("SUPPLIED_SIMULATION_SOURCE", text)
         self.assertIn('acquisition["simulation_source_name"] = default_source', text)
 
+    def test_simulation_interface_checkbox_follows_loaded_channel_mapping(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("function refreshPhysicalInterfaceOptions")
+        end = text.index("function itemEnabledForSimulation", start)
+        body = text[start:end]
+        self.assertIn("enabled.checked = available.length > 0;", body)
+        self.assertIn("模拟可用：${available.join", body)
+
+    def test_save_directory_status_is_checked_against_server_folder(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        self.assertIn("/api/acquisition/save-status?path=", text)
+        self.assertIn("当前采集不保存数据", text)
+
 
 if __name__ == "__main__":
     unittest.main()

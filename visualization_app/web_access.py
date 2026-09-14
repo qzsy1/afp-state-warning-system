@@ -38,6 +38,7 @@ AUTHORIZED_GET = {
     "/api/bootstrap",
     "/api/mysql/defaults",
     "/api/acquisition/status",
+    "/api/acquisition/save-status",
     "/api/acquisition/discover",
     "/api/live",
     "/api/view",

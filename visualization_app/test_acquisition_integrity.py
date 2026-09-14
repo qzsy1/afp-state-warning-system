@@ -18,11 +18,91 @@ from acquisition import (  # noqa: E402
     MySQLSettings,
     NEW_COLLECTION_SENSOR_COLUMNS,
     SimulatorDriver,
+    check_capture_save_root,
+    default_capture_interfaces,
 )
 from training_data import read_excel_or_folder  # noqa: E402
 
 
 class AcquisitionIntegrityTests(unittest.TestCase):
+    def test_simulation_check_reports_each_mapped_interface_as_available(self) -> None:
+        interfaces = default_capture_interfaces()
+        assignments = {
+            "thermocouple_8ch": [f"温度{index}" for index in range(1, 9)],
+            "plc_process": ["温度", "压力", "张力"],
+            "uvc_temperature": ["ROI平均温度"],
+            "abb_motion": ["线速度", "ABB_X", "ABB_Y", "ABB_Z"],
+            "m3232_pressure": ["薄膜压力"],
+        }
+        config = AcquisitionConfig(
+            driver="simulator",
+            acquisition_mode="simulation",
+            dataset_schema="new_collection_v11_3",
+            simulation_source_path=str(
+                Path(r"F:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv")
+            ),
+            source_file=str(
+                Path(r"F:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv")
+            ),
+            interfaces=interfaces,
+            interface_channel_assignments=assignments,
+            selected_sensors=NEW_COLLECTION_SENSOR_COLUMNS.copy(),
+        )
+        result = AcquisitionManager().test_connection(config, timeout_seconds=0.1)
+        self.assertEqual(
+            {item["id"] for item in result["interfaces"]},
+            set(assignments),
+        )
+        self.assertTrue(all(item["enabled"] for item in result["interfaces"]))
+        self.assertTrue(all(item["ok"] for item in result["interfaces"]))
+        self.assertEqual(
+            result["interfaces"][-1]["detected_channels"], ["薄膜压力"]
+        )
+
+    def test_save_root_status_requires_existing_writable_nonempty_directory(self) -> None:
+        self.assertFalse(check_capture_save_root("")["ok"])
+        with tempfile.TemporaryDirectory() as temporary:
+            existing = Path(temporary)
+            status = check_capture_save_root(str(existing))
+            self.assertTrue(status["ok"])
+            missing = existing / "does-not-exist"
+            missing_status = check_capture_save_root(str(missing))
+            self.assertFalse(missing_status["ok"])
+            self.assertFalse(missing.exists())
+
+    def test_empty_save_root_keeps_simulation_in_memory_without_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "default"
+            source = Path(temporary) / "simulation.csv"
+            columns = [
+                "转速", "位移", *[f"温度{index}" for index in range(1, 9)], "压力", "振动"
+            ]
+            with source.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=columns)
+                writer.writeheader()
+                writer.writerows({name: index + 1 for name in columns} for index in range(8))
+            manager = AcquisitionManager(root)
+            config = AcquisitionConfig(
+                driver="simulator",
+                source_file=str(source),
+                sample_rate_hz=1000.0,
+                selected_sensors=[
+                    "转速", "位移", *[f"温度{index}" for index in range(1, 9)], "压力", "振动"
+                ],
+                save_root="",
+            )
+            manager.start(config)
+            deadline = time.time() + 3.0
+            while manager.status()["sample_count"] < 8 and time.time() < deadline:
+                time.sleep(0.02)
+            stopped = manager.stop()
+            self.assertGreaterEqual(stopped["sample_count"], 8)
+            self.assertFalse(stopped["capture_saved"])
+            self.assertFalse(stopped["save_enabled"])
+            self.assertIsNone(stopped["raw_file"])
+            self.assertEqual(stopped["save_status"]["code"], "empty")
+            self.assertEqual(list(root.rglob("*")), [])
+
     def test_physical_binding_allows_plc_and_abb_to_share_one_ethernet_adapter(self) -> None:
         interfaces = [
             {
@@ -217,6 +297,7 @@ class AcquisitionIntegrityTests(unittest.TestCase):
         self, root: Path, source: Path, layer: int, target_rows: int = 20
     ) -> dict:
         manager = AcquisitionManager(root / "unused")
+        (root / "capture").mkdir(parents=True, exist_ok=True)
         config = AcquisitionConfig(
             processing_mode="capture_only",
             dataset_schema="new_collection_v11_3",
@@ -270,6 +351,7 @@ class AcquisitionIntegrityTests(unittest.TestCase):
             root = Path(temporary)
             source = self._source(root)
             manager = AcquisitionManager(root / "unused")
+            (root / "capture").mkdir(parents=True, exist_ok=True)
             selected = ["温度", "压力"]
             config = AcquisitionConfig(
                 processing_mode="capture_only",
@@ -620,6 +702,7 @@ class AcquisitionIntegrityTests(unittest.TestCase):
             root = Path(temporary)
             source = self._source(root)
             manager = AcquisitionManager(root / "unused")
+            (root / "capture").mkdir(parents=True, exist_ok=True)
             config = AcquisitionConfig(
                 processing_mode="capture_only",
                 dataset_schema="new_collection_v11_3",
@@ -668,6 +751,7 @@ class AcquisitionIntegrityTests(unittest.TestCase):
             root = Path(temporary)
             source = self._source(root)
             manager = AcquisitionManager(root / "unused")
+            (root / "capture").mkdir(parents=True, exist_ok=True)
             config = AcquisitionConfig(
                 processing_mode="capture_only",
                 dataset_schema="new_collection_v11_3",
@@ -743,6 +827,7 @@ class AcquisitionIntegrityTests(unittest.TestCase):
             root = Path(temporary)
             source = self._source(root)
             manager = AcquisitionManager(root / "unused")
+            (root / "capture").mkdir(parents=True, exist_ok=True)
             first = AcquisitionConfig(
                 processing_mode="capture_only",
                 dataset_schema="new_collection_v11_3",

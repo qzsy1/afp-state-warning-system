@@ -41,6 +41,7 @@ from acquisition import (
     AcquisitionManager,
     NEW_COLLECTION_SENSOR_COLUMNS,
     SENSOR_COLUMNS,
+    check_capture_save_root,
     integrate_capture_sources,
     default_capture_interfaces,
     sensor_interface_profiles,
@@ -4470,6 +4471,11 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/acquisition/status":
             self._send_json(self.dashboard.acquisition.status())
+            return
+        if parsed.path == "/api/acquisition/save-status":
+            query = parse_qs(parsed.query)
+            requested = self._one(query, "path", "")
+            self._send_json(check_capture_save_root(requested))
             return
         if parsed.path == "/api/acquisition/export-manifest":
             self._send_json(self.dashboard.acquisition.export_manifest())

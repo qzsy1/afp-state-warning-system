@@ -48,6 +48,7 @@ const state = {
   localSaveAuthorized: false,
   localSaveBusy: false,
   localSaveNameDirty: false,
+  saveStatusTimer: null,
   simulationSourceChannels: [],
 };
 
@@ -303,6 +304,7 @@ const controls = {
   runId: $("runIdInput"),
   liveSpecimen: $("liveSpecimenInput"),
   saveRoot: $("saveRootInput"),
+  saveRootStatus: $("saveRootStatus"),
   confirmLocalSave: $("confirmLocalSaveButton"),
   localSaveStatus: $("localSaveStatus"),
   mysqlEnabled: $("mysqlEnabledInput"),
@@ -688,6 +690,7 @@ async function postJson(url, payload = {}, {timeoutMs = 30000, controller = null
 
 function renderAcquisitionStatus(status) {
   state.acquisitionStatus = status;
+  if (status?.save_status) renderSaveRootStatus(status.save_status);
   const node = $("acquisitionStatus");
   const selected = (status.sensors || []).filter((item) => item.selected);
   // The backend applies the authoritative interface-to-channel routing.  In
@@ -978,6 +981,36 @@ function updateLocalSaveStatus(message, error = false) {
   node.textContent = message;
   node.classList.toggle("error", Boolean(error));
   node.classList.toggle("ok", !error && state.localSaveAuthorized);
+}
+
+function renderSaveRootStatus(status) {
+  const node = controls.saveRootStatus;
+  if (!node) return;
+  const payload = status || {};
+  node.textContent = payload.message || "保存位置为空，当前采集不保存数据";
+  node.classList.toggle("error", !payload.ok);
+  node.classList.toggle("ok", Boolean(payload.ok));
+}
+
+async function refreshSaveRootStatus(path = controls.saveRoot?.value.trim() || "") {
+  if (!path) {
+    renderSaveRootStatus({ok: false, message: "保存位置为空，当前采集不保存数据"});
+    return;
+  }
+  if (state.accessRole === "guest") {
+    renderSaveRootStatus({ok: false, message: "访客模拟数据保存在服务器会话目录；本机文件需另行授权"});
+    return;
+  }
+  try {
+    const response = await fetch(`/api/acquisition/save-status?path=${encodeURIComponent(path)}`, {
+      cache: "no-store", credentials: "same-origin",
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "保存目录检查失败");
+    renderSaveRootStatus(result);
+  } catch (error) {
+    renderSaveRootStatus({ok: false, message: `保存目录检查失败，当前采集不保存数据：${error.message}`});
+  }
 }
 
 async function confirmLocalSave() {
@@ -2713,6 +2746,7 @@ async function initialize() {
     state.localSaveAuthorized = false;
     state.localSaveNameDirty = false;
     updateLocalSaveStatus("未确认本地目录；当前不会保存到访问网页的电脑。");
+    refreshSaveRootStatus();
     state.simulationSourceChannels = Array.isArray(payload.acquisition.simulation_source_channels)
       ? payload.acquisition.simulation_source_channels : [];
     document.querySelectorAll(".interface-config-row").forEach((row) => refreshPhysicalInterfaceOptions(row));
@@ -2885,6 +2919,11 @@ controls.saveRoot?.addEventListener("input", () => {
     state.localSaveDirectoryHandle = null;
     updateLocalSaveStatus("保存位置已改变，请重新确认并授权本地保存。", true);
   }
+  if (state.saveStatusTimer) window.clearTimeout(state.saveStatusTimer);
+  state.saveStatusTimer = window.setTimeout(() => {
+    state.saveStatusTimer = null;
+    refreshSaveRootStatus();
+  }, 300);
 });
 $("selectPredictionModelButton").addEventListener("click", selectPredictionModel);
 controls.predictionModel.addEventListener("change", () => {
@@ -3515,7 +3554,7 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
     const enabled = row.querySelector(".interface-enabled");
     if (enabled) {
       enabled.disabled = false;
-      enabled.checked = itemEnabledForSimulation(row);
+      enabled.checked = available.length > 0;
     }
     let warning = row.querySelector(".interface-physical-warning");
     if (!warning) {

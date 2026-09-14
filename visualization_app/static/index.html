@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AFP 实时预测与状态预警系统</title>
-  <link rel="stylesheet" href="/styles.css?v=20260913-agentic-diagnosis-1">
+  <link rel="stylesheet" href="/styles.css?v=20260915-save-status-1">
 </head>
 <body>
   <div class="app-shell">
@@ -113,10 +113,11 @@
             </div>
             <label>采集数据保存位置
               <span class="path-picker-row">
-                <input id="saveRootInput" type="text" placeholder="网页端默认不保存；填写文件夹名称后授权">
+                <input id="saveRootInput" type="text" placeholder="默认：F:\AFP_Capture；为空时不保存">
                 <button id="selectSaveRootButton" class="secondary-button compact-button" type="button">选择</button>
               </span>
             </label>
+            <p id="saveRootStatus" class="control-note error">保存位置为空，当前采集不保存数据</p>
             <div id="browserLocalSavePanel" class="browser-local-save-panel">
               <div class="path-picker-row">
                 <button id="confirmLocalSaveButton" class="secondary-button" type="button">确认并授权本地保存</button>
@@ -478,6 +479,6 @@
     </div>
   </div>
   <script src="/mysql_visibility.js?v=20260909-mysql-toggle-2"></script>
-  <script src="/app.js?v=20260914-local-save-1"></script>
+  <script src="/app.js?v=20260915-save-status-1"></script>
 </body>
 </html>

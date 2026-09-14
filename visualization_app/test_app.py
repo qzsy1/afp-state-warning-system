@@ -291,6 +291,7 @@ class DashboardTests(unittest.TestCase):
                 run_id="TEST_RUN",
                 specimen_id="TEST_SPECIMEN",
                 layer=0,
+                save_root=str(temporary_path),
             )
             stopped = None
             try:
@@ -478,6 +479,7 @@ class DashboardTests(unittest.TestCase):
     def test_selected_save_root_keeps_layer_and_whole_specimen_files(self) -> None:
         def capture_layer(root: Path, layer: int) -> dict:
             manager = AcquisitionManager(root / "unused_default")
+            (root / "用户选择目录").mkdir(parents=True, exist_ok=True)
             config = AcquisitionConfig(
                 driver="simulator",
                 source_file=str(DEFAULT_SIMULATOR_FILE),

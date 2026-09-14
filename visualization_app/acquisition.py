@@ -4,6 +4,7 @@ import base64
 import csv
 import ctypes
 import hashlib
+import io
 import json
 import math
 import os
@@ -170,6 +171,47 @@ DEFAULT_ABB_PASSWORD = "robotics"
 ABB_ROBTARGET_PATH = (
     "/rw/motionsystem/mechunits/ROB_1/robtarget?coordinate=Base&json=1"
 )
+
+
+def check_capture_save_root(path: str | Path | None) -> dict[str, Any]:
+    """Check whether a requested capture directory may be used for saving.
+
+    The check is intentionally non-creating: an empty path, a missing path, or
+    a path without write permission disables file saving for that run.  A
+    short-lived probe file catches Windows ACL/share failures that
+    ``os.access`` alone can miss.
+    """
+    raw = str(path or "").strip()
+    if not raw:
+        return {"ok": False, "code": "empty", "path": "", "message": "保存位置为空，当前采集不保存数据"}
+    candidate = Path(raw).expanduser()
+    try:
+        candidate = candidate.resolve()
+    except OSError as exc:
+        return {"ok": False, "code": "invalid", "path": raw, "message": f"保存文件夹路径无效，当前采集不保存数据：{exc}"}
+    if not candidate.exists():
+        return {"ok": False, "code": "missing", "path": str(candidate), "message": "没有保存文件权限（保存文件夹不存在），当前采集不保存数据"}
+    if not candidate.is_dir():
+        return {"ok": False, "code": "not_directory", "path": str(candidate), "message": "没有保存文件权限（保存位置不是文件夹），当前采集不保存数据"}
+    probe_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", prefix=".afp_write_check_", suffix=".tmp",
+            dir=candidate, delete=False,
+        ) as probe:
+            probe.write(b"afp-save-check")
+            probe.flush()
+            os.fsync(probe.fileno())
+            probe_path = Path(probe.name)
+        return {"ok": True, "code": "ok", "path": str(candidate), "message": "当前可保存数据到该文件夹下"}
+    except (OSError, PermissionError) as exc:
+        return {"ok": False, "code": "not_writable", "path": str(candidate), "message": f"没有保存文件权限，当前采集不保存数据：{exc}"}
+    finally:
+        if probe_path is not None:
+            try:
+                probe_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 BSV_UVC_WIDTH = 256
 BSV_UVC_HEIGHT = 192
 BSV_UVC_PIXELS = BSV_UVC_WIDTH * BSV_UVC_HEIGHT
@@ -2100,6 +2142,8 @@ class AcquisitionManager:
         self.pending_session_metadata: dict[str, Any] = {}
         self.specimen_folder_name = ""
         self.capture_saved = False
+        self.save_enabled = False
+        self.save_status: dict[str, Any] = check_capture_save_root(self.capture_root)
         self.finalization_complete = False
         self.last_data_quality: dict[str, Any] | None = None
         self.last_file_integrity: dict[str, Any] | None = None
@@ -2397,6 +2441,47 @@ class AcquisitionManager:
                 except Exception:
                     pass
         interface_results: list[dict[str, Any]] = []
+        if config.acquisition_mode == "simulation":
+            # Simulation has no physical probe.  Report the logical interface
+            # mapping from the loaded source so the UI does not mistake the
+            # absence of hardware for a disabled interface.
+            for item in config.interfaces or []:
+                interface_id = str(item.get("id") or "")
+                role = str(item.get("role") or "custom")
+                expected = [
+                    name for name in config.interface_channel_assignments.get(interface_id, [])
+                    if name in selected
+                ]
+                detected = [name for name in expected if received.get(name, 0) > 0]
+                enabled = bool(item.get("enabled", True))
+                if not enabled:
+                    state, message, ok = "disabled", "接口已停用", True
+                elif detected or not expected:
+                    state = "ok"
+                    message = (
+                        f"模拟数据已匹配：{'、'.join(detected)}"
+                        if detected else "模拟数据源已启用，当前未分配通道"
+                    )
+                    ok = True
+                else:
+                    state, message, ok = "no_data", "模拟数据未包含该接口对应通道", False
+                interface_results.append({
+                    "id": interface_id,
+                    "role": role,
+                    "driver": "simulator",
+                    "endpoint": "模拟数据源",
+                    "enabled": enabled,
+                    "expected_channels": expected,
+                    "detected_channels": detected,
+                    "missing_channels": [name for name in expected if name not in detected],
+                    "invalid_channels": [],
+                    "sample_counts": {name: int(received.get(name, 0)) for name in detected},
+                    "invalid_sample_counts": {},
+                    "errors": [],
+                    "state": state,
+                    "message": message,
+                    "ok": ok,
+                })
         for item in ([] if config.acquisition_mode == "simulation" else (config.interfaces or [])):
             interface_id = str(item.get("id") or "")
             endpoint = str(item.get("endpoint") or interface_id or "未填写地址")
@@ -2913,6 +2998,8 @@ class AcquisitionManager:
             self.pending_session_metadata = {}
             self.specimen_folder_name = ""
             self.capture_saved = False
+            self.save_enabled = False
+            self.save_status = check_capture_save_root(config.save_root)
             self.finalization_complete = False
             self.full_specimen_path = None
             self.completed_layers = []
@@ -2927,72 +3014,74 @@ class AcquisitionManager:
             self.stopped_at = None
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             self.session_stamp = stamp
-            selected_root = (
-                Path(config.save_root).expanduser()
-                if config.save_root.strip()
-                else self.capture_root
-            )
-            selected_root = selected_root.resolve()
-            selected_root.mkdir(parents=True, exist_ok=True)
             parameter_token = _parameter_token(config)
             # Storage names intentionally exclude specimen/run identifiers.
             specimen_folder_name = parameter_token
             self.specimen_folder_name = specimen_folder_name
-            self.session_dir = selected_root / specimen_folder_name
-            self.capture_record_dir = self.session_dir / "采集记录"
-            self.capture_record_dir.mkdir(parents=True, exist_ok=True)
-            self.timestamp_path = self.capture_record_dir / (
-                f"{specimen_folder_name}_第{config.layer + 1}层_"
-                f"{stamp}_时间戳.csv"
-            )
-            manifest_path = self.capture_record_dir / (
-                f"{specimen_folder_name}_第{config.layer + 1}层_"
-                f"{stamp}_采集清单.json"
-            )
-            # Use stable Unicode layer names for new captures.  The fallback
-            # pattern in _rebuild_whole_specimen still accepts files created
-            # by earlier builds that used replacement characters.
-            self.raw_path = self.session_dir / (
-                f"{specimen_folder_name}_\u7b2c{config.layer + 1}\u5c42.CSV"
-            )
-            if max(len(str(self.raw_path)), len(str(self.timestamp_path))) > 235:
-                raise ValueError(
-                    "保存路径过长。请改选更短的保存根目录，或缩短试样名。"
+            manifest_path: Path | None = None
+            if self.save_status["ok"]:
+                self.save_enabled = True
+                selected_root = Path(str(self.save_status["path"])).resolve()
+                self.session_dir = selected_root / specimen_folder_name
+                self.capture_record_dir = self.session_dir / "采集记录"
+                self.capture_record_dir.mkdir(parents=True, exist_ok=True)
+                self.timestamp_path = self.capture_record_dir / (
+                    f"{specimen_folder_name}_第{config.layer + 1}层_"
+                    f"{stamp}_时间戳.csv"
                 )
+                manifest_path = self.capture_record_dir / (
+                    f"{specimen_folder_name}_第{config.layer + 1}层_"
+                    f"{stamp}_采集清单.json"
+                )
+                # Use stable Unicode layer names for new captures.  The fallback
+                # pattern in _rebuild_whole_specimen still accepts files created
+                # by earlier builds that used replacement characters.
+                self.raw_path = self.session_dir / (
+                    f"{specimen_folder_name}_\u7b2c{config.layer + 1}\u5c42.CSV"
+                )
+                if max(len(str(self.raw_path)), len(str(self.timestamp_path))) > 235:
+                    raise ValueError(
+                        "保存路径过长。请改选更短的保存根目录，或缩短试样名。"
+                    )
+            else:
+                # Keep the acquisition stream and predictions usable while
+                # routing all file output to memory for this run.
+                self.raw_path = Path("未保存.CSV")
             self.driver = build_driver(config)
             try:
                 self.driver.open()
-                self._prepare_capture_identity(config, specimen_folder_name)
-                self.raw_work_path = self.raw_path.with_name(
-                    f"{self.raw_path.name}.partial"
-                )
-                self.timestamp_work_path = self.timestamp_path.with_name(
-                    f"{self.timestamp_path.name}.partial"
-                )
-                self._archive_orphan_partial(self.raw_work_path)
-                self._archive_orphan_timestamp_partials(specimen_folder_name)
-                self._archive_orphan_partial(self.timestamp_work_path)
-                _atomic_write_json(
-                    manifest_path,
-                    {
-                        **self._public_config(config),
-                        "capture_uuid": self.capture_uuid,
-                        "operator_specimen_id": self.operator_specimen_id,
-                        "started_at": datetime.now().isoformat(timespec="milliseconds"),
-                        "raw_encoding": "gb18030",
-                        "raw_columns": config.raw_columns,
-                        "selected_save_root": str(selected_root),
-                        "specimen_folder": str(self.session_dir),
-                        "layer_file": str(self.raw_path),
-                        "working_layer_file": str(self.raw_work_path),
-                        "timestamp_file": str(self.timestamp_path),
-                        "working_timestamp_file": str(self.timestamp_work_path),
-                        "archived_previous_session": self.archived_previous_session,
-                        "whole_specimen_rule": (
-                            f"{specimen_folder_name}_完整试样.CSV（每层结束后原子覆盖更新）"
-                        ),
-                    },
-                )
+                if self.save_enabled:
+                    self._prepare_capture_identity(config, specimen_folder_name)
+                    self.raw_work_path = self.raw_path.with_name(
+                        f"{self.raw_path.name}.partial"
+                    )
+                    self.timestamp_work_path = self.timestamp_path.with_name(
+                        f"{self.timestamp_path.name}.partial"
+                    )
+                    self._archive_orphan_partial(self.raw_work_path)
+                    self._archive_orphan_timestamp_partials(specimen_folder_name)
+                    self._archive_orphan_partial(self.timestamp_work_path)
+                    _atomic_write_json(
+                        manifest_path,
+                        {
+                            **self._public_config(config),
+                            "capture_uuid": self.capture_uuid,
+                            "operator_specimen_id": self.operator_specimen_id,
+                            "started_at": datetime.now().isoformat(timespec="milliseconds"),
+                            "raw_encoding": "gb18030",
+                            "raw_columns": config.raw_columns,
+                            "selected_save_root": str(selected_root),
+                            "specimen_folder": str(self.session_dir),
+                            "layer_file": str(self.raw_path),
+                            "working_layer_file": str(self.raw_work_path),
+                            "timestamp_file": str(self.timestamp_path),
+                            "working_timestamp_file": str(self.timestamp_work_path),
+                            "archived_previous_session": self.archived_previous_session,
+                            "whole_specimen_rule": (
+                                f"{specimen_folder_name}_完整试样.CSV（每层结束后原子覆盖更新）"
+                            ),
+                        },
+                    )
             except Exception as exc:
                 self.last_error = str(exc)
                 try:
@@ -3082,12 +3171,28 @@ class AcquisitionManager:
     def _run(self) -> None:
         config = self.config
         selected = set(config.selected_sensors or [])
+        raw_target = (
+            self.raw_work_path
+            if self.save_enabled and self.raw_work_path is not None
+            else io.StringIO()
+        )
+        timestamp_target = (
+            self.timestamp_work_path
+            if self.save_enabled and self.timestamp_work_path is not None
+            else io.StringIO()
+        )
         try:
-            with self.raw_work_path.open(
-                "w", encoding="gb18030", newline=""
-            ) as raw_file, self.timestamp_work_path.open(
-                "w", encoding="utf-8-sig", newline=""
-            ) as time_file:
+            raw_context = (
+                raw_target.open("w", encoding="gb18030", newline="")
+                if isinstance(raw_target, Path)
+                else raw_target
+            )
+            timestamp_context = (
+                timestamp_target.open("w", encoding="utf-8-sig", newline="")
+                if isinstance(timestamp_target, Path)
+                else timestamp_target
+            )
+            with raw_context as raw_file, timestamp_context as time_file:
                 writer = csv.DictWriter(
                     raw_file, fieldnames=config.raw_columns
                 )
@@ -3453,6 +3558,10 @@ class AcquisitionManager:
         with self.lock:
             if self.finalization_complete:
                 return self.status()
+            if not self.save_enabled or self.session_dir is None or self.config is None:
+                self.capture_saved = False
+                self.finalization_complete = True
+                return self.status()
             if self.session_dir is not None and self.config is not None:
                 intended_raw_path = self.raw_path
                 specimen_folder_name = (
@@ -3810,6 +3919,8 @@ class AcquisitionManager:
                 "online_buffer_rows": len(self.rows),
                 "capture_uuid": self.capture_uuid or None,
                 "capture_saved": self.capture_saved,
+                "save_enabled": self.save_enabled,
+                "save_status": dict(self.save_status),
                 "started_at": self.started_at,
                 "stopped_at": self.stopped_at,
                 "last_error": self.last_error,
@@ -3821,12 +3932,12 @@ class AcquisitionManager:
                 ),
                 "raw_file": (
                     str(self.raw_path)
-                    if (running or self.capture_saved) and self.raw_path
+                    if self.save_enabled and (running or self.capture_saved) and self.raw_path
                     else None
                 ),
                 "layer_file": (
                     str(self.raw_path)
-                    if (running or self.capture_saved) and self.raw_path
+                    if self.save_enabled and (running or self.capture_saved) and self.raw_path
                     else None
                 ),
                 "full_specimen_file": (
