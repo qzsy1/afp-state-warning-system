@@ -3008,6 +3008,9 @@ class AcquisitionManager:
             self.capture_uuid = ""
             self.operator_specimen_id = ""
             self.session_metadata_path = None
+            self.session_dir = None
+            self.capture_record_dir = None
+            self.timestamp_path = None
             self.raw_work_path = None
             self.timestamp_work_path = None
             self.started_at = time.time()
@@ -3046,7 +3049,7 @@ class AcquisitionManager:
             else:
                 # Keep the acquisition stream and predictions usable while
                 # routing all file output to memory for this run.
-                self.raw_path = Path("未保存.CSV")
+                self.raw_path = None
             self.driver = build_driver(config)
             try:
                 self.driver.open()
@@ -3259,7 +3262,11 @@ class AcquisitionManager:
                             row.update(
                                 {
                                     "cycle": config.cycle,
-                                    "file": self.raw_path.name,
+                                    "file": (
+                                        self.raw_path.name
+                                        if self.raw_path is not None
+                                        else "未保存.CSV"
+                                    ),
                                     "root": config.root,
                                     "p": config.p,
                                     "v": config.v,
@@ -3558,7 +3565,55 @@ class AcquisitionManager:
         with self.lock:
             if self.finalization_complete:
                 return self.status()
-            if not self.save_enabled or self.session_dir is None or self.config is None:
+            if self.config is None:
+                self.capture_saved = False
+                self.finalization_complete = True
+                return self.status()
+            mysql_destinations = self._mysql_destinations(self.config)
+            if not self.save_enabled and not mysql_destinations:
+                self.capture_saved = False
+                self.finalization_complete = True
+                return self.status()
+            # CSV output is optional.  When its directory is empty or
+            # unavailable, still finalize an enabled MySQL destination from
+            # the in-memory rows collected during this run.
+            if not self.save_enabled and self.session_dir is None:
+                rows = list(self.rows)
+                destination_results: dict[str, Any] = {}
+                for destination_name, settings in mysql_destinations:
+                    saved = MySQLCaptureStore(settings).save_layer(
+                        self.config,
+                        rows=rows,
+                        layer_file=None,
+                        full_specimen_file=None,
+                        timestamp_file=None,
+                        folder_path=None,
+                        summary={
+                            "sample_count": len(rows),
+                            "capture_saved": False,
+                            "completed_layers": [],
+                            "in_memory_only": True,
+                        },
+                    )
+                    saved["destination"] = destination_name
+                    saved["pending_retry"] = {"attempted": 0, "succeeded": 0, "failed": 0}
+                    destination_results[destination_name] = saved
+                successful = [item for item in destination_results.values() if item.get("ok")]
+                failed = [item for item in destination_results.values() if not item.get("ok")]
+                self.mysql_status = {
+                    "enabled": True,
+                    "ok": not failed,
+                    "state": "synced" if not failed else "pending",
+                    "saved_rows": sum(int(item.get("saved_rows", 0)) for item in successful),
+                    "destination_count": len(destination_results),
+                    "successful_destinations": len(successful),
+                    "failed_destinations": len(failed),
+                    "destinations": destination_results,
+                    "error": "; ".join(
+                        f"{item.get('destination')}: {item.get('error', '未知错误')}"
+                        for item in failed
+                    ),
+                }
                 self.capture_saved = False
                 self.finalization_complete = True
                 return self.status()
@@ -3685,10 +3740,13 @@ class AcquisitionManager:
                     "replaced_layer_archive": self.replaced_layer_archive,
                     "failed_capture_archive": self.failed_capture_archive,
                 }
-                summary_path = self.capture_record_dir / (
-                    f"{intended_raw_path.stem}_{self.session_stamp}_采集摘要.json"
-                )
-                _atomic_write_json(summary_path, summary)
+                summary_path = None
+                if self.capture_record_dir is not None:
+                    summary_path = self.capture_record_dir / (
+                        f"{intended_raw_path.stem if intended_raw_path is not None else '未保存'}_"
+                        f"{self.session_stamp}_采集摘要.json"
+                    )
+                    _atomic_write_json(summary_path, summary)
                 if self.capture_saved and self.session_metadata_path is not None:
                     metadata = dict(self.pending_session_metadata)
                     metadata.update(
@@ -3697,23 +3755,25 @@ class AcquisitionManager:
                             "last_saved_at": summary["stopped_at"],
                             "completed_layers": summary["completed_layers"],
                             "last_layer": self.config.layer + 1,
-                            "last_summary_file": str(summary_path),
+                            "last_summary_file": str(summary_path) if summary_path else None,
                             "last_file_integrity": integrity,
                         }
                     )
                     _atomic_write_json(self.session_metadata_path, metadata)
-                mysql_destinations = self._mysql_destinations(self.config)
-                if self.capture_saved and mysql_destinations and self.raw_path is not None:
+                if mysql_destinations and self.total_sample_count > 0:
                     mysql_rows = (
                         self._read_layer_rows(self.raw_path)
-                        if self.raw_path.is_file()
-                        else []
+                        if self.capture_saved and self.raw_path is not None and self.raw_path.is_file()
+                        else list(self.rows)
                     )
                     destination_results: dict[str, Any] = {}
                     for destination_name, settings in mysql_destinations:
-                        retry_status = self._retry_pending_mysql(
-                            settings, self.session_dir.parent
+                        retry_root = (
+                            self.session_dir.parent
+                            if self.session_dir is not None
+                            else self.capture_root
                         )
+                        retry_status = self._retry_pending_mysql(settings, retry_root)
                         saved = MySQLCaptureStore(settings).save_layer(
                             self.config,
                             rows=mysql_rows,
@@ -3739,38 +3799,39 @@ class AcquisitionManager:
                         saved["pending_retry"] = retry_status
                         destination_results[destination_name] = saved
                         if not saved.get("ok"):
-                            pending_path = self.capture_record_dir / (
-                                f"{self.raw_path.stem}_{self.session_stamp}_"
-                                f"mysql_{destination_name}_pending.json"
-                            )
-                            pending_config = self._public_config(self.config)
-                            pending_config.update(
-                                {
-                                    "mysql_enabled": True,
-                                    "mysql_local_enabled": False,
-                                    "mysql_host": settings.host,
-                                    "mysql_port": settings.port,
-                                    "mysql_user": settings.user,
-                                    "mysql_password": "***" if settings.password else "",
-                                    "mysql_database": settings.database,
-                                }
-                            )
-                            _atomic_write_json(
-                                pending_path,
-                                {
-                                    "mysql": saved,
-                                    "config": pending_config,
-                                    "summary": summary,
-                                    "layer_file": str(self.raw_path),
-                                    "full_specimen_file": str(full_specimen_path)
-                                    if full_specimen_path is not None
-                                    else None,
-                                    "timestamp_file": str(self.timestamp_path)
-                                    if self.timestamp_path is not None
-                                    else None,
-                                    "folder_path": str(self.session_dir),
-                                },
-                            )
+                            if self.capture_record_dir is not None:
+                                pending_path = self.capture_record_dir / (
+                                    f"{self.raw_path.stem if self.raw_path is not None else '未保存'}_"
+                                    f"{self.session_stamp}_mysql_{destination_name}_pending.json"
+                                )
+                                pending_config = self._public_config(self.config)
+                                pending_config.update(
+                                    {
+                                        "mysql_enabled": True,
+                                        "mysql_local_enabled": False,
+                                        "mysql_host": settings.host,
+                                        "mysql_port": settings.port,
+                                        "mysql_user": settings.user,
+                                        "mysql_password": "***" if settings.password else "",
+                                        "mysql_database": settings.database,
+                                    }
+                                )
+                                _atomic_write_json(
+                                    pending_path,
+                                    {
+                                        "mysql": saved,
+                                        "config": pending_config,
+                                        "summary": summary,
+                                        "layer_file": str(self.raw_path) if self.raw_path is not None else None,
+                                        "full_specimen_file": str(full_specimen_path)
+                                        if full_specimen_path is not None
+                                        else None,
+                                        "timestamp_file": str(self.timestamp_path)
+                                        if self.timestamp_path is not None
+                                        else None,
+                                        "folder_path": str(self.session_dir) if self.session_dir is not None else None,
+                                    },
+                                )
                     successful = [item for item in destination_results.values() if item.get("ok")]
                     failed = [item for item in destination_results.values() if not item.get("ok")]
                     self.mysql_status = {
@@ -3788,7 +3849,8 @@ class AcquisitionManager:
                         ),
                     }
                     summary["mysql"] = self.mysql_status
-                    _atomic_write_json(summary_path, summary)
+                    if summary_path is not None:
+                        _atomic_write_json(summary_path, summary)
                 elif mysql_destinations and not self.capture_saved:
                     self.mysql_status = {
                         "enabled": True,
@@ -3798,7 +3860,8 @@ class AcquisitionManager:
                         "error": "未采集到有效数据，未写入MySQL",
                     }
                     summary["mysql"] = self.mysql_status
-                    _atomic_write_json(summary_path, summary)
+                    if summary_path is not None:
+                        _atomic_write_json(summary_path, summary)
                 elif not mysql_destinations:
                     self.mysql_status = {
                         "enabled": False,

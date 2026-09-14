@@ -778,6 +778,47 @@ class AcquisitionIntegrityTests(unittest.TestCase):
             self.assertEqual(mysql["successful_destinations"], 2)
             self.assertEqual(FakeStore.calls, ["127.0.0.1", "192.168.101.31"])
 
+    def test_mysql_is_saved_from_memory_when_csv_root_is_empty(self) -> None:
+        class FakeStore:
+            calls: list[int] = []
+
+            def __init__(self, settings):
+                self.settings = settings
+
+            def test_connection(self):
+                return {"ok": True}
+
+            def save_layer(self, config, **kwargs):
+                type(self).calls.append(len(kwargs["rows"]))
+                return {"ok": True, "saved_rows": len(kwargs["rows"])}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self._source(root)
+            manager = AcquisitionManager(root / "unused")
+            config = AcquisitionConfig(
+                processing_mode="capture_only",
+                dataset_schema="new_collection_v11_3",
+                driver="simulator",
+                source_file=str(source),
+                simulation_source_path=str(source),
+                selected_sensors=NEW_COLLECTION_SENSOR_COLUMNS.copy(),
+                sample_rate_hz=1000.0,
+                save_root="",
+                mysql_local_enabled=True,
+                mysql_local_host="127.0.0.1",
+                mysql_local_database="afp_test",
+            )
+            with patch("acquisition.MySQLCaptureStore", FakeStore):
+                manager.start(config)
+                deadline = time.time() + 5.0
+                while manager.status()["sample_count"] < 20 and time.time() < deadline:
+                    time.sleep(0.01)
+                result = manager.stop()
+            self.assertFalse(result["capture_saved"])
+            self.assertTrue(result["mysql"]["ok"], result)
+            self.assertEqual(FakeStore.calls, [result["sample_count"]])
+
     def test_driver_open_failure_is_closed_and_does_not_leave_active_session(self) -> None:
         class FailingDriver:
             def __init__(self):
