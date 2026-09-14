@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import math
+import http.client
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -24,6 +26,8 @@ from app import (
     NEW_DEMO_CHECKPOINT,
     NEW_DEMO_SOURCE,
     cap_pool,
+    _operation_lock,
+    create_server,
 )
 from online_inference import inspect_prediction_model
 
@@ -671,6 +675,72 @@ class DashboardTests(unittest.TestCase):
         )
         self.assertLess(float(result["selection_metric_value"]), 0.01)
         self.assertNotIn("test", result["selection_basis"].lower())
+
+
+class LanServerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        fake_dashboard = type("FakeDashboard", (), {})()
+        with patch("app.DashboardData", return_value=fake_dashboard):
+            cls.server = create_server(
+                "127.0.0.1",
+                0,
+                {
+                    "enabled": True,
+                    "bind_host": "0.0.0.0",
+                    "port": 8770,
+                    "urls": ["http://127.0.0.1:8770/"],
+                    "api_key": "must-not-leak",
+                },
+            )
+        cls.thread = __import__("threading").Thread(
+            target=cls.server.serve_forever, daemon=True
+        )
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=2)
+
+    def request(self, method: str, path: str, body: dict | None = None, headers=None):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port)
+        payload = None if body is None else json.dumps(body).encode("utf-8")
+        request_headers = {"Host": f"127.0.0.1:{self.server.server_port}"}
+        if body is not None:
+            request_headers["Content-Type"] = "application/json"
+        request_headers.update(headers or {})
+        connection.request(method, path, payload, request_headers)
+        response = connection.getresponse()
+        raw = response.read()
+        connection.close()
+        return response.status, json.loads(raw.decode("utf-8"))
+
+    def test_network_status_never_contains_secrets(self):
+        status, payload = self.request("GET", "/api/network/status")
+        self.assertEqual(status, 200)
+        self.assertNotIn("api_key", json.dumps(payload))
+        self.assertEqual(payload["urls"], ["http://127.0.0.1:8770/"])
+
+    def test_cross_origin_mutation_is_rejected(self):
+        status, _ = self.request(
+            "POST",
+            "/api/acquisition/reset-check",
+            {},
+            {"Origin": "http://attacker.example"},
+        )
+        self.assertEqual(status, 403)
+
+    def test_same_operation_returns_409_while_in_progress(self):
+        lock = _operation_lock("acquisition-check")
+        self.assertTrue(lock.acquire(blocking=False))
+        try:
+            status, payload = self.request("POST", "/api/acquisition/reset-check", {})
+        finally:
+            lock.release()
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["error"], "operation_in_progress")
 
 
 if __name__ == "__main__":

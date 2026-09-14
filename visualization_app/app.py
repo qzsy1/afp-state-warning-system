@@ -11,11 +11,12 @@ import os
 import re
 import sys
 import threading
+import time
 import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 import numpy as np
 import pandas as pd
@@ -125,12 +126,19 @@ DEFAULT_MYSQL_FLAT_QUERY = (
 )
 MYSQL_PREVIEW_LIMIT = 200
 MYSQL_EXPORT_LIMIT = 200_000
+_OPERATION_LOCKS: dict[str, threading.Lock] = {}
+_OPERATION_LOCKS_GUARD = threading.Lock()
 _MYSQL_FORBIDDEN_TOKENS = {
     "ALTER", "ANALYZE", "CALL", "CREATE", "DELETE", "DO", "DROP",
     "GRANT", "HANDLER", "INSERT", "LOAD", "LOCK", "OPTIMIZE",
     "RENAME", "REPAIR", "REPLACE", "REVOKE", "SET", "TRUNCATE",
     "UNLOCK", "UPDATE",
 }
+
+
+def _operation_lock(name: str) -> threading.Lock:
+    with _OPERATION_LOCKS_GUARD:
+        return _OPERATION_LOCKS.setdefault(name, threading.Lock())
 
 def _validate_agent_payload(payload: dict) -> dict:
     from interface_agent import validate_agent_payload
@@ -3878,10 +3886,74 @@ class DashboardData:
 
 class AppHandler(BaseHTTPRequestHandler):
     dashboard: DashboardData
+    network_status: dict[str, Any] = {}
+    service_started_at: float = 0.0
 
     def log_message(self, fmt: str, *args) -> None:
         # 实时数据流可达到10 Hz；逐请求打印会淹没终端并影响长时间运行。
         return
+
+    def _allowed_hosts(self) -> set[str]:
+        hosts = {"localhost", "127.0.0.1"}
+        for url in (self.network_status or {}).get("urls", []):
+            try:
+                host = urlsplit(str(url)).hostname
+            except ValueError:
+                host = None
+            if host:
+                hosts.add(host.lower())
+        return hosts
+
+    def _is_allowed_host(self) -> bool:
+        host_header = str(self.headers.get("Host", "")).strip()
+        if not host_header:
+            return False
+        try:
+            host = urlsplit(f"http://{host_header}").hostname
+        except ValueError:
+            return False
+        return bool(host and host.lower() in self._allowed_hosts())
+
+    def _is_allowed_origin(self) -> bool:
+        if not self._is_allowed_host():
+            return False
+        origin = str(self.headers.get("Origin", "")).strip()
+        if not origin:
+            return True
+        try:
+            parsed = urlsplit(origin)
+            request_host = urlsplit(
+                f"http://{self.headers.get('Host', '')}"
+            ).netloc.lower()
+        except ValueError:
+            return False
+        return parsed.scheme in {"http", "https"} and parsed.netloc.lower() == request_host
+
+    def _reject_unsafe_request(self) -> bool:
+        if self._is_allowed_origin():
+            return False
+        self._send_json({"error": "请求来源或 Host 不被允许"}, HTTPStatus.FORBIDDEN)
+        return True
+
+    def _begin_operation(self, name: str) -> threading.Lock | None:
+        lock = _operation_lock(name)
+        if not lock.acquire(blocking=False):
+            self._send_json(
+                {"error": "operation_in_progress", "operation": name},
+                HTTPStatus.CONFLICT,
+            )
+            return None
+        return lock
+
+    def _send_network_status(self) -> None:
+        payload = dict(self.network_status or {})
+        payload.pop("api_key", None)
+        payload.pop("model_name", None)
+        started = float(self.service_started_at or time.time())
+        payload["service_uptime_seconds"] = round(
+            max(0.0, time.time() - started), 1
+        )
+        self._send_json(payload)
 
     def _send_json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
         raw = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
@@ -3925,11 +3997,17 @@ class AppHandler(BaseHTTPRequestHandler):
         return query.get(key, [default])[0]
 
     def do_GET(self) -> None:  # noqa: N802
+        if not self._is_allowed_host():
+            self._send_json({"error": "请求 Host 不被允许"}, HTTPStatus.FORBIDDEN)
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
             self._send_json(
                 {"status": "ok", "version": APP_VERSION, "build_id": BUILD_ID}
             )
+            return
+        if parsed.path == "/api/network/status":
+            self._send_network_status()
             return
         if parsed.path == "/api/agent/defaults":
             from interface_agent import get_agent_defaults
@@ -4074,6 +4152,31 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if self._reject_unsafe_request():
+            return
+        content_type = str(self.headers.get("Content-Type", "")).lower()
+        if not content_type.startswith("application/json"):
+            self._send_json(
+                {"error": "POST 请求必须使用 application/json"},
+                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+            )
+            return
+        operation_name = None
+        if parsed.path in {
+            "/api/acquisition/test",
+            "/api/acquisition/reset-check",
+            "/api/agent/diagnose",
+        }:
+            operation_name = "acquisition-check"
+        elif parsed.path in {"/api/acquisition/start", "/api/acquisition/stop"}:
+            operation_name = "acquisition-control"
+        elif parsed.path in {"/api/training/start", "/api/training/stop"}:
+            operation_name = "training-control"
+        operation_lock = (
+            self._begin_operation(operation_name) if operation_name else None
+        )
+        if operation_name and operation_lock is None:
+            return
         try:
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length) if length else b"{}"
@@ -4261,12 +4364,30 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
         except Exception as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        finally:
+            if operation_lock is not None:
+                operation_lock.release()
 
 
-def create_server(host: str = "127.0.0.1", port: int = 8765) -> ThreadingHTTPServer:
+def create_server(
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    network_status: dict[str, Any] | None = None,
+) -> ThreadingHTTPServer:
     dashboard = DashboardData()
-    handler = type("ConfiguredAppHandler", (AppHandler,), {"dashboard": dashboard})
-    return ThreadingHTTPServer((host, port), handler)
+    handler = type(
+        "ConfiguredAppHandler",
+        (AppHandler,),
+        {
+            "dashboard": dashboard,
+            "network_status": dict(network_status or {}),
+            "service_started_at": time.time(),
+        },
+    )
+    server = ThreadingHTTPServer((host, port), handler)
+    server.network_status = handler.network_status
+    server.service_started_at = handler.service_started_at
+    return server
 
 
 def main() -> None:
