@@ -529,10 +529,27 @@ def _build_tool_plan_payload(model_name: str, context: DiagnosticToolContext) ->
         {
             "name": str(item.get("function", {}).get("name") or ""),
             "description": str(item.get("function", {}).get("description") or ""),
-            "parameters": deepcopy(item.get("function", {}).get("parameters") or {}),
+            "argument_names": list(
+                (item.get("function", {}).get("parameters", {}).get("properties") or {}).keys()
+            ),
         }
         for item in tool_definitions()
         if isinstance(item, dict)
+    ]
+    compact_events = [
+        {
+            "interface_id": str(item.get("interface_id") or ""),
+            "interface_label": str(item.get("interface_label") or "")[:80],
+            "role": str(item.get("role") or "")[:40],
+            "driver": str(item.get("driver") or "")[:60],
+            "endpoint": str(item.get("endpoint") or "")[:120],
+            "physical_interface_id": str(item.get("physical_interface_id") or "")[:120],
+            "protocol": str(item.get("protocol") or "")[:60],
+            "channels": [str(value)[:80] for value in (item.get("channels") or [])[:17]],
+            "state": str(item.get("state") or "")[:60],
+            "message": str(item.get("message") or "")[:240],
+        }
+        for item in context.events
     ]
     return {
         "model": model_name,
@@ -550,7 +567,11 @@ def _build_tool_plan_payload(model_name: str, context: DiagnosticToolContext) ->
                 "role": "user",
                 "content": json.dumps(
                     {
-                        "case": _initial_case_payload(context, include_event_evidence=False),
+                        "case": {
+                            "task": "按异常现象选择只读取证工具",
+                            "events": compact_events,
+                            "limits": {"max_tool_calls": 12, "read_only": True},
+                        },
                         "available_tools": available_tools,
                     },
                     ensure_ascii=False,

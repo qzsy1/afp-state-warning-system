@@ -493,6 +493,8 @@ class SiliconFlowAgentTests(unittest.TestCase):
         self.assertEqual(plan_input["case"]["events"][0]["interface_id"], "plc_process")
         self.assertNotIn("evidence", plan_input["case"]["events"][0])
         self.assertEqual(len(plan_input["available_tools"]), 8)
+        self.assertNotIn("parameters", plan_input["available_tools"][0])
+        self.assertLess(len(payloads[0]["messages"][1]["content"]), 4000)
         synthesis_input = json.loads(payloads[1]["messages"][1]["content"])
         self.assertNotIn("evidence", synthesis_input["case"]["events"][0])
 
