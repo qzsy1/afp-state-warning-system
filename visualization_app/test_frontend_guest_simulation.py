@@ -62,6 +62,36 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn("配对码生成失败：", body)
         self.assertIn("button.disabled = false", body)
 
+    def test_guest_pairing_entry_explains_unlock_requirement_instead_of_hiding(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("function renderHelperStatus()")
+        end = text.index("async function loadHelperStatus", start)
+        body = text[start:end]
+        self.assertIn("解锁后生成配对码", body)
+        self.assertIn("button?.classList.toggle(\"hidden\", false)", body)
+        self.assertIn("HTTPS 公网地址", body)
+
+    def test_pairing_refreshes_session_before_calling_protected_route(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("async function pairLocalHelper()")
+        end = text.index("function showRealAccessModal", start)
+        body = text[start:end]
+        self.assertIn("await loadAccessSession()", body)
+        self.assertIn("showRealAccessModal()", body)
+        self.assertIn('error?.code !== "csrf_failed"', body)
+
+    def test_api_errors_keep_machine_code_and_show_actionable_helper_text(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("async function postJson")
+        end = text.index("async function requestLocalHelper", start)
+        body = text[start:end]
+        self.assertIn("error.code = code", body)
+        self.assertIn("authorized_session_required", body)
+        self.assertIn("网页会话已刷新，请重试当前操作", body)
+
     def test_runtime_status_identifies_simulation_streams(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")

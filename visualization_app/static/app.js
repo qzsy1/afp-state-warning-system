@@ -124,14 +124,24 @@ function renderHelperStatus() {
   badge.className = `helper-status ${helper.online ? "ok" : helper.paired ? "pending" : "error"}`;
   if (note) {
     note.textContent = state.accessRole === "guest"
-      ? "访客模式只使用模拟数据；解锁真实模式后可配对本机采集辅助程序。"
+      ? (state.secureTransport
+        ? "当前为访客模拟模式；请先解锁真实模式，再生成配对码。"
+        : "当前为访客模拟模式；请使用 HTTPS 公网地址解锁真实模式后，再生成配对码。")
       : helper.online
         ? "本机辅助程序已连接，可识别本机接口并执行真实采集。"
         : helper.paired
           ? "已生成配对信息，请在本机辅助程序中输入配对码并连接。"
           : "真实采集需要在访问此网页的电脑上运行本地采集辅助程序。";
   }
-  button?.classList.toggle("hidden", state.accessRole === "guest");
+  // Keep the entry visible in guest mode.  Hiding it made a normal
+  // permission prerequisite look like a broken pairing-code generator.
+  button?.classList.toggle("hidden", false);
+  if (button) {
+    button.textContent = state.accessRole === "guest" ? "解锁后生成配对码" : "生成配对码";
+    button.title = state.accessRole === "guest"
+      ? "先解锁真实模式，再生成配对码"
+      : "为本机采集辅助程序生成一次性配对码";
+  }
   if (code) {
     code.textContent = state.helperPairingChallenge ? `配对码：${state.helperPairingChallenge}` : "";
     code.classList.toggle("hidden", !state.helperPairingChallenge);
@@ -157,7 +167,17 @@ async function pairLocalHelper() {
   const button = $("pairHelperButton");
   const note = $("helperStatusNote");
   if (state.accessRole === "guest") {
-    if (note) note.textContent = "当前是访客模式；请先在 HTTPS 公网地址解锁真实模式，再生成配对码。";
+    if (note) note.textContent = state.secureTransport
+      ? "当前是访客模式；请先解锁真实模式，再生成配对码。"
+      : "当前是访客模式；请使用 HTTPS 公网地址解锁真实模式，再生成配对码。";
+    if (state.secureTransport) showRealAccessModal();
+    return;
+  }
+  // A login in another tab or a restored session can leave the in-memory
+  // role/CSRF value stale.  Refresh once before the protected pairing call.
+  if (!state.csrf) await loadAccessSession();
+  if (state.accessRole === "guest") {
+    if (note) note.textContent = "当前网页会话未解锁，无法生成配对码。";
     return;
   }
   if (button) {
@@ -166,7 +186,17 @@ async function pairLocalHelper() {
   }
   if (note) note.textContent = "正在生成一次性配对码，请稍候……";
   try {
-    const result = await postJson("/api/helper/pair/start", {});
+    let result;
+    try {
+      result = await postJson("/api/helper/pair/start", {});
+    } catch (error) {
+      // A long-lived page can retain an old CSRF cookie after a login or
+      // public-tunnel reconnect. Refresh the session and retry once.
+      if (error?.code !== "csrf_failed") throw error;
+      await loadAccessSession();
+      if (state.accessRole === "guest") throw error;
+      result = await postJson("/api/helper/pair/start", {});
+    }
     if (!result?.ok) throw new Error(result?.error || "配对码生成失败");
     state.helperPairingChallenge = String(result.challenge || "");
     state.helperStatus = {...state.helperStatus, paired: false, online: false, lastError: ""};
@@ -782,7 +812,18 @@ async function postJson(url, payload = {}, {timeoutMs = 30000, controller = null
       ...(requestController ? {signal: requestController.signal} : {}),
     });
     const result = await response.json();
-    if (!response.ok) throw new Error(result.error || "请求失败");
+    if (!response.ok) {
+      const code = String(result.error || "");
+      const messages = {
+        csrf_failed: "网页会话已刷新，请重试当前操作",
+        real_access_required: "请先解锁真实采集模式",
+        authorized_session_required: "真实采集会话未建立，请重新解锁真实模式",
+        helper_offline: "本机采集辅助程序未连接",
+      };
+      const error = new Error(messages[code] || code || "请求失败");
+      error.code = code;
+      throw error;
+    }
     return result;
   } catch (error) {
     if (error?.name === "AbortError") {
