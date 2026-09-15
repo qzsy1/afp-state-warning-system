@@ -158,6 +158,27 @@ class HelperTransportTests(unittest.TestCase):
         self.assertIn("重新生成配对码", message)
         self.assertIn("辅助程序不会直接退出", message)
 
+    def test_autostart_script_restarts_the_single_delivery_helper(self):
+        script = Path(__file__).with_name("install_local_helper_autostart.ps1")
+        self.assertTrue(script.is_file())
+        text = script.read_text(encoding="utf-8")
+        self.assertIn("Register-ScheduledTask", text)
+        self.assertIn("RestartCount", text)
+        self.assertIn("AFP_Local_Capture_Helper.exe", text)
+        self.assertIn("-Uninstall", text)
+
+    def test_helper_uses_a_single_instance_mutex(self):
+        acquire = getattr(helper_entry, "acquire_single_instance_lock", None)
+        release = getattr(helper_entry, "release_single_instance_lock", None)
+        self.assertIsNotNone(acquire)
+        self.assertIsNotNone(release)
+        first = acquire("AFP_Local_Capture_Helper_test")
+        try:
+            self.assertIsNotNone(first)
+            self.assertIsNone(acquire("AFP_Local_Capture_Helper_test"))
+        finally:
+            release(first)
+
 
 if __name__ == "__main__":
     unittest.main()

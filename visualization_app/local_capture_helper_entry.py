@@ -140,6 +140,29 @@ def authentication_failure_message() -> str:
     return "配对已失效，请在网页端重新生成配对码；辅助程序不会直接退出。"
 
 
+def acquire_single_instance_lock(name: str = "AFP_Local_Capture_Helper") -> int | None:
+    """Return a process-wide Windows mutex handle, or None if already running."""
+
+    if os.name != "nt":
+        return 1
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    handle = kernel32.CreateMutexW(None, False, f"Local\\{name}")
+    if not handle:
+        return None
+    if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        kernel32.CloseHandle(handle)
+        return None
+    return int(handle)
+
+
+def release_single_instance_lock(handle: int | None) -> None:
+    if not handle or os.name != "nt":
+        return
+    ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(handle))
+
+
 def _config_from_payload(payload: dict[str, Any]) -> AcquisitionConfig:
     allowed = {field.name for field in fields(AcquisitionConfig)}
     return AcquisitionConfig(**{key: value for key, value in payload.items() if key in allowed})
@@ -391,7 +414,7 @@ def resolve_runtime_args(
     return args
 
 
-def main() -> None:
+def _run_main() -> None:
     args = resolve_runtime_args()
     if args is None:
         try:
@@ -447,6 +470,17 @@ def main() -> None:
             args = repaired
             args.pairing_token = str(paired.get("pairing_token") or "")
             save_runtime_config(args.server, args.pairing_token, args.device_id, args.transport)
+
+
+def main() -> None:
+    lock = acquire_single_instance_lock()
+    if lock is None:
+        print("本地采集辅助程序已经在运行，未重复启动。", flush=True)
+        return
+    try:
+        _run_main()
+    finally:
+        release_single_instance_lock(lock)
 
 
 if __name__ == "__main__":

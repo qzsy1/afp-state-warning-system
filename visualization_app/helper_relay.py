@@ -63,7 +63,7 @@ class HelperRegistry:
         self,
         *,
         challenge_ttl_seconds: int = 300,
-        heartbeat_ttl_seconds: int = 15,
+        heartbeat_ttl_seconds: int = 60,
         persistence_path: str | Path | None = None,
     ) -> None:
         self.challenge_ttl_seconds = max(30, int(challenge_ttl_seconds))

@@ -13,6 +13,10 @@ from helper_relay import HelperRegistry  # noqa: E402
 
 
 class HelperRelayTests(unittest.TestCase):
+    def test_default_heartbeat_window_covers_transient_helper_backoff(self):
+        registry = HelperRegistry()
+        self.assertGreaterEqual(registry.heartbeat_ttl_seconds, 45)
+
     def test_pairing_is_one_time_and_status_hides_secret(self):
         registry = HelperRegistry()
         challenge = registry.start_pairing("session-a")
