@@ -4,6 +4,7 @@ import base64
 import binascii
 import csv
 import io
+import math
 import re
 import shutil
 import threading
@@ -300,6 +301,93 @@ class GuestSimulationManager:
                 else path.name
             ),
             "channels": channels,
+        }
+
+    @staticmethod
+    def _coerce_dataset_value(value: Any) -> Any:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            number = float(text)
+        except (TypeError, ValueError):
+            return text
+        if not math.isfinite(number):
+            return None
+        return int(number) if number.is_integer() else number
+
+    @classmethod
+    def _read_csv_dataset(cls, path: Path) -> tuple[list[str], list[dict[str, Any]]]:
+        if not path.is_file():
+            raise GuestSimulationError("guest_source_unavailable", "默认模拟数据文件不存在或无法读取")
+        last_error: Exception | None = None
+        for encoding in ("utf-8-sig", "gb18030"):
+            try:
+                with path.open("r", encoding=encoding, newline="") as handle:
+                    reader = csv.DictReader(handle)
+                    columns = [str(item or "").strip() for item in (reader.fieldnames or [])]
+                    columns = [item for item in columns if item]
+                    if not columns:
+                        raise GuestSimulationError("guest_source_invalid", "模拟数据文件缺少表头")
+                    rows: list[dict[str, Any]] = []
+                    for raw in reader:
+                        if not isinstance(raw, dict):
+                            continue
+                        row = {
+                            column: cls._coerce_dataset_value(raw.get(column))
+                            for column in columns
+                        }
+                        if any(value is not None for value in row.values()):
+                            rows.append(row)
+                    if not rows:
+                        raise GuestSimulationError("guest_source_invalid", "模拟数据文件没有有效数据行")
+                    return columns, rows
+            except (OSError, UnicodeDecodeError) as exc:
+                last_error = exc
+        raise GuestSimulationError("guest_source_unavailable", "模拟数据文件编码或读取失败") from last_error
+
+    def dataset(self, session_id: str) -> dict[str, Any]:
+        """Return the approved simulation source once for browser-side replay.
+
+        Only parsed rows and a display name leave the server.  The absolute
+        source path, server save directory and any MySQL credentials are never
+        exposed to a guest browser.
+        """
+        session = self.ensure_session(session_id)
+        selected = session.selected_source is not None
+        profile = session.selected_source or self._profile({})
+        source_type = str(profile.get("source_type") or "single_csv").lower()
+        source_path = Path(str(profile.get("path") or "")).resolve()
+        if source_type == "single_csv":
+            columns, rows = self._read_csv_dataset(source_path)
+            name = source_path.name
+        elif source_type == "folder_csv":
+            if not source_path.is_dir():
+                raise GuestSimulationError("guest_source_unavailable", "模拟数据文件夹不存在或无法读取")
+            files = sorted(source_path.rglob("*.csv"))
+            if not files:
+                raise GuestSimulationError("guest_source_invalid", "模拟数据文件夹不包含 CSV 文件")
+            columns: list[str] = []
+            rows: list[dict[str, Any]] = []
+            for file in files:
+                file_columns, file_rows = self._read_csv_dataset(file)
+                for column in file_columns:
+                    if column not in columns:
+                        columns.append(column)
+                rows.extend(file_rows)
+            name = f"已批准模拟数据（{len(files)} 个 CSV）"
+        else:
+            raise GuestSimulationError("guest_source_not_allowed", "浏览器一次性回放暂不支持 MySQL 模拟源")
+        if len(rows) > 500_000:
+            raise GuestSimulationError("guest_source_too_large", "模拟数据行数超过浏览器回放上限")
+        return {
+            "ok": True,
+            "source_type": source_type,
+            "name": name,
+            "default_source": not selected,
+            "columns": columns,
+            "rows": rows,
+            "total_rows": len(rows),
         }
 
     def safe_config(self, session_id: str, payload: dict[str, Any]) -> AcquisitionConfig:

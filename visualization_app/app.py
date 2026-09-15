@@ -4594,6 +4594,19 @@ class AppHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/simulation/status":
             self._send_json(self.guest_manager.status(self._identity().guest_id))
             return
+        if parsed.path == "/api/simulation/dataset":
+            try:
+                self._send_json(
+                    self.guest_manager.dataset(self._identity().guest_id)
+                )
+            except GuestSimulationError as exc:
+                self._send_json(
+                    {"ok": False, "error": str(exc), "code": exc.code},
+                    HTTPStatus.BAD_REQUEST,
+                )
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
         if parsed.path == "/api/simulation/live":
             try:
                 query = parse_qs(parsed.query)

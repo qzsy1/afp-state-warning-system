@@ -53,6 +53,11 @@ const state = {
   realHeartbeatTimer: null,
   guestSimulationStarted: false,
   guestSimulationStoppedByUser: false,
+  simulationDatasetCache: null,
+  simulationDatasetPromise: null,
+  simulationPlaybackIndex: -1,
+  simulationLocalReplay: false,
+  simulationLocalReplayTimer: null,
   localSaveDirectoryHandle: null,
   localSaveAuthorized: false,
   localSaveBusy: false,
@@ -1865,13 +1870,20 @@ async function testSensorConnection({automatic = false} = {}) {
 async function startAcquisition() {
   try {
     if (state.accessRole === "guest") {
+      // Load the selected/default dataset once, then replay it locally in the
+      // browser.  The server still owns the session/save lifecycle; only the
+      // high-frequency display path leaves the public request loop.
+      await loadSimulationDatasetOnce();
       const guestResult = await postJson("/api/simulation/start", acquisitionConfig());
       state.guestSimulationStarted = true;
       state.guestSimulationStoppedByUser = false;
       renderAcquisitionStatus(guestResult);
       controls.dataMode.value = "live";
       configureDataMode();
-      await loadRealtime();
+      if (!state.payload?.channels?.length) {
+        await loadSimulationTemplate();
+      }
+      startLocalSimulationReplay();
       return;
     }
     await acquireRealControl();
@@ -1917,6 +1929,7 @@ async function startAcquisition() {
 
 async function stopAcquisition() {
   try {
+    stopLocalSimulationReplay();
     const layerControl = controls.datasetSchema.value === "new_collection_v11_3"
       ? controls.newLayer
       : controls.liveLayer;
@@ -2234,6 +2247,7 @@ function configureDataMode() {
       }, livePollIntervalMs());
     }
   } else {
+    stopLocalSimulationReplay();
     window.clearInterval(state.livePollTimer);
     state.livePollTimer = null;
     closeLiveWebSocket();
@@ -2305,6 +2319,157 @@ function applyRealtimePayload(payload) {
       stopPlayback();
     }
   }
+}
+
+const SIMULATION_PLAYBACK_CACHE_ROWS = 20;
+
+function isGuestSimulationMode() {
+  return state.accessRole === "guest"
+    && controls.acquisitionMode?.value === "simulation";
+}
+
+async function loadSimulationDatasetOnce({force = false} = {}) {
+  if (!isGuestSimulationMode()) return null;
+  if (!force && state.simulationDatasetCache) return state.simulationDatasetCache;
+  if (!force && state.simulationDatasetPromise) return state.simulationDatasetPromise;
+  state.simulationDatasetPromise = (async () => {
+    const response = await fetch("/api/simulation/dataset", {
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload?.ok) {
+      throw new Error(payload?.error || "默认模拟数据加载失败");
+    }
+    const rows = Array.isArray(payload.rows) ? payload.rows : [];
+    if (!rows.length) throw new Error("默认模拟数据没有有效数据行");
+    state.simulationDatasetCache = {
+      ...payload,
+      rows,
+      total_rows: Number(payload.total_rows || rows.length),
+      cache_start: 0,
+      cache_rows: rows.slice(0, SIMULATION_PLAYBACK_CACHE_ROWS),
+    };
+    state.simulationSourceChannels = Array.isArray(payload.columns)
+      ? payload.columns : state.simulationSourceChannels;
+    if (controls.cursor) {
+      controls.cursor.max = String(state.simulationDatasetCache.total_rows);
+      if (!state.guestSimulationStarted) controls.cursor.value = "1";
+    }
+    updateDatasetMeta();
+    autoEnableSimulationChannels(state.simulationSourceChannels);
+    return state.simulationDatasetCache;
+  })();
+  try {
+    return await state.simulationDatasetPromise;
+  } finally {
+    state.simulationDatasetPromise = null;
+  }
+}
+
+function simulationCacheFor(index) {
+  const dataset = state.simulationDatasetCache;
+  if (!dataset) return [];
+  const total = dataset.rows.length;
+  const safeIndex = Math.max(0, Math.min(total - 1, Number(index) || 0));
+  const start = Math.max(0, safeIndex - SIMULATION_PLAYBACK_CACHE_ROWS + 1);
+  dataset.cache_start = start;
+  dataset.cache_rows = dataset.rows.slice(start, safeIndex + 1);
+  return dataset.cache_rows;
+}
+
+function buildCachedSimulationPayload(index) {
+  const dataset = state.simulationDatasetCache;
+  const template = state.payload;
+  if (!dataset || !template) return null;
+  const rows = simulationCacheFor(index);
+  const history = Math.max(1, Number(controls.history?.value || 240));
+  const allRows = dataset.rows.slice(0, Math.max(0, Number(index) + 1));
+  const visibleRows = allRows.slice(-history);
+  const channels = (template.channels || []).map((channel) => {
+    const values = visibleRows.map((row) => {
+      const value = Number(row?.[channel.name]);
+      return Number.isFinite(value) ? value : null;
+    });
+    const current = values.length ? values[values.length - 1] : null;
+    return {
+      ...channel,
+      actual: values,
+      x_observed: values.map((_value, position) => position + 1),
+      actual_current: current,
+      prediction_observed: values.map(() => null),
+      prediction_future: [],
+      x_future: [],
+      prediction_current: null,
+      rmse: null,
+    };
+  });
+  const selectedId = Number(controls.sensor?.value || 0);
+  const selected = channels.find((channel) => Number(channel.id) === selectedId)
+    || channels[0]
+    || template.selected_channel;
+  const total = dataset.rows.length;
+  const cursor = Math.min(total, Number(index) + 1);
+  const windowPosition = ((cursor - 1) % 24) + 1;
+  return {
+    ...template,
+    channels,
+    selected_channel: selected,
+    progress: {
+      ...template.progress,
+      cursor,
+      total_points: total,
+      sample_in_window: windowPosition,
+      current_window: Math.floor((cursor - 1) / 24) + 1,
+      total_windows_in_layer: Math.max(1, Math.ceil(total / 24)),
+      finished: cursor >= total,
+    },
+  };
+}
+
+function renderCachedSimulationSample(index) {
+  const payload = buildCachedSimulationPayload(index);
+  if (!payload) return false;
+  state.simulationPlaybackIndex = Number(index);
+  state.payload = payload;
+  render(payload);
+  return true;
+}
+
+function startLocalSimulationReplay() {
+  if (!isGuestSimulationMode() || !state.simulationDatasetCache || !state.payload) return;
+  state.simulationLocalReplay = true;
+  // configureDataMode starts the normal LAN poller for live mode.  Once the
+  // complete dataset is in browser memory that poller must be stopped, or it
+  // would overwrite the locally rendered cursor on every response.
+  window.clearInterval(state.livePollTimer);
+  state.livePollTimer = null;
+  closeLiveWebSocket();
+  stopPlayback();
+  const total = state.simulationDatasetCache.rows.length;
+  state.simulationPlaybackIndex = -1;
+  const tick = () => {
+    if (!state.simulationLocalReplay || !state.guestSimulationStarted) return;
+    const next = Math.min(total - 1, state.simulationPlaybackIndex + 1);
+    renderCachedSimulationSample(next);
+    if (next >= total - 1) {
+      state.simulationLocalReplay = false;
+      $("streamStatus").textContent = "模拟数据已播放完成";
+      document.querySelector(".live-dot")?.classList.remove("active");
+      return;
+    }
+    state.simulationLocalReplayTimer = window.setTimeout(tick, playbackInterval());
+  };
+  window.clearTimeout(state.simulationLocalReplayTimer);
+  $("streamStatus").textContent = "模拟数据本地回放中";
+  document.querySelector(".live-dot")?.classList.add("active");
+  tick();
+}
+
+function stopLocalSimulationReplay() {
+  state.simulationLocalReplay = false;
+  window.clearTimeout(state.simulationLocalReplayTimer);
+  state.simulationLocalReplayTimer = null;
 }
 
 function openLiveWebSocket() {
@@ -2380,6 +2545,7 @@ function queryString() {
 }
 
 async function loadRealtime() {
+  if (state.simulationLocalReplay) return state.payload;
   if (usePublicLiveWebSocket()) {
     openLiveWebSocket();
     return;
@@ -2411,6 +2577,19 @@ async function loadRealtime() {
       window.setTimeout(loadRealtime, controls.dataMode.value === "live" ? livePollIntervalMs() : 0);
     }
   }
+}
+
+async function loadSimulationTemplate() {
+  const response = await fetch(`/api/simulation/live?${queryString()}`, {
+    cache: "no-store",
+    credentials: "same-origin",
+  });
+  const payload = await response.json();
+  if (!response.ok || payload?.error) {
+    throw new Error(payload?.error || "模拟采集模板加载失败");
+  }
+  applyRealtimePayload(payload);
+  return payload;
 }
 
 function scheduleLoad() {
@@ -3125,6 +3304,9 @@ async function initialize() {
       "hidden", controls.dataMode.value !== "live"
     );
     updateSimulationSettings();
+    if (isGuestSimulationMode()) {
+      await loadSimulationDatasetOnce();
+    }
     await loadRealtime();
     scheduleAutomaticHardwareCheck(800);
   } catch (error) {
@@ -4479,6 +4661,9 @@ async function uploadSimulationSource() {
     state.guestSimulationStoppedByUser = false;
     document.querySelectorAll(".interface-config-row").forEach((row) => refreshPhysicalInterfaceOptions(row));
     autoEnableSimulationChannels(state.simulationSourceChannels);
+    stopLocalSimulationReplay();
+    state.simulationDatasetCache = null;
+    await loadSimulationDatasetOnce({force: true});
     toast("模拟数据已载入");
   } catch (error) {
     if (controls.simulationSourceNote) controls.simulationSourceNote.textContent = `模拟数据上传失败：${error.message}`;

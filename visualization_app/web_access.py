@@ -17,6 +17,7 @@ PUBLIC_GET = {
     "/api/auth/session",
     "/api/public/device-status",
     "/api/simulation/status",
+    "/api/simulation/dataset",
     "/api/simulation/live",
     "/api/simulation/ws",
     "/api/simulation/export-manifest",

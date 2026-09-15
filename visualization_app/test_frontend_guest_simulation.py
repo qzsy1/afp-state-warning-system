@@ -149,12 +149,42 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn('"/api/simulation/ws"', text)
         self.assertIn('"/api/live/ws"', text)
 
+    def test_simulation_dataset_route_is_public_read_only(self):
+        source = Path(__file__).with_name("web_access.py")
+        text = source.read_text(encoding="utf-8")
+        self.assertIn('"/api/simulation/dataset"', text)
+
     def test_public_live_frontend_uses_websocket_stream(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
         self.assertIn("new WebSocket", text)
         self.assertIn("/api/simulation/ws", text)
         self.assertIn("/api/live/ws", text)
+
+    def test_simulation_uses_one_time_dataset_load_and_twenty_row_playback_cache(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        self.assertIn("/api/simulation/dataset", text)
+        self.assertIn("SIMULATION_PLAYBACK_CACHE_ROWS = 20", text)
+        self.assertIn("loadSimulationDatasetOnce", text)
+        self.assertIn("simulationDatasetCache", text)
+
+    def test_guest_start_replays_loaded_dataset_in_browser_after_server_start(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("async function startAcquisition()")
+        end = text.index("async function stopAcquisition()", start)
+        body = text[start:end]
+        self.assertIn("await loadSimulationDatasetOnce();", body)
+        self.assertIn('postJson("/api/simulation/start"', body)
+        self.assertIn("startLocalSimulationReplay();", body)
+        self.assertNotIn("await loadRealtime();\n      return;", body)
+
+        replay_start = text.index("function startLocalSimulationReplay()")
+        replay_end = text.index("function stopLocalSimulationReplay()", replay_start)
+        replay_body = text[replay_start:replay_end]
+        self.assertIn("state.livePollTimer", replay_body)
+        self.assertIn("clearInterval", replay_body)
 
     def test_local_helper_websocket_route_keeps_http_fallback_contract(self):
         access = Path(__file__).with_name("web_access.py").read_text(encoding="utf-8")

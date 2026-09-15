@@ -198,6 +198,33 @@ class GuestSimulationTests(unittest.TestCase):
         self.assertEqual(Path(first.simulation_source_path).name, "client.csv")
         self.assertEqual(Path(second.simulation_source_path), self.source)
 
+    def test_default_simulation_dataset_can_be_loaded_once_without_leaking_path(self):
+        manager = self._manager()
+
+        payload = manager.dataset("a" * 32)
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["total_rows"], 1)
+        self.assertEqual(payload["columns"], ["温度", "压力"])
+        self.assertEqual(payload["rows"], [{"温度": 350, "压力": 400}])
+        self.assertEqual(payload["name"], "source.csv")
+        self.assertNotIn("path", payload)
+
+    def test_uploaded_simulation_dataset_replaces_default_for_current_guest(self):
+        manager = self._manager()
+        encoded = base64.b64encode("温度,压力\n351,401\n352,402\n".encode("utf-8")).decode("ascii")
+        manager.upload_source(
+            "a" * 32,
+            "single_csv",
+            [{"name": "client.csv", "data": encoded}],
+        )
+
+        payload = manager.dataset("a" * 32)
+
+        self.assertEqual(payload["total_rows"], 2)
+        self.assertEqual(payload["name"], "client.csv")
+        self.assertEqual(payload["rows"][1]["温度"], 352)
+
     def test_uploaded_folder_requires_csv_files(self):
         manager = self._manager()
         encoded = base64.b64encode(b"not csv").decode("ascii")
