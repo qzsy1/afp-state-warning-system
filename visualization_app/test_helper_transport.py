@@ -29,6 +29,17 @@ class HelperTransportTests(unittest.TestCase):
                 '{"type":"command","request_id":"r1","command":"shell"}',
             )
 
+    def test_dispatch_returns_known_command_failure_to_webpage(self):
+        agent = Mock()
+        agent.discover.side_effect = RuntimeError("设备枚举失败")
+        result = dispatch_command(
+            agent,
+            '{"type":"command","request_id":"r1","command":"discover","payload":{}}',
+        )
+        self.assertEqual(result["request_id"], "r1")
+        self.assertFalse(result["payload"]["ok"])
+        self.assertIn("设备枚举失败", result["payload"]["error"])
+
     def test_helper_cli_without_arguments_returns_setup_guidance_instead_of_argparse_exit(self):
         output = []
         result = resolve_runtime_args(

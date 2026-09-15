@@ -22,28 +22,34 @@ def dispatch_command(agent: LocalCaptureAgent, raw: str | bytes) -> dict[str, An
     command = HelperTransport.decode_command(raw)
     name = command["command"]
     payload = command["payload"]
-    if name == "discover":
-        result = agent.discover()
-    elif name == "status":
-        result = agent.status()
-    elif name == "mysql_preflight":
-        result = agent.mysql_preflight(
-            MySQLSettings.from_mapping(payload),
-            write_test=bool(payload.get("write_test", False)),
-        )
-    elif name == "check_capture":
-        result = agent.check_capture(_config_from_payload(payload))
-    elif name == "mysql_relation_map":
-        result = agent.mysql_relation_map(
-            MySQLSettings.from_mapping(payload),
-            limit=int(payload.get("limit", 1000)),
-        )
-    elif name == "start_capture":
-        result = agent.start_capture(_config_from_payload(payload))
-    elif name == "stop_capture":
-        result = agent.stop_capture()
-    else:  # decode_command already guards this; retain a defensive branch.
-        raise ValueError("helper命令不在允许列表")
+    try:
+        if name == "discover":
+            result = agent.discover()
+        elif name == "status":
+            result = agent.status()
+        elif name == "mysql_preflight":
+            result = agent.mysql_preflight(
+                MySQLSettings.from_mapping(payload),
+                write_test=bool(payload.get("write_test", False)),
+            )
+        elif name == "check_capture":
+            result = agent.check_capture(_config_from_payload(payload))
+        elif name == "mysql_relation_map":
+            result = agent.mysql_relation_map(
+                MySQLSettings.from_mapping(payload),
+                limit=int(payload.get("limit", 1000)),
+            )
+        elif name == "start_capture":
+            result = agent.start_capture(_config_from_payload(payload))
+        elif name == "stop_capture":
+            result = agent.stop_capture()
+        else:  # decode_command already guards this; retain a defensive branch.
+            raise ValueError("helper命令不在允许列表")
+    except Exception as exc:
+        # The command has already been removed from the relay queue.  Always
+        # return its failure to the browser; otherwise the page can only wait
+        # for a result that will never arrive and report a misleading timeout.
+        result = {"ok": False, "error": str(exc) or exc.__class__.__name__}
     return {
         "type": "result",
         "request_id": command["request_id"],

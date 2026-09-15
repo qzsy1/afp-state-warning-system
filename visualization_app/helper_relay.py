@@ -210,6 +210,7 @@ class HelperRegistry:
                 return {"ok": False, "error": "helper_not_paired"}
             helper.last_seen = time.time()
             request = {
+                "type": "command",
                 "ok": True,
                 "request_id": uuid.uuid4().hex,
                 "command": command,

@@ -49,6 +49,7 @@ class HelperRelayTests(unittest.TestCase):
         self.assertTrue(registry.authenticate("device-a", token))
         request = registry.command("session-a", "discover", {})
         polled = registry.poll("device-a", token)
+        self.assertEqual(polled["command"]["type"], "command")
         self.assertEqual(polled["command"]["request_id"], request["request_id"])
         registry.accept_result("device-a", token, request["request_id"], {"ok": True})
         self.assertEqual(registry.pop_result("session-a", request["request_id"]), {"ok": True})
