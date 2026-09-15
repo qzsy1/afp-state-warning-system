@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import sys
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from local_capture_helper_entry import (  # noqa: E402
-    dispatch_command,
-    resolve_runtime_args,
-    should_repair_pairing,
-)
+import local_capture_helper_entry as helper_entry  # noqa: E402
+
+dispatch_command = helper_entry.dispatch_command
+resolve_runtime_args = helper_entry.resolve_runtime_args
+should_repair_pairing = helper_entry.should_repair_pairing
 
 
 class HelperTransportTests(unittest.TestCase):
@@ -99,6 +101,62 @@ class HelperTransportTests(unittest.TestCase):
             should_repair_pairing(RuntimeError("辅助服务连接失败：HTTP Error 401: Unauthorized"))
         )
         self.assertFalse(should_repair_pairing(RuntimeError("网络连接暂时失败")))
+
+    def test_pairing_config_round_trips_without_plaintext_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "helper-config.json"
+            save_runtime_config = getattr(helper_entry, "save_runtime_config", None)
+            load_saved_runtime_config = getattr(helper_entry, "load_saved_runtime_config", None)
+            self.assertIsNotNone(save_runtime_config)
+            self.assertIsNotNone(load_saved_runtime_config)
+            save_runtime_config(
+                "https://afp.example.test",
+                "secret-pairing-token",
+                "local-helper",
+                path=path,
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertNotIn("secret-pairing-token", path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                load_saved_runtime_config(path=path),
+                {
+                    "server": "https://afp.example.test",
+                    "pairing_token": "secret-pairing-token",
+                    "device_id": "local-helper",
+                    "transport": "https",
+                },
+            )
+            self.assertEqual(payload["version"], 1)
+
+    def test_helper_cli_resumes_saved_config_without_prompting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "helper-config.json"
+            save_runtime_config = getattr(helper_entry, "save_runtime_config", None)
+            self.assertIsNotNone(save_runtime_config)
+            save_runtime_config(
+                "https://afp.example.test",
+                "secret-pairing-token",
+                "local-helper",
+                path=path,
+            )
+
+            def unexpected_prompt(_prompt):
+                raise AssertionError("saved helper config should avoid prompting")
+
+            result = resolve_runtime_args(
+                [], input_fn=unexpected_prompt, output_fn=lambda _line: None, config_path=path
+            )
+            self.assertEqual(result.server, "https://afp.example.test")
+            self.assertEqual(result.pairing_token, "secret-pairing-token")
+            self.assertEqual(result.device_id, "local-helper")
+            self.assertEqual(result.transport, "https")
+
+    def test_authentication_failure_is_reported_as_repairable_runtime_state(self):
+        authentication_failure_message = getattr(helper_entry, "authentication_failure_message", None)
+        self.assertIsNotNone(authentication_failure_message)
+        message = authentication_failure_message()
+        self.assertIn("重新生成配对码", message)
+        self.assertIn("辅助程序不会直接退出", message)
 
 
 if __name__ == "__main__":

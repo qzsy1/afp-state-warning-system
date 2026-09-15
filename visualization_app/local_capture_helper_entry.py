@@ -3,15 +3,141 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import ctypes
+import ctypes.wintypes as wintypes
 import json
+import os
 import sys
 import time
 from dataclasses import fields
+from pathlib import Path
 from typing import Any
 
 from acquisition import AcquisitionConfig, MySQLSettings
 from helper_relay import normalize_pairing_code
 from local_capture_agent import HelperTransport, LocalCaptureAgent
+
+
+class PairingRequiredError(RuntimeError):
+    """Raised when the saved helper credential is no longer accepted."""
+
+
+def default_runtime_config_path() -> Path:
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    root = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+    return root / "AFP_Local_Capture_Helper" / "config.json"
+
+
+class _DataBlob(ctypes.Structure):
+    _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
+
+
+def _protect_secret(value: str) -> str:
+    """Encrypt a pairing token with the current Windows user account."""
+
+    raw = str(value).encode("utf-8")
+    if os.name != "nt":
+        return "b64:" + base64.urlsafe_b64encode(raw).decode("ascii")
+    source = _DataBlob(len(raw), ctypes.cast(ctypes.create_string_buffer(raw), ctypes.POINTER(ctypes.c_byte)))
+    target = _DataBlob()
+    crypt_protect = ctypes.windll.crypt32.CryptProtectData
+    crypt_protect.argtypes = [
+        ctypes.POINTER(_DataBlob),
+        wintypes.LPCWSTR,
+        ctypes.POINTER(_DataBlob),
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(_DataBlob),
+    ]
+    crypt_protect.restype = wintypes.BOOL
+    if not crypt_protect(ctypes.byref(source), "AFP Local Capture Helper", None, None, None, 0, ctypes.byref(target)):
+        raise OSError(ctypes.get_last_error(), "Windows DPAPI 加密失败")
+    try:
+        encrypted = ctypes.string_at(target.pbData, target.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(target.pbData)
+    return "dpapi:" + base64.urlsafe_b64encode(encrypted).decode("ascii")
+
+
+def _unprotect_secret(value: str) -> str:
+    encoded = str(value or "")
+    if encoded.startswith("b64:"):
+        return base64.urlsafe_b64decode(encoded[4:].encode("ascii")).decode("utf-8")
+    if not encoded.startswith("dpapi:") or os.name != "nt":
+        return ""
+    encrypted = base64.urlsafe_b64decode(encoded[6:].encode("ascii"))
+    source = _DataBlob(len(encrypted), ctypes.cast(ctypes.create_string_buffer(encrypted), ctypes.POINTER(ctypes.c_byte)))
+    target = _DataBlob()
+    crypt_unprotect = ctypes.windll.crypt32.CryptUnprotectData
+    crypt_unprotect.argtypes = [
+        ctypes.POINTER(_DataBlob),
+        ctypes.POINTER(wintypes.LPWSTR),
+        ctypes.POINTER(_DataBlob),
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(_DataBlob),
+    ]
+    crypt_unprotect.restype = wintypes.BOOL
+    description = wintypes.LPWSTR()
+    if not crypt_unprotect(ctypes.byref(source), ctypes.byref(description), None, None, None, 0, ctypes.byref(target)):
+        raise OSError(ctypes.get_last_error(), "Windows DPAPI 解密失败")
+    try:
+        return ctypes.string_at(target.pbData, target.cbData).decode("utf-8")
+    finally:
+        ctypes.windll.kernel32.LocalFree(target.pbData)
+
+
+def save_runtime_config(
+    server: str,
+    pairing_token: str,
+    device_id: str = "local-helper",
+    transport: str = "https",
+    *,
+    path: str | Path | None = None,
+) -> Path:
+    config_path = Path(path) if path is not None else default_runtime_config_path()
+    config_path = config_path.expanduser().resolve()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "server": str(server).strip().rstrip("/"),
+        "pairing_token_encrypted": _protect_secret(pairing_token),
+        "device_id": str(device_id or "local-helper"),
+        "transport": str(transport or "https"),
+    }
+    temporary = config_path.with_name(config_path.name + ".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, config_path)
+    try:
+        os.chmod(config_path, 0o600)
+    except OSError:
+        pass
+    return config_path
+
+
+def load_saved_runtime_config(*, path: str | Path | None = None) -> dict[str, str] | None:
+    config_path = Path(path) if path is not None else default_runtime_config_path()
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        token = _unprotect_secret(payload.get("pairing_token_encrypted", ""))
+        server = str(payload.get("server") or "").strip()
+        if not server or not token:
+            return None
+        return {
+            "server": server,
+            "pairing_token": token,
+            "device_id": str(payload.get("device_id") or "local-helper"),
+            "transport": str(payload.get("transport") or "https"),
+        }
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, UnicodeError):
+        return None
+
+
+def authentication_failure_message() -> str:
+    return "配对已失效，请在网页端重新生成配对码；辅助程序不会直接退出。"
 
 
 def _config_from_payload(payload: dict[str, Any]) -> AcquisitionConfig:
@@ -91,8 +217,7 @@ def run_http_forever(server_url: str, pairing_token: str, device_id: str) -> Non
             return
         except Exception as exc:
             if should_repair_pairing(exc):
-                print("配对已失效，请重新生成配对码并重启本地采集辅助程序。", flush=True)
-                return
+                raise PairingRequiredError(authentication_failure_message()) from exc
             time.sleep(delay)
             delay = min(delay * 2.0, 30.0)
 
@@ -217,6 +342,7 @@ def resolve_runtime_args(
     input_fn=input,
     output_fn=print,
     gui_fn=None,
+    config_path: str | Path | None = None,
 ) -> argparse.Namespace | None:
     """Resolve CLI arguments without silently exiting when double-clicked.
 
@@ -226,6 +352,14 @@ def resolve_runtime_args(
     """
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if not args.server and not args.pairing_token and not args.pairing_challenge:
+        saved = load_saved_runtime_config(path=config_path)
+        if saved:
+            args.server = saved["server"]
+            args.pairing_token = saved["pairing_token"]
+            args.device_id = saved["device_id"]
+            args.transport = saved["transport"]
+            return args
     if not args.server:
         output_fn("本地采集辅助程序需要网页地址和配对码。")
         output_fn("网页地址示例：http://127.0.0.1:8770 或 https://你的域名")
@@ -283,10 +417,36 @@ def main() -> None:
                 )
             raise RuntimeError(error_code or "辅助程序配对失败")
         args.pairing_token = str(paired.get("pairing_token") or "")
-    if args.transport == "https":
-        run_http_forever(args.server, args.pairing_token, args.device_id)
-    else:
-        run_forever(args.server, args.pairing_token, args.device_id)
+    save_runtime_config(args.server, args.pairing_token, args.device_id, args.transport)
+    while True:
+        try:
+            if args.transport == "https":
+                run_http_forever(args.server, args.pairing_token, args.device_id)
+            else:
+                run_forever(args.server, args.pairing_token, args.device_id)
+            return
+        except PairingRequiredError as exc:
+            print(str(exc), flush=True)
+            repaired = resolve_runtime_args(
+                ["--server", args.server],
+                output_fn=print,
+            )
+            if repaired is None or not repaired.pairing_challenge:
+                return
+            bootstrap = HelperTransport(repaired.server, "", device_id=repaired.device_id)
+            paired = bootstrap.http_json(
+                "api/helper/pair/complete",
+                {"challenge": repaired.pairing_challenge, "device_id": repaired.device_id, "capabilities": {
+                    "hardware_discovery": True, "real_capture": True, "local_csv_save": True, "local_mysql_save": True,
+                }},
+                authorized=False,
+            )
+            if not paired.get("ok"):
+                print(str(paired.get("error") or "重新配对失败"), flush=True)
+                return
+            args = repaired
+            args.pairing_token = str(paired.get("pairing_token") or "")
+            save_runtime_config(args.server, args.pairing_token, args.device_id, args.transport)
 
 
 if __name__ == "__main__":
