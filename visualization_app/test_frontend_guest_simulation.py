@@ -203,6 +203,17 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn("physical_interface_id: physicalId", body)
         self.assertIn("enabled: Boolean(physicalId)", body)
 
+    def test_initialize_does_not_render_unassigned_defaults_before_discovery(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("async function initialize()")
+        end = text.index("function hideLegacyInterfaceFields", start)
+        body = text[start:end]
+        self.assertNotIn(
+            "renderInterfacePanel(payload.acquisition.interface_defaults || []);",
+            body,
+        )
+
     def test_helper_reconnect_triggers_public_interface_rediscovery(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")

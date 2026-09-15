@@ -2935,7 +2935,6 @@ async function initialize() {
     ensureFirstInterfaceRole();
     ensureFirstInterfaceSummary();
     placeSecondInterfaceAfterFirst();
-    renderInterfacePanel(payload.acquisition.interface_defaults || []);
       if (state.accessRole !== "guest") {
         await discoverInterfaces();
       } else {
