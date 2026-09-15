@@ -9,6 +9,10 @@ $ErrorActionPreference = "Stop"
 $taskName = "AFP Local Capture Helper"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $helperDirectory = Join-Path $projectRoot "delivery\AFP_Integrated_System_Modular_v2.0.3_Agentic\local_helper"
+if (-not (Test-Path -LiteralPath $helperDirectory -PathType Container)) {
+    # The same script is copied beside the helper in the delivery folder.
+    $helperDirectory = Join-Path $PSScriptRoot "local_helper"
+}
 $helperExecutable = Join-Path $helperDirectory "AFP_Local_Capture_Helper.exe"
 
 if ($Uninstall) {

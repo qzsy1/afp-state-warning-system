@@ -166,6 +166,7 @@ class HelperTransportTests(unittest.TestCase):
         self.assertIn("RestartCount", text)
         self.assertIn("AFP_Local_Capture_Helper.exe", text)
         self.assertIn("-Uninstall", text)
+        self.assertIn('Join-Path $PSScriptRoot "local_helper"', text)
 
     def test_helper_uses_a_single_instance_mutex(self):
         acquire = getattr(helper_entry, "acquire_single_instance_lock", None)
