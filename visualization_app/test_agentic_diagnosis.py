@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import unittest
 
 try:
@@ -12,6 +13,11 @@ try:
     import agentic_diagnosis
 except ImportError:  # RED phase: added after the offline behavior is specified.
     agentic_diagnosis = None
+
+try:
+    from diagnosis_jobs import DiagnosisJobStore
+except ImportError:  # RED phase: the resumable job store is added by Task 3.
+    DiagnosisJobStore = None
 
 
 INTERFACE_FIXTURES = (
@@ -144,6 +150,43 @@ class NoSensorTruthTests(unittest.TestCase):
             "检查未通过：0/5 个目标传感器接口已由有效数据确认，0/17 个通道正常",
         )
         self.assertNotIn("传感器损坏", json.dumps(normalized, ensure_ascii=False))
+
+
+class DiagnosisJobStoreTests(unittest.TestCase):
+    def test_job_lifecycle_keeps_result_and_enforces_owner(self) -> None:
+        self.assertIsNotNone(DiagnosisJobStore, "diagnosis job store must exist")
+        store = DiagnosisJobStore()
+        job = store.submit(
+            "session-a",
+            "fingerprint-a",
+            lambda: {"diagnoses": [{"fault_type": "接口未响应"}]},
+        )
+        self.assertIn(job["state"], {"pending", "running"})
+        completed = store.wait_for("session-a", job["job_id"], timeout=1.0)
+        self.assertEqual(completed["state"], "success")
+        self.assertEqual(len(completed["result"]["diagnoses"]), 1)
+        self.assertIsNone(store.get("session-b", job["job_id"]))
+
+    def test_failed_job_preserves_fingerprint_and_error(self) -> None:
+        self.assertIsNotNone(DiagnosisJobStore, "diagnosis job store must exist")
+        store = DiagnosisJobStore()
+
+        def fail() -> dict:
+            raise RuntimeError("模型服务不可用")
+
+        job = store.submit("session-a", "fingerprint-b", fail)
+        completed = store.wait_for("session-a", job["job_id"], timeout=1.0)
+        self.assertEqual(completed["state"], "failed")
+        self.assertEqual(completed["fingerprint"], "fingerprint-b")
+        self.assertIn("模型服务不可用", completed["error"])
+
+    def test_resumable_diagnosis_routes_are_authorized_and_registered(self) -> None:
+        access_source = Path(__file__).with_name("web_access.py").read_text(encoding="utf-8")
+        app_source = Path(__file__).with_name("app.py").read_text(encoding="utf-8")
+        self.assertIn('"/api/agent/diagnose/start"', access_source)
+        self.assertIn('"/api/agent/diagnose/result"', access_source)
+        self.assertIn('parsed.path == "/api/agent/diagnose/start"', app_source)
+        self.assertIn('parsed.path == "/api/agent/diagnose/result"', app_source)
 
 
 def diagnostic_context_for(hardware_result: dict):

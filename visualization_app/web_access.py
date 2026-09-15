@@ -51,6 +51,7 @@ AUTHORIZED_GET = {
     "/api/realtime",
     "/api/acquisition/export-manifest",
     "/api/acquisition/export-file",
+    "/api/agent/diagnose/result",
 }
 AUTHORIZED_POST = {
     "/api/real/control/acquire",
@@ -78,9 +79,14 @@ AUTHORIZED_POST = {
     "/api/helper/command",
     "/api/prediction-model/select-file",
     "/api/prediction-model/inspect",
+    "/api/agent/diagnose/start",
 }
 AUTHORIZED_PREFIXES = ("/api/acquisition/", "/api/training/", "/api/mysql/", "/api/real/")
-AUTHORIZED_EXACT = {"/api/agent/diagnose", "/api/auth/logout"}
+AUTHORIZED_EXACT = {
+    "/api/agent/diagnose",
+    "/api/agent/diagnose/start",
+    "/api/auth/logout",
+}
 LOCAL_ADMIN_PREFIX = "/api/admin/"
 LOCAL_ADMIN_GET = {"/api/admin/status", "/api/admin/security/settings"}
 LOCAL_ADMIN_POST = {

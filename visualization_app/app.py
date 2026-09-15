@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 from copy import deepcopy
+import hashlib
 import hmac
 import inspect
 import io
@@ -64,6 +65,7 @@ from web_training import WebTrainingManager
 from guest_simulation import GuestSimulationError, GuestSimulationManager
 from helper_relay import HelperRegistry
 from local_capture_agent import LocalCaptureAgent
+from diagnosis_jobs import DiagnosisJobStore
 from public_status import build_public_device_status
 from web_access import (
     PermissionPolicy,
@@ -3934,6 +3936,7 @@ class AppHandler(BaseHTTPRequestHandler):
     replay_lock: threading.Lock
     model_limiter: SlidingWindowLimiter
     model_call_lock: threading.Lock
+    diagnosis_jobs: DiagnosisJobStore
     access_context: str = "public"
     permission_policy = PermissionPolicy()
     login_limiter = SlidingWindowLimiter()
@@ -4431,6 +4434,18 @@ class AppHandler(BaseHTTPRequestHandler):
                     }
                 )
             return
+        if parsed.path == "/api/agent/diagnose/result":
+            session_id = str(self._identity().session_id or "")
+            if not session_id:
+                self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
+                return
+            job_id = self._one(parse_qs(parsed.query), "job_id", "")
+            snapshot = self.diagnosis_jobs.get(session_id, job_id)
+            if snapshot is None:
+                self._send_json({"error": "job_not_found"}, HTTPStatus.NOT_FOUND)
+                return
+            self._send_json(snapshot)
+            return
         if parsed.path == "/api/training/status":
             query = parse_qs(parsed.query)
             self._send_json(self.dashboard.web_training.status(int(self._one(query, "after_seq", "0"))))
@@ -4864,6 +4879,82 @@ class AppHandler(BaseHTTPRequestHandler):
                     self.guest_manager.stop(self._identity().guest_id)
                 )
                 return
+            if parsed.path == "/api/agent/diagnose/start":
+                from interface_agent import (
+                    DEFAULT_SILICONFLOW_MODEL,
+                    run_interface_diagnoses,
+                )
+
+                identity = self._identity()
+                if identity.role not in {"authorized", "local_admin"}:
+                    self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
+                    return
+                request_data = _validate_agent_payload(payload)
+                try:
+                    stored_key, stored_model = self.security_store.model_credentials()
+                except Exception:
+                    stored_key, stored_model = "", DEFAULT_SILICONFLOW_MODEL
+                api_key = request_data["api_key"] or stored_key
+                model_name = request_data["model_name"] or stored_model
+                if not api_key or not model_name:
+                    self._send_json({"error": "model_not_configured"}, HTTPStatus.BAD_REQUEST)
+                    return
+                session_id = str(identity.session_id or "local-admin")
+                if self.model_limiter.count("model", session_id, 60.0) >= 3:
+                    self._send_json({"error": "model_rate_limited"}, HTTPStatus.TOO_MANY_REQUESTS)
+                    return
+                self.model_limiter.allow("model", session_id, 3, 60.0)
+                events = deepcopy(request_data["events"])
+                hardware_result = deepcopy(request_data["hardware_result"])
+                discovery = deepcopy(self.dashboard.acquisition.discover_interfaces())
+                acquisition_status = deepcopy(self.dashboard.acquisition.status())
+                fingerprint_payload = {
+                    "events": events,
+                    "hardware_result": hardware_result,
+                }
+                fingerprint = hashlib.sha256(
+                    json.dumps(
+                        fingerprint_payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+
+                def run_model() -> dict:
+                    if not self.model_call_lock.acquire(blocking=False):
+                        raise RuntimeError("模型调用正在进行，请稍后重试")
+                    started = time.monotonic()
+                    try:
+                        result = run_interface_diagnoses(
+                            events,
+                            api_key=api_key,
+                            model_name=model_name,
+                            hardware_result=hardware_result,
+                            discovery=discovery,
+                            acquisition_status=acquisition_status,
+                            use_environment_credentials=False,
+                        )
+                        result["model_used"] = str(
+                            result.get("model_status") or ""
+                        ).startswith("success")
+                        self.security_store.append_audit(
+                            "model_success" if result["model_used"] else "model_failure",
+                            session_id=identity.session_id,
+                            remote_label=self._remote_label(),
+                            details={
+                                "model_name": model_name,
+                                "elapsed_seconds": round(max(0.0, time.monotonic() - started), 3),
+                                "job_fingerprint": fingerprint,
+                            },
+                        )
+                        return result
+                    finally:
+                        self.model_call_lock.release()
+
+                snapshot = self.diagnosis_jobs.submit(session_id, fingerprint, run_model)
+                self._send_json(snapshot, HTTPStatus.ACCEPTED)
+                return
             if parsed.path == "/api/agent/diagnose":
                 from interface_agent import (
                     DEFAULT_SILICONFLOW_MODEL,
@@ -5215,6 +5306,7 @@ def create_server(
     replay_lock = threading.Lock()
     model_limiter = SlidingWindowLimiter()
     model_call_lock = threading.Lock()
+    diagnosis_jobs = DiagnosisJobStore()
     handler = type(
         "ConfiguredAppHandler",
         (AppHandler,),
@@ -5227,6 +5319,7 @@ def create_server(
             "replay_lock": replay_lock,
             "model_limiter": model_limiter,
             "model_call_lock": model_call_lock,
+            "diagnosis_jobs": diagnosis_jobs,
             "access_context": str(access_context),
             "public_web_config": dict(public_web_config or {}),
             "login_limiter": SlidingWindowLimiter(),
@@ -5243,6 +5336,7 @@ def create_server(
     server.control_lease = active_control_lease
     server.access_context = handler.access_context
     server.public_web_config = dict(public_web_config or {})
+    server.diagnosis_jobs = diagnosis_jobs
     return server
 
 
