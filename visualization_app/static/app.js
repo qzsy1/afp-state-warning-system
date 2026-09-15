@@ -2372,9 +2372,13 @@ function simulationCacheFor(index) {
   if (!dataset) return [];
   const total = dataset.rows.length;
   const safeIndex = Math.max(0, Math.min(total - 1, Number(index) || 0));
-  const start = Math.max(0, safeIndex - SIMULATION_PLAYBACK_CACHE_ROWS + 1);
+  // Keep a small look-ahead block ready in memory.  The full dataset is
+  // loaded once, while playback/rendering advances through this rolling
+  // 20-row block instead of issuing another network request per sample.
+  const start = Math.floor(safeIndex / SIMULATION_PLAYBACK_CACHE_ROWS)
+    * SIMULATION_PLAYBACK_CACHE_ROWS;
   dataset.cache_start = start;
-  dataset.cache_rows = dataset.rows.slice(start, safeIndex + 1);
+  dataset.cache_rows = dataset.rows.slice(start, start + SIMULATION_PLAYBACK_CACHE_ROWS);
   return dataset.cache_rows;
 }
 
@@ -2384,14 +2388,19 @@ function buildCachedSimulationPayload(index) {
   if (!dataset || !template) return null;
   const rows = simulationCacheFor(index);
   const history = Math.max(1, Number(controls.history?.value || 240));
-  const allRows = dataset.rows.slice(0, Math.max(0, Number(index) + 1));
+  const safeIndex = Math.max(0, Math.min(dataset.rows.length - 1, Number(index) || 0));
+  const currentRow = rows[safeIndex - dataset.cache_start] || dataset.rows[safeIndex];
+  const allRows = dataset.rows.slice(0, safeIndex + 1);
   const visibleRows = allRows.slice(-history);
   const channels = (template.channels || []).map((channel) => {
     const values = visibleRows.map((row) => {
       const value = Number(row?.[channel.name]);
       return Number.isFinite(value) ? value : null;
     });
-    const current = values.length ? values[values.length - 1] : null;
+    const cachedCurrent = Number(currentRow?.[channel.name]);
+    const current = Number.isFinite(cachedCurrent)
+      ? cachedCurrent
+      : (values.length ? values[values.length - 1] : null);
     return {
       ...channel,
       actual: values,

@@ -186,6 +186,13 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn("state.livePollTimer", replay_body)
         self.assertIn("clearInterval", replay_body)
 
+        cache_start = text.index("function simulationCacheFor(index)")
+        cache_end = text.index("function buildCachedSimulationPayload", cache_start)
+        cache_body = text[cache_start:cache_end]
+        self.assertIn("Math.floor(safeIndex / SIMULATION_PLAYBACK_CACHE_ROWS)", cache_body)
+        self.assertIn("cache_start", cache_body)
+        self.assertIn("cache_rows", cache_body)
+
     def test_local_helper_websocket_route_keeps_http_fallback_contract(self):
         access = Path(__file__).with_name("web_access.py").read_text(encoding="utf-8")
         source = Path(__file__).with_name("app.py").read_text(encoding="utf-8")
