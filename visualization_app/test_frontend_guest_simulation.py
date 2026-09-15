@@ -202,7 +202,8 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn('postJson("/api/agent/diagnose/start"', body)
         self.assertIn('fetch(`/api/agent/diagnose/result?job_id=', text)
         self.assertIn("state.agentJobId", body)
-        self.assertNotIn('postJson("/api/agent/diagnose",', body)
+        self.assertIn('state.accessRole === "guest"', body)
+        self.assertIn('postJson("/api/agent/diagnose",', body)
 
     def test_agent_job_polling_survives_request_timeout_without_aborting_server_job(self):
         source = Path(__file__).with_name("static") / "app.js"

@@ -1764,6 +1764,19 @@ async function runAgentDiagnosis({automatic = false} = {}) {
   const autoStatus = $("agentAutoStatus");
   if (autoStatus) autoStatus.textContent = automatic ? "新异常已提交 LangChain 诊断任务……" : "正在提交诊断任务……";
   try {
+    if (state.accessRole === "guest") {
+      if (autoStatus) autoStatus.textContent = "正在执行本地规则诊断……";
+      const result = await postJson("/api/agent/diagnose", {
+        api_key: "",
+        model_name: "",
+        events: state.agentEvents,
+        hardware_result: state.hardwareCheck,
+      }, {timeoutMs: 30000});
+      if (requestId !== state.agentRequestId) return null;
+      state.agentResult = result;
+      if (autoStatus) autoStatus.textContent = result.model_message || "本地诊断已完成。";
+      return result;
+    }
     const started = await postJson("/api/agent/diagnose/start", {
       api_key: state.accessRole === "guest" ? "" : (agentApiKeyInput?.value.trim() || ""),
       model_name: state.accessRole === "guest" ? "" : (agentModelNameInput?.value.trim() || ""),
