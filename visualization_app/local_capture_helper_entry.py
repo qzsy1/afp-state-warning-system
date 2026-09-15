@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from dataclasses import fields
 from typing import Any
@@ -142,11 +143,80 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _prompt_setup_gui(existing_server: str = "") -> argparse.Namespace | None:
+    """Show a setup dialog when Explorer did not provide a usable console.
+
+    A console EXE launched by double-click can have stdin redirected to an
+    already-closed handle.  The previous implementation treated that as a
+    normal cancellation and exited, leaving the web page with no heartbeat.
+    The small Tk dialog keeps the same one-time URL/code contract without
+    requiring a terminal window.
+    """
+
+    try:
+        import tkinter as tk
+        from tkinter import messagebox, ttk
+    except Exception:
+        return None
+
+    result: dict[str, str] = {}
+    root = tk.Tk()
+    root.title("AFP 本地采集辅助程序")
+    root.resizable(False, False)
+    frame = ttk.Frame(root, padding=16)
+    frame.grid()
+    ttk.Label(frame, text="连接网页端并识别本机接口", font=("Microsoft YaHei UI", 11, "bold")).grid(
+        row=0, column=0, columnspan=2, sticky="w", pady=(0, 10)
+    )
+    ttk.Label(frame, text="网页地址").grid(row=1, column=0, sticky="w", pady=4)
+    server_var = tk.StringVar(value=existing_server)
+    server_entry = ttk.Entry(frame, textvariable=server_var, width=54)
+    server_entry.grid(row=1, column=1, pady=4)
+    ttk.Label(frame, text="配对码").grid(row=2, column=0, sticky="w", pady=4)
+    challenge_var = tk.StringVar()
+    challenge_entry = ttk.Entry(frame, textvariable=challenge_var, width=54)
+    challenge_entry.grid(row=2, column=1, pady=4)
+    ttk.Label(
+        frame,
+        text="请先在网页端解锁真实模式并生成配对码；配对码 5 分钟内有效。",
+    ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 12))
+
+    def submit() -> None:
+        server = server_var.get().strip()
+        challenge = normalize_pairing_code(challenge_var.get())
+        if not server or not challenge:
+            messagebox.showwarning("信息不完整", "请输入网页地址和配对码。", parent=root)
+            return
+        result.update(server=server, pairing_challenge=challenge)
+        root.destroy()
+
+    def cancel() -> None:
+        root.destroy()
+
+    buttons = ttk.Frame(frame)
+    buttons.grid(row=4, column=0, columnspan=2, sticky="e", pady=(2, 0))
+    ttk.Button(buttons, text="连接", command=submit).grid(row=0, column=0, padx=(0, 8))
+    ttk.Button(buttons, text="取消", command=cancel).grid(row=0, column=1)
+    root.protocol("WM_DELETE_WINDOW", cancel)
+    server_entry.focus_set()
+    root.mainloop()
+    if not result:
+        return None
+    return argparse.Namespace(
+        server=result["server"],
+        pairing_token="",
+        pairing_challenge=result["pairing_challenge"],
+        device_id="local-helper",
+        transport="https",
+    )
+
+
 def resolve_runtime_args(
     argv: list[str] | None = None,
     *,
     input_fn=input,
     output_fn=print,
+    gui_fn=None,
 ) -> argparse.Namespace | None:
     """Resolve CLI arguments without silently exiting when double-clicked.
 
@@ -159,10 +229,19 @@ def resolve_runtime_args(
     if not args.server:
         output_fn("本地采集辅助程序需要网页地址和配对码。")
         output_fn("网页地址示例：http://127.0.0.1:8770 或 https://你的域名")
+        # Explorer launches may have no usable stdin.  Open the setup dialog
+        # immediately in that case instead of waiting for an input handle
+        # that will be closed and making the helper silently disappear.
+        if input_fn is input:
+            try:
+                if not sys.stdin.isatty():
+                    return (gui_fn or _prompt_setup_gui)()
+            except (AttributeError, OSError):
+                return (gui_fn or _prompt_setup_gui)()
         try:
             args.server = str(input_fn("请输入网页地址：")).strip()
         except (EOFError, OSError):
-            return None
+            return (gui_fn or _prompt_setup_gui)()
         if not args.server:
             output_fn("未输入网页地址，辅助程序未启动。")
             return None
@@ -170,7 +249,7 @@ def resolve_runtime_args(
         try:
             args.pairing_challenge = str(input_fn("请输入网页端生成的配对码：")).strip()
         except (EOFError, OSError):
-            return None
+            return (gui_fn or _prompt_setup_gui)(args.server)
         if not args.pairing_challenge:
             output_fn("未输入配对码，辅助程序未启动。")
             return None

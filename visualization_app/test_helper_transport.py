@@ -74,6 +74,26 @@ class HelperTransportTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.pairing_challenge, "challenge-1")
 
+    def test_helper_cli_falls_back_to_setup_gui_when_console_input_is_unavailable(self):
+        expected = object()
+        def unavailable(_prompt):
+            raise EOFError
+        result = resolve_runtime_args(
+            [], input_fn=unavailable, gui_fn=lambda _server="": expected,
+            output_fn=lambda _line: None,
+        )
+        self.assertIs(result, expected)
+
+    def test_helper_cli_uses_setup_gui_if_pairing_prompt_closes(self):
+        expected = object()
+        result = resolve_runtime_args(
+            ["--server", "https://example.test"],
+            input_fn=lambda _prompt: (_ for _ in ()).throw(EOFError),
+            gui_fn=lambda server="": (server, expected),
+            output_fn=lambda _line: None,
+        )
+        self.assertEqual(result, ("https://example.test", expected))
+
     def test_authentication_failure_requires_repair_instead_of_silent_retry(self):
         self.assertTrue(
             should_repair_pairing(RuntimeError("辅助服务连接失败：HTTP Error 401: Unauthorized"))
