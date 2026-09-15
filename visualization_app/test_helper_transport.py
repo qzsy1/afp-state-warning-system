@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import sys
 import json
+import inspect
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock
@@ -49,7 +52,8 @@ class HelperTransportTests(unittest.TestCase):
     def test_helper_cli_without_arguments_returns_setup_guidance_instead_of_argparse_exit(self):
         output = []
         result = resolve_runtime_args(
-            [], input_fn=lambda _prompt: "", output_fn=output.append
+            [], input_fn=lambda _prompt: "", output_fn=output.append,
+            config_path=Path(__file__).with_name(".missing-helper-config.json"),
         )
         self.assertIsNone(result)
         self.assertTrue(any("网页地址" in line for line in output))
@@ -83,6 +87,7 @@ class HelperTransportTests(unittest.TestCase):
         result = resolve_runtime_args(
             [], input_fn=unavailable, gui_fn=lambda _server="": expected,
             output_fn=lambda _line: None,
+            config_path=Path(__file__).with_name(".missing-helper-config.json"),
         )
         self.assertIs(result, expected)
 
@@ -179,6 +184,54 @@ class HelperTransportTests(unittest.TestCase):
             self.assertIsNone(acquire("AFP_Local_Capture_Helper_test"))
         finally:
             release(first)
+
+    def test_http_poll_loop_dispatches_hardware_checks_off_the_heartbeat_thread(self):
+        source = inspect.getsource(helper_entry.run_http_forever)
+        self.assertIn("ThreadPoolExecutor", source)
+        self.assertIn("max_workers=1", source)
+        self.assertIn("executor.submit", source)
+
+    def test_http_poll_loop_keeps_heartbeats_while_command_is_slow(self):
+        polls = []
+        results = []
+        finished = threading.Event()
+
+        class FakeTransport:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def http_json(self, path, payload, **_kwargs):
+                if path == "api/helper/poll":
+                    polls.append(time.monotonic())
+                    if len(polls) == 1:
+                        return {
+                            "ok": True,
+                            "command": {
+                                "type": "command",
+                                "request_id": "slow-check",
+                                "command": "check_capture",
+                                "payload": {},
+                            },
+                        }
+                    if len(polls) >= 4:
+                        raise KeyboardInterrupt
+                    return {"ok": True, "command": None, "heartbeat": True}
+                results.append((path, payload))
+                finished.set()
+                return {"ok": True}
+
+        def slow_dispatch(_agent, _raw):
+            time.sleep(0.7)
+            return {"request_id": "slow-check", "payload": {"ok": False}}
+
+        with unittest.mock.patch.object(helper_entry, "HelperTransport", FakeTransport), \
+             unittest.mock.patch.object(helper_entry, "LocalCaptureAgent", return_value=Mock()), \
+             unittest.mock.patch.object(helper_entry, "dispatch_command", side_effect=slow_dispatch):
+            helper_entry.run_http_forever("https://example.test", "token", "local-helper")
+
+        self.assertGreaterEqual(len(polls), 4)
+        self.assertTrue(finished.wait(2.0))
+        self.assertEqual(results[0][0], "api/helper/result")
 
 
 if __name__ == "__main__":

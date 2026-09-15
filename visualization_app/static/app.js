@@ -4870,7 +4870,11 @@ async function testSensorConnection({automatic = false} = {}) {
       node.textContent = `${automatic ? "正在自动检查" : "正在检查"}访问者电脑上的接口和传感器…`;
     }
     try {
-      const result = await requestLocalHelper("check_capture", acquisitionConfig(), {timeoutMs: 30000});
+      // A real-interface probe may have to wait for serial/USB/PLC/ABB
+      // drivers to time out one by one.  The helper keeps its heartbeat on a
+      // separate thread, so allow the command enough time to finish instead
+      // of reporting a client-side timeout while the check is still running.
+      const result = await requestLocalHelper("check_capture", acquisitionConfig(), {timeoutMs: 120000});
       state.hardwareCheck = result;
       state.hardwareCheckFingerprint = hardwareConfigFingerprint();
       renderHardwareCheckResult(result, {automatic});
