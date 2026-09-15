@@ -193,6 +193,16 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn('state.accessRole === "authorized"', body)
         self.assertIn('requestLocalHelper("discover"', body)
 
+    def test_helper_reconnect_triggers_public_interface_rediscovery(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("async function loadHelperStatus")
+        end = text.index("async function pairLocalHelper", start)
+        body = text[start:end]
+        self.assertIn("wasOnline", body)
+        self.assertIn("discoverInterfaces()", body)
+        self.assertIn("state.helperStatus.online", body)
+
     def test_agent_diagnosis_uses_resumable_job_submission_and_polling(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")

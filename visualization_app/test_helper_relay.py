@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import time
 import unittest
+import tempfile
 from unittest.mock import patch
 from pathlib import Path
 
@@ -82,6 +83,22 @@ class HelperRelayTests(unittest.TestCase):
         self.assertFalse(status["online"])
         self.assertFalse(request["queued"])
         self.assertEqual(request["error"], "helper_offline")
+
+    def test_pairing_survives_server_restart_without_persisting_plaintext_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "helper_registry.json"
+            first = HelperRegistry(persistence_path=path)
+            challenge = first.start_pairing("session-a")
+            paired = first.complete_pairing(challenge["challenge"], "device-a", {"discover": True})
+            token = paired["pairing_token"]
+            self.assertTrue(path.is_file())
+            self.assertNotIn(token, path.read_text(encoding="utf-8"))
+
+            restarted = HelperRegistry(persistence_path=path)
+            status = restarted.status("session-a")
+            self.assertTrue(status["paired"])
+            self.assertFalse(status["online"])
+            self.assertEqual(restarted.authenticate("device-a", token), "session-a")
 
 
 if __name__ == "__main__":

@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
+import os
 import secrets
 import threading
 import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 
@@ -61,12 +64,71 @@ class HelperRegistry:
         *,
         challenge_ttl_seconds: int = 300,
         heartbeat_ttl_seconds: int = 15,
+        persistence_path: str | Path | None = None,
     ) -> None:
         self.challenge_ttl_seconds = max(30, int(challenge_ttl_seconds))
         self.heartbeat_ttl_seconds = max(1, int(heartbeat_ttl_seconds))
+        self.persistence_path = Path(persistence_path).resolve() if persistence_path else None
         self._lock = threading.RLock()
         self._pairings: dict[str, _Pairing] = {}
         self._helpers: dict[str, _Helper] = {}
+        self._load_persisted_helpers()
+
+    def _load_persisted_helpers(self) -> None:
+        path = self.persistence_path
+        if path is None or not path.is_file():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            helpers = payload.get("helpers", {}) if isinstance(payload, dict) else {}
+            if not isinstance(helpers, dict):
+                return
+            with self._lock:
+                for session_id, item in helpers.items():
+                    if not isinstance(item, dict):
+                        continue
+                    device_id = str(item.get("device_id") or "").strip()
+                    token_hash = str(item.get("token_hash") or "").strip()
+                    if not device_id or len(token_hash) != 64:
+                        continue
+                    self._helpers[str(session_id)] = _Helper(
+                        session_id=str(session_id),
+                        device_id=device_id,
+                        token_hash=token_hash,
+                        capabilities=dict(item.get("capabilities") or {}),
+                        online=False,
+                        last_seen=None,
+                    )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return
+
+    def _persist_helpers_locked(self) -> None:
+        path = self.persistence_path
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "version": 1,
+                "helpers": {
+                    session_id: {
+                        "device_id": helper.device_id,
+                        "token_hash": helper.token_hash,
+                        "capabilities": dict(helper.capabilities),
+                    }
+                    for session_id, helper in self._helpers.items()
+                },
+            }
+            temporary = path.with_name(path.name + ".tmp")
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                encoding="utf-8",
+            )
+            os.replace(temporary, path)
+        except OSError:
+            # Pairing remains valid for the running process; a filesystem
+            # failure must not interrupt an active acquisition session.
+            return
 
     def start_pairing(self, session_id: str) -> dict[str, Any]:
         challenge = secrets.token_urlsafe(24)
@@ -112,6 +174,7 @@ class HelperRegistry:
                 online=True,
                 last_seen=now,
             )
+            self._persist_helpers_locked()
             return {
                 "ok": True,
                 "session_id": matched_session,

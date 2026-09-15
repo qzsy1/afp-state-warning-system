@@ -158,6 +158,7 @@ function renderHelperStatus() {
 }
 
 async function loadHelperStatus() {
+  const wasOnline = Boolean(state.helperStatus?.online);
   if (state.accessRole === "guest") {
     state.helperStatus = {paired: false, online: false, capabilities: {}};
     renderHelperStatus();
@@ -170,6 +171,16 @@ async function loadHelperStatus() {
     state.helperStatus = {paired: false, online: false, capabilities: {}, lastError: "辅助程序状态读取失败"};
   }
   renderHelperStatus();
+  // A public page can finish loading before the helper reconnects.  Once the
+  // helper heartbeat becomes online, refresh the physical-interface mapping
+  // automatically so the panel does not remain on the initial "未分配" state.
+  if (
+    state.accessRole === "authorized"
+    && state.helperStatus.online
+    && !wasOnline
+  ) {
+    await discoverInterfaces();
+  }
 }
 
 async function pairLocalHelper() {

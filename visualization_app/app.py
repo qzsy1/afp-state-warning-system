@@ -5302,6 +5302,10 @@ def create_server(
         },
     )
     active_control_lease = control_lease or RealControlLease()
+    helper_registry = HelperRegistry(
+        persistence_path=runtime_root / "helper_registry.json"
+    )
+    active_dashboard.helper_registry = helper_registry
     replay_cache: dict[str, tuple[int, dict]] = {}
     replay_lock = threading.Lock()
     model_limiter = SlidingWindowLimiter()
