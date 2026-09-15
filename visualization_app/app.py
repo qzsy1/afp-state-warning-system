@@ -80,7 +80,12 @@ from web_access import (
 from web_auth import AuthenticationError, SecurityStore
 from control_lease import RealControlLease
 from json_safety import json_safe_value
-from websocket_live import encode_json_frame, encode_server_frame, websocket_handshake_headers
+from websocket_live import (
+    encode_json_frame,
+    encode_server_frame,
+    recv_client_frame,
+    websocket_handshake_headers,
+)
 
 
 APP_DIR = Path(os.environ.get("AFP_LEGACY_APP_DIR") or Path(__file__).resolve().parent).resolve()
@@ -4403,6 +4408,110 @@ class AppHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError, TimeoutError):
             return
 
+    def _serve_helper_websocket(self, query: dict[str, list[str]]) -> None:
+        """Keep one authenticated local-helper connection open over WSS.
+
+        The helper uses the same pairing token and command contract as the
+        legacy HTTPS poller.  This endpoint only changes message transport;
+        discovery and capture still execute in the existing helper process.
+        """
+        authorization = str(self.headers.get("Authorization", ""))
+        token = (
+            authorization[7:].strip()
+            if authorization.lower().startswith("bearer ")
+            else ""
+        )
+        device_id = str(
+            (query.get("device_id") or [""])[0]
+            or self.headers.get("X-AFP-Device-ID", "")
+        ).strip()
+        session_id = self.dashboard.helper_registry.authenticate(device_id, token)
+        if not session_id:
+            self._send_json({"ok": False, "error": "helper_authentication_failed"}, HTTPStatus.UNAUTHORIZED)
+            return
+        key = str(self.headers.get("Sec-WebSocket-Key") or "").strip()
+        if not key:
+            self._send_json({"ok": False, "error": "websocket_key_missing"}, HTTPStatus.BAD_REQUEST)
+            return
+        headers = websocket_handshake_headers(key)
+        previous_protocol = self.protocol_version
+        self.protocol_version = "HTTP/1.1"
+        try:
+            self.send_response(HTTPStatus.SWITCHING_PROTOCOLS)
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+        finally:
+            self.protocol_version = previous_protocol
+        self.close_connection = True
+
+        def sender(message: dict[str, Any]) -> None:
+            self.request.sendall(encode_json_frame(message))
+
+        if not self.dashboard.helper_registry.attach(
+            session_id, device_id, token, sender
+        ):
+            return
+        self.request.settimeout(30.0)
+        try:
+            while True:
+                opcode, raw = recv_client_frame(self.request)
+                if opcode == 0x8:  # close
+                    try:
+                        self.request.sendall(encode_server_frame(b"", opcode=0x8))
+                    except OSError:
+                        pass
+                    return
+                if opcode == 0x9:  # ping
+                    self.request.sendall(encode_server_frame(raw, opcode=0xA))
+                    continue
+                if opcode != 0x1:  # only text application messages are needed
+                    continue
+                try:
+                    message = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, ValueError):
+                    sender({"type": "error", "error": "helper消息不是有效JSON"})
+                    continue
+                if not isinstance(message, dict):
+                    sender({"type": "error", "error": "helper消息必须是JSON对象"})
+                    continue
+                message_type = str(message.get("type") or "").strip().lower()
+                if message_type == "hello":
+                    capabilities = message.get("capabilities")
+                    self.dashboard.helper_registry.attach(
+                        session_id,
+                        device_id,
+                        token,
+                        sender,
+                        capabilities=capabilities
+                        if isinstance(capabilities, dict)
+                        else None,
+                    )
+                    sender({"type": "hello_ack", "ok": True})
+                elif message_type == "heartbeat":
+                    if self.dashboard.helper_registry.authenticate(device_id, token):
+                        sender({"type": "heartbeat_ack", "ok": True})
+                    else:
+                        sender({"type": "error", "error": "helper_authentication_failed"})
+                        return
+                elif message_type == "result":
+                    accepted = self.dashboard.helper_registry.accept_result(
+                        device_id,
+                        token,
+                        str(message.get("request_id") or ""),
+                        message.get("payload")
+                        if isinstance(message.get("payload"), dict)
+                        else {},
+                    )
+                    sender({"type": "result_ack", **accepted})
+                else:
+                    sender({"type": "error", "error": "helper消息类型不受支持"})
+        except (BrokenPipeError, ConnectionResetError, ConnectionError, OSError, TimeoutError, ValueError):
+            return
+        finally:
+            self.dashboard.helper_registry.detach(session_id)
+
     def do_GET(self) -> None:  # noqa: N802
         if not self._is_allowed_host():
             self._send_json({"error": "请求 Host 不被允许"}, HTTPStatus.FORBIDDEN)
@@ -4418,6 +4527,12 @@ class AppHandler(BaseHTTPRequestHandler):
             and str(self.headers.get("Upgrade") or "").lower() == "websocket"
         ):
             self._serve_live_websocket(parse_qs(parsed.query))
+            return
+        if (
+            parsed.path == "/api/helper/ws"
+            and str(self.headers.get("Upgrade") or "").lower() == "websocket"
+        ):
+            self._serve_helper_websocket(parse_qs(parsed.query))
             return
         if parsed.path == "/api/health":
             self._send_json(

@@ -156,6 +156,15 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn("/api/simulation/ws", text)
         self.assertIn("/api/live/ws", text)
 
+    def test_local_helper_websocket_route_keeps_http_fallback_contract(self):
+        access = Path(__file__).with_name("web_access.py").read_text(encoding="utf-8")
+        source = Path(__file__).with_name("app.py").read_text(encoding="utf-8")
+        helper = Path(__file__).with_name("local_capture_helper_entry.py").read_text(encoding="utf-8")
+        self.assertIn('"/api/helper/ws"', access)
+        self.assertIn("def _serve_helper_websocket", source)
+        self.assertIn("api/helper/poll", helper)
+        self.assertIn("run_auto_forever", helper)
+
     def test_simulation_interface_checkbox_follows_loaded_channel_mapping(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")

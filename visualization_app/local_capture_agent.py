@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -190,14 +191,32 @@ class HelperTransport:
 
     def connect_once(self):
         """Open one WSS connection when websocket-client is installed."""
-        if not self.server_url.startswith("wss://"):
-            raise ValueError("本地辅助程序只允许使用wss://服务地址")
+        if not self.server_url:
+            raise ValueError("辅助服务地址不能为空")
         try:
             import websocket  # type: ignore
         except ImportError as exc:
             raise RuntimeError("缺少websocket-client依赖，无法连接公网辅助服务") from exc
+        parsed = urllib.parse.urlsplit(self.server_url)
+        if parsed.scheme not in {"wss", "https"}:
+            raise ValueError("本地辅助程序只允许使用 HTTPS/WSS 服务地址")
+        path = parsed.path.rstrip("/")
+        if not path or path == "/":
+            path = "/api/helper/ws"
+        elif not path.endswith("/api/helper/ws"):
+            # The saved server value is normally an origin URL.  Ignore any
+            # accidental landing-page path instead of producing a bad nested
+            # endpoint such as ``/base/api/helper/ws``.
+            path = "/api/helper/ws"
+        query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        query = [(key, value) for key, value in query if key != "device_id"]
+        query.append(("device_id", self.device_id))
+        scheme = "wss" if parsed.scheme == "https" else parsed.scheme
+        url = urllib.parse.urlunsplit(
+            (scheme, parsed.netloc, path, urllib.parse.urlencode(query), "")
+        )
         return websocket.create_connection(
-            self.server_url,
+            url,
             timeout=10,
             header=[f"Authorization: Bearer {self.pairing_token}"],
         )

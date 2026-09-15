@@ -21,7 +21,7 @@ if (Test-Path -LiteralPath $staging) {
 }
 New-Item -ItemType Directory -Path $staging | Out-Null
 & $PythonExecutable -3.11 -m PyInstaller --noconfirm --clean --onefile --console `
-    --name "AFP_Local_Capture_Helper" --distpath $staging --workpath (Join-Path $staging "build") `
+    --hidden-import websocket --name "AFP_Local_Capture_Helper" --distpath $staging --workpath (Join-Path $staging "build") `
     --specpath $staging $entry
 if ($LASTEXITCODE -ne 0) {
     throw "本地辅助程序PyInstaller构建失败：$LASTEXITCODE"

@@ -95,7 +95,7 @@ def save_runtime_config(
     server: str,
     pairing_token: str,
     device_id: str = "local-helper",
-    transport: str = "https",
+    transport: str = "auto",
     *,
     path: str | Path | None = None,
 ) -> Path:
@@ -107,7 +107,7 @@ def save_runtime_config(
         "server": str(server).strip().rstrip("/"),
         "pairing_token_encrypted": _protect_secret(pairing_token),
         "device_id": str(device_id or "local-helper"),
-        "transport": str(transport or "https"),
+        "transport": str(transport or "auto"),
     }
     temporary = config_path.with_name(config_path.name + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
@@ -131,7 +131,13 @@ def load_saved_runtime_config(*, path: str | Path | None = None) -> dict[str, st
             "server": server,
             "pairing_token": token,
             "device_id": str(payload.get("device_id") or "local-helper"),
-            "transport": str(payload.get("transport") or "https"),
+            # Old helpers stored ``https`` while the resilient default now
+            # means WSS-first with HTTPS polling fallback.
+            "transport": (
+                "auto"
+                if str(payload.get("transport") or "https").lower() == "https"
+                else str(payload.get("transport") or "auto")
+            ),
         }
     except (OSError, ValueError, TypeError, json.JSONDecodeError, UnicodeError):
         return None
@@ -271,14 +277,22 @@ def run_http_forever(server_url: str, pairing_token: str, device_id: str) -> Non
         executor.shutdown(wait=False, cancel_futures=True)
 
 
-def run_forever(server_url: str, pairing_token: str, device_id: str) -> None:
+def run_forever(
+    server_url: str,
+    pairing_token: str,
+    device_id: str,
+    *,
+    max_consecutive_failures: int | None = None,
+) -> bool:
     agent = LocalCaptureAgent()
     transport = HelperTransport(server_url, pairing_token, device_id=device_id)
     delay = 1.0
+    failures = 0
     while True:
         connection = None
         try:
             connection = transport.connect_once()
+            failures = 0
             connection.send(
                 json.dumps(
                     transport.hello(
@@ -288,15 +302,45 @@ def run_forever(server_url: str, pairing_token: str, device_id: str) -> None:
                 )
             )
             delay = 1.0
+            try:
+                connection.settimeout(10)
+            except Exception:
+                pass
             while True:
-                raw = connection.recv()
+                try:
+                    raw = connection.recv()
+                except Exception as exc:
+                    # websocket-client exposes a dedicated timeout exception;
+                    # avoid importing its private class and keep the helper
+                    # heartbeat portable across package versions.
+                    if exc.__class__.__name__ == "WebSocketTimeoutException":
+                        connection.send(json.dumps({"type": "heartbeat"}))
+                        continue
+                    raise
                 if raw is None:
                     break
-                response = dispatch_command(agent, raw)
+                try:
+                    message = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+                except (TypeError, ValueError, UnicodeDecodeError):
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                if message.get("type") in {"hello_ack", "heartbeat_ack", "result_ack"}:
+                    continue
+                if message.get("type") == "error":
+                    if str(message.get("error") or "") == "helper_authentication_failed":
+                        raise PairingRequiredError(authentication_failure_message())
+                    continue
+                response = dispatch_command(agent, json.dumps(message, ensure_ascii=False))
                 connection.send(json.dumps(response, ensure_ascii=False))
         except KeyboardInterrupt:
-            return
+            return True
+        except PairingRequiredError:
+            raise
         except Exception:
+            failures += 1
+            if max_consecutive_failures and failures >= max_consecutive_failures:
+                return False
             time.sleep(delay)
             delay = min(delay * 2.0, 30.0)
         finally:
@@ -307,13 +351,34 @@ def run_forever(server_url: str, pairing_token: str, device_id: str) -> None:
                     pass
 
 
+def run_auto_forever(server_url: str, pairing_token: str, device_id: str) -> None:
+    """Prefer WSS, then fall back to the proven HTTPS poller.
+
+    Three consecutive WSS connection failures are enough to identify an
+    unavailable endpoint or missing optional dependency.  Once the fallback
+    poller is active, all existing pairing and command semantics remain in
+    place, so a public tunnel outage cannot make the helper exit.
+    """
+    try:
+        connected = run_forever(
+            server_url,
+            pairing_token,
+            device_id,
+            max_consecutive_failures=3,
+        )
+    except PairingRequiredError:
+        raise
+    if not connected:
+        run_http_forever(server_url, pairing_token, device_id)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AFP本地采集辅助程序")
     parser.add_argument("--server", default="", help="网页服务地址，例如 https://afp.example.com")
     parser.add_argument("--pairing-token", default="")
     parser.add_argument("--pairing-challenge", default="")
     parser.add_argument("--device-id", default="local-helper")
-    parser.add_argument("--transport", choices=("https", "wss"), default="https")
+    parser.add_argument("--transport", choices=("auto", "https", "wss"), default="auto")
     return parser
 
 
@@ -381,7 +446,7 @@ def _prompt_setup_gui(existing_server: str = "") -> argparse.Namespace | None:
         pairing_token="",
         pairing_challenge=result["pairing_challenge"],
         device_id="local-helper",
-        transport="https",
+        transport="auto",
     )
 
 
@@ -471,8 +536,10 @@ def _run_main() -> None:
         try:
             if args.transport == "https":
                 run_http_forever(args.server, args.pairing_token, args.device_id)
-            else:
+            elif args.transport == "wss":
                 run_forever(args.server, args.pairing_token, args.device_id)
+            else:
+                run_auto_forever(args.server, args.pairing_token, args.device_id)
             return
         except PairingRequiredError as exc:
             print(str(exc), flush=True)

@@ -188,6 +188,7 @@ class HelperRegistry:
         device_id: str,
         pairing_token: str,
         sender: Callable[[dict[str, Any]], None],
+        capabilities: dict[str, Any] | None = None,
     ) -> bool:
         with self._lock:
             helper = self._helpers.get(session_id)
@@ -198,6 +199,9 @@ class HelperRegistry:
             helper.sender = sender
             helper.online = True
             helper.last_seen = time.time()
+            if isinstance(capabilities, dict):
+                helper.capabilities = dict(capabilities)
+                self._persist_helpers_locked()
             return True
 
     def detach(self, session_id: str) -> None:

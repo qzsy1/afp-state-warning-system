@@ -104,6 +104,24 @@ class HelperRelayTests(unittest.TestCase):
             self.assertFalse(status["online"])
             self.assertEqual(restarted.authenticate("device-a", token), "session-a")
 
+    def test_attach_updates_capabilities_and_marks_helper_online(self):
+        registry = HelperRegistry()
+        challenge = registry.start_pairing("session-a")
+        paired = registry.complete_pairing(challenge["challenge"], "device-a", {})
+        registry.detach("session-a")
+
+        attached = registry.attach(
+            "session-a",
+            "device-a",
+            paired["pairing_token"],
+            lambda _request: None,
+            capabilities={"hardware_discovery": True},
+        )
+
+        self.assertTrue(attached)
+        self.assertTrue(registry.status("session-a")["online"])
+        self.assertTrue(registry.status("session-a")["capabilities"]["hardware_discovery"])
+
 
 if __name__ == "__main__":
     unittest.main()

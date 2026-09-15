@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import socket
 from typing import Any
 
 
@@ -51,6 +52,76 @@ def encode_json_frame(payload: dict[str, Any]) -> bytes:
             allow_nan=False,
         )
     )
+
+
+def decode_client_frame(frame: bytes) -> tuple[int, bytes]:
+    """Decode one complete masked client frame.
+
+    Browser/helper clients must mask frames sent to a server.  The helper is
+    deliberately limited to one complete frame because the HTTP handler reads
+    the exact frame length from the socket before calling this function.
+    """
+    data = bytes(frame)
+    if len(data) < 2:
+        raise ValueError("WebSocket 帧不完整")
+    first, second = data[0], data[1]
+    if not first & 0x80:
+        raise ValueError("不支持 WebSocket 分片帧")
+    if not second & 0x80:
+        raise ValueError("客户端 WebSocket 帧必须掩码")
+    opcode = first & 0x0F
+    length = second & 0x7F
+    offset = 2
+    if length == 126:
+        if len(data) < offset + 2:
+            raise ValueError("WebSocket 帧长度不完整")
+        length = int.from_bytes(data[offset : offset + 2], "big")
+        offset += 2
+    elif length == 127:
+        if len(data) < offset + 8:
+            raise ValueError("WebSocket 帧长度不完整")
+        length = int.from_bytes(data[offset : offset + 8], "big")
+        offset += 8
+    if len(data) < offset + 4 + length:
+        raise ValueError("WebSocket 帧载荷不完整")
+    if len(data) != offset + 4 + length:
+        raise ValueError("WebSocket 帧包含多余数据")
+    mask = data[offset : offset + 4]
+    offset += 4
+    payload = bytes(value ^ mask[index % 4] for index, value in enumerate(data[offset:]))
+    return opcode, payload
+
+
+def recv_client_frame(connection: socket.socket, max_bytes: int = 1_048_576) -> tuple[int, bytes]:
+    """Read and decode one complete client frame from a connected socket."""
+    def receive_exact(size: int) -> bytes:
+        chunks: list[bytes] = []
+        remaining = size
+        while remaining:
+            chunk = connection.recv(remaining)
+            if not chunk:
+                raise ConnectionError("WebSocket 连接已关闭")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    head = receive_exact(2)
+    length_code = head[1] & 0x7F
+    extension = b""
+    if length_code == 126:
+        extension = receive_exact(2)
+        length = int.from_bytes(extension, "big")
+    elif length_code == 127:
+        extension = receive_exact(8)
+        length = int.from_bytes(extension, "big")
+    else:
+        length = length_code
+    if length > max_bytes:
+        raise ValueError("WebSocket 帧载荷过大")
+    mask = receive_exact(4) if head[1] & 0x80 else b""
+    payload = receive_exact(length)
+    raw = head + extension + mask + payload
+    return decode_client_frame(raw)
 
 
 def websocket_handshake_headers(client_key: str) -> dict[str, str]:

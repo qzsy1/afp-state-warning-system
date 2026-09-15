@@ -22,6 +22,7 @@ PUBLIC_GET = {
     "/api/simulation/export-manifest",
     "/api/simulation/export-file",
     "/api/simulation/download",
+    "/api/helper/ws",
     "/api/agent/defaults",
     "/api/bootstrap",
 }
