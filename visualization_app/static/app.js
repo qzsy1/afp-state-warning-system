@@ -678,72 +678,6 @@ function selectedModelInputSensors() {
 
 
 
-async function discoverInterfaces() {
-  // A simulation stream is a local CSV/folder/MySQL source.  It must never
-  // be blocked by the presence (or absence) of physical COM ports.
-  if (controls.acquisitionMode?.value === "simulation") {
-    state.availableInterfaces = [];
-    state.physicalInterfaces = [];
-    if (controls.interfaceDiscoveryStatus) {
-      controls.interfaceDiscoveryStatus.textContent =
-        "模拟采集不需要识别物理接口；仅使用当前选择的 CSV/文件夹/MySQL 数据源";
-    }
-    return;
-  }
-  if (state.accessRole === "authorized") {
-    if (!state.helperStatus?.paired) {
-      state.interfaceCatalog = buildSimulationInterfaceCatalog().map((item) => ({...item, enabled: false, physical_interface_id: "", physical_verified: false}));
-      renderInterfacePanel(state.interfaceCatalog);
-      if (controls.interfaceDiscoveryStatus) controls.interfaceDiscoveryStatus.textContent = "真实采集等待本机采集辅助程序配对；未读取服务器电脑接口";
-      return;
-    }
-    try {
-      const helper = await requestLocalHelper("discover", {}, {timeoutMs: 15000});
-      const physical = Array.isArray(helper.interfaces) ? helper.interfaces : [];
-      const defaults = Array.isArray(helper.raw_discovery?.defaults) && helper.raw_discovery.defaults.length
-        ? helper.raw_discovery.defaults : defaultInterfaceCatalog();
-      const bindings = new Map((helper.sensor_bindings || []).map((item) => [String(item.role || ""), item]));
-      state.physicalInterfaces = physical;
-      state.availableInterfaces = recognizedInterfacePortsFrom(helper.raw_discovery?.ports || []);
-      state.interfaceCatalog = defaults.map((item) => {
-        const binding = bindings.get(String(item.role || ""));
-        return {...item, physical_interface_id: binding?.physical_interface_id || "", physical_interface_kind: binding?.physical_kind || "", physical_verified: Boolean(binding?.interface_detected || binding?.driver_available)};
-      });
-      renderInterfacePanel(state.interfaceCatalog);
-      markHardwareCheckStale("本机辅助程序接口识别结果已更新");
-      if (controls.interfaceDiscoveryStatus) controls.interfaceDiscoveryStatus.textContent = physical.length
-        ? `已由本机辅助程序识别 ${physical.length} 个实际接口并完成传感器映射`
-        : "本机辅助程序未发现兼容接口";
-      return;
-    } catch (error) {
-      if (controls.interfaceDiscoveryStatus) controls.interfaceDiscoveryStatus.textContent = `本机辅助程序识别失败：${error.message}`;
-      return;
-    }
-  }
-  try {
-    const result = await fetch("/api/acquisition/discover", {cache: "no-store"}).then((response) => response.json());
-    const firstDefault = result.defaults?.[0];
-    if (firstDefault) {
-      controls.driver.value = firstDefault.driver || "serial_json";
-      controls.endpoint.value = firstDefault.endpoint || controls.endpoint.value;
-      controls.baudrate.value = String(firstDefault.baudrate || 115200);
-      if (controls.firstInterfaceRole) controls.firstInterfaceRole.value = firstDefault.role || "thermocouple";
-    }
-    state.interfaceCatalog = result.defaults || [];
-    renderInterfacePanel(state.interfaceCatalog);
-    const ports = result.ports || [];
-    if (controls.interfaceDiscoveryStatus) {
-      controls.interfaceDiscoveryStatus.textContent = ports.length
-        ? `发现 ${ports.length} 个串口：${ports.map((item) => item.endpoint).join(", ")}`
-        : "未发现串口；可手动填写 COM 端口或 TCP 地址";
-    }
-  } catch (error) {
-    if (controls.interfaceDiscoveryStatus) controls.interfaceDiscoveryStatus.textContent = `接口识别失败：${error.message}`;
-  }
-}
-
-
-
 function liveEvidenceScopeKey() {
   const newSchema = controls.datasetSchema.value === "new_collection_v11_3";
   return JSON.stringify({
@@ -4012,11 +3946,61 @@ function renderInterfacePanel(configs) {
 async function discoverInterfaces() {
   if (controls.acquisitionMode?.value === "simulation") {
     state.availableInterfaces = [];
+    state.physicalInterfaces = [];
     if (controls.interfaceDiscoveryStatus) {
       controls.interfaceDiscoveryStatus.textContent =
         "模拟采集不需要识别物理接口；仅使用当前选择的 CSV/文件夹/MySQL 数据源";
     }
     return;
+  }
+  if (state.accessRole === "authorized") {
+    if (!state.helperStatus?.paired) {
+      state.interfaceCatalog = buildSimulationInterfaceCatalog().map((item) => ({
+        ...item,
+        enabled: false,
+        physical_interface_id: "",
+        physical_verified: false,
+      }));
+      renderInterfacePanel(state.interfaceCatalog);
+      if (controls.interfaceDiscoveryStatus) {
+        controls.interfaceDiscoveryStatus.textContent =
+          "真实采集等待本机采集辅助程序配对；未读取服务器电脑接口";
+      }
+      return;
+    }
+    try {
+      const helper = await requestLocalHelper("discover", {}, {timeoutMs: 15000});
+      const physical = Array.isArray(helper.interfaces) ? helper.interfaces : [];
+      const defaults = Array.isArray(helper.raw_discovery?.defaults) && helper.raw_discovery.defaults.length
+        ? helper.raw_discovery.defaults : defaultInterfaceCatalog();
+      const bindings = new Map(
+        (helper.sensor_bindings || []).map((item) => [String(item.role || ""), item]),
+      );
+      state.physicalInterfaces = physical;
+      state.availableInterfaces = recognizedInterfacePortsFrom(helper.raw_discovery?.ports || []);
+      state.interfaceCatalog = defaults.map((item) => {
+        const binding = bindings.get(String(item.role || ""));
+        return {
+          ...item,
+          physical_interface_id: binding?.physical_interface_id || "",
+          physical_interface_kind: binding?.physical_kind || "",
+          physical_verified: Boolean(binding?.interface_detected || binding?.driver_available),
+        };
+      });
+      renderInterfacePanel(state.interfaceCatalog);
+      markHardwareCheckStale("本机辅助程序接口识别结果已更新");
+      if (controls.interfaceDiscoveryStatus) {
+        controls.interfaceDiscoveryStatus.textContent = physical.length
+          ? `已由本机辅助程序识别 ${physical.length} 个实际接口并完成传感器映射`
+          : "本机辅助程序未发现兼容接口";
+      }
+      return;
+    } catch (error) {
+      if (controls.interfaceDiscoveryStatus) {
+        controls.interfaceDiscoveryStatus.textContent = `本机辅助程序识别失败：${error.message}`;
+      }
+      return;
+    }
   }
   try {
     const result = await fetch("/api/acquisition/discover", {cache: "no-store"}).then((response) => response.json());

@@ -177,6 +177,22 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn('acquisition["interface_discovery"] = {', text)
         self.assertIn('"physical_interfaces": physical_interfaces', text)
 
+    def test_public_read_only_relation_refresh_does_not_require_capture_control(self):
+        source = Path(__file__).with_name("app.py")
+        text = source.read_text(encoding="utf-8")
+        start = text.index("controlled_paths = {")
+        end = text.index("}", start)
+        body = text[start:end]
+        self.assertNotIn('"/api/mysql/relation-map"', body)
+
+    def test_discover_interfaces_has_one_authoritative_definition_with_helper_branch(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        self.assertEqual(text.count("async function discoverInterfaces()"), 1)
+        body = text[text.index("async function discoverInterfaces()"):]
+        self.assertIn('state.accessRole === "authorized"', body)
+        self.assertIn('requestLocalHelper("discover"', body)
+
     def test_simulation_mapping_does_not_cross_assign_serial_to_usb_profiles(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")

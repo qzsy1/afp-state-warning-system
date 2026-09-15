@@ -4815,7 +4815,6 @@ class AppHandler(BaseHTTPRequestHandler):
                 "/api/training/import",
                 "/api/training/start",
                 "/api/training/stop",
-                "/api/mysql/relation-map",
             }
             if parsed.path in controlled_paths and not self._require_real_control():
                 return
