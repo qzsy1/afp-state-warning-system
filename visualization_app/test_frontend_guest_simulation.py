@@ -103,6 +103,15 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertNotIn('settings.mysql_local_host', body)
         self.assertNotIn('settings.mysql_local_port', body)
 
+    def test_public_authorized_page_does_not_replace_visitor_mysql_defaults(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("async function loadMysqlDefaults")
+        end = text.index("const LAYER_EVIDENCE_VISIBILITY_KEY", start)
+        body = text[start:end]
+        self.assertIn('state.accessRole === "local_admin"', body)
+        self.assertIn("assign(controls.mysqlLocalHost, local.host)", body)
+
     def test_runtime_status_identifies_simulation_streams(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")

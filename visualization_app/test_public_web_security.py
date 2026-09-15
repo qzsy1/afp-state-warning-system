@@ -230,6 +230,22 @@ class PublicWebAccessTests(unittest.TestCase):
             is_secure_request("192.168.1.50", {"Host": "127.0.0.1:8770"}, "public")
         )
 
+    def test_direct_private_lan_client_is_distinguished_from_cloudflare_proxy(self):
+        from web_access import is_lan_client
+
+        self.assertTrue(is_lan_client("192.168.101.44", {"Host": "192.168.101.31:8770"}))
+        self.assertTrue(is_lan_client("10.0.0.44", {"Host": "10.0.0.10:8770"}))
+        self.assertFalse(
+            is_lan_client(
+                "127.0.0.1",
+                {
+                    "Host": "temporary-check.trycloudflare.com",
+                    "CF-Connecting-IP": "203.0.113.10",
+                    "X-Forwarded-Proto": "https",
+                },
+            )
+        )
+
     def test_quick_tunnel_host_requires_cloudflare_https_from_loopback(self):
         from web_access import is_trusted_quick_tunnel_request
 

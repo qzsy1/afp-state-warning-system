@@ -69,6 +69,7 @@ from web_access import (
     PermissionPolicy,
     RequestIdentity,
     SlidingWindowLimiter,
+    is_lan_client,
     is_secure_request,
     is_trusted_quick_tunnel_request,
 )
@@ -4078,6 +4079,11 @@ class AppHandler(BaseHTTPRequestHandler):
             "127.0.0.1",
             "::1",
         }:
+            identity = RequestIdentity("local_admin", "local-admin", guest_id)
+        elif self.access_context == "public" and is_lan_client(peer_host, self.headers):
+            # A direct private-network client is the operator's LAN session.
+            # Cloudflare requests arrive through loopback with a CF identity
+            # header and remain guest/authorized according to web login.
             identity = RequestIdentity("local_admin", "local-admin", guest_id)
         else:
             token = str(cookies.get("afp_session") or "")

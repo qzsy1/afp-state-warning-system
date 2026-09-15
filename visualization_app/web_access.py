@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import threading
 import time
 from collections import defaultdict, deque
@@ -158,6 +159,28 @@ def is_secure_request(
         return True
     forwarded = str(headers.get("X-Forwarded-Proto", "")).split(",", 1)[0]
     return bool(loopback and forwarded.strip().lower() == "https")
+
+
+def is_lan_client(peer_host: str, headers: Mapping[str, str]) -> bool:
+    """Return true for a direct private-network client, not a tunnel proxy.
+
+    The public listener is shared by LAN and Cloudflare traffic.  Cloudflare
+    connects to the origin over loopback and adds ``CF-Connecting-IP``; a
+    direct LAN browser instead arrives with its private address and no proxy
+    identity.  Keep loopback out of this check so the public loopback tests
+    and the separate local-admin listener retain their existing semantics.
+    """
+
+    peer = str(peer_host or "").strip()
+    if not peer or peer in {"127.0.0.1", "::1", "localhost"}:
+        return False
+    if str(headers.get("CF-Connecting-IP", "")).strip():
+        return False
+    try:
+        address = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+    return bool(address.is_private)
 
 
 def is_trusted_quick_tunnel_request(

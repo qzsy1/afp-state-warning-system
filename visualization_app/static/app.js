@@ -506,11 +506,18 @@ async function loadMysqlDefaults() {
     assign(controls.mysqlUser, target.user);
     assign(controls.mysqlPassword, target.password);
     assign(controls.mysqlDatabase, target.database);
-    assign(controls.mysqlLocalHost, local.host);
-    assign(controls.mysqlLocalPort, local.port);
-    assign(controls.mysqlLocalUser, local.user);
-    assign(controls.mysqlLocalPassword, local.password);
-    assign(controls.mysqlLocalDatabase, local.database);
+    // The server profile describes the acquisition host.  A public page's
+    // local-MySQL section belongs to the visitor computer and is executed by
+    // its paired helper, so never overwrite those fields with server-local
+    // credentials.  The desktop/LAN admin page is the one case where both
+    // sides are the same machine and the profile is authoritative.
+    if (state.accessRole === "local_admin") {
+      assign(controls.mysqlLocalHost, local.host);
+      assign(controls.mysqlLocalPort, local.port);
+      assign(controls.mysqlLocalUser, local.user);
+      assign(controls.mysqlLocalPassword, local.password);
+      assign(controls.mysqlLocalDatabase, local.database);
+    }
   } catch (_) {
     // Static defaults remain usable when a legacy backend lacks this endpoint.
   }
