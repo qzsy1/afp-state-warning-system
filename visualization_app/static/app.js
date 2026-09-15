@@ -2224,7 +2224,7 @@ function configureDataMode() {
     window.clearInterval(state.livePollTimer);
     state.livePollTimer = window.setInterval(() => {
       if (!state.busy) loadRealtime();
-    }, 100);
+    }, livePollIntervalMs());
   } else {
     window.clearInterval(state.livePollTimer);
     state.livePollTimer = null;
@@ -2233,6 +2233,20 @@ function configureDataMode() {
   configureAutomaticIndicator(true);
   updateDatasetMeta();
   loadRealtime();
+}
+
+function livePollIntervalMs() {
+  // A public HTTPS tunnel adds a variable round trip.  Polling faster than
+  // that only queues stale requests and makes the chart appear to trickle in.
+  // Keep LAN/local refresh responsive while pacing public refreshes.
+  const host = String(window.location.hostname || "").toLowerCase();
+  const isPrivateHost = host === "localhost"
+    || host === "127.0.0.1"
+    || host === "::1"
+    || /^10\./.test(host)
+    || /^192\.168\./.test(host)
+    || /^172\.(1[6-9]|2\d|3[0-1])\./.test(host);
+  return window.location.protocol === "https:" && !isPrivateHost ? 250 : 100;
 }
 
 function queryString() {
@@ -2302,7 +2316,7 @@ async function loadRealtime() {
     state.busy = false;
     if (state.reloadQueued) {
       state.reloadQueued = false;
-      window.setTimeout(loadRealtime, 0);
+      window.setTimeout(loadRealtime, controls.dataMode.value === "live" ? livePollIntervalMs() : 0);
     }
   }
 }

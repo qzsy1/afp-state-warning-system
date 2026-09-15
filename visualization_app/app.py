@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 from copy import deepcopy
+import gzip
 import hashlib
 import hmac
 import inspect
@@ -81,6 +82,27 @@ from json_safety import json_safe_value
 
 
 APP_DIR = Path(os.environ.get("AFP_LEGACY_APP_DIR") or Path(__file__).resolve().parent).resolve()
+
+
+def encode_json_response(payload: dict, accept_encoding: str = "") -> tuple[bytes, bool]:
+    """Serialize a JSON response and compress large browser payloads when supported.
+
+    Live charts return several channels, prediction arrays, and evidence in one
+    response.  Sending that unchanged through a public tunnel adds avoidable
+    transfer time.  Compression is opt-in per request and never changes the
+    JSON contract; helper clients that do not advertise gzip keep the original
+    bytes.
+    """
+
+    raw = json.dumps(
+        json_safe_value(payload), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+    if len(raw) < 1024 or "gzip" not in str(accept_encoding or "").lower():
+        return raw, False
+    compressed = gzip.compress(raw, compresslevel=6, mtime=0)
+    if len(compressed) >= len(raw):
+        return raw, False
+    return compressed, True
 
 
 def local_mysql_profile() -> dict:
@@ -4219,12 +4241,14 @@ class AppHandler(BaseHTTPRequestHandler):
             return {"installed": False, "running": False, "service_name": "cloudflared", "error_code": "inspection_unavailable"}
 
     def _send_json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
-        raw = json.dumps(
-            json_safe_value(payload), ensure_ascii=False, allow_nan=False
-        ).encode("utf-8")
+        raw, compressed = encode_json_response(
+            payload, self.headers.get("Accept-Encoding", "")
+        )
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
+        if compressed:
+            self.send_header("Content-Encoding", "gzip")
         self.send_header("Cache-Control", "no-store")
         self._send_security_headers()
         self.end_headers()

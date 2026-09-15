@@ -136,6 +136,13 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn("SUPPLIED_SIMULATION_SOURCE", text)
         self.assertIn('acquisition["simulation_source_name"] = default_source', text)
 
+    def test_large_json_responses_are_compressed_for_public_clients(self):
+        source = Path(__file__).with_name("app.py")
+        text = source.read_text(encoding="utf-8")
+        self.assertIn("def encode_json_response", text)
+        self.assertIn('"gzip" not in str(accept_encoding or "").lower()', text)
+        self.assertIn('self.send_header("Content-Encoding", "gzip")', text)
+
     def test_simulation_interface_checkbox_follows_loaded_channel_mapping(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
@@ -363,6 +370,8 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
     def test_real_capture_routes_through_online_local_helper(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
+        self.assertIn("function livePollIntervalMs()", text)
+        self.assertIn("livePollIntervalMs()", text)
         self.assertIn("requestLocalHelper(\"discover\"", text)
         self.assertIn("requestLocalHelper(\"check_capture\"", text)
         self.assertIn("timeoutMs: 120000", text)
