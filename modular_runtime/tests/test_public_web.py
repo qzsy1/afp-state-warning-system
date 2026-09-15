@@ -22,6 +22,13 @@ class PublicWebConfigTests(unittest.TestCase):
         self.assertEqual(config.local_admin_port, 8771)
         self.assertEqual(config.origin_url, "http://127.0.0.1:8770")
 
+    def test_public_service_stays_alive_after_desktop_window_closes(self):
+        config = PublicWebConfig.from_mapping({"enabled": True})
+        self.assertTrue(
+            config.keep_alive_after_window_close,
+            "公网源站不能因桌面窗口关闭而被回收",
+        )
+
     def test_rejects_public_admin_port_collision(self):
         with self.assertRaises(ValueError):
             PublicWebConfig.from_mapping({"public_port": 8771})

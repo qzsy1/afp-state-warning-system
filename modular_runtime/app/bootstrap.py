@@ -556,9 +556,16 @@ def _launch_public_web(context: Any, manager: Any) -> None:
         )
         webview.start(debug=False)
     finally:
-        for server in servers:
-            server.shutdown()
-            server.server_close()
+        # Closing the desktop webview must not tear down the HTTP origin.  In
+        # public mode that origin is also the target of the Cloudflare Tunnel;
+        # shutting it down leaves the tunnel URL alive but unusable.  Join the
+        # public server thread to keep this process alive until it is stopped.
+        if config.keep_alive_after_window_close and sys.exc_info()[0] is None:
+            threads[0].join()
+        else:
+            for server in servers:
+                server.shutdown()
+                server.server_close()
 
 
 def main(root: Path, arguments: list[str] | None = None) -> None:

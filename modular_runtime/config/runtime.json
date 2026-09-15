@@ -37,6 +37,7 @@
     "local_admin_bind_host": "127.0.0.1",
     "local_admin_port": 8771,
     "open_desktop_window": true,
+    "keep_alive_after_window_close": true,
     "hostname": "",
     "domain": "",
     "cloudflare_tunnel_enabled": false,

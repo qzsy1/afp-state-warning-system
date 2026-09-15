@@ -27,6 +27,10 @@ class PublicWebConfig:
     local_admin_bind_host: str = "127.0.0.1"
     local_admin_port: int = 8771
     open_desktop_window: bool = True
+    # The desktop window is only a client of the HTTP services.  Keep the
+    # public/local listeners alive after that window is closed so a Cloudflare
+    # tunnel never points at a dead origin.
+    keep_alive_after_window_close: bool = True
     domain: str = ""
     cloudflare_tunnel_enabled: bool = False
     cloudflared_path: str = "cloudflared"
@@ -65,6 +69,7 @@ class PublicWebConfig:
             local_admin_bind_host=admin_host,
             local_admin_port=admin_port,
             open_desktop_window=bool(values.get("open_desktop_window", True)),
+            keep_alive_after_window_close=bool(values.get("keep_alive_after_window_close", True)),
             domain=str(values.get("domain", "")).strip(),
             cloudflare_tunnel_enabled=bool(values.get("cloudflare_tunnel_enabled", False)),
             cloudflared_path=str(values.get("cloudflared_path", "cloudflared")).strip() or "cloudflared",
