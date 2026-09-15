@@ -8,6 +8,10 @@ const state = {
   timer: null,
   requestTimer: null,
   livePollTimer: null,
+  liveSocket: null,
+  liveSocketQuery: "",
+  liveSocketReconnectTimer: null,
+  liveSocketReconnectAttempt: 0,
   busy: false,
   reloadQueued: false,
   requestedHorizon: null,
@@ -2222,17 +2226,22 @@ function configureDataMode() {
     stopPlayback();
     controls.realtimePrediction.checked = true;
     window.clearInterval(state.livePollTimer);
-    state.livePollTimer = window.setInterval(() => {
-      if (!state.busy) loadRealtime();
-    }, livePollIntervalMs());
+    if (usePublicLiveWebSocket()) {
+      openLiveWebSocket();
+    } else {
+      state.livePollTimer = window.setInterval(() => {
+        if (!state.busy) loadRealtime();
+      }, livePollIntervalMs());
+    }
   } else {
     window.clearInterval(state.livePollTimer);
     state.livePollTimer = null;
+    closeLiveWebSocket();
   }
   updateRealAcquisitionVisibility();
   configureAutomaticIndicator(true);
   updateDatasetMeta();
-  loadRealtime();
+  if (!usePublicLiveWebSocket()) loadRealtime();
 }
 
 function livePollIntervalMs() {
@@ -2247,6 +2256,101 @@ function livePollIntervalMs() {
     || /^192\.168\./.test(host)
     || /^172\.(1[6-9]|2\d|3[0-1])\./.test(host);
   return window.location.protocol === "https:" && !isPrivateHost ? 250 : 100;
+}
+
+function usePublicLiveWebSocket() {
+  const host = String(window.location.hostname || "").toLowerCase();
+  const privateHost = host === "localhost"
+    || host === "127.0.0.1"
+    || host === "::1"
+    || /^10\./.test(host)
+    || /^192\.168\./.test(host)
+    || /^172\.(1[6-9]|2\d|3[0-1])\./.test(host);
+  return typeof window.WebSocket === "function"
+    && window.location.protocol === "https:"
+    && !privateHost;
+}
+
+function closeLiveWebSocket() {
+  window.clearTimeout(state.liveSocketReconnectTimer);
+  state.liveSocketReconnectTimer = null;
+  state.liveSocketQuery = "";
+  state.liveSocketReconnectAttempt = 0;
+  const socket = state.liveSocket;
+  state.liveSocket = null;
+  if (socket) {
+    socket.onclose = null;
+    socket.close();
+  }
+}
+
+function applyRealtimePayload(payload) {
+  if (!payload || payload.type === "error") {
+    throw new Error(payload?.error || "实时数据服务异常");
+  }
+  state.payload = payload;
+  if (controls.dataMode.value === "replay") {
+    controls.cursor.max = payload.progress.total_points;
+    controls.cursor.value = payload.progress.cursor;
+  }
+  render(payload);
+  $("connectionStatus").textContent = "实时数据服务已连接";
+  document.querySelector(".status-dot").classList.add("connected");
+  if (payload.acquisition) renderAcquisitionStatus(payload.acquisition);
+  renderRuntimeStatus(payload);
+  if (payload.progress.finished && state.playing) {
+    if (controls.loop.checked) {
+      controls.cursor.value = 1;
+    } else {
+      stopPlayback();
+    }
+  }
+}
+
+function openLiveWebSocket() {
+  if (!usePublicLiveWebSocket() || controls.dataMode.value !== "live") return;
+  const query = queryString();
+  if (
+    state.liveSocket
+    && state.liveSocketQuery === query
+    && (state.liveSocket.readyState === WebSocket.OPEN
+      || state.liveSocket.readyState === WebSocket.CONNECTING)
+  ) return;
+  if (state.liveSocket) {
+    state.liveSocket.onclose = null;
+    state.liveSocket.close();
+    state.liveSocket = null;
+  }
+  state.liveSocketQuery = query;
+  const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const endpoint = state.accessRole === "guest" ? "/api/simulation/ws" : "/api/live/ws";
+  const socket = new WebSocket(`${scheme}//${window.location.host}${endpoint}?${query}`);
+  state.liveSocket = socket;
+  socket.onopen = () => {
+    state.liveSocketReconnectAttempt = 0;
+    $("connectionStatus").textContent = "实时数据推送已连接";
+    document.querySelector(".status-dot").classList.add("connected");
+  };
+  socket.onmessage = (event) => {
+    try {
+      applyRealtimePayload(JSON.parse(event.data));
+    } catch (error) {
+      $("connectionStatus").textContent = `实时数据服务异常：${error.message}`;
+    }
+  };
+  socket.onerror = () => {
+    $("connectionStatus").textContent = "实时数据推送连接异常";
+  };
+  socket.onclose = () => {
+    if (state.liveSocket === socket) state.liveSocket = null;
+    if (!usePublicLiveWebSocket() || controls.dataMode.value !== "live") return;
+    const attempt = Math.min(6, state.liveSocketReconnectAttempt + 1);
+    state.liveSocketReconnectAttempt = attempt;
+    state.liveSocketReconnectTimer = window.setTimeout(
+      openLiveWebSocket,
+      Math.min(5000, 500 * (2 ** (attempt - 1))),
+    );
+  };
 }
 
 function queryString() {
@@ -2276,6 +2380,10 @@ function queryString() {
 }
 
 async function loadRealtime() {
+  if (usePublicLiveWebSocket()) {
+    openLiveWebSocket();
+    return;
+  }
   if (state.busy) {
     state.reloadQueued = true;
     return;
@@ -2288,23 +2396,7 @@ async function loadRealtime() {
     const response = await fetch(`${endpoint}?${queryString()}`, { cache: "no-store" });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || "实时数据请求失败");
-    state.payload = payload;
-    if (controls.dataMode.value === "replay") {
-      controls.cursor.max = payload.progress.total_points;
-      controls.cursor.value = payload.progress.cursor;
-    }
-    render(payload);
-    $("connectionStatus").textContent = "实时数据服务已连接";
-    document.querySelector(".status-dot").classList.add("connected");
-    if (payload.acquisition) renderAcquisitionStatus(payload.acquisition);
-    renderRuntimeStatus(payload);
-    if (payload.progress.finished && state.playing) {
-      if (controls.loop.checked) {
-        controls.cursor.value = 1;
-      } else {
-        stopPlayback();
-      }
-    }
+    applyRealtimePayload(payload);
   } catch (error) {
     stopPlayback();
     toast(error.message);

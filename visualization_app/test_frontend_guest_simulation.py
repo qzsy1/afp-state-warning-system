@@ -143,6 +143,19 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn('"gzip" not in str(accept_encoding or "").lower()', text)
         self.assertIn('self.send_header("Content-Encoding", "gzip")', text)
 
+    def test_public_live_routes_expose_websocket_upgrade(self):
+        source = Path(__file__).with_name("web_access.py")
+        text = source.read_text(encoding="utf-8")
+        self.assertIn('"/api/simulation/ws"', text)
+        self.assertIn('"/api/live/ws"', text)
+
+    def test_public_live_frontend_uses_websocket_stream(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        self.assertIn("new WebSocket", text)
+        self.assertIn("/api/simulation/ws", text)
+        self.assertIn("/api/live/ws", text)
+
     def test_simulation_interface_checkbox_follows_loaded_channel_mapping(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")

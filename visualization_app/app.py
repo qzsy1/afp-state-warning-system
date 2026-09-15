@@ -14,6 +14,7 @@ import mimetypes
 import os
 import re
 import secrets
+import select
 import sys
 import threading
 import time
@@ -79,6 +80,7 @@ from web_access import (
 from web_auth import AuthenticationError, SecurityStore
 from control_lease import RealControlLease
 from json_safety import json_safe_value
+from websocket_live import encode_json_frame, encode_server_frame, websocket_handshake_headers
 
 
 APP_DIR = Path(os.environ.get("AFP_LEGACY_APP_DIR") or Path(__file__).resolve().parent).resolve()
@@ -4337,6 +4339,70 @@ class AppHandler(BaseHTTPRequestHandler):
             acquisition=acquisition,
         )
 
+    def _serve_live_websocket(self, query: dict[str, list[str]]) -> None:
+        """Push live dashboard payloads over one RFC 6455 connection.
+
+        The existing acquisition and prediction code remains the source of
+        truth.  This endpoint only replaces repeated HTTP requests with a
+        persistent server-to-browser stream; local/LAN clients keep the
+        existing polling path.
+        """
+        from websocket_live import websocket_handshake_headers
+
+        key = str(self.headers.get("Sec-WebSocket-Key") or "").strip()
+        if not key:
+            self._send_json({"error": "websocket_key_missing"}, HTTPStatus.BAD_REQUEST)
+            return
+        headers = websocket_handshake_headers(key)
+        previous_protocol = self.protocol_version
+        self.protocol_version = "HTTP/1.1"
+        try:
+            self.send_response(HTTPStatus.SWITCHING_PROTOCOLS)
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+        finally:
+            self.protocol_version = previous_protocol
+        self.close_connection = True
+        # A server-initiated stream does not need browser application frames,
+        # but checking readability lets us acknowledge close/ping frames.
+        self.request.settimeout(5.0)
+        acquisition = None
+        if self.path.split("?", 1)[0] == "/api/simulation/ws":
+            acquisition = self.guest_manager.acquisition(self._identity().guest_id)
+        try:
+            next_push = 0.0
+            while True:
+                now = time.monotonic()
+                wait_for = max(0.0, min(0.25, next_push - now))
+                readable, _, _ = select.select([self.request], [], [], wait_for)
+                if readable:
+                    try:
+                        control = self.request.recv(4096)
+                    except (OSError, TimeoutError):
+                        return
+                    if not control:
+                        return
+                    opcode = control[0] & 0x0F
+                    if opcode == 0x8:  # close
+                        self.request.sendall(encode_server_frame(b"", opcode=0x8))
+                        return
+                    if opcode == 0x9:  # ping
+                        self.request.sendall(encode_server_frame(b"", opcode=0xA))
+                    continue
+                if time.monotonic() < next_push:
+                    continue
+                try:
+                    payload = self._live_payload(query, acquisition=acquisition)
+                    frame = encode_json_frame(payload)
+                except Exception as exc:
+                    frame = encode_json_frame({"type": "error", "error": str(exc)})
+                self.request.sendall(frame)
+                next_push = time.monotonic() + 0.25
+        except (BrokenPipeError, ConnectionResetError, OSError, TimeoutError):
+            return
+
     def do_GET(self) -> None:  # noqa: N802
         if not self._is_allowed_host():
             self._send_json({"error": "请求 Host 不被允许"}, HTTPStatus.FORBIDDEN)
@@ -4346,6 +4412,12 @@ class AppHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/") and not self._require_permission(
             "GET", parsed.path
         ):
+            return
+        if (
+            parsed.path in {"/api/simulation/ws", "/api/live/ws"}
+            and str(self.headers.get("Upgrade") or "").lower() == "websocket"
+        ):
+            self._serve_live_websocket(parse_qs(parsed.query))
             return
         if parsed.path == "/api/health":
             self._send_json(
