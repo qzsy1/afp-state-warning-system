@@ -1290,11 +1290,11 @@ async function testMysqlConnection(local = false) {
     const result = local && state.accessRole === "authorized"
       ? await requestLocalHelper("mysql_preflight", {
         mysql_enabled: true,
-        mysql_host: settings.mysql_local_host,
-        mysql_port: settings.mysql_local_port,
-        mysql_user: settings.mysql_local_user,
-        mysql_password: settings.mysql_local_password,
-        mysql_database: settings.mysql_local_database,
+        mysql_host: settings.mysql_host,
+        mysql_port: settings.mysql_port,
+        mysql_user: settings.mysql_user,
+        mysql_password: settings.mysql_password,
+        mysql_database: settings.mysql_database,
         require_schema: true,
         write_test: false,
       }, {timeoutMs: 20000})
@@ -1334,11 +1334,11 @@ async function refreshRelationMap(scope) {
     const result = local && state.accessRole === "authorized"
       ? await requestLocalHelper("mysql_relation_map", {
         mysql_enabled: true,
-        mysql_host: settings.mysql_local_host,
-        mysql_port: settings.mysql_local_port,
-        mysql_user: settings.mysql_local_user,
-        mysql_password: settings.mysql_local_password,
-        mysql_database: settings.mysql_local_database,
+        mysql_host: settings.mysql_host,
+        mysql_port: settings.mysql_port,
+        mysql_user: settings.mysql_user,
+        mysql_password: settings.mysql_password,
+        mysql_database: settings.mysql_database,
         limit: 1000,
       }, {timeoutMs: 20000})
       : await postJson("/api/mysql/relation-map", {...settings, limit: 1000});

@@ -92,6 +92,17 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn("authorized_session_required", body)
         self.assertIn("网页会话已刷新，请重试当前操作", body)
 
+    def test_local_mysql_helper_receives_unified_mysql_setting_keys(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("async function testMysqlConnection")
+        end = text.index("async function refreshRelationMap", start)
+        body = text[start:end]
+        self.assertIn('mysql_host: settings.mysql_host', body)
+        self.assertIn('mysql_port: settings.mysql_port', body)
+        self.assertNotIn('settings.mysql_local_host', body)
+        self.assertNotIn('settings.mysql_local_port', body)
+
     def test_runtime_status_identifies_simulation_streams(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
