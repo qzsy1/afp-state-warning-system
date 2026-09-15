@@ -119,6 +119,14 @@ function renderHelperStatus() {
   const code = $("helperPairingCode");
   const button = $("pairHelperButton");
   if (!badge) return;
+  if (state.accessRole === "local_admin") {
+    badge.textContent = "内置采集服务";
+    badge.className = "helper-status ok";
+    if (note) note.textContent = "局域网直连本机真实采集，无需辅助程序。";
+    button?.classList.toggle("hidden", true);
+    code?.classList.toggle("hidden", true);
+    return;
+  }
   const helper = state.helperStatus || {};
   badge.textContent = helper.online ? "已连接" : helper.paired ? "已配对，等待连接" : "未配对";
   badge.className = `helper-status ${helper.online ? "ok" : helper.paired ? "pending" : "error"}`;

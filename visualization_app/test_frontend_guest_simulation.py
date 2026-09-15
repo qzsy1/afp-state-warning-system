@@ -112,6 +112,15 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn('state.accessRole === "local_admin"', body)
         self.assertIn("assign(controls.mysqlLocalHost, local.host)", body)
 
+    def test_lan_admin_does_not_require_public_helper_pairing(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("function renderHelperStatus")
+        end = text.index("async function loadHelperStatus", start)
+        body = text[start:end]
+        self.assertIn('state.accessRole === "local_admin"', body)
+        self.assertIn("局域网直连本机真实采集，无需辅助程序", body)
+
     def test_runtime_status_identifies_simulation_streams(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
