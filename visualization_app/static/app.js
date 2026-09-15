@@ -35,6 +35,10 @@ const state = {
   agentRequestId: 0,
   agentDefaultKeyAvailable: false,
   physicalInterfaces: [],
+  // Keep the last real-mode mapping out of the simulation catalog.  Mode
+  // switches must not force a second pairing just to redraw the cards.
+  realInterfaceSnapshot: null,
+  realInterfaceSnapshotAt: 0,
   lanStatusTimer: null,
   accessRole: "guest",
   authenticated: false,
@@ -3991,6 +3995,7 @@ function renderInterfacePanel(configs) {
 
 async function discoverInterfaces() {
   if (controls.acquisitionMode?.value === "simulation") {
+    rememberRealInterfaceSnapshot();
     state.availableInterfaces = [];
     state.physicalInterfaces = [];
     if (controls.interfaceDiscoveryStatus) {
@@ -4001,16 +4006,23 @@ async function discoverInterfaces() {
   }
   if (state.accessRole === "authorized") {
     if (!state.helperStatus?.paired) {
-      state.interfaceCatalog = buildSimulationInterfaceCatalog().map((item) => ({
-        ...item,
-        enabled: false,
-        physical_interface_id: "",
-        physical_verified: false,
-      }));
-      renderInterfacePanel(state.interfaceCatalog);
+      // Restore the cached real mapping while the helper reconnects (cached real mapping);
+      // this is
+      // intentionally display-only and is never used to start capture.
+      if (!restoreCachedRealInterfaceSnapshot()) {
+        state.interfaceCatalog = buildSimulationInterfaceCatalog().map((item) => ({
+          ...item,
+          enabled: false,
+          physical_interface_id: "",
+          physical_verified: false,
+        }));
+        renderInterfacePanel(state.interfaceCatalog);
+      }
       if (controls.interfaceDiscoveryStatus) {
         controls.interfaceDiscoveryStatus.textContent =
-          "真实采集等待本机采集辅助程序配对；未读取服务器电脑接口";
+          state.realInterfaceSnapshot
+            ? "辅助程序暂时离线；已恢复最后一次真实接口映射，等待自动重连"
+            : "真实采集等待本机采集辅助程序配对；未读取服务器电脑接口";
       }
       return;
     }
@@ -4043,6 +4055,12 @@ async function discoverInterfaces() {
           enabled: Boolean(physicalId),
         };
       });
+      state.realInterfaceSnapshot = {
+        catalog: state.interfaceCatalog.map((item) => ({...item})),
+        physical: physical.map((item) => ({...item})),
+        available: state.availableInterfaces.map((item) => ({...item})),
+      };
+      state.realInterfaceSnapshotAt = Date.now();
       renderInterfacePanel(state.interfaceCatalog);
       markHardwareCheckStale("本机辅助程序接口识别结果已更新");
       if (controls.interfaceDiscoveryStatus) {
@@ -4052,8 +4070,11 @@ async function discoverInterfaces() {
       }
       return;
     } catch (error) {
+      restoreCachedRealInterfaceSnapshot();
       if (controls.interfaceDiscoveryStatus) {
-        controls.interfaceDiscoveryStatus.textContent = `本机辅助程序识别失败：${error.message}`;
+        controls.interfaceDiscoveryStatus.textContent = state.realInterfaceSnapshot
+          ? `辅助程序暂时离线，已显示最后一次真实映射：${error.message}`
+          : `本机辅助程序识别失败：${error.message}`;
       }
       return;
     }
@@ -4079,6 +4100,26 @@ async function discoverInterfaces() {
   } catch (error) {
     if (controls.interfaceDiscoveryStatus) controls.interfaceDiscoveryStatus.textContent = `接口识别失败：${error.message}`;
   }
+}
+
+function rememberRealInterfaceSnapshot() {
+  if (state.accessRole !== "authorized" || !Array.isArray(state.interfaceCatalog) || !state.interfaceCatalog.length) return;
+  state.realInterfaceSnapshot = {
+    catalog: state.interfaceCatalog.map((item) => ({...item})),
+    physical: (state.physicalInterfaces || []).map((item) => ({...item})),
+    available: (state.availableInterfaces || []).map((item) => ({...item})),
+  };
+  state.realInterfaceSnapshotAt = Date.now();
+}
+
+function restoreCachedRealInterfaceSnapshot() {
+  const snapshot = state.realInterfaceSnapshot;
+  if (!snapshot?.catalog?.length) return false;
+  state.interfaceCatalog = snapshot.catalog.map((item) => ({...item}));
+  state.physicalInterfaces = (snapshot.physical || []).map((item) => ({...item}));
+  state.availableInterfaces = (snapshot.available || []).map((item) => ({...item}));
+  renderInterfacePanel(state.interfaceCatalog);
+  return true;
 }
 
 function recognizedInterfacePortsFrom(ports) {
@@ -4182,6 +4223,7 @@ function updateSimulationSettings() {
   }
   updateRealAcquisitionVisibility();
   if (simulation) {
+    rememberRealInterfaceSnapshot();
     const current = buildSimulationInterfaceCatalog();
     if (state.physicalInterfaces.length) {
       state.interfaceCatalog = autoAssignPhysicalInterfaces(current, {allowSerialFallback: false});
@@ -4190,7 +4232,13 @@ function updateSimulationSettings() {
     }
     renderInterfacePanel(state.interfaceCatalog);
   } else {
-    discoverInterfaces();
+    // Repaint the last real mapping immediately, then refresh status and
+    // physical interfaces in the background.  This avoids a blank/unassigned
+    // interval when switching back from simulation. The realInterfaceSnapshot
+    // is display-only until the helper confirms a fresh discovery.
+    restoreCachedRealInterfaceSnapshot();
+    loadHelperStatus().catch(() => {});
+    discoverInterfaces().catch(() => {});
   }
 }
 

@@ -303,6 +303,27 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
             "real-mode physical bindings must not leak into simulation mode",
         )
 
+    def test_mode_switch_preserves_last_real_mapping_for_immediate_restore(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        self.assertIn("realInterfaceSnapshot", text)
+        discover_start = text.index("async function discoverInterfaces()")
+        discover_end = text.index("function recognizedInterfacePortsFrom", discover_start)
+        discover = text[discover_start:discover_end]
+        self.assertIn("state.realInterfaceSnapshot", discover)
+        self.assertIn("最后一次真实接口映射", discover)
+        self.assertIn("cached real mapping", discover)
+
+    def test_returning_to_real_mode_refreshes_helper_status_and_mapping(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("function updateSimulationSettings()")
+        end = text.index("function updateIntegrationSource", start)
+        body = text[start:end]
+        self.assertIn("loadHelperStatus()", body)
+        self.assertIn("discoverInterfaces()", body)
+        self.assertIn("realInterfaceSnapshot", body)
+
     def test_local_save_picker_does_not_require_a_prior_name_and_refreshes_status(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
