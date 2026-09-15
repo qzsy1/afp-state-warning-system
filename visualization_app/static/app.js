@@ -31,6 +31,7 @@ const state = {
   agentFingerprint: "",
   agentBusy: false,
   agentController: null,
+  agentJobId: "",
   agentRequestId: 0,
   agentDefaultKeyAvailable: false,
   physicalInterfaces: [],
@@ -1723,6 +1724,7 @@ function updateAgentFromHardwareResult(result, {automatic = false} = {}) {
     state.agentController?.abort();
     state.agentController = null;
     state.agentBusy = false;
+    state.agentJobId = "";
     state.agentFingerprint = fingerprint;
     state.agentResult = null;
     const autoStatus = $("agentAutoStatus");
@@ -1734,25 +1736,46 @@ function updateAgentFromHardwareResult(result, {automatic = false} = {}) {
   if (events.length && changed && !state.agentResult) runAgentDiagnosis({automatic: true});
 }
 
+async function pollAgentDiagnosisJob(jobId, requestId, {timeoutMs = 240000, intervalMs = 1200} = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (requestId !== state.agentRequestId) return null;
+    const response = await fetch(`/api/agent/diagnose/result?job_id=${encodeURIComponent(jobId)}`, {
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+    let snapshot = null;
+    try { snapshot = await response.json(); } catch (_error) { snapshot = {}; }
+    if (!response.ok) throw new Error(snapshot.error || `诊断任务查询失败（${response.status}）`);
+    if (snapshot.state === "success") return snapshot.result || {};
+    if (snapshot.state === "failed") throw new Error(snapshot.error || "诊断任务执行失败");
+    await new Promise((resolve) => window.setTimeout(resolve, intervalMs));
+  }
+  throw new Error("诊断任务仍在执行，请稍后查看结果");
+}
+
 async function runAgentDiagnosis({automatic = false} = {}) {
   if (!state.agentEvents.length || !renderAgentGate()) return null;
   const requestId = ++state.agentRequestId;
-  state.agentController?.abort();
-  const controller = typeof AbortController === "function" ? new AbortController() : null;
-  state.agentController = controller;
   state.agentBusy = true;
+  state.agentJobId = "";
   renderAgentGate();
   if (state.hardwareCheck) renderHardwareCheckResult(state.hardwareCheck, {automatic});
   const autoStatus = $("agentAutoStatus");
-  if (autoStatus) autoStatus.textContent = automatic ? "新异常已触发 LangChain 诊断……" : "正在重新诊断全部异常……";
+  if (autoStatus) autoStatus.textContent = automatic ? "新异常已提交 LangChain 诊断任务……" : "正在提交诊断任务……";
   try {
-    const result = await postJson("/api/agent/diagnose", {
+    const started = await postJson("/api/agent/diagnose/start", {
       api_key: state.accessRole === "guest" ? "" : (agentApiKeyInput?.value.trim() || ""),
       model_name: state.accessRole === "guest" ? "" : (agentModelNameInput?.value.trim() || ""),
       events: state.agentEvents,
       hardware_result: state.hardwareCheck,
-    }, {timeoutMs: 210000, controller});
+    }, {timeoutMs: 30000});
     if (requestId !== state.agentRequestId) return null;
+    state.agentJobId = started.job_id || "";
+    if (!state.agentJobId) throw new Error("服务器未返回诊断任务编号");
+    if (autoStatus) autoStatus.textContent = "诊断任务已提交，正在等待模型结果……";
+    const result = await pollAgentDiagnosisJob(state.agentJobId, requestId);
+    if (requestId !== state.agentRequestId || !result) return null;
     state.agentResult = result;
     if (autoStatus) autoStatus.textContent = result.model_message || "LangChain 诊断已完成。";
     return result;
@@ -1762,7 +1785,7 @@ async function runAgentDiagnosis({automatic = false} = {}) {
   } finally {
     if (requestId === state.agentRequestId) {
       state.agentBusy = false;
-      if (state.agentController === controller) state.agentController = null;
+      state.agentJobId = "";
       renderAgentGate();
       if (state.hardwareCheck) renderHardwareCheckResult(state.hardwareCheck, {automatic});
     }
@@ -4687,6 +4710,7 @@ function markHardwareCheckStale(reason = "配置已变化") {
   state.agentController?.abort();
   state.agentController = null;
   state.agentBusy = false;
+  state.agentJobId = "";
   state.agentEvents = [];
   state.agentResult = null;
   state.agentFingerprint = "";

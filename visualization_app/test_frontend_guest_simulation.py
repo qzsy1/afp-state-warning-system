@@ -193,6 +193,27 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn('state.accessRole === "authorized"', body)
         self.assertIn('requestLocalHelper("discover"', body)
 
+    def test_agent_diagnosis_uses_resumable_job_submission_and_polling(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("async function runAgentDiagnosis")
+        end = text.index("async function testSensorConnection", start)
+        body = text[start:end]
+        self.assertIn('postJson("/api/agent/diagnose/start"', body)
+        self.assertIn('fetch(`/api/agent/diagnose/result?job_id=', text)
+        self.assertIn("state.agentJobId", body)
+        self.assertNotIn('postJson("/api/agent/diagnose",', body)
+
+    def test_agent_job_polling_survives_request_timeout_without_aborting_server_job(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("async function runAgentDiagnosis")
+        end = text.index("async function testSensorConnection", start)
+        body = text[start:end]
+        self.assertIn("pollAgentDiagnosisJob", body)
+        self.assertIn("state.agentJobId =", body)
+        self.assertNotIn("state.agentController?.abort()", body)
+
     def test_simulation_mapping_does_not_cross_assign_serial_to_usb_profiles(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
