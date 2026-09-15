@@ -203,6 +203,15 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn("discoverInterfaces()", body)
         self.assertIn("state.helperStatus.online", body)
 
+    def test_public_reset_check_acquires_real_control_before_protected_reset(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("async function resetAndCheckHardware()")
+        end = text.index("function renderLiveHardwareMonitor", start)
+        body = text[start:end]
+        self.assertIn("await acquireRealControl();", body)
+        self.assertIn('postJson("/api/acquisition/reset-check"', body)
+
     def test_agent_diagnosis_uses_resumable_job_submission_and_polling(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")

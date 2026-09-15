@@ -4899,10 +4899,11 @@ async function resetAndCheckHardware() {
     while (state.hardwareCheckInProgress && Date.now() < deadline) {
       await new Promise((resolve) => window.setTimeout(resolve, 20));
     }
-  }
-  try {
-    if (state.accessRole !== "guest") {
-      await postJson("/api/acquisition/reset-check", {});
+    }
+    try {
+      if (state.accessRole !== "guest") {
+        await acquireRealControl();
+        await postJson("/api/acquisition/reset-check", {});
     } else {
       state.guestSimulationStarted = false;
       state.guestSimulationStoppedByUser = false;
