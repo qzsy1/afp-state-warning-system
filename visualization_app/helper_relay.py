@@ -56,8 +56,14 @@ class _Helper:
 class HelperRegistry:
     """Authorize one helper per web session without persisting secrets."""
 
-    def __init__(self, *, challenge_ttl_seconds: int = 300) -> None:
+    def __init__(
+        self,
+        *,
+        challenge_ttl_seconds: int = 300,
+        heartbeat_ttl_seconds: int = 15,
+    ) -> None:
         self.challenge_ttl_seconds = max(30, int(challenge_ttl_seconds))
+        self.heartbeat_ttl_seconds = max(1, int(heartbeat_ttl_seconds))
         self._lock = threading.RLock()
         self._pairings: dict[str, _Pairing] = {}
         self._helpers: dict[str, _Helper] = {}
@@ -187,6 +193,10 @@ class HelperRegistry:
             helper = self._helpers.get(session_id)
             if helper is None:
                 return {"paired": False, "online": False, "capabilities": {}}
+            if helper.online and helper.last_seen is not None:
+                if time.time() - helper.last_seen > self.heartbeat_ttl_seconds:
+                    helper.online = False
+                    helper.sender = None
             return {
                 "paired": True,
                 "online": bool(helper.online),
@@ -208,6 +218,12 @@ class HelperRegistry:
             helper = self._helpers.get(session_id)
             if helper is None:
                 return {"ok": False, "error": "helper_not_paired"}
+            if helper.online and helper.last_seen is not None:
+                if time.time() - helper.last_seen > self.heartbeat_ttl_seconds:
+                    helper.online = False
+                    helper.sender = None
+            if not helper.online:
+                return {"ok": False, "queued": False, "error": "helper_offline"}
             helper.last_seen = time.time()
             request = {
                 "type": "command",

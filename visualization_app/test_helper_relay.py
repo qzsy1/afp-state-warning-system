@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import sys
+import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -68,6 +70,18 @@ class HelperRelayTests(unittest.TestCase):
         displayed = f"配对码：{challenge['challenge']}"
         result = registry.complete_pairing(displayed, "device-a", {})
         self.assertTrue(result["ok"])
+
+    def test_stale_helper_is_reported_offline_and_command_is_not_queued(self):
+        registry = HelperRegistry(heartbeat_ttl_seconds=15)
+        challenge = registry.start_pairing("session-a")
+        registry.complete_pairing(challenge["challenge"], "device-a", {})
+        with patch("helper_relay.time.time", return_value=time.time() + 16):
+            status = registry.status("session-a")
+            request = registry.command("session-a", "discover", {})
+        self.assertTrue(status["paired"])
+        self.assertFalse(status["online"])
+        self.assertFalse(request["queued"])
+        self.assertEqual(request["error"], "helper_offline")
 
 
 if __name__ == "__main__":

@@ -57,6 +57,13 @@ def dispatch_command(agent: LocalCaptureAgent, raw: str | bytes) -> dict[str, An
     }
 
 
+def should_repair_pairing(error: BaseException) -> bool:
+    """Return true when the server rejected the helper credentials."""
+
+    text = str(error or "").lower()
+    return "401" in text or "authentication_failed" in text or "配对失效" in text
+
+
 def run_http_forever(server_url: str, pairing_token: str, device_id: str) -> None:
     agent = LocalCaptureAgent()
     transport = HelperTransport(server_url, pairing_token, device_id=device_id)
@@ -81,7 +88,10 @@ def run_http_forever(server_url: str, pairing_token: str, device_id: str) -> Non
             time.sleep(0.25)
         except KeyboardInterrupt:
             return
-        except Exception:
+        except Exception as exc:
+            if should_repair_pairing(exc):
+                print("配对已失效，请重新生成配对码并重启本地采集辅助程序。", flush=True)
+                return
             time.sleep(delay)
             delay = min(delay * 2.0, 30.0)
 

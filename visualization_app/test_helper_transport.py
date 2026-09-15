@@ -7,7 +7,11 @@ from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from local_capture_helper_entry import dispatch_command, resolve_runtime_args  # noqa: E402
+from local_capture_helper_entry import (  # noqa: E402
+    dispatch_command,
+    resolve_runtime_args,
+    should_repair_pairing,
+)
 
 
 class HelperTransportTests(unittest.TestCase):
@@ -69,6 +73,12 @@ class HelperTransportTests(unittest.TestCase):
         )
         self.assertIsNotNone(result)
         self.assertEqual(result.pairing_challenge, "challenge-1")
+
+    def test_authentication_failure_requires_repair_instead_of_silent_retry(self):
+        self.assertTrue(
+            should_repair_pairing(RuntimeError("辅助服务连接失败：HTTP Error 401: Unauthorized"))
+        )
+        self.assertFalse(should_repair_pairing(RuntimeError("网络连接暂时失败")))
 
 
 if __name__ == "__main__":
