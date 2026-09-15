@@ -4025,13 +4025,23 @@ async function discoverInterfaces() {
       );
       state.physicalInterfaces = physical;
       state.availableInterfaces = recognizedInterfacePortsFrom(helper.raw_discovery?.ports || []);
-      state.interfaceCatalog = defaults.map((item) => {
+      // Older helpers may return the physical inventory but omit the binding
+      // list.  Run the same protocol-aware allocator used by the LAN path so
+      // every compatible (including explicitly auto-assignable placeholder)
+      // interface gets a deterministic mapping before the cards render.
+      const allocated = autoAssignPhysicalInterfaces(
+        defaults.map((item) => ({...item})),
+        {allowSerialFallback: true},
+      );
+      state.interfaceCatalog = allocated.map((item) => {
         const binding = bindings.get(String(item.role || ""));
+        const physicalId = binding?.physical_interface_id || item.physical_interface_id || "";
         return {
           ...item,
-          physical_interface_id: binding?.physical_interface_id || "",
-          physical_interface_kind: binding?.physical_kind || "",
+          physical_interface_id: physicalId,
+          physical_interface_kind: binding?.physical_kind || item.physical_interface_kind || "",
           physical_verified: Boolean(binding?.interface_detected || binding?.driver_available),
+          enabled: Boolean(physicalId),
         };
       });
       renderInterfacePanel(state.interfaceCatalog);

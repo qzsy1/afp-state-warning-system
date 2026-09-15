@@ -193,6 +193,16 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn('state.accessRole === "authorized"', body)
         self.assertIn('requestLocalHelper("discover"', body)
 
+    def test_authorized_discovery_enables_every_protocol_bound_interface(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("async function discoverInterfaces()")
+        end = text.index("function recognizedInterfacePortsFrom", start)
+        body = text[start:end]
+        self.assertIn("autoAssignPhysicalInterfaces", body)
+        self.assertIn("physical_interface_id: physicalId", body)
+        self.assertIn("enabled: Boolean(physicalId)", body)
+
     def test_helper_reconnect_triggers_public_interface_rediscovery(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
