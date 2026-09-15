@@ -365,6 +365,7 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         text = source.read_text(encoding="utf-8")
         self.assertIn("requestLocalHelper(\"discover\"", text)
         self.assertIn("requestLocalHelper(\"check_capture\"", text)
+        self.assertIn("timeoutMs: 120000", text)
         self.assertIn("requestLocalHelper(\"start_capture\"", text)
         self.assertIn("requestLocalHelper(\"stop_capture\"", text)
 
