@@ -158,6 +158,33 @@ class AcquisitionIntegrityTests(unittest.TestCase):
                 interface_channel_assignments={"a": ["温度"]},
             )
 
+    def test_simulation_allows_shared_logical_source_for_multiple_interfaces(self) -> None:
+        """An uploaded file is one logical source, not a real adapter binding."""
+        interfaces = [
+            {
+                "id": "thermocouple_8ch", "enabled": True,
+                "role": "thermocouple", "driver": "smrf_hid",
+                "endpoint": "SMRFCT08B", "physical_interface_id": "simulation_source",
+                "physical_interface_kind": "usb_hid",
+            },
+            {
+                "id": "plc_process", "enabled": True,
+                "role": "plc", "driver": "modbus_tcp",
+                "endpoint": "192.168.125.5:502", "physical_interface_id": "simulation_source",
+                "physical_interface_kind": "ethernet",
+            },
+        ]
+        config = AcquisitionConfig(
+            acquisition_mode="simulation", dataset_schema="new_collection_v11_3",
+            simulation_source_path="simulation.csv", selected_sensors=["温度1", "温度", "压力"],
+            interfaces=interfaces,
+            interface_channel_assignments={
+                "thermocouple_8ch": ["温度1"],
+                "plc_process": ["温度", "压力"],
+            },
+        )
+        self.assertEqual(config.interface_channel_assignments["plc_process"], ["温度", "压力"])
+
     def test_physical_binding_rejects_role_protocol_mismatch(self) -> None:
         with self.assertRaisesRegex(ValueError, "协议.*不匹配"):
             AcquisitionConfig(

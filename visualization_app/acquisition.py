@@ -432,7 +432,14 @@ def _validate_physical_interface_bindings(
 
     PLC and ABB intentionally share the same Ethernet adapter.  Every other
     enabled logical interface must own a distinct physical adapter/device.
+
+    Simulation files are a single logical source.  The UI keeps the same
+    sensor/interface cards for routing and display, so several cards may
+    intentionally carry the sentinel ``simulation_source`` binding.  That is
+    not a physical adapter collision and must not be checked as one.
     """
+    if acquisition_mode != "real":
+        return
     seen: dict[str, dict[str, Any]] = {}
     for item in interfaces:
         if not item.get("enabled", True):
