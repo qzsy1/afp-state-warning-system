@@ -278,6 +278,11 @@
                 <label>层号（从0开始，每次递增1）<input id="liveLayerInput" class="step-one-input" type="number" value="0" min="0" step="1" inputmode="numeric"></label>
               </div>
               <div id="newParameterGrid" class="compact-input-grid hidden">
+                <div class="process-parameter-auto-row">
+                  <label class="checkbox-row"><input id="autoProcessParametersInput" type="checkbox">自动读取工艺参数</label>
+                  <button id="readProcessParametersButton" class="secondary-button" type="button">立即读取</button>
+                </div>
+                <p id="processParameterReadStatus" class="control-note process-parameter-read-status">未启用自动读取；当前使用下方手动输入值。</p>
                 <label>初始压实力/N<input id="initialForceInput" type="number" value="400"></label>
                 <label>铺放速度/mm·s⁻¹<input id="placementSpeedInput" type="number" value="80"></label>
                 <label>PID 角度/°<input id="pidAngleInput" type="number" value="5"></label>
@@ -490,6 +495,7 @@
     </div>
   </div>
   <script src="/mysql_visibility.js?v=20260909-mysql-toggle-2"></script>
-  <script src="/app.js?v=20260915-websocket-live-1"></script>
+  <script src="/process_parameters.js?v=20260916-auto-process-1"></script>
+  <script src="/app.js?v=20260916-auto-process-1"></script>
 </body>
 </html>

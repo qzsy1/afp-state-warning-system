@@ -225,6 +225,29 @@ class GuestSimulationTests(unittest.TestCase):
         self.assertEqual(payload["name"], "client.csv")
         self.assertEqual(payload["rows"][1]["温度"], 352)
 
+    def test_guest_process_parameter_read_uses_current_uploaded_source(self):
+        manager = self._manager()
+        encoded = base64.b64encode(
+            (
+                "温度,压力,initial_compaction_force_N,placement_speed_mm_s,pid_angle_deg,temperature_setpoint_C\n"
+                "351,401,430,95,8,370\n"
+            ).encode("utf-8")
+        ).decode("ascii")
+        manager.upload_source(
+            "a" * 32,
+            "single_csv",
+            [{"name": "process.csv", "data": encoded}],
+        )
+
+        result = manager.read_process_parameters("a" * 32, {
+            "dataset_schema": "new_collection_v11_3",
+            "selected_sensors": ["温度", "压力"],
+        })
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["values"]["initial_compaction_force_N"], 430.0)
+        self.assertEqual(result["values"]["temperature_setpoint_C"], 370.0)
+
     def test_uploaded_folder_requires_csv_files(self):
         manager = self._manager()
         encoded = base64.b64encode(b"not csv").decode("ascii")

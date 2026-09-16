@@ -5080,6 +5080,13 @@ class AppHandler(BaseHTTPRequestHandler):
                     self.guest_manager.start(self._identity().guest_id, payload)
                 )
                 return
+            if parsed.path == "/api/simulation/process-parameters":
+                self._send_json(
+                    self.guest_manager.read_process_parameters(
+                        self._identity().guest_id, payload
+                    )
+                )
+                return
             if parsed.path == "/api/simulation/select-source":
                 self._send_json(
                     self.guest_manager.select_source(
@@ -5290,6 +5297,19 @@ class AppHandler(BaseHTTPRequestHandler):
                 result = self.dashboard.acquisition.test_connection(config)
                 result["prediction_model"] = model_validation
                 self._send_json(result)
+                return
+            if parsed.path == "/api/acquisition/process-parameters":
+                demo = (
+                    (self.dashboard.bootstrap(include_discovery=False).get("acquisition") or {})
+                    .get("new_collection_demo") or {}
+                )
+                payload = resolve_default_simulation_source(
+                    payload, str(demo.get("source_file") or "")
+                )
+                config = AcquisitionConfig(**payload)
+                self._send_json(
+                    self.dashboard.acquisition.read_process_parameters(config)
+                )
                 return
             if parsed.path == "/api/acquisition/reset-check":
                 self._send_json(self.dashboard.acquisition.reset_check_state())

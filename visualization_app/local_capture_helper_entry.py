@@ -216,6 +216,8 @@ def dispatch_command(agent: LocalCaptureAgent, raw: str | bytes) -> dict[str, An
             )
         elif name == "check_capture":
             result = agent.check_capture(_config_from_payload(payload))
+        elif name == "read_process_parameters":
+            result = agent.read_process_parameters(_config_from_payload(payload))
         elif name == "mysql_relation_map":
             result = agent.mysql_relation_map(
                 MySQLSettings.from_mapping(payload),
@@ -560,7 +562,7 @@ def _run_main() -> None:
         paired = bootstrap.http_json(
             "api/helper/pair/complete",
             {"challenge": args.pairing_challenge, "device_id": args.device_id, "capabilities": {
-                "hardware_discovery": True, "real_capture": True, "local_csv_save": True, "local_mysql_save": True,
+                "hardware_discovery": True, "real_capture": True, "process_parameter_read": True, "local_csv_save": True, "local_mysql_save": True,
             }},
             authorized=False,
         )
@@ -595,7 +597,7 @@ def _run_main() -> None:
             paired = bootstrap.http_json(
                 "api/helper/pair/complete",
                 {"challenge": repaired.pairing_challenge, "device_id": repaired.device_id, "capabilities": {
-                    "hardware_discovery": True, "real_capture": True, "local_csv_save": True, "local_mysql_save": True,
+                    "hardware_discovery": True, "real_capture": True, "process_parameter_read": True, "local_csv_save": True, "local_mysql_save": True,
                 }},
                 authorized=False,
             )

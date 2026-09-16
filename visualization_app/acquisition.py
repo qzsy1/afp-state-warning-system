@@ -16,6 +16,7 @@ import time
 import tempfile
 import sys
 import urllib.request
+import urllib.parse
 import uuid
 from collections import deque
 from copy import deepcopy
@@ -170,6 +171,18 @@ DEFAULT_ABB_USER = "Default User"
 DEFAULT_ABB_PASSWORD = "robotics"
 ABB_ROBTARGET_PATH = (
     "/rw/motionsystem/mechunits/ROB_1/robtarget?coordinate=Base&json=1"
+)
+ABB_RAPID_SYMBOL_BASE_PATH = "/rw/rapid/symbol/data/RAPID"
+ABB_PROCESS_TASK = "T_ROB1"
+ABB_PROCESS_MODULE = "MainModule"
+ABB_SPEED_VARIABLE = "zMovespeed"
+PLC_PID_ANGLE_REGISTER = 20
+
+PROCESS_PARAMETER_DEFINITIONS = (
+    ("initial_compaction_force_N", "初始压实力", "N"),
+    ("placement_speed_mm_s", "铺放速度", "mm/s"),
+    ("pid_angle_deg", "PID角度", "°"),
+    ("temperature_setpoint_C", "设定温度", "°C"),
 )
 
 
@@ -1637,6 +1650,50 @@ class AbbRobotDriver(SampleDriver):
         state = payload["_embedded"]["_state"][0]
         return float(state["x"]), float(state["y"]), float(state["z"])
 
+    @staticmethod
+    def _find_json_value(value: Any) -> Any:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if str(key).lower() in {"value", "_value"}:
+                    return item
+                found = AbbRobotDriver._find_json_value(item)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = AbbRobotDriver._find_json_value(item)
+                if found is not None:
+                    return found
+        return None
+
+    def read_rapid_symbol(
+        self,
+        task: str,
+        module: str,
+        variable: str,
+    ) -> str:
+        credentials = base64.b64encode(
+            f"{self.username}:{self.password}".encode("utf-8")
+        ).decode("ascii")
+        path = "/".join(
+            urllib.parse.quote(str(part), safe="")
+            for part in (task, module, variable)
+        )
+        request = urllib.request.Request(
+            f"{self.base_url}{ABB_RAPID_SYMBOL_BASE_PATH}/{path}?json=1",
+            headers={
+                "Authorization": f"Basic {credentials}",
+                "Accept": "application/json",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            raw = response.read().decode("utf-8")
+        payload = json.loads(raw)
+        value = self._find_json_value(payload)
+        if value is None:
+            raise ValueError(f"ABB变量{variable}响应中没有value字段")
+        return str(value)
+
     def read_sample(self) -> dict[str, float] | None:
         try:
             x, y, z = self._fetch_position()
@@ -2134,6 +2191,172 @@ def build_driver(config: AcquisitionConfig) -> SampleDriver:
     raise ValueError(f"不支持的采集驱动：{config.driver}")
 
 
+def _parameter_result_template() -> list[dict[str, Any]]:
+    return [
+        {
+            "key": key,
+            "label": label,
+            "unit": unit,
+            "ok": False,
+            "value": None,
+            "source": "",
+            "message": "尚未读取",
+        }
+        for key, label, unit in PROCESS_PARAMETER_DEFINITIONS
+    ]
+
+
+def _process_parameter_payload(parameters: list[dict[str, Any]]) -> dict[str, Any]:
+    values = {
+        str(item["key"]): float(item["value"])
+        for item in parameters
+        if item.get("ok") and item.get("value") is not None
+    }
+    return {
+        "ok": bool(values),
+        "complete": len(values) == len(PROCESS_PARAMETER_DEFINITIONS),
+        "values": values,
+        "parameters": parameters,
+    }
+
+
+def _read_simulation_process_parameters(config: AcquisitionConfig) -> dict[str, Any]:
+    parameters = _parameter_result_template()
+    if config.simulation_source_type == "mysql":
+        for item in parameters:
+            item["message"] = "MySQL模拟源暂不支持自动读取工艺参数"
+        return _process_parameter_payload(parameters)
+    source = Path(config.simulation_source_path or config.source_file)
+    if config.simulation_source_type == "folder_csv":
+        files = sorted(source.rglob("*.csv")) if source.is_dir() else []
+        if not files:
+            raise FileNotFoundError(f"模拟采集文件夹不包含 CSV：{source}")
+    else:
+        if not source.is_file():
+            raise FileNotFoundError(f"模拟数据文件不存在：{source}")
+        files = [source]
+    frames = []
+    for file in files:
+        try:
+            frames.append(pd.read_csv(file, encoding="utf-8-sig"))
+        except UnicodeDecodeError:
+            frames.append(pd.read_csv(file, encoding="gb18030"))
+    frame = pd.concat(frames, ignore_index=True, sort=False)
+    for item in parameters:
+        key = str(item["key"])
+        if key not in frame.columns:
+            item["message"] = f"模拟数据缺少列 {key}"
+            continue
+        numeric = pd.to_numeric(frame[key], errors="coerce")
+        finite = numeric[numeric.map(lambda value: math.isfinite(float(value)) if pd.notna(value) else False)]
+        if finite.empty:
+            item["message"] = f"模拟数据列 {key} 没有有效数值"
+            continue
+        item.update(
+            ok=True,
+            value=float(finite.iloc[0]),
+            source="模拟数据文件",
+            message=f"已从 {source.name or '模拟数据'} 读取",
+        )
+    return _process_parameter_payload(parameters)
+
+
+def _default_read_plc_registers(
+    interface: dict[str, Any], address: int, quantity: int
+) -> list[int]:
+    driver = ModbusTcpDriver(
+        str(interface.get("endpoint") or f"{DEFAULT_PLC_IP}:{DEFAULT_PLC_PORT}"),
+        register_map={},
+        slave_id=int(interface.get("slave_id") or DEFAULT_PLC_SLAVE_ID),
+        timeout=float(interface.get("timeout") or 1.0),
+    )
+    try:
+        driver.open()
+        return driver._read_holding_registers(int(address), int(quantity))
+    finally:
+        driver.close()
+
+
+def _default_read_abb_symbol(
+    interface: dict[str, Any], task: str, module: str, variable: str
+) -> str:
+    driver = AbbRobotDriver(
+        str(interface.get("endpoint") or DEFAULT_ABB_IP),
+        str(interface.get("username") or DEFAULT_ABB_USER),
+        str(interface.get("password") or DEFAULT_ABB_PASSWORD),
+        timeout=float(interface.get("timeout") or 1.5),
+    )
+    return driver.read_rapid_symbol(task, module, variable)
+
+
+def _parse_abb_speeddata(raw: Any) -> float:
+    match = re.search(r"\[\s*([-+]?\d+(?:\.\d+)?)", str(raw or ""))
+    if not match:
+        raise ValueError(f"ABB铺放速度返回格式无效：{str(raw or '')[:120]}")
+    value = float(match.group(1))
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("ABB铺放速度不是有效正数")
+    return value
+
+
+def read_real_process_parameters(
+    interfaces: list[dict[str, Any]],
+    *,
+    read_plc_registers=_default_read_plc_registers,
+    read_abb_symbol=_default_read_abb_symbol,
+) -> dict[str, Any]:
+    parameters = _parameter_result_template()
+    by_key = {str(item["key"]): item for item in parameters}
+    enabled = [dict(item) for item in (interfaces or []) if item.get("enabled", True)]
+    plc = next(
+        (item for item in enabled if item.get("role") == "plc" or item.get("driver") == "modbus_tcp"),
+        None,
+    )
+    robot = next(
+        (item for item in enabled if item.get("role") == "robot" or item.get("driver") == "abb_robot"),
+        None,
+    )
+    pressure = by_key["initial_compaction_force_N"]
+    pressure["message"] = "未配置压实力设定值读取地址；已保留原输入值"
+    temperature = by_key["temperature_setpoint_C"]
+    temperature["message"] = "未配置温度设定值读取地址；已保留原输入值"
+
+    angle = by_key["pid_angle_deg"]
+    if plc is None:
+        angle["message"] = "未找到已启用的PLC接口；已保留原输入值"
+    else:
+        try:
+            registers = read_plc_registers(plc, PLC_PID_ANGLE_REGISTER, 1)
+            if not registers:
+                raise ValueError("PLC未返回DT20寄存器")
+            angle.update(
+                ok=True,
+                value=float(registers[0]) / 10.0,
+                source="PLC DT20",
+                message="已读取PLC PID角度设定值",
+            )
+        except Exception as exc:
+            angle["message"] = f"PLC PID角度读取失败：{exc}；已保留原输入值"
+
+    speed = by_key["placement_speed_mm_s"]
+    if robot is None:
+        speed["message"] = "未找到已启用的ABB接口；已保留原输入值"
+    else:
+        try:
+            raw = read_abb_symbol(
+                robot, ABB_PROCESS_TASK, ABB_PROCESS_MODULE, ABB_SPEED_VARIABLE
+            )
+            speed.update(
+                ok=True,
+                value=_parse_abb_speeddata(raw),
+                source="ABB RAPID zMovespeed",
+                message="已读取ABB铺放速度设定值",
+            )
+        except Exception as exc:
+            speed["message"] = f"ABB铺放速度读取失败：{exc}；已保留原输入值"
+    return _process_parameter_payload(parameters)
+
+
 class AcquisitionManager:
     def __init__(self, capture_root: Path = DEFAULT_CAPTURE_ROOT) -> None:
         self.capture_root = capture_root
@@ -2215,6 +2438,11 @@ class AcquisitionManager:
             {"id": "rtsp_thermal", "label": "IP热像仪 RTSP"},
             {"id": "m3232_pressure", "label": "M3232薄膜压力（115200，矩阵自动识别）"},
         ]
+
+    def read_process_parameters(self, config: AcquisitionConfig) -> dict[str, Any]:
+        if config.acquisition_mode == "simulation":
+            return _read_simulation_process_parameters(config)
+        return read_real_process_parameters(list(config.interfaces or []))
 
     @staticmethod
     def discover_interfaces() -> dict[str, Any]:

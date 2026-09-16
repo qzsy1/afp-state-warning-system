@@ -543,6 +543,20 @@ body.resizing-sensor-list { cursor: ns-resize; user-select: none; }
   font-size: 11px;
 }
 .acquisition-parameter-panel .collection-index-note { margin-top: 1px; }
+.process-parameter-auto-row {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 6px;
+  border: 1px solid #c7dfef;
+  border-radius: 5px;
+  background: #f8fcff;
+}
+.process-parameter-auto-row label { margin: 0; font-weight: 800; }
+.process-parameter-auto-row button { min-height: 27px; padding: 3px 9px; white-space: nowrap; }
+.process-parameter-read-status { grid-column: 1 / -1; }
 .interface-config-row.check-ok, .sensor-checklist-row.check-ok { background: #eefaf5; border-color: #89cdae; }
 .interface-config-row.check-error, .sensor-checklist-row.check-error { background: #fff0f1; border-color: #dc9098; }
 .interface-config-row.check-waiting, .sensor-checklist-row.check-waiting { background: #fff9e8; border-color: #dfc56b; }

@@ -17,7 +17,16 @@ from typing import Any, Callable
 
 
 ALLOWED_HELPER_COMMANDS = frozenset(
-    {"discover", "check_capture", "mysql_preflight", "mysql_relation_map", "start_capture", "stop_capture", "status"}
+    {
+        "discover",
+        "check_capture",
+        "read_process_parameters",
+        "mysql_preflight",
+        "mysql_relation_map",
+        "start_capture",
+        "stop_capture",
+        "status",
+    }
 )
 
 

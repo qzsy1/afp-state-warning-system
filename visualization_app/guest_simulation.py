@@ -390,6 +390,13 @@ class GuestSimulationManager:
             "total_rows": len(rows),
         }
 
+    def read_process_parameters(
+        self, session_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        session = self.ensure_session(session_id)
+        config = self.safe_config(session_id, payload)
+        return session.acquisition.read_process_parameters(config)
+
     def safe_config(self, session_id: str, payload: dict[str, Any]) -> AcquisitionConfig:
         session = self.ensure_session(session_id)
         profile = session.selected_source or self._profile(payload)

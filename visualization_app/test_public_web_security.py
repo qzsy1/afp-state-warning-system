@@ -181,6 +181,28 @@ class PublicWebAccessTests(unittest.TestCase):
             policy.authorize("POST", "/api/mysql/preflight", authorized).allowed
         )
 
+    def test_process_parameter_routes_separate_guest_simulation_from_real_access(self):
+        from web_access import PermissionPolicy, RequestIdentity
+
+        policy = PermissionPolicy()
+        guest = RequestIdentity("guest", None, "guest-a")
+        authorized = RequestIdentity("authorized", "session-a", "guest-a")
+
+        self.assertTrue(
+            policy.authorize(
+                "POST", "/api/simulation/process-parameters", guest
+            ).allowed
+        )
+        denied = policy.authorize(
+            "POST", "/api/acquisition/process-parameters", guest
+        )
+        self.assertFalse(denied.allowed)
+        self.assertTrue(
+            policy.authorize(
+                "POST", "/api/acquisition/process-parameters", authorized
+            ).allowed
+        )
+
     def test_helper_transport_routes_are_public_but_token_authenticated(self):
         from web_access import PermissionPolicy, RequestIdentity
 

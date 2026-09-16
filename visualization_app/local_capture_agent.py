@@ -110,6 +110,7 @@ class LocalCaptureAgent:
             "capabilities": {
                 "hardware_discovery": True,
                 "real_capture": True,
+                "process_parameter_read": True,
                 "local_csv_save": True,
                 "local_mysql_save": True,
             },
@@ -130,6 +131,9 @@ class LocalCaptureAgent:
 
     def check_capture(self, config: Any) -> dict[str, Any]:
         return self.manager.test_connection(config)
+
+    def read_process_parameters(self, config: Any) -> dict[str, Any]:
+        return self.manager.read_process_parameters(config)
 
     def stop_capture(self) -> dict[str, Any]:
         return self.manager.stop()

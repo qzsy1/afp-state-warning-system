@@ -67,6 +67,7 @@ const state = {
   helperStatus: {paired: false, online: false, capabilities: {}},
   helperPairingChallenge: "",
   helperStatusTimer: null,
+  processParameterBusy: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -475,6 +476,9 @@ const controls = {
   placementSpeed: $("placementSpeedInput"),
   pidAngle: $("pidAngleInput"),
   temperatureSetpoint: $("temperatureSetpointInput"),
+  autoProcessParameters: $("autoProcessParametersInput"),
+  readProcessParameters: $("readProcessParametersButton"),
+  processParameterReadStatus: $("processParameterReadStatus"),
   conditionId: $("conditionIdInput"),
   replicate: $("replicateInput"),
   newLayer: $("newLayerInput"),
@@ -1869,6 +1873,9 @@ async function testSensorConnection({automatic = false} = {}) {
 
 async function startAcquisition() {
   try {
+    if (controls.autoProcessParameters?.checked) {
+      await readProcessParameters({automatic: true});
+    }
     if (state.accessRole === "guest") {
       // Load the selected/default dataset once, then replay it locally in the
       // browser.  The server still owns the session/save lifecycle; only the
@@ -3413,6 +3420,19 @@ controls.autoHardwareCheck?.addEventListener("change", () => {
 });
 controls.discoverInterfaces?.addEventListener("click", discoverInterfaces);
 controls.addInterface?.addEventListener("click", addInterface);
+controls.autoProcessParameters?.addEventListener("change", () => {
+  if (controls.autoProcessParameters.checked) {
+    readProcessParameters({automatic: true});
+  } else if (controls.processParameterReadStatus) {
+    controls.processParameterReadStatus.classList.remove("ok", "error");
+    controls.processParameterReadStatus.textContent =
+      "未启用自动读取；当前使用下方手动输入值。";
+    controls.processParameterReadStatus.title = "";
+  }
+});
+controls.readProcessParameters?.addEventListener(
+  "click", () => readProcessParameters()
+);
 $("testMysqlButton")?.addEventListener("click", () => testMysqlConnection(false));
 $("testLocalMysqlButton")?.addEventListener("click", () => testMysqlConnection(true));
 $("refreshLocalRelationMapButton")?.addEventListener("click", () => refreshRelationMap("local"));
@@ -4614,6 +4634,9 @@ async function selectSimulationSource() {
     });
     if (result.selected) {
       controls.simulationSourcePath.value = result.path || result.name || "";
+      if (controls.autoProcessParameters?.checked) {
+        await readProcessParameters({automatic: true});
+      }
       toast("模拟采集数据源已选择");
     }
   } catch (error) { toast(`无法选择模拟数据源：${error.message}`); }
@@ -4673,6 +4696,9 @@ async function uploadSimulationSource() {
     stopLocalSimulationReplay();
     state.simulationDatasetCache = null;
     await loadSimulationDatasetOnce({force: true});
+    if (controls.autoProcessParameters?.checked) {
+      await readProcessParameters({automatic: true});
+    }
     toast("模拟数据已载入");
   } catch (error) {
     if (controls.simulationSourceNote) controls.simulationSourceNote.textContent = `模拟数据上传失败：${error.message}`;
@@ -4748,6 +4774,71 @@ function acquisitionConfig() {
   };
 }
 
+function renderProcessParameterReadStatus(summary, result) {
+  const status = controls.processParameterReadStatus;
+  if (!status) return;
+  const details = Array.isArray(summary?.details) ? summary.details : [];
+  status.textContent = summary?.message || "工艺参数读取完成";
+  status.title = details.join("\n");
+  status.classList.toggle("ok", Boolean(summary?.updated));
+  status.classList.toggle("error", !summary?.updated);
+  if (result?.complete) {
+    status.textContent += "。四项工艺参数均已读取。";
+  } else if (summary?.updated) {
+    status.textContent += "。将鼠标移到此处可查看各项来源或失败原因。";
+  }
+}
+
+async function readProcessParameters({automatic = false} = {}) {
+  if (state.processParameterBusy) return false;
+  if (controls.datasetSchema?.value !== "new_collection_v11_3") return false;
+  const status = controls.processParameterReadStatus;
+  const button = controls.readProcessParameters;
+  state.processParameterBusy = true;
+  if (button) button.disabled = true;
+  if (status) {
+    status.classList.remove("ok", "error");
+    status.textContent = automatic
+      ? "开始采集前正在刷新工艺参数……"
+      : "正在读取工艺参数……";
+  }
+  try {
+    const config = acquisitionConfig();
+    const simulation = config.acquisition_mode === "simulation";
+    let result;
+    if (simulation && state.accessRole === "guest") {
+      result = await postJson(
+        "/api/simulation/process-parameters", config, {timeoutMs: 20000}
+      );
+    } else if (!simulation && state.accessRole === "authorized") {
+      result = await requestLocalHelper(
+        "read_process_parameters", config, {timeoutMs: 20000}
+      );
+    } else {
+      result = await postJson(
+        "/api/acquisition/process-parameters", config, {timeoutMs: 20000}
+      );
+    }
+    const summary = window.ProcessParameterReader?.applyResult(result, controls);
+    if (!summary) throw new Error("工艺参数读取组件未加载");
+    renderProcessParameterReadStatus(summary, result);
+    markLiveScopeChanged();
+    return Boolean(summary.updated);
+  } catch (error) {
+    if (status) {
+      status.classList.remove("ok");
+      status.classList.add("error");
+      status.textContent = `工艺参数读取失败：${error.message || error}；现有输入值已保留。`;
+      status.title = status.textContent;
+    }
+    if (!automatic) toast(error.message || String(error));
+    return false;
+  } finally {
+    state.processParameterBusy = false;
+    if (button) button.disabled = false;
+  }
+}
+
 function validatePhysicalInterfaceBindings(items, realMode) {
   if (!realMode) return;
   const seen = new Map();
@@ -4772,6 +4863,9 @@ function validatePhysicalInterfaceBindings(items, realMode) {
 controls.acquisitionMode?.addEventListener("change", () => {
   updateSimulationSettings();
   markHardwareCheckStale("采集模式已变化");
+  if (controls.autoProcessParameters?.checked) {
+    readProcessParameters({automatic: true});
+  }
 });
 controls.simulationSourceType?.addEventListener("change", updateSimulationSettings);
 controls.selectSimulationSource?.addEventListener("click", selectSimulationSource);

@@ -28,6 +28,15 @@ class LocalCaptureAgentTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             transport.decode_command('{"type":"command","command":"shell"}')
 
+    def test_transport_accepts_process_parameter_read_command(self):
+        command = HelperTransport.decode_command(
+            '{"type":"command","request_id":"read-1",'
+            '"command":"read_process_parameters","payload":{}}'
+        )
+
+        self.assertEqual(command["command"], "read_process_parameters")
+        self.assertEqual(command["request_id"], "read-1")
+
     @patch("local_capture_agent.AcquisitionManager.discover_interfaces")
     def test_discover_returns_five_logical_sensor_bindings(self, discover):
         discover.return_value = {
@@ -60,6 +69,21 @@ class LocalCaptureAgentTests(unittest.TestCase):
         agent.stop_capture()
         self.assertTrue(manager.start.called)
         self.assertTrue(manager.stop.called)
+
+    @patch("local_capture_agent.AcquisitionManager")
+    def test_process_parameter_read_delegates_to_existing_manager(self, manager_cls):
+        manager = manager_cls.return_value
+        manager.read_process_parameters.return_value = {
+            "ok": True,
+            "values": {"pid_angle_deg": 5.0},
+        }
+        agent = LocalCaptureAgent(manager=manager)
+        config = Mock()
+
+        result = agent.read_process_parameters(config)
+
+        self.assertEqual(result["values"]["pid_angle_deg"], 5.0)
+        manager.read_process_parameters.assert_called_once_with(config)
 
 
 if __name__ == "__main__":
