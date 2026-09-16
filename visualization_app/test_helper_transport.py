@@ -128,12 +128,12 @@ class HelperTransportTests(unittest.TestCase):
                     "server": "https://afp.example.test",
                     "pairing_token": "secret-pairing-token",
                     "device_id": "local-helper",
-                    "transport": "https",
+                    "transport": "auto",
                 },
             )
             self.assertEqual(payload["version"], 1)
 
-    def test_helper_cli_resumes_saved_config_without_prompting(self):
+    def test_helper_cli_shows_setup_gui_for_saved_config_when_double_clicked(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "helper-config.json"
             save_runtime_config = getattr(helper_entry, "save_runtime_config", None)
@@ -146,15 +146,40 @@ class HelperTransportTests(unittest.TestCase):
             )
 
             def unexpected_prompt(_prompt):
-                raise AssertionError("saved helper config should avoid prompting")
+                raise AssertionError("saved helper config should use the setup gui")
+
+            expected = object()
+            result = resolve_runtime_args(
+                [],
+                input_fn=unexpected_prompt,
+                output_fn=lambda _line: None,
+                gui_fn=lambda server="": (server, expected),
+                config_path=path,
+            )
+            self.assertEqual(result, ("https://afp.example.test", expected))
+
+    def test_helper_cli_resumes_saved_config_in_background_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "helper-config.json"
+            save_runtime_config = getattr(helper_entry, "save_runtime_config", None)
+            self.assertIsNotNone(save_runtime_config)
+            save_runtime_config(
+                "https://afp.example.test",
+                "secret-pairing-token",
+                "local-helper",
+                path=path,
+            )
+
+            def unexpected_prompt(_prompt):
+                raise AssertionError("background helper config should avoid prompting")
 
             result = resolve_runtime_args(
-                [], input_fn=unexpected_prompt, output_fn=lambda _line: None, config_path=path
+                ["--background"], input_fn=unexpected_prompt, output_fn=lambda _line: None, config_path=path
             )
             self.assertEqual(result.server, "https://afp.example.test")
             self.assertEqual(result.pairing_token, "secret-pairing-token")
             self.assertEqual(result.device_id, "local-helper")
-            self.assertEqual(result.transport, "https")
+            self.assertEqual(result.transport, "auto")
 
     def test_authentication_failure_is_reported_as_repairable_runtime_state(self):
         authentication_failure_message = getattr(helper_entry, "authentication_failure_message", None)

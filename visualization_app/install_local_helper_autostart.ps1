@@ -25,7 +25,7 @@ if (-not (Test-Path -LiteralPath $helperExecutable -PathType Leaf)) {
     throw "找不到辅助程序：$helperExecutable"
 }
 
-$action = New-ScheduledTaskAction -Execute $helperExecutable -WorkingDirectory $helperDirectory
+$action = New-ScheduledTaskAction -Execute $helperExecutable -Argument "--background" -WorkingDirectory $helperDirectory
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `

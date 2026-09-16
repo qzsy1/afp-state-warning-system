@@ -379,6 +379,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pairing-challenge", default="")
     parser.add_argument("--device-id", default="local-helper")
     parser.add_argument("--transport", choices=("auto", "https", "wss"), default="auto")
+    parser.add_argument(
+        "--background",
+        action="store_true",
+        help="复用已保存配置并在后台运行；双击启动时不使用此模式。",
+    )
     return parser
 
 
@@ -466,14 +471,17 @@ def resolve_runtime_args(
     """
     parser = _build_parser()
     args = parser.parse_args(argv)
+    saved = None
     if not args.server and not args.pairing_token and not args.pairing_challenge:
         saved = load_saved_runtime_config(path=config_path)
-        if saved:
+        if saved and args.background:
             args.server = saved["server"]
             args.pairing_token = saved["pairing_token"]
             args.device_id = saved["device_id"]
             args.transport = saved["transport"]
             return args
+        if saved:
+            return (gui_fn or _prompt_setup_gui)(saved["server"])
     if not args.server:
         output_fn("本地采集辅助程序需要网页地址和配对码。")
         output_fn("网页地址示例：http://127.0.0.1:8770 或 https://你的域名")
@@ -483,13 +491,13 @@ def resolve_runtime_args(
         if input_fn is input:
             try:
                 if not sys.stdin.isatty():
-                    return (gui_fn or _prompt_setup_gui)()
+                    return (gui_fn or _prompt_setup_gui)(saved["server"] if saved else "")
             except (AttributeError, OSError):
-                return (gui_fn or _prompt_setup_gui)()
+                return (gui_fn or _prompt_setup_gui)(saved["server"] if saved else "")
         try:
             args.server = str(input_fn("请输入网页地址：")).strip()
         except (EOFError, OSError):
-            return (gui_fn or _prompt_setup_gui)()
+            return (gui_fn or _prompt_setup_gui)(saved["server"] if saved else "")
         if not args.server:
             output_fn("未输入网页地址，辅助程序未启动。")
             return None
