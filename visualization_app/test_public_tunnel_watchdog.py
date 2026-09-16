@@ -27,6 +27,22 @@ class PublicTunnelWatchdogContractTests(unittest.TestCase):
         text = source.read_text(encoding="utf-8-sig")
         self.assertIn("trycloudflare", text)
         self.assertIn("quick-tunnel-url.txt", text)
+        self.assertIn("-Encoding ASCII", text)
+
+    def test_watchdog_requires_end_to_end_public_health(self):
+        source = Path(__file__).with_name("public_tunnel_watchdog.ps1")
+        text = source.read_text(encoding="utf-8-sig")
+        self.assertIn("function Test-PublicTunnel", text)
+        self.assertIn('$PublicUrl.TrimEnd("/") + "/api/health"', text)
+        self.assertIn("if (-not (Test-PublicTunnel $url)) { return $false }", text)
+
+    def test_watchdog_keeps_local_helper_running_after_tunnel_recovery(self):
+        source = Path(__file__).with_name("public_tunnel_watchdog.ps1")
+        text = source.read_text(encoding="utf-8-sig")
+        self.assertIn("AFP_Local_Capture_Helper.exe", text)
+        self.assertIn("function Ensure-Helper", text)
+        self.assertIn('Start-Process -FilePath $HelperExe', text)
+        self.assertIn('-ArgumentList "--background"', text)
 
 
 if __name__ == "__main__":

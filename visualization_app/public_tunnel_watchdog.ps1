@@ -15,6 +15,8 @@ if (-not (Test-Path (Join-Path $DeliveryRoot "AFP_Integrated_System_Modular.exe"
     $DeliveryRoot = "F:\AFP_Integrated_Modular_v2\delivery\AFP_Integrated_System_Modular_v2.0.3_Agentic"
 }
 $AppExe = Join-Path $DeliveryRoot "AFP_Integrated_System_Modular.exe"
+$HelperRoot = Join-Path $DeliveryRoot "local_helper"
+$HelperExe = Join-Path $HelperRoot "AFP_Local_Capture_Helper.exe"
 $CloudflaredExe = "F:\softwawre\cloudflared\cloudflared.exe"
 $CloudflaredRoot = Split-Path -Parent $CloudflaredExe
 $TunnelLog = Join-Path $CloudflaredRoot "quick-tunnel-watchdog.log"
@@ -34,6 +36,13 @@ function Get-TunnelProcess {
         $_.Name -eq "cloudflared.exe" -and
         $_.ExecutablePath -eq $CloudflaredExe -and
         $_.CommandLine -match "127\.0\.0\.1:8770"
+    }
+}
+
+function Get-HelperProcess {
+    Get-CimInstance Win32_Process | Where-Object {
+        $_.Name -eq "AFP_Local_Capture_Helper.exe" -and
+        $_.ExecutablePath -eq $HelperExe
     }
 }
 
@@ -62,13 +71,24 @@ function Get-TunnelUrl([string]$Metrics) {
     return ""
 }
 
-function Save-TunnelUrl([string]$Metrics) {
-    $url = Get-TunnelUrl $Metrics
-    if ($url) {
-        Set-Content -LiteralPath $TunnelUrlFile -Value ($url + "/") -Encoding UTF8
-        return $url
+function Test-PublicTunnel([string]$PublicUrl) {
+    if (-not $PublicUrl) { return $false }
+    $healthUrl = $PublicUrl.TrimEnd("/") + "/api/health"
+    foreach ($attempt in 1..2) {
+        try {
+            $response = Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 8
+            if ($response.StatusCode -eq 200) { return $true }
+        } catch {
+            if ($attempt -lt 2) { Start-Sleep -Seconds 2 }
+        }
     }
-    return ""
+    return $false
+}
+
+function Save-TunnelUrl([string]$Url) {
+    if (-not $Url) { return $false }
+    Set-Content -LiteralPath $TunnelUrlFile -Value ($Url.TrimEnd("/") + "/") -Encoding ASCII
+    return $true
 }
 
 function Test-Tunnel {
@@ -76,7 +96,10 @@ function Test-Tunnel {
     if (-not $metrics) { return $false }
     $match = [regex]::Match($metrics, 'cloudflared_tunnel_ha_connections\s+(\d+)')
     if (-not $match.Success -or [int]$match.Groups[1].Value -lt 1) { return $false }
-    return [bool](Save-TunnelUrl $metrics)
+    $url = Get-TunnelUrl $metrics
+    if (-not $url) { return $false }
+    if (-not (Test-PublicTunnel $url)) { return $false }
+    return [bool](Save-TunnelUrl $url)
 }
 
 function Ensure-Origin {
@@ -101,6 +124,30 @@ function Stop-StaleTunnel {
     if ($processes.Count) { Start-Sleep -Seconds 2 }
 }
 
+function Ensure-Helper {
+    if (-not (Test-Path -LiteralPath $HelperExe -PathType Leaf)) { return $false }
+    if (Get-HelperProcess) { return $true }
+    Start-Process -FilePath $HelperExe `
+        -ArgumentList "--background" `
+        -WorkingDirectory $HelperRoot `
+        -WindowStyle Hidden | Out-Null
+    $deadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $deadline) {
+        if (Get-HelperProcess) { return $true }
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
+}
+
+function Restart-Helper {
+    $processes = @(Get-HelperProcess)
+    foreach ($process in $processes) {
+        Stop-Process -Id $process.ProcessId -Force
+    }
+    if ($processes.Count) { Start-Sleep -Seconds 1 }
+    return Ensure-Helper
+}
+
 function Start-Tunnel {
     if (-not (Test-Path $CloudflaredExe)) { return $false }
     Start-Process -FilePath $CloudflaredExe `
@@ -110,10 +157,7 @@ function Start-Tunnel {
         -WindowStyle Hidden | Out-Null
     $deadline = (Get-Date).AddSeconds(30)
     while ((Get-Date) -lt $deadline) {
-        $metrics = Get-TunnelMetrics
-        if ($metrics -and (Save-TunnelUrl $metrics) -and (Test-Tunnel)) {
-            return $true
-        }
+        if (Test-Tunnel) { return $true }
         Start-Sleep -Seconds 2
     }
     return $false
@@ -121,9 +165,14 @@ function Start-Tunnel {
 
 function Ensure-Tunnel {
     if (-not (Ensure-Origin)) { return $false }
-    if (Test-Tunnel) { return $true }
+    if (Test-Tunnel) {
+        Ensure-Helper | Out-Null
+        return $true
+    }
     Stop-StaleTunnel
-    return Start-Tunnel
+    $started = Start-Tunnel
+    if ($started) { Restart-Helper | Out-Null }
+    return $started
 }
 
 function Install-Watchdog {

@@ -136,6 +136,7 @@ class HelperTransportTests(unittest.TestCase):
     def test_helper_cli_shows_setup_gui_for_saved_config_when_double_clicked(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "helper-config.json"
+            hint_path = Path(directory) / "missing-tunnel-url.txt"
             save_runtime_config = getattr(helper_entry, "save_runtime_config", None)
             self.assertIsNotNone(save_runtime_config)
             save_runtime_config(
@@ -155,6 +156,7 @@ class HelperTransportTests(unittest.TestCase):
                 output_fn=lambda _line: None,
                 gui_fn=lambda server="": (server, expected),
                 config_path=path,
+                server_hint_path=hint_path,
             )
             self.assertEqual(result, ("https://afp.example.test", expected))
 
@@ -184,6 +186,19 @@ class HelperTransportTests(unittest.TestCase):
             )
             self.assertEqual(result, ("https://current-public.trycloudflare.com/", expected))
             self.assertEqual(seen["server"], "https://current-public.trycloudflare.com/")
+
+    def test_helper_accepts_powershell_utf8_bom_in_tunnel_url_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            hint_path = Path(directory) / "quick-tunnel-url.txt"
+            hint_path.write_text(
+                "\ufeffhttps://current-public.trycloudflare.com/\r\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                helper_entry.load_current_server_hint(path=hint_path),
+                "https://current-public.trycloudflare.com/",
+            )
 
     def test_helper_cli_resumes_saved_config_in_background_mode(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -40,7 +40,7 @@ def default_server_hint_path() -> Path:
 def load_current_server_hint(*, path: str | Path | None = None) -> str:
     hint_path = Path(path) if path is not None else default_server_hint_path()
     try:
-        server = hint_path.read_text(encoding="utf-8").strip()
+        server = hint_path.read_text(encoding="utf-8").lstrip("\ufeff").strip()
     except OSError:
         return ""
     if server.startswith(("https://", "http://")):
