@@ -501,7 +501,7 @@ def resolve_runtime_args(
     if not args.server and not args.pairing_token and not args.pairing_challenge:
         saved = load_saved_runtime_config(path=config_path)
         if saved and args.background:
-            args.server = saved["server"]
+            args.server = preferred_setup_server(saved["server"], server_hint_path=server_hint_path)
             args.pairing_token = saved["pairing_token"]
             args.device_id = saved["device_id"]
             args.transport = saved["transport"]

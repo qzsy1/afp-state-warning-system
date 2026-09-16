@@ -114,7 +114,7 @@ class HelperTransportTests(unittest.TestCase):
             load_saved_runtime_config = getattr(helper_entry, "load_saved_runtime_config", None)
             self.assertIsNotNone(save_runtime_config)
             self.assertIsNotNone(load_saved_runtime_config)
-            save_runtime_config(
+            helper_entry.save_runtime_config(
                 "https://afp.example.test",
                 "secret-pairing-token",
                 "local-helper",
@@ -188,6 +188,7 @@ class HelperTransportTests(unittest.TestCase):
     def test_helper_cli_resumes_saved_config_in_background_mode(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "helper-config.json"
+            hint_path = Path(directory) / "missing-tunnel-url.txt"
             save_runtime_config = getattr(helper_entry, "save_runtime_config", None)
             self.assertIsNotNone(save_runtime_config)
             save_runtime_config(
@@ -201,12 +202,39 @@ class HelperTransportTests(unittest.TestCase):
                 raise AssertionError("background helper config should avoid prompting")
 
             result = resolve_runtime_args(
-                ["--background"], input_fn=unexpected_prompt, output_fn=lambda _line: None, config_path=path
+                ["--background"],
+                input_fn=unexpected_prompt,
+                output_fn=lambda _line: None,
+                config_path=path,
+                server_hint_path=hint_path,
             )
             self.assertEqual(result.server, "https://afp.example.test")
             self.assertEqual(result.pairing_token, "secret-pairing-token")
             self.assertEqual(result.device_id, "local-helper")
             self.assertEqual(result.transport, "auto")
+
+    def test_background_helper_uses_current_tunnel_instead_of_stale_saved_url(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "helper-config.json"
+            hint_path = Path(directory) / "quick-tunnel-url.txt"
+            hint_path.write_text("https://current-public.trycloudflare.com/\n", encoding="utf-8")
+            helper_entry.save_runtime_config(
+                "https://stale-public.trycloudflare.com",
+                "secret-pairing-token",
+                "local-helper",
+                path=path,
+            )
+
+            result = resolve_runtime_args(
+                ["--background"],
+                input_fn=lambda _prompt: (_ for _ in ()).throw(AssertionError("should not prompt")),
+                output_fn=lambda _line: None,
+                config_path=path,
+                server_hint_path=hint_path,
+            )
+
+            self.assertEqual(result.server, "https://current-public.trycloudflare.com/")
+            self.assertEqual(result.pairing_token, "secret-pairing-token")
 
     def test_authentication_failure_is_reported_as_repairable_runtime_state(self):
         authentication_failure_message = getattr(helper_entry, "authentication_failure_message", None)
