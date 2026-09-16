@@ -30,6 +30,31 @@ def default_runtime_config_path() -> Path:
     return root / "AFP_Local_Capture_Helper" / "config.json"
 
 
+def default_server_hint_path() -> Path:
+    configured = os.environ.get("AFP_PUBLIC_TUNNEL_URL_FILE")
+    if configured:
+        return Path(configured)
+    return Path("F:/softwawre/cloudflared/quick-tunnel-url.txt")
+
+
+def load_current_server_hint(*, path: str | Path | None = None) -> str:
+    hint_path = Path(path) if path is not None else default_server_hint_path()
+    try:
+        server = hint_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    if server.startswith(("https://", "http://")):
+        return server
+    return ""
+
+
+def preferred_setup_server(saved_server: str = "", *, server_hint_path: str | Path | None = None) -> str:
+    current = load_current_server_hint(path=server_hint_path)
+    if current:
+        return current
+    return str(saved_server or "")
+
+
 class _DataBlob(ctypes.Structure):
     _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
 
@@ -462,6 +487,7 @@ def resolve_runtime_args(
     output_fn=print,
     gui_fn=None,
     config_path: str | Path | None = None,
+    server_hint_path: str | Path | None = None,
 ) -> argparse.Namespace | None:
     """Resolve CLI arguments without silently exiting when double-clicked.
 
@@ -481,7 +507,9 @@ def resolve_runtime_args(
             args.transport = saved["transport"]
             return args
         if saved:
-            return (gui_fn or _prompt_setup_gui)(saved["server"])
+            return (gui_fn or _prompt_setup_gui)(
+                preferred_setup_server(saved["server"], server_hint_path=server_hint_path)
+            )
     if not args.server:
         output_fn("本地采集辅助程序需要网页地址和配对码。")
         output_fn("网页地址示例：http://127.0.0.1:8770 或 https://你的域名")
@@ -491,13 +519,19 @@ def resolve_runtime_args(
         if input_fn is input:
             try:
                 if not sys.stdin.isatty():
-                    return (gui_fn or _prompt_setup_gui)(saved["server"] if saved else "")
+                    return (gui_fn or _prompt_setup_gui)(
+                        preferred_setup_server(saved["server"] if saved else "", server_hint_path=server_hint_path)
+                    )
             except (AttributeError, OSError):
-                return (gui_fn or _prompt_setup_gui)(saved["server"] if saved else "")
+                return (gui_fn or _prompt_setup_gui)(
+                    preferred_setup_server(saved["server"] if saved else "", server_hint_path=server_hint_path)
+                )
         try:
             args.server = str(input_fn("请输入网页地址：")).strip()
         except (EOFError, OSError):
-            return (gui_fn or _prompt_setup_gui)(saved["server"] if saved else "")
+            return (gui_fn or _prompt_setup_gui)(
+                preferred_setup_server(saved["server"] if saved else "", server_hint_path=server_hint_path)
+            )
         if not args.server:
             output_fn("未输入网页地址，辅助程序未启动。")
             return None
