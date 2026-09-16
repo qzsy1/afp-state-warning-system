@@ -47,6 +47,7 @@ from acquisition import (
     check_capture_save_root,
     integrate_capture_sources,
     default_capture_interfaces,
+    resolve_default_simulation_source,
     sensor_interface_profiles,
     select_capture_folder,
     select_simulation_source,
@@ -5456,6 +5457,13 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._send_json(result)
                 return
             if parsed.path == "/api/acquisition/start":
+                demo = (
+                    (self.dashboard.bootstrap(include_discovery=False).get("acquisition") or {})
+                    .get("new_collection_demo") or {}
+                )
+                payload = resolve_default_simulation_source(
+                    payload, str(demo.get("source_file") or "")
+                )
                 if str(payload.get("simulation_source_type", "")).lower() == "mysql":
                     payload["simulation_mysql_query"] = validate_read_only_mysql_query(
                         str(payload.get("simulation_mysql_query", ""))

@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import acquisition  # noqa: E402
 from acquisition import (  # noqa: E402
     AcquisitionConfig,
     AcquisitionManager,
@@ -25,6 +26,23 @@ from training_data import read_excel_or_folder  # noqa: E402
 
 
 class AcquisitionIntegrityTests(unittest.TestCase):
+    def test_default_simulation_basename_resolves_to_configured_absolute_path(self) -> None:
+        resolver = getattr(acquisition, "resolve_default_simulation_source", None)
+        self.assertTrue(callable(resolver), "authorized simulation needs a canonical source resolver")
+        with tempfile.TemporaryDirectory() as temp:
+            default_source = Path(temp) / "SIM_PRESSURE_M3232_new_collection.csv"
+            default_source.write_text("温度\n350\n", encoding="utf-8")
+            payload = {
+                "simulation_source_type": "single_csv",
+                "simulation_source_path": default_source.name,
+                "source_file": default_source.name,
+            }
+
+            normalized = resolver(payload, default_source)
+
+        self.assertEqual(normalized["simulation_source_path"], str(default_source.resolve()))
+        self.assertEqual(normalized["source_file"], str(default_source.resolve()))
+
     def test_simulation_check_reports_each_mapped_interface_as_available(self) -> None:
         interfaces = default_capture_interfaces()
         assignments = {

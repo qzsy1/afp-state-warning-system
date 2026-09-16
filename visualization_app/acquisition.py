@@ -173,6 +173,30 @@ ABB_ROBTARGET_PATH = (
 )
 
 
+def resolve_default_simulation_source(
+    payload: dict[str, Any], default_source: str | Path
+) -> dict[str, Any]:
+    """Replace a display-only default CSV name with its canonical path.
+
+    Public/desktop bootstrap may display only the default file name.  The
+    authorized acquisition endpoint still needs the server-side absolute path;
+    arbitrary user-selected paths are deliberately left unchanged.
+    """
+
+    values = dict(payload or {})
+    if str(values.get("simulation_source_type") or "single_csv").lower() != "single_csv":
+        return values
+    configured = Path(str(default_source or "").strip())
+    if not configured.is_file():
+        return values
+    canonical = str(configured.resolve())
+    for key in ("simulation_source_path", "source_file"):
+        submitted = str(values.get(key) or "").strip()
+        if submitted and not Path(submitted).is_absolute() and Path(submitted).name == configured.name:
+            values[key] = canonical
+    return values
+
+
 def check_capture_save_root(path: str | Path | None) -> dict[str, Any]:
     """Check whether a requested capture directory may be used for saving.
 

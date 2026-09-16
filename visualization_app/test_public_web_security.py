@@ -282,6 +282,7 @@ class PublicWebHttpTests(unittest.TestCase):
         root = Path(self.temp.name)
         source = root / "simulation.csv"
         source.write_bytes("温度,压力\n350,400\n".encode("utf-8"))
+        self.default_simulation_source = source.resolve()
         self.hardware_start_calls = 0
 
         class FakeAcquisition:
@@ -322,7 +323,7 @@ class PublicWebHttpTests(unittest.TestCase):
                 "defaults": {},
                 "acquisition": {
                     "drivers": [],
-                    "new_collection_demo": {"source_file": "C:\\private\\demo.csv"},
+                    "new_collection_demo": {"source_file": str(self.default_simulation_source)},
                     "default_save_root": "C:\\private\\capture",
                 },
             },
@@ -572,6 +573,40 @@ class PublicWebHttpTests(unittest.TestCase):
         self.assertEqual(second_status, 200)
         self.assertEqual(first, second)
         self.assertEqual(start.call_count, 1)
+
+    def test_authorized_default_simulation_filename_resolves_to_bootstrap_path(self):
+        self.request_json("GET", "/api/auth/session")
+        self.request_json(
+            "POST",
+            "/api/auth/login",
+            {"password": "Correct-Horse-2026"},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        self.request_json(
+            "POST", "/api/real/control/acquire", {}, headers={"X-Forwarded-Proto": "https"}
+        )
+        with patch.object(
+            self.server.dashboard.acquisition,
+            "start",
+            return_value={"running": True},
+        ) as start:
+            status, _, _ = self.request_json(
+                "POST",
+                "/api/acquisition/start",
+                {
+                    "acquisition_mode": "simulation",
+                    "driver": "simulator",
+                    "simulation_source_type": "single_csv",
+                    "simulation_source_path": self.default_simulation_source.name,
+                    "source_file": self.default_simulation_source.name,
+                },
+                headers={"X-Forwarded-Proto": "https"},
+            )
+
+        self.assertEqual(status, 200)
+        config = start.call_args.args[0]
+        self.assertEqual(config.simulation_source_path, str(self.default_simulation_source))
+        self.assertEqual(config.source_file, str(self.default_simulation_source))
 
 
 class RealControlLeaseTests(unittest.TestCase):
