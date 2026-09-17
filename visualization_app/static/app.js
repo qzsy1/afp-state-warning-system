@@ -92,6 +92,7 @@ function renderAccessState() {
   const note = $("real-access-transport-note");
   if (badge) {
     badge.textContent = state.accessRole === "local_admin" ? "本机管理模式"
+      : state.accessRole === "lan_operator" ? "局域网边缘采集模式"
       : state.accessRole === "authorized" ? "真实模式已解锁" : "访客模拟模式";
     badge.className = `access-mode-badge ${state.accessRole}`;
   }
@@ -128,6 +129,10 @@ async function loadAccessSession() {
   return payload;
 }
 
+function usesLocalCaptureHelper() {
+  return state.accessRole === "lan_operator" || state.accessRole === "authorized";
+}
+
 function renderHelperStatus() {
   const badge = $("helperStatus");
   const note = $("helperStatusNote");
@@ -137,7 +142,7 @@ function renderHelperStatus() {
   if (state.accessRole === "local_admin") {
     badge.textContent = "内置采集服务";
     badge.className = "helper-status ok";
-    if (note) note.textContent = "局域网直连本机真实采集，无需辅助程序。";
+    if (note) note.textContent = "服务器本机采集，无需辅助程序。";
     button?.classList.toggle("hidden", true);
     code?.classList.toggle("hidden", true);
     return;
@@ -189,7 +194,7 @@ async function loadHelperStatus() {
   // helper heartbeat becomes online, refresh the physical-interface mapping
   // automatically so the panel does not remain on the initial "未分配" state.
   if (
-    state.accessRole === "authorized"
+    usesLocalCaptureHelper()
     && state.helperStatus.online
     && !wasOnline
   ) {
@@ -814,7 +819,7 @@ async function postJson(url, payload = {}, {timeoutMs = 30000, controller = null
 }
 
 async function requestLocalHelper(command, payload = {}, {timeoutMs = 30000} = {}) {
-  if (state.accessRole !== "authorized" || !state.helperStatus?.paired) {
+  if (!usesLocalCaptureHelper() || !state.helperStatus?.paired) {
     throw new Error("尚未配对访问者电脑上的本地采集辅助程序");
   }
   const queued = await postJson("/api/helper/command", {command, payload});
@@ -1107,7 +1112,7 @@ async function selectSaveRoot() {
     await confirmLocalSave();
     return;
   }
-  if (state.accessRole !== "local_admin" && state.accessRole !== "authorized") {
+  if (state.accessRole !== "local_admin" && !usesLocalCaptureHelper()) {
     toast("网页本地保存请先填写目录名称，再点击“确认并授权本地保存”");
     return;
   }
@@ -1265,7 +1270,7 @@ async function testMysqlConnection(local = false) {
   try {
     status.textContent = `正在检查${label} MySQL 数据库（不会创建或修改表）……`;
     const settings = local ? unifiedLocalMysqlSettings() : unifiedMysqlSettings();
-    const result = local && state.accessRole === "authorized"
+    const result = local && usesLocalCaptureHelper()
       ? await requestLocalHelper("mysql_preflight", {
         mysql_enabled: true,
         mysql_host: settings.mysql_host,
@@ -1309,7 +1314,7 @@ async function refreshRelationMap(scope) {
   const status = local ? $("mysqlLocalStatus") : $("mysqlTargetStatus");
   try {
     if (status) status.textContent = `正在读取${label}数据库 ${settings.mysql_host}/${database} 的关系表……`;
-    const result = local && state.accessRole === "authorized"
+    const result = local && usesLocalCaptureHelper()
       ? await requestLocalHelper("mysql_relation_map", {
         mysql_enabled: true,
         mysql_host: settings.mysql_host,
@@ -1913,7 +1918,7 @@ async function startAcquisition() {
       resetLiveEvidenceDisplay();
     }
     state.liveScopeKey = nextScope;
-    const result = state.accessRole === "authorized" && controls.acquisitionMode?.value !== "simulation"
+    const result = usesLocalCaptureHelper() && controls.acquisitionMode?.value !== "simulation"
       ? await requestLocalHelper("start_capture", acquisitionConfig(), {timeoutMs: 30000})
       : await postJson("/api/acquisition/start", acquisitionConfig());
     if (controls.processingMode.value !== "capture_only") {
@@ -1941,7 +1946,7 @@ async function stopAcquisition() {
       ? controls.newLayer
       : controls.liveLayer;
     const completedLayer = Number(layerControl.value) || 0;
-    const result = state.accessRole === "authorized" && controls.acquisitionMode?.value !== "simulation"
+    const result = usesLocalCaptureHelper() && controls.acquisitionMode?.value !== "simulation"
       ? await requestLocalHelper("stop_capture", {}, {timeoutMs: 30000})
       : await postJson(
         state.accessRole === "guest" ? "/api/simulation/stop" : "/api/acquisition/stop",
@@ -4321,7 +4326,7 @@ async function discoverInterfaces() {
     }
     return;
   }
-  if (state.accessRole === "authorized") {
+  if (usesLocalCaptureHelper()) {
     if (!state.helperStatus?.paired) {
       // Restore the cached real mapping while the helper reconnects (cached real mapping);
       // this is
@@ -4420,7 +4425,7 @@ async function discoverInterfaces() {
 }
 
 function rememberRealInterfaceSnapshot() {
-  if (state.accessRole !== "authorized" || !Array.isArray(state.interfaceCatalog) || !state.interfaceCatalog.length) return;
+  if (!usesLocalCaptureHelper() || !Array.isArray(state.interfaceCatalog) || !state.interfaceCatalog.length) return;
   state.realInterfaceSnapshot = {
     catalog: state.interfaceCatalog.map((item) => ({...item})),
     physical: (state.physicalInterfaces || []).map((item) => ({...item})),
@@ -4810,7 +4815,7 @@ async function readProcessParameters({automatic = false} = {}) {
       result = await postJson(
         "/api/simulation/process-parameters", config, {timeoutMs: 20000}
       );
-    } else if (!simulation && state.accessRole === "authorized") {
+    } else if (!simulation && usesLocalCaptureHelper()) {
       result = await requestLocalHelper(
         "read_process_parameters", config, {timeoutMs: 20000}
       );
@@ -5254,7 +5259,7 @@ async function testSensorConnection({automatic = false} = {}) {
     updateAgentFromHardwareResult(result, {automatic});
     return result;
   }
-  if (state.accessRole === "authorized" && controls.acquisitionMode?.value !== "simulation") {
+  if (usesLocalCaptureHelper() && controls.acquisitionMode?.value !== "simulation") {
     state.hardwareCheckInProgress = true;
     const node = controls.hardwareCheckStatus;
     const button = $("testSensorsButton");

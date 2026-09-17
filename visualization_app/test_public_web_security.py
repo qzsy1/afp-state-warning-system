@@ -155,6 +155,39 @@ class PublicWebAuthTests(unittest.TestCase):
 
 
 class PublicWebAccessTests(unittest.TestCase):
+    def test_lan_operator_has_unique_session_and_helper_backed_real_access(self):
+        from web_access import (
+            PermissionPolicy,
+            RequestIdentity,
+            lan_session_id,
+            uses_local_capture_helper,
+        )
+
+        first = RequestIdentity("lan_operator", lan_session_id("guest-a"), "guest-a")
+        second = RequestIdentity("lan_operator", lan_session_id("guest-b"), "guest-b")
+        policy = PermissionPolicy()
+
+        self.assertNotEqual(first.session_id, second.session_id)
+        self.assertTrue(str(first.session_id).startswith("lan-"))
+        self.assertTrue(uses_local_capture_helper(first.role))
+        self.assertTrue(
+            policy.authorize("POST", "/api/helper/pair/start", first).allowed
+        )
+        self.assertTrue(
+            policy.authorize("POST", "/api/acquisition/start", first).allowed
+        )
+        denied = policy.authorize("GET", "/api/admin/status", first)
+        self.assertFalse(denied.allowed)
+        self.assertEqual(denied.error, "local_admin_required")
+
+    def test_only_remote_real_roles_use_local_capture_helper(self):
+        from web_access import uses_local_capture_helper
+
+        self.assertTrue(uses_local_capture_helper("lan_operator"))
+        self.assertTrue(uses_local_capture_helper("authorized"))
+        self.assertFalse(uses_local_capture_helper("local_admin"))
+        self.assertFalse(uses_local_capture_helper("guest"))
+
     def test_guest_can_read_public_status_but_cannot_call_real_control(self):
         from web_access import PermissionPolicy, RequestIdentity
 

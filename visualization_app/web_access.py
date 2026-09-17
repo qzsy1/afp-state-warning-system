@@ -8,7 +8,25 @@ from dataclasses import dataclass
 from typing import Literal, Mapping
 
 
-Role = Literal["guest", "authorized", "local_admin"]
+Role = Literal["guest", "authorized", "lan_operator", "local_admin"]
+
+REAL_ACCESS_ROLES = frozenset({"authorized", "lan_operator", "local_admin"})
+HELPER_BACKED_ROLES = frozenset({"authorized", "lan_operator"})
+
+
+def lan_session_id(guest_id: str) -> str:
+    """Return a stable per-browser LAN session without sharing admin state."""
+
+    value = str(guest_id or "").strip()
+    if not value:
+        raise ValueError("LAN会话缺少浏览器标识")
+    return f"lan-{value}"
+
+
+def uses_local_capture_helper(role: str) -> bool:
+    """Remote real-control roles execute hardware on their visitor computer."""
+
+    return str(role or "") in HELPER_BACKED_ROLES
 
 
 PUBLIC_GET = {
@@ -147,7 +165,7 @@ class PermissionPolicy:
         public_routes = PUBLIC_GET if method == "GET" else PUBLIC_POST
         if path in public_routes:
             return AccessDecision(True)
-        if identity.role in {"authorized", "local_admin"}:
+        if identity.role in REAL_ACCESS_ROLES:
             return AccessDecision(True)
         return AccessDecision(False, "real_access_required", 403)
 

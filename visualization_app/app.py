@@ -71,12 +71,15 @@ from local_capture_agent import LocalCaptureAgent
 from diagnosis_jobs import DiagnosisJobStore
 from public_status import build_public_device_status
 from web_access import (
+    REAL_ACCESS_ROLES,
     PermissionPolicy,
     RequestIdentity,
     SlidingWindowLimiter,
     is_lan_client,
     is_secure_request,
     is_trusted_quick_tunnel_request,
+    lan_session_id,
+    uses_local_capture_helper,
 )
 from web_auth import AuthenticationError, SecurityStore
 from control_lease import RealControlLease
@@ -4117,7 +4120,9 @@ class AppHandler(BaseHTTPRequestHandler):
             # A direct private-network client is the operator's LAN session.
             # Cloudflare requests arrive through loopback with a CF identity
             # header and remain guest/authorized according to web login.
-            identity = RequestIdentity("local_admin", "local-admin", guest_id)
+            identity = RequestIdentity(
+                "lan_operator", lan_session_id(guest_id), guest_id
+            )
         else:
             token = str(cookies.get("afp_session") or "")
             session = self.security_store.resolve_session(token) if token else None
@@ -4160,7 +4165,7 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def _require_real_control(self) -> bool:
         identity = self._identity()
-        if identity.role not in {"authorized", "local_admin"}:
+        if identity.role not in REAL_ACCESS_ROLES:
             self._send_json({"error": "real_access_required"}, HTTPStatus.FORBIDDEN)
             return False
         owner_id = self._control_owner_id()
@@ -4572,10 +4577,10 @@ class AppHandler(BaseHTTPRequestHandler):
             safe_status = self.security_store.safe_status()
             self._send_json(
                 {
-                    "authenticated": identity.role in {"authorized", "local_admin"},
+                    "authenticated": identity.role in REAL_ACCESS_ROLES,
                     "role": identity.role,
                     "model_access": bool(
-                        identity.role in {"authorized", "local_admin"}
+                        identity.role in REAL_ACCESS_ROLES
                         and safe_status.get("model_configured")
                     ),
                     "secure_transport": self._is_secure_transport(),
@@ -4641,7 +4646,7 @@ class AppHandler(BaseHTTPRequestHandler):
             from interface_agent import DEFAULT_SILICONFLOW_MODEL
 
             identity = self._identity()
-            if identity.role in {"authorized", "local_admin"}:
+            if identity.role in REAL_ACCESS_ROLES:
                 _api_key, model_name = self.security_store.model_credentials()
                 self._send_json(
                     {
@@ -5118,7 +5123,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 )
 
                 identity = self._identity()
-                if identity.role not in {"authorized", "local_admin"}:
+                if identity.role not in REAL_ACCESS_ROLES:
                     self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
                     return
                 request_data = _validate_agent_payload(payload)
@@ -5195,7 +5200,7 @@ class AppHandler(BaseHTTPRequestHandler):
 
                 request_data = _validate_agent_payload(payload)
                 identity = self._identity()
-                if identity.role in {"authorized", "local_admin"}:
+                if identity.role in REAL_ACCESS_ROLES:
                     try:
                         stored_key, stored_model = self.security_store.model_credentials()
                     except Exception:

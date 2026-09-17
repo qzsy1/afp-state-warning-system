@@ -112,14 +112,29 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn('state.accessRole === "local_admin"', body)
         self.assertIn("assign(controls.mysqlLocalHost, local.host)", body)
 
-    def test_lan_admin_does_not_require_public_helper_pairing(self):
+    def test_only_loopback_admin_skips_helper_pairing(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
         start = text.index("function renderHelperStatus")
         end = text.index("async function loadHelperStatus", start)
         body = text[start:end]
         self.assertIn('state.accessRole === "local_admin"', body)
-        self.assertIn("局域网直连本机真实采集，无需辅助程序", body)
+        self.assertIn("服务器本机采集，无需辅助程序", body)
+
+    def test_lan_and_public_real_modes_share_helper_routing_policy(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("function usesLocalCaptureHelper")
+        end = text.index("function renderHelperStatus", start)
+        policy = text[start:end]
+        self.assertIn('state.accessRole === "lan_operator"', policy)
+        self.assertIn('state.accessRole === "authorized"', policy)
+
+        discover_start = text.index("async function discoverInterfaces()")
+        discover_end = text.index("function recognizedInterfacePortsFrom", discover_start)
+        discover = text[discover_start:discover_end]
+        self.assertIn("usesLocalCaptureHelper()", discover)
+        self.assertNotIn('state.accessRole === "authorized"', discover)
 
     def test_runtime_status_identifies_simulation_streams(self):
         source = Path(__file__).with_name("static") / "app.js"
@@ -256,7 +271,7 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         text = source.read_text(encoding="utf-8")
         self.assertEqual(text.count("async function discoverInterfaces()"), 1)
         body = text[text.index("async function discoverInterfaces()"):]
-        self.assertIn('state.accessRole === "authorized"', body)
+        self.assertIn("usesLocalCaptureHelper()", body)
         self.assertIn('requestLocalHelper("discover"', body)
 
     def test_authorized_discovery_enables_every_protocol_bound_interface(self):
