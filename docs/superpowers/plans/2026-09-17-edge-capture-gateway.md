@@ -35,10 +35,10 @@
 - Produces: unique `lan-<guest_id>` session identifiers.
 - Produces: frontend `usesLocalCaptureHelper()` policy.
 
-- [ ] Write tests proving direct LAN clients are `lan_operator`, two guest cookies do not share a session, LAN cannot call admin routes, and LAN can call pairing/real-control routes.
-- [ ] Run the focused tests and confirm they fail because `lan_operator` does not exist.
-- [ ] Implement the role and replace helper routing checks that currently only accept `authorized`.
-- [ ] Run focused security/frontend tests and commit `feat: isolate lan helper sessions`.
+- [x] Write tests proving direct LAN clients are `lan_operator`, two guest cookies do not share a session, LAN cannot call admin routes, and LAN can call pairing/real-control routes.
+- [x] Run the focused tests and confirm they fail because `lan_operator` does not exist.
+- [x] Implement the role and replace helper routing checks that currently only accept `authorized`.
+- [x] Run focused security/frontend tests and commit `feat: isolate lan helper sessions`.
 
 ### Task 2: Ordered remote acquisition mirror
 
@@ -53,10 +53,10 @@
 - Produces: `RemoteAcquisitionMirror.numeric_matrix() -> tuple[list[dict], list[float]]`.
 - Produces: `RemoteAcquisitionRegistry.for_session(session_id)`.
 
-- [ ] Write tests for first batch, duplicate acknowledgement, out-of-order rejection, capture reset and independent sessions.
-- [ ] Run tests and confirm import/behavior failures.
-- [ ] Implement bounded, locked mirrors with `(capture_uuid, sequence)` deduplication.
-- [ ] Run focused tests and commit `feat: add session remote acquisition mirror`.
+- [x] Write tests for first batch, duplicate acknowledgement, out-of-order rejection, capture reset and independent sessions.
+- [x] Run tests and confirm import/behavior failures.
+- [x] Implement bounded, locked mirrors with `(capture_uuid, sequence)` deduplication.
+- [x] Run focused tests and commit `feat: add session remote acquisition mirror`.
 
 ### Task 3: Helper sample batching and acknowledgement
 
@@ -72,10 +72,10 @@
 - Produces: `LocalCaptureAgent.ack_sample_batch(capture_uuid, sequence)`.
 - Consumes: `RemoteAcquisitionRegistry.ingest(session_id, batch)`.
 
-- [ ] Write failing tests for pending-batch replay, acknowledgement advancement, private HTTP/WS acceptance, public plaintext rejection and shared agent state across WSS-to-HTTP fallback.
-- [ ] Run focused tests and confirm expected failures.
-- [ ] Implement sample messages for WSS and `/api/helper/samples` for HTTPS polling fallback.
-- [ ] Run focused tests and commit `feat: stream helper sample batches`.
+- [x] Write failing tests for pending-batch replay, acknowledgement advancement, private HTTP/WS acceptance, public plaintext rejection and shared agent state across WSS-to-HTTP fallback.
+- [x] Run focused tests and confirm expected failures.
+- [x] Implement sample messages for WSS and `/api/helper/samples` for HTTPS polling fallback.
+- [x] Run focused tests and commit `feat: stream helper sample batches`.
 
 ### Task 4: Feed remote rows into prediction and warning
 
@@ -88,10 +88,10 @@
 - Produces: handler acquisition selection by identity/session.
 - Consumes: `RemoteAcquisitionMirror.status()` and `numeric_matrix()`.
 
-- [ ] Write a failing integration test where helper rows appear in `/api/live` for their session and never in another session or server-local acquisition.
-- [ ] Run the test and confirm it reads the wrong acquisition source.
-- [ ] Select the remote mirror for helper-backed live HTTP/WebSocket and acquisition status.
-- [ ] Run integration tests and commit `feat: use edge samples for live prediction`.
+- [x] Write a failing integration test where helper rows appear in `/api/live` for their session and never in another session or server-local acquisition.
+- [x] Run the test and confirm it reads the wrong acquisition source.
+- [x] Select the remote mirror for helper-backed live HTTP/WebSocket and acquisition status.
+- [x] Run integration tests and commit `feat: use edge samples for live prediction`.
 
 ### Task 5: Frontend pairing, start-state and no-fallback behavior
 
@@ -105,10 +105,10 @@
 - Consumes: `lan_operator`, helper status and remote acquisition status.
 - Produces: explicit execution-source and first-sample states.
 
-- [ ] Write source-contract tests for LAN pairing visibility, helper routing of discovery/start/stop/process parameters/local MySQL, and no server fallback.
-- [ ] Run tests and confirm the old authorized-only conditions fail.
-- [ ] Implement the shared helper policy and wait-for-first-sample status.
-- [ ] Run frontend contract tests and commit `feat: expose lan edge capture state`.
+- [x] Write source-contract tests for LAN pairing visibility, helper routing of discovery/start/stop/process parameters/local MySQL, and no server fallback.
+- [x] Run tests and confirm the old authorized-only conditions fail.
+- [x] Implement the shared helper policy and wait-for-first-sample status.
+- [x] Run frontend contract tests and commit `feat: expose lan edge capture state`.
 
 ### Task 6: Regression, packaging and two-process verification
 
@@ -119,8 +119,8 @@
 **Interfaces:**
 - Verifies the full edge gateway contract; introduces no new runtime API.
 
-- [ ] Run helper, security, acquisition, MySQL, diagnosis and frontend test suites.
-- [ ] Run Python compile checks and JavaScript syntax checks.
-- [ ] Start a server plus helper test process, pair, ingest known rows, verify live output, disconnect/reconnect and verify no duplicates.
-- [ ] Build the helper and integrated EXE into their existing delivery paths, then run `--verify-files`, `--self-test` and functional smoke checks.
-- [ ] Inspect `git diff`, confirm no duplicate delivery directory, and commit `build: refresh edge capture gateway binaries`.
+- [x] Run helper, security, acquisition, MySQL, diagnosis and frontend test suites.
+- [x] Run Python compile checks and JavaScript syntax checks.
+- [x] Start a server plus helper test process, pair, ingest known rows, verify live output, disconnect/reconnect and verify no duplicates.
+- [x] Build the helper and integrated EXE into their existing delivery paths, then run `--verify-files`, `--self-test` and functional smoke checks.
+- [x] Inspect `git diff`, confirm no duplicate delivery directory, and commit `build: refresh edge capture gateway binaries`.
