@@ -17,7 +17,12 @@ import urllib.request
 import uuid
 from typing import Any
 
-from acquisition import AcquisitionManager, MySQLSettings
+from acquisition import (
+    AcquisitionManager,
+    MySQLSettings,
+    check_capture_save_root,
+    select_capture_folder,
+)
 from helper_relay import ALLOWED_HELPER_COMMANDS
 from mysql_storage import MySQLCaptureStore
 from json_safety import json_safe_value
@@ -42,6 +47,9 @@ class LocalCaptureAgent:
         self._stream_cursor = 0
         self._stream_sequence = 0
         self._pending_batch: dict[str, Any] | None = None
+        self._status_revision = 0
+        self._pending_status_revision = -1
+        self._status_dirty = False
 
     @staticmethod
     def _choose_candidate(
@@ -135,6 +143,13 @@ class LocalCaptureAgent:
     def mysql_relation_map(self, settings: MySQLSettings, *, limit: int = 1000) -> dict[str, Any]:
         return MySQLCaptureStore(settings).relation_map(max(1, min(int(limit), 1000)), auto_initialize=False)
 
+    def check_save_root(self, path: str) -> dict[str, Any]:
+        return check_capture_save_root(str(path or ""))
+
+    def select_folder(self, initial_path: str = "") -> dict[str, Any]:
+        selected = select_capture_folder(str(initial_path or ""))
+        return {"selected": bool(selected), "path": selected}
+
     def start_capture(self, config: Any) -> dict[str, Any]:
         result = self.manager.start(config)
         with self._stream_lock:
@@ -142,6 +157,9 @@ class LocalCaptureAgent:
             self._stream_cursor = 0
             self._stream_sequence = 0
             self._pending_batch = None
+            self._status_revision += 1
+            self._pending_status_revision = -1
+            self._status_dirty = True
             capture_uuid = self._capture_uuid
         response = dict(result) if isinstance(result, dict) else {"result": result}
         response["capture_uuid"] = capture_uuid
@@ -161,7 +179,7 @@ class LocalCaptureAgent:
                 self._stream_cursor = 0
                 self._stream_sequence = 0
             end = min(len(rows), self._stream_cursor + batch_limit)
-            if end <= self._stream_cursor:
+            if end <= self._stream_cursor and not self._status_dirty:
                 return None
             pending = {
                 "capture_uuid": self._capture_uuid,
@@ -171,6 +189,7 @@ class LocalCaptureAgent:
                 "status": json_safe_value(self.manager.status()),
             }
             self._pending_batch = pending
+            self._pending_status_revision = self._status_revision
             return dict(pending)
 
     def ack_sample_batch(self, capture_uuid: str, sequence: int) -> bool:
@@ -185,6 +204,9 @@ class LocalCaptureAgent:
             self._stream_cursor += len(pending["rows"])
             self._stream_sequence += 1
             self._pending_batch = None
+            if self._pending_status_revision == self._status_revision:
+                self._status_dirty = False
+            self._pending_status_revision = -1
             return True
 
     def check_capture(self, config: Any) -> dict[str, Any]:
@@ -194,7 +216,14 @@ class LocalCaptureAgent:
         return self.manager.read_process_parameters(config)
 
     def stop_capture(self) -> dict[str, Any]:
-        return self.manager.stop()
+        result = self.manager.stop()
+        with self._stream_lock:
+            self._status_revision += 1
+            self._status_dirty = True
+            capture_uuid = self._capture_uuid
+        response = dict(result) if isinstance(result, dict) else {"result": result}
+        response["capture_uuid"] = capture_uuid
+        return response
 
     def status(self) -> dict[str, Any]:
         return self.manager.status()

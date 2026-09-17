@@ -47,6 +47,29 @@ class LocalCaptureAgentTests(unittest.TestCase):
         self.assertFalse(agent.ack_sample_batch("other-capture", pending["sequence"]))
         self.assertEqual(agent.next_sample_batch(), pending)
 
+    def test_stop_emits_final_status_batch_even_when_no_new_rows_arrive(self):
+        manager = Mock()
+        manager.start.return_value = {"running": True}
+        manager.stop.return_value = {"running": False, "finalization_complete": True}
+        manager.numeric_matrix.return_value = ([], [])
+        manager.status.side_effect = [
+            {"running": True, "config": {}},
+            {"running": False, "config": {}, "finalization_complete": True},
+        ]
+        agent = LocalCaptureAgent(manager=manager)
+        started = agent.start_capture(Mock())
+        initial = agent.next_sample_batch()
+        self.assertEqual(initial["rows"], [])
+        agent.ack_sample_batch(started["capture_uuid"], initial["sequence"])
+
+        stopped = agent.stop_capture()
+        final = agent.next_sample_batch()
+
+        self.assertFalse(stopped["running"])
+        self.assertEqual(stopped["capture_uuid"], started["capture_uuid"])
+        self.assertEqual(final["rows"], [])
+        self.assertFalse(final["status"]["running"])
+
     def test_transport_builds_hello_without_secrets(self):
         transport = HelperTransport(
             "wss://example.test/helper", "pairing-secret", device_id="device-a"
@@ -129,6 +152,19 @@ class LocalCaptureAgentTests(unittest.TestCase):
 
         self.assertEqual(result["values"]["pid_angle_deg"], 5.0)
         manager.read_process_parameters.assert_called_once_with(config)
+
+    @patch("local_capture_agent.select_capture_folder", return_value="F:\\AFP_Capture")
+    @patch("local_capture_agent.check_capture_save_root", return_value={"ok": True})
+    def test_save_folder_operations_execute_on_helper_computer(self, check_root, select_folder):
+        agent = LocalCaptureAgent(manager=Mock())
+
+        selected = agent.select_folder("F:\\")
+        checked = agent.check_save_root("F:\\AFP_Capture")
+
+        self.assertEqual(selected, {"selected": True, "path": "F:\\AFP_Capture"})
+        self.assertTrue(checked["ok"])
+        select_folder.assert_called_once_with("F:\\")
+        check_root.assert_called_once_with("F:\\AFP_Capture")
 
 
 if __name__ == "__main__":

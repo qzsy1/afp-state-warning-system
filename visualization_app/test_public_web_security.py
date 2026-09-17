@@ -463,6 +463,65 @@ class PublicWebHttpTests(unittest.TestCase):
         self.assertEqual(payload["error"], "real_access_required")
         self.assertEqual(self.hardware_start_calls, 0)
 
+    def test_paired_helper_samples_feed_authorized_session_status(self):
+        self.request_json("GET", "/api/auth/session")
+        login_status, _, _ = self.request_json(
+            "POST",
+            "/api/auth/login",
+            {"password": "Correct-Horse-2026"},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        self.assertEqual(login_status, 200)
+        pair_status, challenge, _ = self.request_json(
+            "POST", "/api/helper/pair/start", {}
+        )
+        self.assertEqual(pair_status, 200)
+        complete_status, paired, _ = self.request_json(
+            "POST",
+            "/api/helper/pair/complete",
+            {
+                "challenge": challenge["challenge"],
+                "device_id": "visitor-pc",
+                "capabilities": {"real_capture": True},
+            },
+        )
+        self.assertEqual(complete_status, 200)
+
+        sample_status, accepted, _ = self.request_json(
+            "POST",
+            "/api/helper/samples",
+            {
+                "device_id": "visitor-pc",
+                "batch": {
+                    "capture_uuid": "capture-a",
+                    "sequence": 0,
+                    "rows": [{"温度": 350.0}],
+                    "timestamps": [1.0],
+                    "status": {
+                        "running": True,
+                        "config": {
+                            "acquisition_mode": "real",
+                            "dataset_schema": "legacy_original",
+                            "selected_sensors": ["温度"],
+                        },
+                        "sensors": [],
+                    },
+                },
+            },
+            headers={"Authorization": f"Bearer {paired['pairing_token']}"},
+            csrf=False,
+        )
+        self.assertEqual(sample_status, 200)
+        self.assertTrue(accepted["ok"])
+
+        status_code, remote_status, _ = self.request_json(
+            "GET", "/api/acquisition/status"
+        )
+        self.assertEqual(status_code, 200)
+        self.assertTrue(remote_status["remote_source"])
+        self.assertTrue(remote_status["first_sample_received"])
+        self.assertEqual(remote_status["capture_uuid"], "capture-a")
+
     def test_loopback_login_and_forwarded_https_login_succeed(self):
         self.request_json("GET", "/api/auth/session")
         status, payload, _ = self.request_json(
@@ -787,6 +846,10 @@ class BuildManifestTests(unittest.TestCase):
         script = (Path(__file__).resolve().parent.parent / "modular_runtime" / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
         self.assertIn("public_web_security.sqlite3", script)
         self.assertIn("sk-[A-Za-z0-9_-]{20,}", script)
+
+    def test_build_script_packages_edge_capture_runtime(self):
+        script = (Path(__file__).resolve().parent.parent / "modular_runtime" / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn('"edge_capture.py"', script)
 
 
 if __name__ == "__main__":

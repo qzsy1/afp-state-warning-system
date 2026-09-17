@@ -59,6 +59,12 @@ class HelperTransportTests(unittest.TestCase):
 
         agent.ack_sample_batch.assert_not_called()
 
+    def test_websocket_hardware_commands_run_off_heartbeat_loop(self):
+        source = inspect.getsource(helper_entry.run_forever)
+        self.assertIn("ThreadPoolExecutor", source)
+        self.assertIn("executor.submit", source)
+        self.assertIn("_dispatch_and_send_websocket", source)
+
     @patch("local_capture_helper_entry.run_http_forever")
     @patch("local_capture_helper_entry.run_forever", return_value=False)
     def test_auto_fallback_reuses_same_agent_instance(self, run_wss, run_http):

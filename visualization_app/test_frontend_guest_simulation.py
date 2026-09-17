@@ -312,6 +312,7 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         end = text.index("function renderLiveHardwareMonitor", start)
         body = text[start:end]
         self.assertIn("await acquireRealControl();", body)
+        self.assertIn("if (!usesLocalCaptureHelper())", body)
         self.assertIn('postJson("/api/acquisition/reset-check"', body)
 
     def test_agent_diagnosis_uses_resumable_job_submission_and_polling(self):
@@ -451,6 +452,57 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn("timeoutMs: 120000", text)
         self.assertIn("requestLocalHelper(\"start_capture\"", text)
         self.assertIn("requestLocalHelper(\"stop_capture\"", text)
+
+    def test_helper_capture_waits_for_server_to_receive_first_sample(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        self.assertIn("async function waitForEdgeFirstSample", text)
+        start = text.index("async function startAcquisition()")
+        end = text.index("async function stopAcquisition()", start)
+        body = text[start:end]
+        self.assertIn("await waitForEdgeFirstSample", body)
+        self.assertIn("capture_uuid", body)
+
+    def test_helper_backed_bootstrap_does_not_expose_server_interface_inventory(self):
+        source = Path(__file__).with_name("app.py").read_text(encoding="utf-8")
+        start = source.index('if parsed.path == "/api/bootstrap"')
+        end = source.index('if parsed.path == "/api/mysql/defaults"', start)
+        body = source[start:end]
+        self.assertIn("uses_local_capture_helper(identity.role)", body)
+        self.assertIn('acquisition["interface_discovery"] = {"physical_interfaces": []}', body)
+
+    def test_helper_backed_save_folder_never_uses_server_picker_or_server_path_check(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        select_start = text.index("async function selectSaveRoot()")
+        select_end = text.index("function updateLocalSaveStatus", select_start)
+        select_body = text[select_start:select_end]
+        self.assertIn('requestLocalHelper("select_folder"', select_body)
+
+        status_start = text.index("async function refreshSaveRootStatus")
+        status_end = text.index("async function confirmLocalSave", status_start)
+        status_body = text[status_start:status_end]
+        self.assertIn('requestLocalHelper("check_save_root"', status_body)
+
+    def test_helper_backed_real_capture_does_not_repeat_server_export(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("async function saveFinishedCaptureLocally()")
+        end = text.index("async function testMysqlConnection", start)
+        body = text[start:end]
+        self.assertIn("usesLocalCaptureHelper()", body)
+        self.assertIn('state.acquisitionMode !== "simulation"', body)
+        self.assertIn("return", body)
+
+    def test_diagnosis_uses_helper_hardware_evidence_and_remote_acquisition_status(self):
+        source = Path(__file__).with_name("app.py").read_text(encoding="utf-8")
+        self.assertIn("def _diagnostic_context", source)
+        self.assertIn("uses_local_capture_helper(identity.role)", source)
+        self.assertIn('"source": "local_helper"', source)
+        self.assertNotIn(
+            "discovery = deepcopy(self.dashboard.acquisition.discover_interfaces())",
+            source,
+        )
 
 
 if __name__ == "__main__":

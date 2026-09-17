@@ -929,6 +929,27 @@ function renderAcquisitionStatus(status) {
     `${status.last_error ? ` · 错误：${status.last_error}` : ""}`;
 }
 
+async function waitForEdgeFirstSample(captureUuid, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const response = await fetch("/api/acquisition/status", {
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+    const status = await response.json();
+    if (!response.ok) throw new Error(status.error || "无法读取边缘采集状态");
+    if (
+      status.capture_uuid === captureUuid
+      && status.first_sample_received
+    ) return status;
+    if (!state.helperStatus?.online) {
+      throw new Error("本地采集辅助程序已离线，尚未收到首批数据");
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 250));
+  }
+  throw new Error("辅助程序已启动，但服务器在15秒内未收到首批有效采集数据");
+}
+
 function renderRuntimeStatus(payload = state.payload) {
   const node = $("streamStatus");
   const dot = document.querySelector(".live-dot");
@@ -1117,9 +1138,10 @@ async function selectSaveRoot() {
     return;
   }
   try {
-    const result = await postJson("/api/acquisition/select-folder", {
-      initial_path: controls.saveRoot.value.trim(),
-    });
+    const initialPath = controls.saveRoot.value.trim();
+    const result = usesLocalCaptureHelper()
+      ? await requestLocalHelper("select_folder", {initial_path: initialPath})
+      : await postJson("/api/acquisition/select-folder", {initial_path: initialPath});
     if (result.selected) {
       controls.saveRoot.value = result.path;
       await refreshSaveRootStatus(result.path);
@@ -1181,6 +1203,11 @@ async function refreshSaveRootStatus(path = controls.saveRoot?.value.trim() || "
     return;
   }
   try {
+    if (usesLocalCaptureHelper()) {
+      const result = await requestLocalHelper("check_save_root", {path});
+      renderSaveRootStatus(result);
+      return;
+    }
     const response = await fetch(`/api/acquisition/save-status?path=${encodeURIComponent(path)}`, {
       cache: "no-store", credentials: "same-origin",
     });
@@ -1222,6 +1249,10 @@ async function confirmLocalSave() {
 }
 
 async function saveFinishedCaptureLocally() {
+  // In real helper-backed mode the edge gateway writes the capture directly
+  // on the visitor PC.  A second server export would duplicate files and may
+  // accidentally export another session's data.
+  if (usesLocalCaptureHelper() && state.acquisitionMode !== "simulation") return;
   if (!state.localSaveAuthorized || !state.localSaveDirectoryHandle || state.localSaveBusy) return;
   state.localSaveBusy = true;
   try {
@@ -1918,13 +1949,17 @@ async function startAcquisition() {
       resetLiveEvidenceDisplay();
     }
     state.liveScopeKey = nextScope;
-    const result = usesLocalCaptureHelper() && controls.acquisitionMode?.value !== "simulation"
+    const helperBackedReal = usesLocalCaptureHelper() && controls.acquisitionMode?.value !== "simulation";
+    const result = helperBackedReal
       ? await requestLocalHelper("start_capture", acquisitionConfig(), {timeoutMs: 30000})
       : await postJson("/api/acquisition/start", acquisitionConfig());
     if (controls.processingMode.value !== "capture_only") {
       applyPredictionModelProfile(result.prediction_model, false);
     }
-    renderAcquisitionStatus(result);
+    const activeStatus = helperBackedReal
+      ? await waitForEdgeFirstSample(result.capture_uuid)
+      : result;
+    renderAcquisitionStatus(activeStatus);
     controls.dataMode.value = "live";
     configureDataMode();
     await loadRealtime();
@@ -5363,7 +5398,9 @@ async function resetAndCheckHardware() {
     try {
       if (state.accessRole !== "guest") {
         await acquireRealControl();
-        await postJson("/api/acquisition/reset-check", {});
+        if (!usesLocalCaptureHelper()) {
+          await postJson("/api/acquisition/reset-check", {});
+        }
     } else {
       state.guestSimulationStarted = false;
       state.guestSimulationStoppedByUser = false;

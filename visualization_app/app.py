@@ -4174,6 +4174,39 @@ class AppHandler(BaseHTTPRequestHandler):
             self.dashboard.remote_acquisitions,
         )
 
+    def _diagnostic_context(
+        self, hardware_result: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        identity = self._identity()
+        acquisition_status = deepcopy(self._request_acquisition().status())
+        if not uses_local_capture_helper(identity.role):
+            return (
+                deepcopy(self.dashboard.acquisition.discover_interfaces()),
+                acquisition_status,
+            )
+        physical_interfaces = []
+        for item in hardware_result.get("interfaces") or []:
+            if not isinstance(item, dict):
+                continue
+            physical_interfaces.append(
+                {
+                    "id": item.get("physical_interface_id") or item.get("id"),
+                    "endpoint": item.get("endpoint"),
+                    "kind": item.get("physical_interface_kind"),
+                    "protocol": item.get("driver"),
+                    "detected": bool(item.get("ok")),
+                    "state": item.get("state"),
+                    "message": item.get("message"),
+                }
+            )
+        return (
+            {
+                "source": "local_helper",
+                "physical_interfaces": physical_interfaces,
+            },
+            acquisition_status,
+        )
+
     def _require_real_control(self) -> bool:
         identity = self._identity()
         if identity.role not in REAL_ACCESS_ROLES:
@@ -4719,6 +4752,15 @@ class AppHandler(BaseHTTPRequestHandler):
             if default_source:
                 acquisition["simulation_source_type"] = "single_csv"
                 acquisition["simulation_source_name"] = default_source
+            if uses_local_capture_helper(identity.role):
+                # Real acquisition for remote operators belongs to the paired
+                # visitor helper.  Never seed its panel with server hardware
+                # or a server-local save folder while the helper reconnects.
+                bootstrap = deepcopy(bootstrap)
+                acquisition = bootstrap.get("acquisition") or {}
+                acquisition["interface_discovery"] = {"physical_interfaces": []}
+                acquisition["default_save_root"] = ""
+                bootstrap["acquisition"] = acquisition
             if identity.role == "guest":
                 bootstrap = deepcopy(bootstrap)
                 bootstrap["manifest"] = {
@@ -5173,8 +5215,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.model_limiter.allow("model", session_id, 3, 60.0)
                 events = deepcopy(request_data["events"])
                 hardware_result = deepcopy(request_data["hardware_result"])
-                discovery = deepcopy(self.dashboard.acquisition.discover_interfaces())
-                acquisition_status = deepcopy(self.dashboard.acquisition.status())
+                discovery, acquisition_status = self._diagnostic_context(
+                    hardware_result
+                )
                 fingerprint_payload = {
                     "events": events,
                     "hardware_result": hardware_result,
@@ -5250,13 +5293,16 @@ class AppHandler(BaseHTTPRequestHandler):
                     use_environment = False
 
                 def run_local() -> dict:
+                    discovery, acquisition_status = self._diagnostic_context(
+                        request_data["hardware_result"]
+                    )
                     local_result = run_interface_diagnoses(
                         request_data["events"],
                         api_key="",
                         model_name=DEFAULT_SILICONFLOW_MODEL,
                         hardware_result=request_data["hardware_result"],
-                        discovery=self.dashboard.acquisition.discover_interfaces(),
-                        acquisition_status=self.dashboard.acquisition.status(),
+                        discovery=discovery,
+                        acquisition_status=acquisition_status,
                         use_environment_credentials=False,
                     )
                     local_result["model_used"] = False
@@ -5291,13 +5337,16 @@ class AppHandler(BaseHTTPRequestHandler):
                     started = time.monotonic()
                     self.model_limiter.allow("model", session_key, 3, 60.0)
                     try:
+                        discovery, acquisition_status = self._diagnostic_context(
+                            request_data["hardware_result"]
+                        )
                         result = run_interface_diagnoses(
                             request_data["events"],
                             api_key=api_key,
                             model_name=model_name,
                             hardware_result=request_data["hardware_result"],
-                            discovery=self.dashboard.acquisition.discover_interfaces(),
-                            acquisition_status=self.dashboard.acquisition.status(),
+                            discovery=discovery,
+                            acquisition_status=acquisition_status,
                             use_environment_credentials=use_environment,
                         )
                         result["model_used"] = str(

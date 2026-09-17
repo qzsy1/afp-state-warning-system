@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import sys
+import threading
 import time
 from dataclasses import fields
 from pathlib import Path
@@ -223,6 +224,10 @@ def dispatch_command(agent: LocalCaptureAgent, raw: str | bytes) -> dict[str, An
                 MySQLSettings.from_mapping(payload),
                 limit=int(payload.get("limit", 1000)),
             )
+        elif name == "check_save_root":
+            result = agent.check_save_root(str(payload.get("path") or ""))
+        elif name == "select_folder":
+            result = agent.select_folder(str(payload.get("initial_path") or ""))
         elif name == "start_capture":
             result = agent.start_capture(_config_from_payload(payload))
         elif name == "stop_capture":
@@ -296,6 +301,20 @@ def flush_http_sample_batch(
     return result
 
 
+def _dispatch_and_send_websocket(
+    agent: LocalCaptureAgent,
+    message: dict[str, Any],
+    send_json,
+) -> None:
+    """Run a potentially blocking hardware command away from heartbeats."""
+
+    response = dispatch_command(agent, json.dumps(message, ensure_ascii=False))
+    try:
+        send_json(response)
+    except Exception:
+        return
+
+
 def run_http_forever(
     server_url: str,
     pairing_token: str,
@@ -347,15 +366,21 @@ def run_forever(
     failures = 0
     while True:
         connection = None
+        executor = None
         try:
             connection = transport.connect_once()
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="afp-helper-wss-command")
+            send_lock = threading.Lock()
+
+            def send_json(message: dict[str, Any]) -> None:
+                encoded = json.dumps(message, ensure_ascii=False)
+                with send_lock:
+                    connection.send(encoded)
+
             failures = 0
-            connection.send(
-                json.dumps(
-                    transport.hello(
-                        capabilities=agent.discover().get("capabilities", {})
-                    ),
-                    ensure_ascii=False,
+            send_json(
+                transport.hello(
+                    capabilities=agent.discover().get("capabilities", {})
                 )
             )
             delay = 1.0
@@ -370,12 +395,7 @@ def run_forever(
                 if now - last_sample_send >= 1.0:
                     pending = agent.next_sample_batch(limit=20)
                     if pending is not None:
-                        connection.send(
-                            json.dumps(
-                                {"type": "sample_batch", "batch": pending},
-                                ensure_ascii=False,
-                            )
-                        )
+                        send_json({"type": "sample_batch", "batch": pending})
                     last_sample_send = now
                 try:
                     raw = connection.recv()
@@ -385,7 +405,7 @@ def run_forever(
                     # heartbeat portable across package versions.
                     if exc.__class__.__name__ == "WebSocketTimeoutException":
                         if time.monotonic() - last_heartbeat >= 10.0:
-                            connection.send(json.dumps({"type": "heartbeat"}))
+                            send_json({"type": "heartbeat"})
                             last_heartbeat = time.monotonic()
                         continue
                     raise
@@ -410,8 +430,7 @@ def run_forever(
                     if str(message.get("error") or "") == "helper_authentication_failed":
                         raise PairingRequiredError(authentication_failure_message())
                     continue
-                response = dispatch_command(agent, json.dumps(message, ensure_ascii=False))
-                connection.send(json.dumps(response, ensure_ascii=False))
+                executor.submit(_dispatch_and_send_websocket, agent, message, send_json)
         except KeyboardInterrupt:
             return True
         except PairingRequiredError:
@@ -423,6 +442,8 @@ def run_forever(
             time.sleep(delay)
             delay = min(delay * 2.0, 30.0)
         finally:
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
             if connection is not None:
                 try:
                     connection.close()
