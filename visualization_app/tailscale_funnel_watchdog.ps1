@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet("Run", "Install", "Uninstall", "Once", "Status")]
     [string]$Mode = "Run"

@@ -7,6 +7,7 @@ class TailscaleFunnelWatchdogContractTests(unittest.TestCase):
         self.source = Path(__file__).with_name("tailscale_funnel_watchdog.ps1")
 
     def test_watchdog_uses_persistent_funnel_for_existing_origin(self):
+        self.assertEqual(self.source.read_bytes()[:3], b"\xef\xbb\xbf")
         text = self.source.read_text(encoding="utf-8-sig")
         self.assertIn("tailscale.exe", text)
         self.assertIn("funnel --bg --https=443 --yes http://127.0.0.1:8770", text)
