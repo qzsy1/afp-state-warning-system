@@ -128,15 +128,30 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn('state.accessRole === "local_admin"', body)
         self.assertIn("assign(controls.mysqlLocalHost, local.host)", body)
 
-    def test_unlock_reloads_authorized_mysql_defaults_and_clears_stale_test(self):
+    def test_unlock_shows_progress_and_refreshes_defaults_in_background(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
         start = text.index("async function unlockRealMode()")
         end = text.index("async function lockRealMode()", start)
         body = text[start:end]
-        self.assertIn("await loadAccessSession();", body)
+        self.assertIn('submit.disabled = true', body)
+        self.assertIn('submit.textContent = "正在解锁…"', body)
+        self.assertIn('note.textContent = "正在验证授权密码，请稍候……"', body)
+        self.assertIn("void loadAccessSession()", body)
         self.assertIn("state.mysqlConnectionTests.target = null;", body)
-        self.assertIn("await loadMysqlDefaults();", body)
+        self.assertIn("void loadMysqlDefaults()", body)
+
+    def test_initialize_starts_independent_bootstrap_requests_in_parallel(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("async function initialize()")
+        end = text.index('$("playButton")', start)
+        body = text[start:end]
+        self.assertIn("const bootstrapPromise = fetch(\"/api/bootstrap\"", body)
+        self.assertIn("await Promise.all([", body)
+        self.assertIn("loadHelperStatus({deferDiscovery: true})", body)
+        self.assertIn("loadAgentDefaults()", body)
+        self.assertIn("loadMysqlDefaults()", body)
 
     def test_live_requests_identify_simulation_or_real_acquisition_source(self):
         source = Path(__file__).with_name("static") / "app.js"

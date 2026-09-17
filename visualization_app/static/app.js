@@ -176,7 +176,7 @@ function renderHelperStatus() {
   }
 }
 
-async function loadHelperStatus() {
+async function loadHelperStatus({deferDiscovery = false} = {}) {
   const wasOnline = Boolean(state.helperStatus?.online);
   if (state.accessRole === "guest") {
     state.helperStatus = {paired: false, online: false, capabilities: {}};
@@ -198,7 +198,11 @@ async function loadHelperStatus() {
     && state.helperStatus.online
     && !wasOnline
   ) {
-    await discoverInterfaces();
+    if (deferDiscovery) {
+      void discoverInterfaces().catch(() => {});
+    } else {
+      await discoverInterfaces();
+    }
   }
 }
 
@@ -313,15 +317,39 @@ async function unlockRealMode() {
   }
   const password = $("real-access-password")?.value || "";
   if (!password) { toast("请输入授权密码"); return; }
+  const submit = $("real-access-submit");
+  const note = $("real-access-transport-note");
+  if (submit?.disabled) return;
+  if (submit) {
+    submit.disabled = true;
+    submit.textContent = "正在解锁…";
+  }
+  if (note) note.textContent = "正在验证授权密码，请稍候……";
   try {
-    const result = await postJson("/api/auth/login", {password});
+    const result = await postJson("/api/auth/login", {password}, {timeoutMs: 15000});
     hideRealAccessModal();
-    await loadAccessSession();
+    // Apply the login response immediately; the follow-up session/defaults
+    // requests are reconciled in the background to avoid tunnel round-trips
+    // blocking the unlocked controls.
+    state.accessRole = result.role || "authorized";
+    state.authenticated = result.authenticated !== false;
+    state.modelAccess = Boolean(result.model_access);
+    state.csrf = readCookie("afp_csrf");
+    renderAccessState();
     state.mysqlConnectionTests.target = null;
-    await loadMysqlDefaults();
     syncTargetMysqlSection();
     toast(result.model_access ? "真实模式已解锁，服务器模型可用" : "真实模式已解锁，将使用本地规则");
-  } catch (error) { toast(error.message); }
+    void loadAccessSession().catch(() => {});
+    void loadMysqlDefaults().then(() => syncTargetMysqlSection()).catch(() => {});
+  } catch (error) {
+    if (note) note.textContent = error.message || "授权失败，请检查密码后重试";
+    toast(error.message);
+  } finally {
+    if (submit) {
+      submit.disabled = false;
+      submit.textContent = "确认解锁";
+    }
+  }
 }
 
 async function lockRealMode() {
@@ -3272,16 +3300,23 @@ async function initialize() {
     state.lanStatusTimer = window.setInterval(() => {
       refreshLanWebStatus().catch(() => markServerDisconnected());
     }, 10000);
-     await loadAccessSession();
-     renderHelperStatus();
-     await loadHelperStatus();
-     window.clearInterval(state.helperStatusTimer);
-     state.helperStatusTimer = window.setInterval(() => { loadHelperStatus().catch(() => {}); }, 5000);
-     await loadAgentDefaults();
+    // Start the public bootstrap request immediately.  The other independent
+    // defaults/status requests no longer serialize behind it over the tunnel.
+    const bootstrapPromise = fetch("/api/bootstrap", { cache: "no-store" });
+    await loadAccessSession();
+    renderHelperStatus();
+    await Promise.all([
+      loadHelperStatus({deferDiscovery: true}),
+      loadAgentDefaults(),
+      loadMysqlDefaults(),
+    ]);
+    window.clearInterval(state.helperStatusTimer);
+    state.helperStatusTimer = window.setInterval(() => {
+      loadHelperStatus({deferDiscovery: true}).catch(() => {});
+    }, 5000);
     syncLocalMysqlSection();
     syncTargetMysqlSection();
-    await loadMysqlDefaults();
-    const response = await fetch("/api/bootstrap", { cache: "no-store" });
+    const response = await bootstrapPromise;
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || "初始化失败");
     state.bootstrap = payload;
