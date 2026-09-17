@@ -67,6 +67,7 @@ from new_collection_health import (
 from web_training import WebTrainingManager
 from guest_simulation import GuestSimulationError, GuestSimulationManager
 from helper_relay import HelperRegistry
+from edge_capture import RemoteAcquisitionRegistry, select_acquisition_for_identity
 from local_capture_agent import LocalCaptureAgent
 from diagnosis_jobs import DiagnosisJobStore
 from public_status import build_public_device_status
@@ -788,6 +789,7 @@ class DashboardData:
         self.acquisition = AcquisitionManager()
         self.local_capture_agent = LocalCaptureAgent(manager=self.acquisition)
         self.helper_registry = HelperRegistry()
+        self.remote_acquisitions = RemoteAcquisitionRegistry()
         self.causal_online_optimizer = CausalOnlineConsistency(
                 (
                     DATA_DIR / "causal_online_consistency_artifact.joblib"
@@ -4163,6 +4165,15 @@ class AppHandler(BaseHTTPRequestHandler):
         identity = self._identity()
         return str(identity.session_id or "")
 
+    def _request_acquisition(self):
+        identity = self._identity()
+        return select_acquisition_for_identity(
+            identity.role,
+            identity.session_id,
+            self.dashboard.acquisition,
+            self.dashboard.remote_acquisitions,
+        )
+
     def _require_real_control(self) -> bool:
         identity = self._identity()
         if identity.role not in REAL_ACCESS_ROLES:
@@ -4306,6 +4317,7 @@ class AppHandler(BaseHTTPRequestHandler):
         query: dict[str, list[str]],
         acquisition: AcquisitionManager | None = None,
     ) -> dict:
+        acquisition = acquisition or self._request_acquisition()
         return self.dashboard.live(
             sensor_id=int(self._one(query, "sensor", "2")),
             history=int(self._one(query, "history", "240")),
@@ -4511,6 +4523,13 @@ class AppHandler(BaseHTTPRequestHandler):
                         else {},
                     )
                     sender({"type": "result_ack", **accepted})
+                elif message_type == "sample_batch":
+                    batch = message.get("batch")
+                    accepted = self.dashboard.remote_acquisitions.ingest(
+                        session_id,
+                        batch if isinstance(batch, dict) else {},
+                    )
+                    sender({"type": "sample_ack", **accepted})
                 else:
                     sender({"type": "error", "error": "helper消息类型不受支持"})
         except (BrokenPipeError, ConnectionResetError, ConnectionError, OSError, TimeoutError, ValueError):
@@ -4755,7 +4774,7 @@ class AppHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": result is not None, "request_id": request_id, "payload": result})
             return
         if parsed.path == "/api/acquisition/status":
-            self._send_json(self.dashboard.acquisition.status())
+            self._send_json(self._request_acquisition().status())
             return
         if parsed.path == "/api/acquisition/save-status":
             query = parse_qs(parsed.query)
@@ -4858,6 +4877,7 @@ class AppHandler(BaseHTTPRequestHandler):
             "/api/helper/pair/complete",
             "/api/helper/poll",
             "/api/helper/result",
+            "/api/helper/samples",
         }
         if not helper_transport_path and not self._require_csrf():
             return
@@ -4907,12 +4927,22 @@ class AppHandler(BaseHTTPRequestHandler):
                 )
                 self._send_json(result)
                 return
-            if parsed.path in {"/api/helper/poll", "/api/helper/result"}:
+            if parsed.path in {"/api/helper/poll", "/api/helper/result", "/api/helper/samples"}:
                 authorization = str(self.headers.get("Authorization", ""))
                 token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
                 device_id = str(payload.get("device_id") or "")
                 if parsed.path == "/api/helper/poll":
                     result = self.dashboard.helper_registry.poll(device_id, token)
+                elif parsed.path == "/api/helper/samples":
+                    session_id = self.dashboard.helper_registry.authenticate(device_id, token)
+                    if session_id is None:
+                        result = {"ok": False, "error": "helper_authentication_failed"}
+                    else:
+                        batch = payload.get("batch")
+                        result = self.dashboard.remote_acquisitions.ingest(
+                            session_id,
+                            batch if isinstance(batch, dict) else {},
+                        )
                 else:
                     result = self.dashboard.helper_registry.accept_result(
                         device_id,
@@ -5563,6 +5593,7 @@ def create_server(
         persistence_path=runtime_root / "helper_registry.json"
     )
     active_dashboard.helper_registry = helper_registry
+    active_dashboard.remote_acquisitions = RemoteAcquisitionRegistry()
     replay_cache: dict[str, tuple[int, dict]] = {}
     replay_lock = threading.Lock()
     model_limiter = SlidingWindowLimiter()

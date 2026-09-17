@@ -247,6 +247,9 @@ class PublicWebAccessTests(unittest.TestCase):
         self.assertTrue(
             policy.authorize("POST", "/api/helper/pair/complete", guest).allowed
         )
+        self.assertTrue(
+            policy.authorize("POST", "/api/helper/samples", guest).allowed
+        )
 
     def test_authorized_session_can_use_real_routes_but_not_admin_routes(self):
         from web_access import PermissionPolicy, RequestIdentity

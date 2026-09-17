@@ -8,7 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -20,6 +20,56 @@ should_repair_pairing = helper_entry.should_repair_pairing
 
 
 class HelperTransportTests(unittest.TestCase):
+    def test_http_sample_flush_acknowledges_only_accepted_batch(self):
+        agent = Mock()
+        agent.next_sample_batch.return_value = {
+            "capture_uuid": "capture-a",
+            "sequence": 3,
+            "rows": [{"温度": 350.0}],
+            "timestamps": [1.0],
+            "status": {"running": True},
+        }
+        transport = Mock()
+        transport.http_json.return_value = {
+            "ok": True,
+            "capture_uuid": "capture-a",
+            "ack_sequence": 3,
+        }
+
+        result = helper_entry.flush_http_sample_batch(agent, transport, "pc-01")
+
+        self.assertTrue(result["ok"])
+        transport.http_json.assert_called_once()
+        self.assertEqual(transport.http_json.call_args.args[0], "api/helper/samples")
+        agent.ack_sample_batch.assert_called_once_with("capture-a", 3)
+
+    def test_http_sample_flush_keeps_pending_batch_when_server_rejects_it(self):
+        agent = Mock()
+        agent.next_sample_batch.return_value = {
+            "capture_uuid": "capture-a",
+            "sequence": 3,
+            "rows": [],
+            "timestamps": [],
+            "status": {"running": True},
+        }
+        transport = Mock()
+        transport.http_json.return_value = {"ok": False, "error": "sample_sequence_gap"}
+
+        helper_entry.flush_http_sample_batch(agent, transport, "pc-01")
+
+        agent.ack_sample_batch.assert_not_called()
+
+    @patch("local_capture_helper_entry.run_http_forever")
+    @patch("local_capture_helper_entry.run_forever", return_value=False)
+    def test_auto_fallback_reuses_same_agent_instance(self, run_wss, run_http):
+        from local_capture_helper_entry import run_auto_forever
+
+        sentinel_agent = object()
+        run_auto_forever("https://afp.example.test", "token", "pc-01", agent=sentinel_agent)
+
+        self.assertIs(run_wss.call_args.kwargs["agent"], sentinel_agent)
+        self.assertIs(run_http.call_args.kwargs["agent"], sentinel_agent)
+
     def test_dispatch_discover_returns_structured_result(self):
         agent = Mock()
         agent.discover.return_value = {"sensor_bindings": []}

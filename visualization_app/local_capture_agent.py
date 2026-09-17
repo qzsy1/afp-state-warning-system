@@ -9,14 +9,18 @@ from the five logical AFP sensors to discovered physical interfaces.
 from __future__ import annotations
 
 import json
+import ipaddress
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from typing import Any
 
 from acquisition import AcquisitionManager, MySQLSettings
 from helper_relay import ALLOWED_HELPER_COMMANDS
 from mysql_storage import MySQLCaptureStore
+from json_safety import json_safe_value
 
 
 _ROLE_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
@@ -33,6 +37,11 @@ class LocalCaptureAgent:
 
     def __init__(self, manager: AcquisitionManager | None = None) -> None:
         self.manager = manager or AcquisitionManager()
+        self._stream_lock = threading.RLock()
+        self._capture_uuid = ""
+        self._stream_cursor = 0
+        self._stream_sequence = 0
+        self._pending_batch: dict[str, Any] | None = None
 
     @staticmethod
     def _choose_candidate(
@@ -127,7 +136,56 @@ class LocalCaptureAgent:
         return MySQLCaptureStore(settings).relation_map(max(1, min(int(limit), 1000)), auto_initialize=False)
 
     def start_capture(self, config: Any) -> dict[str, Any]:
-        return self.manager.start(config)
+        result = self.manager.start(config)
+        with self._stream_lock:
+            self._capture_uuid = uuid.uuid4().hex
+            self._stream_cursor = 0
+            self._stream_sequence = 0
+            self._pending_batch = None
+            capture_uuid = self._capture_uuid
+        response = dict(result) if isinstance(result, dict) else {"result": result}
+        response["capture_uuid"] = capture_uuid
+        return response
+
+    def next_sample_batch(self, *, limit: int = 20) -> dict[str, Any] | None:
+        """Return one replayable batch without advancing before acknowledgement."""
+
+        batch_limit = max(1, min(int(limit), 200))
+        with self._stream_lock:
+            if self._pending_batch is not None:
+                return dict(self._pending_batch)
+            if not self._capture_uuid:
+                return None
+            rows, timestamps = self.manager.numeric_matrix()
+            if self._stream_cursor > len(rows):
+                self._stream_cursor = 0
+                self._stream_sequence = 0
+            end = min(len(rows), self._stream_cursor + batch_limit)
+            if end <= self._stream_cursor:
+                return None
+            pending = {
+                "capture_uuid": self._capture_uuid,
+                "sequence": self._stream_sequence,
+                "rows": [json_safe_value(dict(row)) for row in rows[self._stream_cursor:end]],
+                "timestamps": [float(value) for value in timestamps[self._stream_cursor:end]],
+                "status": json_safe_value(self.manager.status()),
+            }
+            self._pending_batch = pending
+            return dict(pending)
+
+    def ack_sample_batch(self, capture_uuid: str, sequence: int) -> bool:
+        with self._stream_lock:
+            pending = self._pending_batch
+            if pending is None:
+                return False
+            if str(capture_uuid) != str(pending["capture_uuid"]):
+                return False
+            if int(sequence) != int(pending["sequence"]):
+                return False
+            self._stream_cursor += len(pending["rows"])
+            self._stream_sequence += 1
+            self._pending_batch = None
+            return True
 
     def check_capture(self, config: Any) -> dict[str, Any]:
         return self.manager.test_connection(config)
@@ -202,8 +260,18 @@ class HelperTransport:
         except ImportError as exc:
             raise RuntimeError("缺少websocket-client依赖，无法连接公网辅助服务") from exc
         parsed = urllib.parse.urlsplit(self.server_url)
-        if parsed.scheme not in {"wss", "https"}:
-            raise ValueError("本地辅助程序只允许使用 HTTPS/WSS 服务地址")
+        if parsed.scheme not in {"ws", "wss", "http", "https"}:
+            raise ValueError("本地辅助程序服务地址协议无效")
+        if parsed.scheme in {"ws", "http"}:
+            hostname = str(parsed.hostname or "").strip().lower()
+            private_origin = hostname in {"localhost", "127.0.0.1", "::1"}
+            if not private_origin:
+                try:
+                    private_origin = ipaddress.ip_address(hostname).is_private
+                except ValueError:
+                    private_origin = False
+            if not private_origin:
+                raise ValueError("公网辅助程序地址必须使用 HTTPS/WSS")
         path = parsed.path.rstrip("/")
         if not path or path == "/":
             path = "/api/helper/ws"
@@ -215,7 +283,7 @@ class HelperTransport:
         query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
         query = [(key, value) for key, value in query if key != "device_id"]
         query.append(("device_id", self.device_id))
-        scheme = "wss" if parsed.scheme == "https" else parsed.scheme
+        scheme = {"https": "wss", "http": "ws"}.get(parsed.scheme, parsed.scheme)
         url = urllib.parse.urlunsplit(
             (scheme, parsed.netloc, path, urllib.parse.urlencode(query), "")
         )

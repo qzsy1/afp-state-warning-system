@@ -17,6 +17,22 @@ from websocket_live import decode_client_frame  # noqa: E402
 
 
 class HelperWebSocketTransportTests(unittest.TestCase):
+    def test_helper_websocket_contract_carries_sample_batches_and_acknowledgements(self):
+        server = Path(__file__).with_name("app.py").read_text(encoding="utf-8")
+        helper = Path(__file__).with_name("local_capture_helper_entry.py").read_text(encoding="utf-8")
+
+        self.assertIn('message_type == "sample_batch"', server)
+        self.assertIn('"type": "sample_ack"', server)
+        self.assertIn('message.get("type") == "sample_ack"', helper)
+        self.assertIn("next_sample_batch", helper)
+
+    def test_live_routes_select_session_remote_acquisition(self):
+        server = Path(__file__).with_name("app.py").read_text(encoding="utf-8")
+        self.assertIn("def _request_acquisition", server)
+        self.assertIn("acquisition = acquisition or self._request_acquisition()", server)
+        self.assertIn('parsed.path == "/api/acquisition/status"', server)
+        self.assertIn("self._request_acquisition().status()", server)
+
     def test_websocket_url_adds_helper_endpoint_and_device_id(self):
         transport = HelperTransport(
             "https://afp.example.test/base",

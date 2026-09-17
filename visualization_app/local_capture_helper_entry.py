@@ -274,8 +274,36 @@ def _dispatch_and_report(
             delay = min(delay * 2.0, 4.0)
 
 
-def run_http_forever(server_url: str, pairing_token: str, device_id: str) -> None:
-    agent = LocalCaptureAgent()
+def flush_http_sample_batch(
+    agent: LocalCaptureAgent,
+    transport: HelperTransport,
+    device_id: str,
+) -> dict[str, Any]:
+    """Send at most one pending sample batch and advance only after ACK."""
+
+    batch = agent.next_sample_batch(limit=20)
+    if not isinstance(batch, dict):
+        return {"ok": True, "idle": True}
+    result = transport.http_json(
+        "api/helper/samples",
+        {"device_id": device_id, "batch": batch},
+    )
+    if result.get("ok"):
+        agent.ack_sample_batch(
+            str(result.get("capture_uuid") or batch["capture_uuid"]),
+            int(result.get("ack_sequence", batch["sequence"])),
+        )
+    return result
+
+
+def run_http_forever(
+    server_url: str,
+    pairing_token: str,
+    device_id: str,
+    *,
+    agent: LocalCaptureAgent | None = None,
+) -> None:
+    agent = agent or LocalCaptureAgent()
     transport = HelperTransport(server_url, pairing_token, device_id=device_id)
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="afp-helper-command")
     delay = 1.0
@@ -291,6 +319,7 @@ def run_http_forever(server_url: str, pairing_token: str, device_id: str) -> Non
                     # endpoint.  Keep the poller free so the server still sees
                     # a heartbeat while the single command worker finishes.
                     executor.submit(_dispatch_and_report, agent, transport, device_id, command)
+                flush_http_sample_batch(agent, transport, device_id)
                 delay = 1.0
                 time.sleep(0.25)
             except KeyboardInterrupt:
@@ -310,8 +339,9 @@ def run_forever(
     device_id: str,
     *,
     max_consecutive_failures: int | None = None,
+    agent: LocalCaptureAgent | None = None,
 ) -> bool:
-    agent = LocalCaptureAgent()
+    agent = agent or LocalCaptureAgent()
     transport = HelperTransport(server_url, pairing_token, device_id=device_id)
     delay = 1.0
     failures = 0
@@ -330,10 +360,23 @@ def run_forever(
             )
             delay = 1.0
             try:
-                connection.settimeout(10)
+                connection.settimeout(0.25)
             except Exception:
                 pass
+            last_heartbeat = time.monotonic()
+            last_sample_send = 0.0
             while True:
+                now = time.monotonic()
+                if now - last_sample_send >= 1.0:
+                    pending = agent.next_sample_batch(limit=20)
+                    if pending is not None:
+                        connection.send(
+                            json.dumps(
+                                {"type": "sample_batch", "batch": pending},
+                                ensure_ascii=False,
+                            )
+                        )
+                    last_sample_send = now
                 try:
                     raw = connection.recv()
                 except Exception as exc:
@@ -341,7 +384,9 @@ def run_forever(
                     # avoid importing its private class and keep the helper
                     # heartbeat portable across package versions.
                     if exc.__class__.__name__ == "WebSocketTimeoutException":
-                        connection.send(json.dumps({"type": "heartbeat"}))
+                        if time.monotonic() - last_heartbeat >= 10.0:
+                            connection.send(json.dumps({"type": "heartbeat"}))
+                            last_heartbeat = time.monotonic()
                         continue
                     raise
                 if raw is None:
@@ -353,6 +398,13 @@ def run_forever(
                 if not isinstance(message, dict):
                     continue
                 if message.get("type") in {"hello_ack", "heartbeat_ack", "result_ack"}:
+                    continue
+                if message.get("type") == "sample_ack":
+                    if message.get("ok"):
+                        agent.ack_sample_batch(
+                            str(message.get("capture_uuid") or ""),
+                            int(message.get("ack_sequence", -1)),
+                        )
                     continue
                 if message.get("type") == "error":
                     if str(message.get("error") or "") == "helper_authentication_failed":
@@ -378,7 +430,13 @@ def run_forever(
                     pass
 
 
-def run_auto_forever(server_url: str, pairing_token: str, device_id: str) -> None:
+def run_auto_forever(
+    server_url: str,
+    pairing_token: str,
+    device_id: str,
+    *,
+    agent: LocalCaptureAgent | None = None,
+) -> None:
     """Prefer WSS, then fall back to the proven HTTPS poller.
 
     Three consecutive WSS connection failures are enough to identify an
@@ -386,17 +444,24 @@ def run_auto_forever(server_url: str, pairing_token: str, device_id: str) -> Non
     poller is active, all existing pairing and command semantics remain in
     place, so a public tunnel outage cannot make the helper exit.
     """
+    shared_agent = agent or LocalCaptureAgent()
     try:
         connected = run_forever(
             server_url,
             pairing_token,
             device_id,
             max_consecutive_failures=3,
+            agent=shared_agent,
         )
     except PairingRequiredError:
         raise
     if not connected:
-        run_http_forever(server_url, pairing_token, device_id)
+        run_http_forever(
+            server_url,
+            pairing_token,
+            device_id,
+            agent=shared_agent,
+        )
 
 
 def _build_parser() -> argparse.ArgumentParser:

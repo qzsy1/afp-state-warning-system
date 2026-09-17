@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import unittest
 
-from edge_capture import RemoteAcquisitionMirror, RemoteAcquisitionRegistry
+from edge_capture import (
+    RemoteAcquisitionMirror,
+    RemoteAcquisitionRegistry,
+    select_acquisition_for_identity,
+)
 
 
 def batch(capture_uuid: str, sequence: int, values: list[float]) -> dict:
@@ -23,6 +27,30 @@ def batch(capture_uuid: str, sequence: int, values: list[float]) -> dict:
 
 
 class RemoteAcquisitionMirrorTests(unittest.TestCase):
+    def test_helper_backed_identity_selects_its_own_remote_mirror(self):
+        registry = RemoteAcquisitionRegistry()
+        local = object()
+
+        selected = select_acquisition_for_identity(
+            "lan_operator", "lan-a", local, registry
+        )
+        other = select_acquisition_for_identity(
+            "authorized", "session-b", local, registry
+        )
+
+        self.assertIs(selected, registry.for_session("lan-a"))
+        self.assertIs(other, registry.for_session("session-b"))
+        self.assertIsNot(selected, other)
+
+    def test_loopback_admin_keeps_server_local_acquisition(self):
+        registry = RemoteAcquisitionRegistry()
+        local = object()
+
+        self.assertIs(
+            select_acquisition_for_identity("local_admin", "local-admin", local, registry),
+            local,
+        )
+
     def test_first_batch_populates_acquisition_compatible_surface(self):
         mirror = RemoteAcquisitionMirror(max_rows=10)
 

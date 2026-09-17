@@ -12,6 +12,41 @@ from local_capture_agent import HelperTransport  # noqa: E402
 
 
 class LocalCaptureAgentTests(unittest.TestCase):
+    def test_sample_batch_is_replayed_until_ack_then_advances(self):
+        manager = Mock()
+        manager.start.return_value = {"running": True, "config": {"acquisition_mode": "real"}}
+        manager.status.return_value = {"running": True, "config": {"acquisition_mode": "real"}}
+        manager.numeric_matrix.return_value = (
+            [{"温度": 350.0}, {"温度": 351.0}, {"温度": 352.0}],
+            [1.0, 2.0, 3.0],
+        )
+        agent = LocalCaptureAgent(manager=manager)
+
+        started = agent.start_capture(Mock())
+        first = agent.next_sample_batch(limit=2)
+        replay = agent.next_sample_batch(limit=2)
+
+        self.assertTrue(started["capture_uuid"])
+        self.assertEqual(first, replay)
+        self.assertEqual(first["sequence"], 0)
+        self.assertEqual(len(first["rows"]), 2)
+        self.assertTrue(agent.ack_sample_batch(first["capture_uuid"], 0))
+        second = agent.next_sample_batch(limit=2)
+        self.assertEqual(second["sequence"], 1)
+        self.assertEqual(second["rows"], [{"温度": 352.0}])
+
+    def test_batch_ack_for_other_capture_does_not_advance_cursor(self):
+        manager = Mock()
+        manager.start.return_value = {"running": True}
+        manager.status.return_value = {"running": True, "config": {}}
+        manager.numeric_matrix.return_value = ([{"压力": 1.0}], [1.0])
+        agent = LocalCaptureAgent(manager=manager)
+        agent.start_capture(Mock())
+        pending = agent.next_sample_batch()
+
+        self.assertFalse(agent.ack_sample_batch("other-capture", pending["sequence"]))
+        self.assertEqual(agent.next_sample_batch(), pending)
+
     def test_transport_builds_hello_without_secrets(self):
         transport = HelperTransport(
             "wss://example.test/helper", "pairing-secret", device_id="device-a"
@@ -36,6 +71,16 @@ class LocalCaptureAgentTests(unittest.TestCase):
 
         self.assertEqual(command["command"], "read_process_parameters")
         self.assertEqual(command["request_id"], "read-1")
+
+    def test_transport_allows_plain_websocket_only_for_private_network_origin(self):
+        private = HelperTransport("http://192.168.101.31:8770", "token", device_id="pc")
+        with patch("websocket.create_connection", return_value=object()) as create:
+            private.connect_once()
+        self.assertTrue(create.call_args.args[0].startswith("ws://192.168.101.31:8770/"))
+
+        public = HelperTransport("http://example.com:8770", "token", device_id="pc")
+        with self.assertRaisesRegex(ValueError, "公网"):
+            public.connect_once()
 
     @patch("local_capture_agent.AcquisitionManager.discover_interfaces")
     def test_discover_returns_five_logical_sensor_bindings(self, discover):

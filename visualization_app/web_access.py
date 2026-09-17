@@ -56,6 +56,7 @@ PUBLIC_POST = {
     "/api/helper/pair/complete",
     "/api/helper/poll",
     "/api/helper/result",
+    "/api/helper/samples",
 }
 AUTHORIZED_GET = {
     "/api/real/control/status",

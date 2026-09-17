@@ -149,3 +149,16 @@ class RemoteAcquisitionRegistry:
 
     def ingest(self, session_id: str, batch: dict[str, Any]) -> dict[str, Any]:
         return self.for_session(session_id).ingest(batch)
+
+
+def select_acquisition_for_identity(
+    role: str,
+    session_id: str | None,
+    local_acquisition: Any,
+    remote_registry: RemoteAcquisitionRegistry,
+) -> Any:
+    """Select hardware rows without ever falling back for helper-backed roles."""
+
+    if str(role or "") in {"lan_operator", "authorized"}:
+        return remote_registry.for_session(str(session_id or ""))
+    return local_acquisition
