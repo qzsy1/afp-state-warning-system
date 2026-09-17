@@ -42,6 +42,11 @@ class PublicTunnelWatchdogContractTests(unittest.TestCase):
         self.assertIn("AFP_Local_Capture_Helper.exe", text)
         self.assertIn("function Ensure-Helper", text)
         self.assertIn('Start-Process -FilePath $HelperExe', text)
+
+    def test_watchdog_starts_origin_without_opening_desktop_window(self):
+        source = Path(__file__).with_name("public_tunnel_watchdog.ps1")
+        text = source.read_text(encoding="utf-8-sig")
+        self.assertIn('-ArgumentList "--server-only"', text)
         self.assertIn('-ArgumentList "--background"', text)
 
 

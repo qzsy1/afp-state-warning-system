@@ -80,6 +80,33 @@ def _persist_lan_web_status(context: Any, status: dict[str, Any]) -> None:
     path.write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _afp_server_available(url: str, timeout: float = 1.5) -> bool:
+    """Return true only when an existing listener is this AFP application."""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return payload.get("status") == "ok" and bool(payload.get("version"))
+    except Exception:
+        return False
+
+
+def _show_desktop_window(context: Any, url: str) -> None:
+    try:
+        import webview
+    except ImportError as exc:
+        raise RuntimeError("桌面界面组件缺失，请使用已打包的软件或安装 pywebview。") from exc
+    ui_config = context.config.get("ui", {})
+    webview.create_window(
+        str(ui_config.get("title", "AFP 实时预测、状态预警与模型训练系统（模块化版）")),
+        url,
+        width=int(ui_config.get("width", 1660)),
+        height=int(ui_config.get("height", 1040)),
+        min_size=(1180, 760),
+        text_select=True,
+    )
+    webview.start(debug=False)
+
+
 def self_test(context: Any, manager: Any) -> dict[str, Any]:
     required = [
         context.paths.legacy_dir / "app.py",
@@ -403,7 +430,7 @@ def functional_smoke(context: Any, manager: Any) -> dict[str, Any]:
     return report
 
 
-def launch(context: Any, manager: Any) -> None:
+def launch(context: Any, manager: Any, *, server_only: bool = False) -> None:
     from lan_web import LanWebConfig, discover_lan_urls, safe_network_status
 
     # The public-web deployment uses one shared dashboard and two explicitly
@@ -411,7 +438,7 @@ def launch(context: Any, manager: Any) -> None:
     # 8771.  Keep the legacy single-listener path below for older configs and
     # for rollback compatibility.
     if context.config.get("public_web"):
-        return _launch_public_web(context, manager)
+        return _launch_public_web(context, manager, server_only=server_only)
 
     config = LanWebConfig.from_mapping(context.config.get("lan_web", {}))
     bind_host = config.bind_host if config.enabled else "127.0.0.1"
@@ -467,12 +494,22 @@ def launch(context: Any, manager: Any) -> None:
         server.server_close()
 
 
-def _launch_public_web(context: Any, manager: Any) -> None:
+def _launch_public_web(
+    context: Any, manager: Any, *, server_only: bool = False
+) -> None:
     from lan_web import discover_lan_urls
     from public_web import PublicWebConfig, public_web_urls
 
     config = PublicWebConfig.from_mapping(context.config.get("public_web", {}))
     if not config.enabled:
+        return
+    existing_admin_url = f"http://127.0.0.1:{config.local_admin_port}/"
+    if _afp_server_available(existing_admin_url + "api/health"):
+        # The watchdog may already own the shared acquisition server.  A
+        # second desktop launch reuses it instead of creating another server
+        # process that can disagree about capture state or fail on the port.
+        if not server_only and config.open_desktop_window:
+            _show_desktop_window(context, existing_admin_url)
         return
     legacy_app = _legacy_module("app", context)
     dashboard = legacy_app.DashboardData()
@@ -538,23 +575,10 @@ def _launch_public_web(context: Any, manager: Any) -> None:
     }
     _persist_lan_web_status(context, status)
     try:
-        if not config.open_desktop_window:
+        if server_only or not config.open_desktop_window:
             threads[1].join()
             return
-        try:
-            import webview
-        except ImportError as exc:
-            raise RuntimeError("桌面界面组件缺失，请使用已打包的软件或安装 pywebview。") from exc
-        ui_config = context.config.get("ui", {})
-        webview.create_window(
-            str(ui_config.get("title", "AFP 实时预测、状态预警与模型训练系统（模块化版）")),
-            urls["local_admin"],
-            width=int(ui_config.get("width", 1660)),
-            height=int(ui_config.get("height", 1040)),
-            min_size=(1180, 760),
-            text_select=True,
-        )
-        webview.start(debug=False)
+        _show_desktop_window(context, urls["local_admin"])
     finally:
         # Closing the desktop webview must not tear down the HTTP origin.  In
         # public mode that origin is also the target of the Cloudflare Tunnel;
@@ -585,6 +609,7 @@ def main(root: Path, arguments: list[str] | None = None) -> None:
     parser.add_argument("--reload-module", default="")
     parser.add_argument("--install-patch", default="")
     parser.add_argument("--rollback", action="store_true")
+    parser.add_argument("--server-only", action="store_true")
     args = parser.parse_args(arguments)
     context, manager = initialize(root)
 
@@ -631,4 +656,4 @@ def main(root: Path, arguments: list[str] | None = None) -> None:
     if args.module_status:
         _emit_command_result(context, "module-status", manager.status())
         return
-    launch(context, manager)
+    launch(context, manager, server_only=args.server_only)

@@ -4171,13 +4171,14 @@ class AppHandler(BaseHTTPRequestHandler):
         identity = self._identity()
         return str(identity.session_id or "")
 
-    def _request_acquisition(self):
+    def _request_acquisition(self, requested_mode: str = ""):
         identity = self._identity()
         return select_acquisition_for_identity(
             identity.role,
             identity.session_id,
             self.dashboard.acquisition,
             self.dashboard.remote_acquisitions,
+            requested_mode=requested_mode,
         )
 
     def _diagnostic_context(
@@ -4356,7 +4357,9 @@ class AppHandler(BaseHTTPRequestHandler):
         query: dict[str, list[str]],
         acquisition: AcquisitionManager | None = None,
     ) -> dict:
-        acquisition = acquisition or self._request_acquisition()
+        acquisition = acquisition or self._request_acquisition(
+            self._one(query, "acquisition_mode", "")
+        )
         return self.dashboard.live(
             sensor_id=int(self._one(query, "sensor", "2")),
             history=int(self._one(query, "history", "240")),
@@ -4822,7 +4825,12 @@ class AppHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": result is not None, "request_id": request_id, "payload": result})
             return
         if parsed.path == "/api/acquisition/status":
-            self._send_json(self._request_acquisition().status())
+            query = parse_qs(parsed.query)
+            self._send_json(
+                self._request_acquisition(
+                    self._one(query, "acquisition_mode", "")
+                ).status()
+            )
             return
         if parsed.path == "/api/acquisition/save-status":
             query = parse_qs(parsed.query)

@@ -130,6 +130,21 @@ class UpdateTests(unittest.TestCase):
 
 
 class LaunchTests(unittest.TestCase):
+    def test_existing_afp_server_probe_requires_healthy_json(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"status":"ok","version":"2.0"}'
+        with patch.object(bootstrap.urllib.request, "urlopen", return_value=response):
+            self.assertTrue(
+                bootstrap._afp_server_available("http://127.0.0.1:8771/api/health")
+            )
+
+        response.read.return_value = b'{"status":"other"}'
+        with patch.object(bootstrap.urllib.request, "urlopen", return_value=response):
+            self.assertFalse(
+                bootstrap._afp_server_available("http://127.0.0.1:8771/api/health")
+            )
+
     def test_launch_uses_configured_fixed_port_and_lan_bind(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

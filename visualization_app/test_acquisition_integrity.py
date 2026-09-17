@@ -958,6 +958,55 @@ class AcquisitionIntegrityTests(unittest.TestCase):
                     time.sleep(0.01)
                 manager.stop()
 
+    def test_active_simulation_is_finalized_and_replaced_by_new_start(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self._source(root)
+            manager = AcquisitionManager(root / "unused")
+            first = AcquisitionConfig(
+                processing_mode="capture_only",
+                dataset_schema="new_collection_v11_3",
+                driver="simulator",
+                acquisition_mode="simulation",
+                source_file=str(source),
+                simulation_source_path=str(source),
+                selected_sensors=NEW_COLLECTION_SENSOR_COLUMNS.copy(),
+                sample_rate_hz=10.0,
+                save_root="",
+                condition_id="FIRST",
+            )
+            second = AcquisitionConfig(
+                processing_mode="capture_only",
+                dataset_schema="new_collection_v11_3",
+                driver="simulator",
+                acquisition_mode="simulation",
+                source_file=str(source),
+                simulation_source_path=str(source),
+                selected_sensors=NEW_COLLECTION_SENSOR_COLUMNS.copy(),
+                sample_rate_hz=10.0,
+                save_root="",
+                condition_id="SECOND",
+            )
+
+            manager.start(first)
+            self.assertTrue(manager.status()["running"])
+            replaced = manager.start(second)
+            try:
+                self.assertTrue(replaced["running"])
+                self.assertEqual(replaced["config"]["condition_id"], "SECOND")
+            finally:
+                manager.stop()
+
+    def test_active_real_capture_cannot_be_replaced_implicitly(self) -> None:
+        manager = AcquisitionManager()
+        manager.config = AcquisitionConfig(acquisition_mode="simulation", driver="simulator")
+        manager.config.acquisition_mode = "real"
+        manager.thread = SimpleNamespace(is_alive=lambda: True)
+        replacement = AcquisitionConfig(acquisition_mode="simulation", driver="simulator")
+
+        with self.assertRaisesRegex(RuntimeError, "真实采集已经在运行"):
+            manager.start(replacement)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -103,6 +103,22 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertNotIn('settings.mysql_local_host', body)
         self.assertNotIn('settings.mysql_local_port', body)
 
+    def test_start_preflights_every_enabled_mysql_destination(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        validate_start = text.index("async function validateEnabledMysqlBeforeStart")
+        validate_end = text.index("async function refreshRelationMap", validate_start)
+        validate_body = text[validate_start:validate_end]
+        self.assertIn("controls.mysqlEnabled?.checked", validate_body)
+        self.assertIn("controls.mysqlLocalEnabled?.checked", validate_body)
+        self.assertIn("await testMysqlConnection(false)", validate_body)
+        self.assertIn("await testMysqlConnection(true)", validate_body)
+
+        start = text.index("async function startAcquisition()")
+        end = text.index("async function stopAcquisition()", start)
+        start_body = text[start:end]
+        self.assertIn("await validateEnabledMysqlBeforeStart();", start_body)
+
     def test_public_authorized_page_does_not_replace_visitor_mysql_defaults(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
@@ -111,6 +127,29 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         body = text[start:end]
         self.assertIn('state.accessRole === "local_admin"', body)
         self.assertIn("assign(controls.mysqlLocalHost, local.host)", body)
+
+    def test_unlock_reloads_authorized_mysql_defaults_and_clears_stale_test(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("async function unlockRealMode()")
+        end = text.index("async function lockRealMode()", start)
+        body = text[start:end]
+        self.assertIn("await loadAccessSession();", body)
+        self.assertIn("state.mysqlConnectionTests.target = null;", body)
+        self.assertIn("await loadMysqlDefaults();", body)
+
+    def test_live_requests_identify_simulation_or_real_acquisition_source(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("function queryString()")
+        end = text.index("async function loadRealtime()", start)
+        body = text[start:end]
+        self.assertIn("acquisition_mode: controls.acquisitionMode.value", body)
+
+        wait_start = text.index("async function waitForEdgeFirstSample")
+        wait_end = text.index("function renderRuntimeStatus", wait_start)
+        wait_body = text[wait_start:wait_end]
+        self.assertIn('/api/acquisition/status?acquisition_mode=real', wait_body)
 
     def test_only_loopback_admin_skips_helper_pairing(self):
         source = Path(__file__).with_name("static") / "app.js"

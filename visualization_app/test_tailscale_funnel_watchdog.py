@@ -36,6 +36,10 @@ class TailscaleFunnelWatchdogContractTests(unittest.TestCase):
         self.assertIn("New-ScheduledTaskTrigger -AtLogOn", text)
         self.assertIn("CurrentVersion\\Run", text)
 
+    def test_watchdog_starts_origin_without_opening_a_second_desktop_window(self):
+        text = self.source.read_text(encoding="utf-8-sig")
+        self.assertIn('-ArgumentList "--server-only"', text)
+
     def test_watchdog_records_actionable_authentication_state(self):
         text = self.source.read_text(encoding="utf-8-sig")
         self.assertIn("funnel-status.json", text)

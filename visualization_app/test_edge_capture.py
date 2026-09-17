@@ -51,6 +51,26 @@ class RemoteAcquisitionMirrorTests(unittest.TestCase):
             local,
         )
 
+    def test_helper_backed_simulation_explicitly_selects_server_acquisition(self):
+        registry = RemoteAcquisitionRegistry()
+        local = object()
+
+        selected = select_acquisition_for_identity(
+            "authorized", "session-a", local, registry, requested_mode="simulation"
+        )
+
+        self.assertIs(selected, local)
+
+    def test_helper_backed_real_mode_explicitly_selects_remote_mirror(self):
+        registry = RemoteAcquisitionRegistry()
+        local = object()
+
+        selected = select_acquisition_for_identity(
+            "lan_operator", "lan-a", local, registry, requested_mode="real"
+        )
+
+        self.assertIs(selected, registry.for_session("lan-a"))
+
     def test_first_batch_populates_acquisition_compatible_surface(self):
         mirror = RemoteAcquisitionMirror(max_rows=10)
 

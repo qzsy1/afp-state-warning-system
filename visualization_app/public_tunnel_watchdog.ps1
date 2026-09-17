@@ -106,7 +106,10 @@ function Ensure-Origin {
     if (Test-Origin) { return $true }
     if (-not (Test-Path $AppExe)) { return $false }
     if (-not (Get-AppProcess)) {
-        Start-Process -FilePath $AppExe -WorkingDirectory $DeliveryRoot -WindowStyle Hidden | Out-Null
+        Start-Process -FilePath $AppExe `
+            -ArgumentList "--server-only" `
+            -WorkingDirectory $DeliveryRoot `
+            -WindowStyle Hidden | Out-Null
     }
     $deadline = (Get-Date).AddSeconds(45)
     while ((Get-Date) -lt $deadline) {

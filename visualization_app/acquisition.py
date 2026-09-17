@@ -2362,6 +2362,7 @@ class AcquisitionManager:
         self.capture_root = capture_root
         self.capture_root.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self.lifecycle_lock = threading.RLock()
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.driver: SampleDriver | None = None
@@ -3211,6 +3212,32 @@ class AcquisitionManager:
         }
 
     def start(self, config: AcquisitionConfig) -> dict:
+        """Start one capture while safely replacing an active simulation.
+
+        A simulation is disposable and may be left running when a browser is
+        refreshed or switches modes.  Finalize it before the next start so it
+        cannot permanently block local, LAN, or public operation.  A real
+        hardware capture is never taken over implicitly.
+        """
+        with self.lifecycle_lock:
+            with self.lock:
+                active = self.thread is not None and self.thread.is_alive()
+                active_mode = (
+                    self.config.acquisition_mode if self.config is not None else ""
+                )
+            replaced_simulation = bool(active and active_mode == "simulation")
+            if active and not replaced_simulation:
+                raise RuntimeError("真实采集已经在运行，请先停止当前采集")
+            if replaced_simulation:
+                stopped = self.stop()
+                if stopped.get("running"):
+                    raise RuntimeError("上一模拟采集未能停止，请稍后重试")
+            result = self._start_new(config)
+            if replaced_simulation:
+                result["replaced_active_simulation"] = True
+            return result
+
+    def _start_new(self, config: AcquisitionConfig) -> dict:
         with self.lock:
             if self.thread is not None and self.thread.is_alive():
                 raise RuntimeError("采集已经在运行")
@@ -3805,6 +3832,10 @@ class AcquisitionManager:
         return destinations
 
     def stop(self) -> dict:
+        with self.lifecycle_lock:
+            return self._stop_active()
+
+    def _stop_active(self) -> dict:
         self.stop_event.set()
         thread = self.thread
         if thread is not None:

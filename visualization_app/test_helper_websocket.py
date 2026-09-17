@@ -29,9 +29,10 @@ class HelperWebSocketTransportTests(unittest.TestCase):
     def test_live_routes_select_session_remote_acquisition(self):
         server = Path(__file__).with_name("app.py").read_text(encoding="utf-8")
         self.assertIn("def _request_acquisition", server)
-        self.assertIn("acquisition = acquisition or self._request_acquisition()", server)
+        self.assertIn('self._one(query, "acquisition_mode", "")', server)
         self.assertIn('parsed.path == "/api/acquisition/status"', server)
-        self.assertIn("self._request_acquisition().status()", server)
+        self.assertIn("self._request_acquisition(", server)
+        self.assertIn(").status()", server)
 
     def test_websocket_url_adds_helper_endpoint_and_device_id(self):
         transport = HelperTransport(

@@ -156,9 +156,12 @@ def select_acquisition_for_identity(
     session_id: str | None,
     local_acquisition: Any,
     remote_registry: RemoteAcquisitionRegistry,
+    requested_mode: str = "",
 ) -> Any:
     """Select hardware rows without ever falling back for helper-backed roles."""
 
     if str(role or "") in {"lan_operator", "authorized"}:
+        if str(requested_mode or "").lower() == "simulation":
+            return local_acquisition
         return remote_registry.for_session(str(session_id or ""))
     return local_acquisition

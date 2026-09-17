@@ -317,6 +317,9 @@ async function unlockRealMode() {
     const result = await postJson("/api/auth/login", {password});
     hideRealAccessModal();
     await loadAccessSession();
+    state.mysqlConnectionTests.target = null;
+    await loadMysqlDefaults();
+    syncTargetMysqlSection();
     toast(result.model_access ? "真实模式已解锁，服务器模型可用" : "真实模式已解锁，将使用本地规则");
   } catch (error) { toast(error.message); }
 }
@@ -932,7 +935,7 @@ function renderAcquisitionStatus(status) {
 async function waitForEdgeFirstSample(captureUuid, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const response = await fetch("/api/acquisition/status", {
+    const response = await fetch("/api/acquisition/status?acquisition_mode=real", {
       cache: "no-store",
       credentials: "same-origin",
     });
@@ -1326,11 +1329,29 @@ async function testMysqlConnection(local = false) {
     status.textContent = result.ok
       ? `${label} MySQL 已连接：${settings.mysql_host}:${settings.mysql_port}/${result.database}（${result.driver}）${result.schema_ready === false ? "，但AFP表结构不完整" : ""}`
       : `${label} MySQL 连接失败：${friendlyError}`;
+    return result;
   } catch (error) {
-    state.mysqlConnectionTests[scope] = {ok: false, error: error.message};
+    const failed = {ok: false, error: error.message};
+    state.mysqlConnectionTests[scope] = failed;
     status.classList.remove("ok");
     status.classList.add("error");
     status.textContent = `${label} MySQL 连接失败：${error.message}`;
+    return failed;
+  }
+}
+
+async function validateEnabledMysqlBeforeStart() {
+  const failures = [];
+  if (controls.mysqlEnabled?.checked) {
+    const target = await testMysqlConnection(false);
+    if (!target?.ok) failures.push(`目标电脑 MySQL：${target?.error || "连接失败"}`);
+  }
+  if (controls.mysqlLocalEnabled?.checked) {
+    const local = await testMysqlConnection(true);
+    if (!local?.ok) failures.push(`本机 MySQL：${local?.error || "连接失败"}`);
+  }
+  if (failures.length) {
+    throw new Error(`MySQL 保存预检未通过；${failures.join("；")}`);
   }
 }
 
@@ -1929,6 +1950,7 @@ async function startAcquisition() {
       startLocalSimulationReplay();
       return;
     }
+    await validateEnabledMysqlBeforeStart();
     await acquireRealControl();
     if (state.hardwareCheckInProgress) {
       throw new Error("接口与传感器通道检查正在进行，请等待检查完成");
@@ -2590,6 +2612,7 @@ function queryString() {
     prediction_horizon: state.requestedHorizon ?? controls.horizon.value,
     forecast_lead: controls.forecastLead?.value || "1",
     realtime_prediction: controls.realtimePrediction.checked,
+    acquisition_mode: controls.acquisitionMode.value,
     processing_mode: controls.processingMode.value,
     use_optimized_warning: controls.optimizedWarning.checked,
     dataset_schema: activeInputSchemaId(),
