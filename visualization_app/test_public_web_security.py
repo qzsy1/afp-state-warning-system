@@ -329,6 +329,33 @@ class PublicWebAccessTests(unittest.TestCase):
             )
         )
 
+    def test_tailscale_funnel_host_requires_https_from_loopback(self):
+        from web_access import is_trusted_tailscale_funnel_request
+
+        headers = {"X-Forwarded-Proto": "https"}
+        self.assertTrue(
+            is_trusted_tailscale_funnel_request(
+                "127.0.0.1", "afp-server.example.ts.net", headers
+            )
+        )
+        self.assertFalse(
+            is_trusted_tailscale_funnel_request(
+                "192.168.1.50", "afp-server.example.ts.net", headers
+            )
+        )
+        self.assertFalse(
+            is_trusted_tailscale_funnel_request(
+                "127.0.0.1",
+                "afp-server.example.ts.net",
+                {"X-Forwarded-Proto": "http"},
+            )
+        )
+        self.assertFalse(
+            is_trusted_tailscale_funnel_request(
+                "127.0.0.1", "attacker.example.com", headers
+            )
+        )
+
 
 class PublicWebHttpTests(unittest.TestCase):
     def setUp(self) -> None:

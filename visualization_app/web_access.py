@@ -240,6 +240,23 @@ def is_trusted_quick_tunnel_request(
     )
 
 
+def is_trusted_tailscale_funnel_request(
+    peer_host: str,
+    host: str,
+    headers: Mapping[str, str],
+) -> bool:
+    """Accept a stable ``*.ts.net`` Funnel host only via local HTTPS proxy."""
+
+    peer = str(peer_host or "").strip().lower()
+    normalized_host = str(host or "").strip().lower().split(":", 1)[0].rstrip(".")
+    forwarded = str(headers.get("X-Forwarded-Proto", "")).split(",", 1)[0]
+    return (
+        peer in {"127.0.0.1", "::1", "localhost"}
+        and normalized_host.endswith(".ts.net")
+        and forwarded.strip().lower() == "https"
+    )
+
+
 class SlidingWindowLimiter:
     """Thread-safe fixed-count limiter with an optional temporary block."""
 

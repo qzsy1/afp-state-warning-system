@@ -35,7 +35,7 @@ def default_server_hint_path() -> Path:
     configured = os.environ.get("AFP_PUBLIC_TUNNEL_URL_FILE")
     if configured:
         return Path(configured)
-    return Path("F:/softwawre/cloudflared/quick-tunnel-url.txt")
+    return Path("F:/softwawre/tailscale/funnel-url.txt")
 
 
 def load_current_server_hint(*, path: str | Path | None = None) -> str:

@@ -79,6 +79,7 @@ from web_access import (
     is_lan_client,
     is_secure_request,
     is_trusted_quick_tunnel_request,
+    is_trusted_tailscale_funnel_request,
     lan_session_id,
     uses_local_capture_helper,
 )
@@ -4006,12 +4007,17 @@ class AppHandler(BaseHTTPRequestHandler):
         normalized_host = host.lower()
         if normalized_host in self._allowed_hosts():
             return True
-        # Quick Tunnels receive a random trycloudflare.com hostname, so it
-        # cannot be listed in runtime.json ahead of time.  Trust it only when
-        # cloudflared is the loopback HTTPS proxy, never from a LAN client.
+        # Public reverse proxies can use either the legacy random Cloudflare
+        # hostname or the stable Tailscale Funnel hostname.  Trust either only
+        # when its provider-specific checks prove a loopback HTTPS proxy.
         peer_host = str(self.client_address[0] if self.client_address else "")
-        return is_trusted_quick_tunnel_request(
-            peer_host, normalized_host, self.headers
+        return (
+            is_trusted_quick_tunnel_request(
+                peer_host, normalized_host, self.headers
+            )
+            or is_trusted_tailscale_funnel_request(
+                peer_host, normalized_host, self.headers
+            )
         )
 
     def _is_allowed_origin(self) -> bool:

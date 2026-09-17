@@ -5,7 +5,9 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $entry = Join-Path $PSScriptRoot "local_capture_helper_entry.py"
-$delivery = Join-Path $root "delivery\AFP_Integrated_System_Modular_v2.0.3_Agentic\local_helper"
+$deliveryRoot = Join-Path $root "delivery\AFP_Integrated_System_Modular_v2.0.3_Agentic"
+$delivery = Join-Path $deliveryRoot "local_helper"
+$watchdogSource = Join-Path $PSScriptRoot "tailscale_funnel_watchdog.ps1"
 $staging = Join-Path ([System.IO.Path]::GetTempPath()) "afp-local-helper-build"
 
 if (-not (Test-Path -LiteralPath $entry)) {
@@ -32,4 +34,5 @@ if (-not (Test-Path -LiteralPath $delivery)) {
 }
 $target = Join-Path $delivery "AFP_Local_Capture_Helper.exe"
 Copy-Item -LiteralPath (Join-Path $staging "AFP_Local_Capture_Helper.exe") -Destination $target -Force
+Copy-Item -LiteralPath $watchdogSource -Destination (Join-Path $deliveryRoot "tailscale_funnel_watchdog.ps1") -Force
 Write-Host "已更新本地辅助程序：$target"

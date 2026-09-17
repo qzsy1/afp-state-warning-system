@@ -256,6 +256,11 @@ class HelperTransportTests(unittest.TestCase):
                 "https://current-public.trycloudflare.com/",
             )
 
+    def test_helper_default_server_hint_prefers_tailscale_funnel_file(self):
+        hint_path = helper_entry.default_server_hint_path()
+        self.assertEqual(hint_path.name, "funnel-url.txt")
+        self.assertIn("tailscale", str(hint_path).lower())
+
     def test_helper_cli_resumes_saved_config_in_background_mode(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "helper-config.json"
