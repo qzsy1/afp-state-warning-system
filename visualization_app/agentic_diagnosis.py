@@ -1128,6 +1128,47 @@ def run_siliconflow_tool_agent(
     raise last_error or AgentToolCallError("模型没有返回最终结构化诊断")
 
 
+def run_siliconflow_fast_diagnosis(
+    api_key: str,
+    model_name: str,
+    context: DiagnosticToolContext,
+    local_diagnoses: list[dict[str, Any]],
+    *,
+    transport: Any = None,
+) -> dict[str, Any]:
+    """Perform one bounded model synthesis over the frozen local evidence.
+
+    The default web path must return local facts immediately and make at most
+    one provider request.  Deep tool planning remains available through the
+    existing agent runners when explicitly requested.
+    """
+    if not str(api_key).strip() or not str(model_name).strip():
+        return run_offline_diagnosis(context, local_diagnoses)
+    offline_result = run_offline_diagnosis(context, local_diagnoses)
+    evidence_by_id = {
+        str(item.get("evidence_id")): item
+        for diagnosis in offline_result.get("diagnoses") or []
+        for item in diagnosis.get("evidence") or []
+        if isinstance(item, dict) and item.get("evidence_id")
+    }
+    caller = transport or (lambda payload: _request_siliconflow(api_key, payload))
+    response = caller(_build_structured_payload(model_name, context, offline_result))
+    message = _assistant_message(response)
+    parsed = _parse_final_json(_final_message_content(message))
+    result = _validate_final_result(
+        parsed,
+        context,
+        evidence_by_id,
+        local_diagnoses,
+        model_name,
+        0,
+    )
+    result["execution_mode"] = "siliconflow_fast"
+    result["model_status"] = "success"
+    result["model_message"] = "已基于本地证据完成单次模型综合"
+    return result
+
+
 def _run_structured_fallback(
     api_key: str,
     model_name: str,

@@ -97,6 +97,30 @@ class RemoteAcquisitionMirrorTests(unittest.TestCase):
         self.assertTrue(duplicate["duplicate"])
         self.assertEqual(len(mirror.numeric_matrix()[0]), 1)
 
+    def test_stream_version_and_latency_metadata_change_only_for_accepted_batches(self):
+        mirror = RemoteAcquisitionMirror()
+        payload = batch("capture-a", 0, [350.0])
+        payload["transport"] = {
+            "helper_batch_created_at": 1001.5,
+            "helper_queue_depth": 3,
+        }
+
+        self.assertEqual(mirror.stream_version(), 0)
+        accepted = mirror.ingest(payload)
+        version = mirror.stream_version()
+        duplicate = mirror.ingest(payload)
+        status = mirror.status()
+
+        self.assertTrue(accepted["ok"])
+        self.assertGreater(version, 0)
+        self.assertEqual(mirror.stream_version(), version)
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(status["remote_stream_version"], version)
+        self.assertEqual(status["remote_latest_sample_at"], 1000.0)
+        self.assertEqual(status["remote_helper_batch_created_at"], 1001.5)
+        self.assertEqual(status["remote_helper_queue_depth"], 3)
+        self.assertIsInstance(status["remote_server_received_at"], float)
+
     def test_out_of_order_batch_is_rejected_with_expected_sequence(self):
         mirror = RemoteAcquisitionMirror()
         mirror.ingest(batch("capture-a", 0, [350.0]))

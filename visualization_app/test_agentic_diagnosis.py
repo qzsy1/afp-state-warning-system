@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
 import unittest
 
 try:
@@ -179,6 +180,27 @@ class DiagnosisJobStoreTests(unittest.TestCase):
         self.assertEqual(completed["state"], "failed")
         self.assertEqual(completed["fingerprint"], "fingerprint-b")
         self.assertIn("模型服务不可用", completed["error"])
+
+    def test_job_snapshot_exposes_local_result_before_model_finishes(self) -> None:
+        self.assertIsNotNone(DiagnosisJobStore, "diagnosis job store must exist")
+        release = threading.Event()
+        store = DiagnosisJobStore()
+        def run_model():
+            release.wait(1.0)
+            return {"diagnoses": [{"fault_type": "model"}]}
+
+        job = store.submit(
+            "session-local",
+            "fingerprint-local",
+            run_model,
+            local_result={"diagnoses": [{"fault_type": "local"}]},
+        )
+        self.assertEqual(job["local_result"]["diagnoses"][0]["fault_type"], "local")
+        self.assertIn(job["phase"], {"model_pending", "complete"})
+        release.set()
+        completed = store.wait_for("session-local", job["job_id"], timeout=1.0)
+        self.assertEqual(completed["state"], "success")
+        self.assertEqual(completed["result"]["diagnoses"][0]["fault_type"], "model")
 
     def test_resumable_diagnosis_routes_are_authorized_and_registered(self) -> None:
         access_source = Path(__file__).with_name("web_access.py").read_text(encoding="utf-8")

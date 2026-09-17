@@ -30,6 +30,7 @@ const state = {
   hardwareCheckController: null,
   hardwareCheckTimer: null,
   mysqlConnectionTests: {local: null, target: null},
+  localMysqlProfile: {scope: "helper_local", configured: false, state: "missing"},
   agentEvents: [],
   agentResult: null,
   agentFingerprint: "",
@@ -64,6 +65,7 @@ const state = {
   localSaveNameDirty: false,
   saveStatusTimer: null,
   simulationSourceChannels: [],
+  simulationSourceId: "",
   helperStatus: {paired: false, online: false, capabilities: {}},
   helperPairingChallenge: "",
   helperStatusTimer: null,
@@ -185,7 +187,10 @@ async function loadHelperStatus({deferDiscovery = false} = {}) {
   }
   try {
     const result = await fetch("/api/helper/status", {cache: "no-store"}).then((response) => response.json());
-    if (result && !result.error) state.helperStatus = result;
+    if (result && !result.error) {
+      state.helperStatus = result;
+      applyLocalMysqlProfileMetadata(result.capabilities?.local_mysql_profile);
+    }
   } catch (_error) {
     state.helperStatus = {paired: false, online: false, capabilities: {}, lastError: "辅助程序状态读取失败"};
   }
@@ -562,6 +567,32 @@ function unifiedLocalMysqlSettings(extra = {}) {
     mysql_charset: "utf8mb4",
     ...extra,
   };
+}
+
+function applyLocalMysqlProfileMetadata(profile) {
+  if (!profile || typeof profile !== "object") return;
+  state.localMysqlProfile = {...profile};
+  const assign = (control, value) => {
+    if (control && value !== undefined && value !== null) control.value = String(value);
+  };
+  assign(controls.mysqlLocalHost, profile.host);
+  assign(controls.mysqlLocalPort, profile.port);
+  assign(controls.mysqlLocalUser, profile.user);
+  assign(controls.mysqlLocalDatabase, profile.database);
+  if (usesLocalCaptureHelper() && controls.mysqlLocalPassword) {
+    controls.mysqlLocalPassword.value = "";
+    controls.mysqlLocalPassword.placeholder = profile.configured
+      ? "已由本机辅助程序加密保存；留空沿用"
+      : "当前电脑尚未配置，请输入（允许空密码）";
+  }
+  const status = $("mysqlLocalStatus");
+  if (status && usesLocalCaptureHelper() && !profile.configured) {
+    status.classList.remove("ok");
+    status.classList.add("error");
+    status.textContent = profile.state === "decrypt_failed"
+      ? "访问电脑本机 MySQL：原凭据不属于当前 Windows 用户，请重新填写并检查。"
+      : "访问电脑本机 MySQL：当前电脑尚未配置。";
+  }
 }
 
 async function loadMysqlDefaults() {
@@ -1327,23 +1358,27 @@ async function saveFinishedCaptureLocally() {
 
 async function testMysqlConnection(local = false) {
   const scope = local ? "local" : "target";
-  const label = local ? "本机" : "目标电脑";
+  const label = local
+    ? (usesLocalCaptureHelper() ? "访问电脑本机" : "服务器本机")
+    : "服务器/目标电脑";
   const status = local ? $("mysqlLocalStatus") : $("mysqlTargetStatus");
   try {
     status.textContent = `正在检查${label} MySQL 数据库（不会创建或修改表）……`;
     const settings = local ? unifiedLocalMysqlSettings() : unifiedMysqlSettings();
-    const result = local && usesLocalCaptureHelper()
-      ? await requestLocalHelper("mysql_preflight", {
-        mysql_enabled: true,
-        mysql_host: settings.mysql_host,
-        mysql_port: settings.mysql_port,
-        mysql_user: settings.mysql_user,
-        mysql_password: settings.mysql_password,
-        mysql_database: settings.mysql_database,
+    let result;
+    if (local && usesLocalCaptureHelper()) {
+      if (!state.localMysqlProfile?.configured || settings.mysql_password !== "") {
+        const profile = await requestLocalHelper("mysql_profile_save", settings, {timeoutMs: 20000});
+        applyLocalMysqlProfileMetadata(profile);
+      }
+      result = await requestLocalHelper("mysql_preflight", {
+        use_saved_profile: true,
         require_schema: true,
         write_test: false,
-      }, {timeoutMs: 20000})
-      : await postJson("/api/mysql/test", {...settings, read_only: true});
+      }, {timeoutMs: 20000});
+    } else {
+      result = await postJson("/api/mysql/test", {...settings, read_only: true});
+    }
     state.mysqlConnectionTests[scope] = result;
     status.classList.toggle("ok", Boolean(result.ok));
     status.classList.toggle("error", !result.ok);
@@ -1352,7 +1387,7 @@ async function testMysqlConnection(local = false) {
     const friendlyError = detail.message
       ? `[${detail.code || detail.category}] ${detail.message}`
       : (errorText.includes("1045") || errorText.toLowerCase().includes("access denied")
-        ? "账号或密码错误：请确认 MySQL 用户名和密码设置正确"
+        ? "账号或密码错误，或用户@来源主机未授权：请核对 MySQL 账户授权范围"
         : errorText);
     status.textContent = result.ok
       ? `${label} MySQL 已连接：${settings.mysql_host}:${settings.mysql_port}/${result.database}（${result.driver}）${result.schema_ready === false ? "，但AFP表结构不完整" : ""}`
@@ -1372,11 +1407,11 @@ async function validateEnabledMysqlBeforeStart() {
   const failures = [];
   if (controls.mysqlEnabled?.checked) {
     const target = await testMysqlConnection(false);
-    if (!target?.ok) failures.push(`目标电脑 MySQL：${target?.error || "连接失败"}`);
+    if (!target?.ok) failures.push(`服务器/目标电脑 MySQL：${target?.error || "连接失败"}`);
   }
   if (controls.mysqlLocalEnabled?.checked) {
     const local = await testMysqlConnection(true);
-    if (!local?.ok) failures.push(`本机 MySQL：${local?.error || "连接失败"}`);
+    if (!local?.ok) failures.push(`${usesLocalCaptureHelper() ? "访问电脑本机" : "服务器本机"} MySQL：${local?.error || "连接失败"}`);
   }
   if (failures.length) {
     throw new Error(`MySQL 保存预检未通过；${failures.join("；")}`);
@@ -1396,12 +1431,7 @@ async function refreshRelationMap(scope) {
     if (status) status.textContent = `正在读取${label}数据库 ${settings.mysql_host}/${database} 的关系表……`;
     const result = local && usesLocalCaptureHelper()
       ? await requestLocalHelper("mysql_relation_map", {
-        mysql_enabled: true,
-        mysql_host: settings.mysql_host,
-        mysql_port: settings.mysql_port,
-        mysql_user: settings.mysql_user,
-        mysql_password: settings.mysql_password,
-        mysql_database: settings.mysql_database,
+        use_saved_profile: true,
         limit: 1000,
       }, {timeoutMs: 20000})
       : await postJson("/api/mysql/relation-map", {...settings, limit: 1000});
@@ -1742,6 +1772,8 @@ function appendAgentDiagnostics(node) {
   }
   const statusText = result.execution_mode === "siliconflow_agent"
     ? "硅基流动模型已自主选用诊断工具"
+    : result.execution_mode === "siliconflow_fast"
+      ? "硅基流动模型已基于本地证据完成单次综合"
     : result.execution_mode === "siliconflow_structured"
       ? "硅基流动模型已基于本地证据完成结构化诊断（兼容模式）"
     : result.model_status === "failed_offline_fallback"
@@ -1849,7 +1881,7 @@ function updateAgentFromHardwareResult(result, {automatic = false} = {}) {
   if (events.length && changed && !state.agentResult) runAgentDiagnosis({automatic: true});
 }
 
-async function pollAgentDiagnosisJob(jobId, requestId, {timeoutMs = 240000, intervalMs = 1200} = {}) {
+async function pollAgentDiagnosisJob(jobId, requestId, {timeoutMs = 120000, intervalMs = 1200} = {}) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (requestId !== state.agentRequestId) return null;
@@ -1862,6 +1894,12 @@ async function pollAgentDiagnosisJob(jobId, requestId, {timeoutMs = 240000, inte
     if (!response.ok) throw new Error(snapshot.error || `诊断任务查询失败（${response.status}）`);
     if (snapshot.state === "success") return snapshot.result || {};
     if (snapshot.state === "failed") throw new Error(snapshot.error || "诊断任务执行失败");
+    if (snapshot.local_result && !state.agentResult) {
+      state.agentResult = snapshot.local_result;
+      const localStatus = $("agentAutoStatus");
+      if (localStatus) localStatus.textContent = "本地事实已就绪，等待模型综合……";
+      if (state.hardwareCheck) renderHardwareCheckResult(state.hardwareCheck, {automatic: false});
+    }
     await new Promise((resolve) => window.setTimeout(resolve, intervalMs));
   }
   throw new Error("诊断任务仍在执行，请稍后查看结果");
@@ -1898,7 +1936,12 @@ async function runAgentDiagnosis({automatic = false} = {}) {
     }, {timeoutMs: 30000});
     if (requestId !== state.agentRequestId) return null;
     state.agentJobId = started.job_id || "";
-    if (!state.agentJobId) throw new Error("服务器未返回诊断任务编号");
+    if (started.local_result) {
+      state.agentResult = started.local_result;
+      if (autoStatus) autoStatus.textContent = "本地事实已就绪，等待模型综合……";
+      if (state.hardwareCheck) renderHardwareCheckResult(state.hardwareCheck, {automatic});
+    }
+    if (!state.agentJobId) return state.agentResult;
     if (autoStatus) autoStatus.textContent = "诊断任务已提交，正在等待模型结果……";
     const result = await pollAgentDiagnosisJob(state.agentJobId, requestId);
     if (requestId !== state.agentRequestId || !result) return null;
@@ -2035,7 +2078,7 @@ async function stopAcquisition() {
       ? await requestLocalHelper("stop_capture", {}, {timeoutMs: 30000})
       : await postJson(
         state.accessRole === "guest" ? "/api/simulation/stop" : "/api/acquisition/stop",
-        {},
+        {acquisition_mode: controls.acquisitionMode?.value || "real"},
       );
     if (state.accessRole === "guest") {
       state.guestSimulationStarted = false;
@@ -2604,7 +2647,9 @@ function openLiveWebSocket() {
   };
   socket.onmessage = (event) => {
     try {
-      applyRealtimePayload(JSON.parse(event.data));
+      const payload = JSON.parse(event.data);
+      if (payload?.type === "heartbeat") return;
+      applyRealtimePayload(payload);
     } catch (error) {
       $("connectionStatus").textContent = `实时数据服务异常：${error.message}`;
     }
@@ -4706,9 +4751,9 @@ async function runIntegration() {
 
 async function selectSimulationSource() {
   const sourceType = controls.simulationSourceType?.value || "single_csv";
-  if (state.accessRole === "guest") {
+  if (state.accessRole !== "local_admin") {
     if (sourceType === "mysql") {
-      toast("访客模式的 MySQL 使用本机管理员配置；请在本机管理页面设置数据源");
+      toast("远程 MySQL 数据源请在数据库设置中配置；本机文件请切换为 CSV 并上传");
       return;
     }
     const picker = controls.simulationSourceFile;
@@ -4723,14 +4768,12 @@ async function selectSimulationSource() {
   }
   if (sourceType === "mysql") return;
   try {
-    const endpoint = state.accessRole === "guest"
-      ? "/api/simulation/select-source"
-      : "/api/acquisition/select-source";
-    const result = await postJson(endpoint, {
+    const result = await postJson("/api/acquisition/select-source", {
       source_type: sourceType,
       initial_path: controls.simulationSourcePath?.value.trim() || "",
     });
     if (result.selected) {
+      state.simulationSourceId = "";
       controls.simulationSourcePath.value = result.path || result.name || "";
       if (controls.autoProcessParameters?.checked) {
         await readProcessParameters({automatic: true});
@@ -4779,11 +4822,15 @@ async function uploadSimulationSource() {
   try {
     if (controls.simulationSourceNote) controls.simulationSourceNote.textContent = "正在上传并校验模拟数据……";
     const uploaded = await Promise.all(files.map(readSimulationFile));
-    const result = await postJson("/api/simulation/upload-source", {
+    const endpoint = state.accessRole === "guest"
+      ? "/api/simulation/upload-source"
+      : "/api/acquisition/upload-source";
+    const result = await postJson(endpoint, {
       source_type: sourceType,
       files: uploaded,
     }, {timeoutMs: 120000});
     controls.simulationSourcePath.value = result.name || result.path || "已导入模拟数据";
+    state.simulationSourceId = String(result.source_id || "");
     state.simulationSourceChannels = Array.isArray(result.channels) ? result.channels : [];
     if (controls.simulationSourceNote) controls.simulationSourceNote.textContent =
       `已导入 ${result.name || "模拟数据"}；请点击“开始采集”后才开始读取，预测、预警和保存均基于该数据。`;
@@ -4793,7 +4840,9 @@ async function uploadSimulationSource() {
     autoEnableSimulationChannels(state.simulationSourceChannels);
     stopLocalSimulationReplay();
     state.simulationDatasetCache = null;
-    await loadSimulationDatasetOnce({force: true});
+    if (state.accessRole === "guest") {
+      await loadSimulationDatasetOnce({force: true});
+    }
     if (controls.autoProcessParameters?.checked) {
       await readProcessParameters({automatic: true});
     }
@@ -4813,11 +4862,13 @@ function acquisitionConfig() {
   validatePhysicalInterfaceBindings(interfaceState.interfaces, controls.acquisitionMode?.value !== "simulation");
   const first = interfaceState.interfaces[0] || {};
   const simulation = controls.acquisitionMode?.value === "simulation";
+  const remoteSimulation = simulation && state.accessRole !== "local_admin";
   return {
     processing_mode: controls.processingMode.value,
     acquisition_mode: simulation ? "simulation" : "real",
     simulation_source_type: controls.simulationSourceType?.value || "single_csv",
-    simulation_source_path: simulation ? (controls.simulationSourcePath?.value.trim() || "") : "",
+    simulation_source_path: simulation && !remoteSimulation ? (controls.simulationSourcePath?.value.trim() || "") : "",
+    ...(remoteSimulation ? {simulation_source_id: state.simulationSourceId || ""} : {}),
     simulation_mysql_query: controls.simulationMysqlQuery?.value.trim() || "",
     simulation_mysql_host: controls.mysqlHost?.value.trim() || "192.168.101.31",
     simulation_mysql_port: Number(controls.mysqlPort?.value) || 3306,
@@ -4848,7 +4899,7 @@ function acquisitionConfig() {
     v: Number(controls.liveSpeed.value) || 0,
     pr: Number(controls.livePressure.value) || 0,
     root: "LIVE",
-    source_file: simulation ? (controls.simulationSourcePath?.value.trim() || "") : "",
+    source_file: simulation && !remoteSimulation ? (controls.simulationSourcePath?.value.trim() || "") : "",
     save_root: controls.saveRoot.value.trim(),
     mysql_enabled: Boolean(controls.mysqlEnabled?.checked),
     mysql_host: controls.mysqlHost?.value.trim() || "192.168.101.31",
@@ -4860,7 +4911,7 @@ function acquisitionConfig() {
     mysql_local_host: controls.mysqlLocalHost?.value.trim() || "127.0.0.1",
     mysql_local_port: Number(controls.mysqlLocalPort?.value) || 3306,
     mysql_local_user: controls.mysqlLocalUser?.value.trim() || "root",
-    mysql_local_password: controls.mysqlLocalPassword?.value ?? "",
+    mysql_local_password: usesLocalCaptureHelper() ? "" : (controls.mysqlLocalPassword?.value ?? ""),
     mysql_local_database: controls.mysqlLocalDatabase?.value.trim() || "afp_state_warning",
     mysql_charset: "utf8mb4",
     mysql_connect_timeout: 5,

@@ -180,6 +180,56 @@ class GuestSimulationTests(unittest.TestCase):
         self.assertEqual(config.simulation_mysql_password, "")
         self.assertFalse(config.mysql_enabled)
 
+    def test_public_simulation_status_never_exposes_server_absolute_paths(self):
+        """A remote start/status/stop response must contain only public scopes."""
+        manager = self._manager()
+        session_id = "a" * 32
+        session = manager.ensure_session(session_id)
+        payloads = []
+
+        try:
+            payloads.append(
+                manager.start(
+                    session_id,
+                    {
+                        "source_profile": "builtin",
+                        "processing_mode": "capture_only",
+                        "selected_sensors": ["温度", "压力"],
+                    },
+                )
+            )
+            payloads.append(manager.status(session_id))
+        finally:
+            payloads.append(manager.stop(session_id))
+
+        def all_strings(value):
+            if isinstance(value, dict):
+                for item in value.values():
+                    yield from all_strings(item)
+            elif isinstance(value, list):
+                for item in value:
+                    yield from all_strings(item)
+            elif isinstance(value, str):
+                yield value
+
+        exposed_strings = list(all_strings(payloads))
+        self.assertFalse(
+            any(str(session.save_root) in value for value in exposed_strings),
+            exposed_strings,
+        )
+        self.assertFalse(
+            any(str(self.source) in value for value in exposed_strings),
+            exposed_strings,
+        )
+        self.assertEqual(
+            payloads[0]["server_save_scope"],
+            f"public_simulation/{session_id}",
+        )
+        self.assertEqual(
+            payloads[0]["config"]["save_root"],
+            f"public_simulation/{session_id}",
+        )
+
     def test_uploaded_csv_becomes_the_source_for_only_that_guest_session(self):
         manager = self._manager()
         first_id = "a" * 32
@@ -197,6 +247,26 @@ class GuestSimulationTests(unittest.TestCase):
         second = manager.safe_config(second_id, {})
         self.assertEqual(Path(first.simulation_source_path).name, "client.csv")
         self.assertEqual(Path(second.simulation_source_path), self.source)
+
+    def test_uploaded_source_uses_an_opaque_session_bound_identifier(self):
+        module = self._module()
+        manager = self._manager()
+        first_id = "a" * 32
+        second_id = "b" * 32
+        encoded = base64.b64encode("温度,压力\n351,401\n".encode("utf-8")).decode("ascii")
+
+        result = manager.upload_source(
+            first_id,
+            "single_csv",
+            [{"name": "client.csv", "data": encoded}],
+        )
+
+        self.assertRegex(result["source_id"], r"^[A-Za-z0-9_-]{20,64}$")
+        resolved = manager.resolve_uploaded_source(first_id, result["source_id"])
+        self.assertEqual(Path(resolved["path"]).name, "client.csv")
+        with self.assertRaises(module.GuestSimulationError) as raised:
+            manager.resolve_uploaded_source(second_id, result["source_id"])
+        self.assertEqual(raised.exception.code, "simulation_source_not_found")
 
     def test_default_simulation_dataset_can_be_loaded_once_without_leaking_path(self):
         manager = self._manager()
@@ -297,6 +367,23 @@ class GuestSimulationTests(unittest.TestCase):
             self.assertEqual(archive.read("result.csv"), b"x\n1\n")
         self.assertNotIn(b"secret", raw)
         self.assertEqual(name, f"afp_simulation_{first_id}.zip")
+
+    def test_expired_stopped_session_cleanup_does_not_touch_other_sessions(self):
+        manager = self._manager()
+        stale = manager.ensure_session("a" * 32)
+        fresh = manager.ensure_session("b" * 32)
+        stale.last_access_at = 10.0
+        fresh.last_access_at = 95.0
+        stale_file = stale.save_root / "stale.csv"
+        fresh_file = fresh.save_root / "fresh.csv"
+        stale_file.write_text("x\n1\n", encoding="utf-8")
+        fresh_file.write_text("x\n2\n", encoding="utf-8")
+
+        result = manager.cleanup_expired(max_idle_seconds=20.0, now=100.0)
+
+        self.assertEqual(result["removed_sessions"], 1)
+        self.assertFalse(stale.save_root.exists())
+        self.assertTrue(fresh_file.exists())
 
     def test_dashboard_live_uses_the_guest_acquisition_argument(self):
         from app import DashboardData

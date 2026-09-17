@@ -99,11 +99,25 @@ def classify_mysql_error(error: Any) -> dict[str, str]:
     match = re.search(r"\b(10(?:44|45|49)|1130|1146|2003|2005|2061)\b", text)
     if match:
         code = match.group(1)
+    if code == "1130" or "host is not allowed" in lowered:
+        return {
+            "category": "host",
+            "code": code or "1130",
+            "message": "目标MySQL没有允许当前电脑主机访问的用户记录，请检查用户@来源主机授权",
+        }
     if code == "1045":
+        account = re.search(
+            r"for user\s+['\"]?([^'\"\s]+)['\"]?@['\"]?([^'\"\s]+)",
+            text,
+            re.IGNORECASE,
+        )
+        suffix = ""
+        if account:
+            suffix = f"（失败账号为 {account.group(1)}@{account.group(2)}，请核对用户@来源主机授权）"
         return {
             "category": "authentication",
             "code": code or "1045",
-            "message": "用户名/密码错误，或该用户没有从当前客户端主机登录的账号记录",
+            "message": "用户名/密码错误，或该用户没有从当前客户端主机登录的账号记录" + suffix,
         }
     if code == "1044" or "access denied" in lowered and "database" in lowered:
         return {
@@ -122,12 +136,6 @@ def classify_mysql_error(error: Any) -> dict[str, str]:
             "category": "database",
             "code": code or "1049",
             "message": "数据库或AFP关系结构不存在，需要先初始化",
-        }
-    if code == "1130" or "host is not allowed" in lowered:
-        return {
-            "category": "host",
-            "code": code or "1130",
-            "message": "目标MySQL没有允许当前电脑主机访问的用户记录",
         }
     if code in {"2003", "2005"} or "can't connect" in lowered or "timed out" in lowered:
         return {

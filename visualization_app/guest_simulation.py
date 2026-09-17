@@ -6,6 +6,7 @@ import csv
 import io
 import math
 import re
+import secrets
 import shutil
 import threading
 import time
@@ -21,6 +22,8 @@ DEFAULT_PER_SESSION_BYTES = 256 * 1024 * 1024
 DEFAULT_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_MAX_RUNNING = 4
 DEFAULT_MAX_UPLOAD_BYTES = 64 * 1024 * 1024
+DEFAULT_MAX_UPLOAD_FILE_BYTES = 16 * 1024 * 1024
+DEFAULT_MAX_UPLOAD_FILES = 500
 _SESSION_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,64}$")
 
 
@@ -216,6 +219,8 @@ class GuestSimulationManager:
             raise ValueError("请选择至少一个 CSV 文件")
         if clean_type == "single_csv" and len(files) != 1:
             raise ValueError("单 CSV 模式只能选择一个文件")
+        if len(files) > DEFAULT_MAX_UPLOAD_FILES:
+            raise ValueError(f"上传文件数量超过 {DEFAULT_MAX_UPLOAD_FILES} 个限制")
 
         source_root = (session.save_root / ".simulation_source").resolve()
         if session.save_root not in source_root.parents:
@@ -241,6 +246,8 @@ class GuestSimulationManager:
                     content = base64.b64decode(encoded, validate=True)
                 except (ValueError, binascii.Error) as exc:
                     raise ValueError("上传文件内容不是有效的 Base64") from exc
+                if len(content) > DEFAULT_MAX_UPLOAD_FILE_BYTES:
+                    raise ValueError("单个上传文件超过 16 MB 限制")
                 total += len(content)
                 if total > DEFAULT_MAX_UPLOAD_BYTES:
                     raise ValueError("上传文件总大小超过 64 MB 限制")
@@ -254,13 +261,16 @@ class GuestSimulationManager:
             source_root if clean_type == "folder_csv"
             else source_root / Path(names[0])
         ).resolve()
+        source_id = secrets.token_urlsafe(24)
         session.selected_source = {
+            "source_id": source_id,
             "source_type": clean_type,
             "path": str(selected_path),
         }
         status = self.source_status(session_id)
         return {
             "selected": True,
+            "source_id": source_id,
             "source_type": clean_type,
             "path": "",
             "name": names[0] if clean_type == "single_csv" else f"已上传 {len(names)} 个 CSV",
@@ -268,6 +278,24 @@ class GuestSimulationManager:
             "bytes": total,
             "channels": status.get("channels", []),
         }
+
+    def resolve_uploaded_source(
+        self, session_id: str, source_id: str
+    ) -> dict[str, Any]:
+        session = self.ensure_session(session_id)
+        selected = session.selected_source
+        if (
+            not isinstance(selected, dict)
+            or not str(source_id or "")
+            or not secrets.compare_digest(
+                str(selected.get("source_id") or ""), str(source_id or "")
+            )
+        ):
+            raise GuestSimulationError(
+                "simulation_source_not_found",
+                "远程模拟数据源不存在或不属于当前浏览器会话，请重新选择并上传",
+            )
+        return dict(selected)
 
     def source_status(self, session_id: str) -> dict[str, Any]:
         session = self.ensure_session(session_id)
@@ -399,6 +427,17 @@ class GuestSimulationManager:
 
     def safe_config(self, session_id: str, payload: dict[str, Any]) -> AcquisitionConfig:
         session = self.ensure_session(session_id)
+        requested_source_id = str(payload.get("simulation_source_id") or "").strip()
+        if requested_source_id:
+            self.resolve_uploaded_source(session_id, requested_source_id)
+        elif (
+            str(payload.get("source_file") or "").strip()
+            or str(payload.get("simulation_source_path") or "").strip()
+        ):
+            raise GuestSimulationError(
+                "remote_path_not_accessible",
+                "远程路径不可由服务器直接访问，请使用浏览器选择并上传",
+            )
         profile = session.selected_source or self._profile(payload)
         source_type = str(profile.get("source_type") or "single_csv").lower()
         if source_type not in {"single_csv", "folder_csv", "mysql"}:
@@ -489,9 +528,29 @@ class GuestSimulationManager:
     def _public_status(
         session: GuestSimulationSession, status: dict[str, Any]
     ) -> dict[str, Any]:
-        payload = dict(status)
+        public_scope = f"public_simulation/{session.session_id}"
+        private_root = session.save_root.resolve()
+
+        def project(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {key: project(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [project(item) for item in value]
+            if not isinstance(value, str) or not value:
+                return value
+            candidate = Path(value)
+            if not candidate.is_absolute():
+                return value
+            try:
+                relative = candidate.resolve().relative_to(private_root)
+            except (OSError, ValueError):
+                return "管理员批准的模拟数据源"
+            suffix = relative.as_posix()
+            return public_scope if suffix == "." else f"{public_scope}/{suffix}"
+
+        payload = project(status)
         payload["guest_session_id"] = session.session_id
-        payload["server_save_scope"] = f"public_simulation/{session.session_id}"
+        payload["server_save_scope"] = public_scope
         config = payload.get("config")
         if isinstance(config, dict):
             safe_config = dict(config)
@@ -538,6 +597,47 @@ class GuestSimulationManager:
         session.last_access_at = time.time()
         return session.acquisition.export_file(relative_path)
 
+    @staticmethod
+    def _remove_session_files(session: GuestSimulationSession) -> int:
+        removed_files = 0
+        for path in sorted(
+            session.save_root.rglob("*"), key=lambda item: len(item.parts), reverse=True
+        ):
+            if path.is_file() and not path.is_symlink():
+                path.unlink(missing_ok=True)
+                removed_files += 1
+            elif path.is_dir():
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+        try:
+            session.save_root.rmdir()
+        except OSError:
+            pass
+        return removed_files
+
+    def cleanup_expired(
+        self,
+        *,
+        max_idle_seconds: float = 3600.0,
+        now: float | None = None,
+    ) -> dict[str, int]:
+        current = time.time() if now is None else float(now)
+        cutoff = current - max(1.0, float(max_idle_seconds))
+        removed_sessions = 0
+        removed_files = 0
+        with self._lock:
+            for session_id, session in list(self._sessions.items()):
+                if session.last_access_at > cutoff:
+                    continue
+                if session.acquisition.status().get("running"):
+                    continue
+                removed_files += self._remove_session_files(session)
+                self._sessions.pop(session_id, None)
+                removed_sessions += 1
+        return {"removed_sessions": removed_sessions, "removed_files": removed_files}
+
     def cleanup_stopped(self) -> dict[str, int]:
         removed_sessions = 0
         removed_files = 0
@@ -545,21 +645,7 @@ class GuestSimulationManager:
             for session_id, session in list(self._sessions.items()):
                 if session.acquisition.status().get("running"):
                     continue
-                for path in sorted(
-                    session.save_root.rglob("*"), key=lambda item: len(item.parts), reverse=True
-                ):
-                    if path.is_file() and not path.is_symlink():
-                        path.unlink(missing_ok=True)
-                        removed_files += 1
-                    elif path.is_dir():
-                        try:
-                            path.rmdir()
-                        except OSError:
-                            pass
-                try:
-                    session.save_root.rmdir()
-                except OSError:
-                    pass
+                removed_files += self._remove_session_files(session)
                 self._sessions.pop(session_id, None)
                 removed_sessions += 1
         return {"removed_sessions": removed_sessions, "removed_files": removed_files}

@@ -6,6 +6,7 @@ import hashlib
 import os
 import socket
 import threading
+import time
 from contextlib import contextmanager
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -175,12 +176,15 @@ def _clean_hardware_result(value: Any) -> dict[str, Any]:
 def validate_agent_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Validate one local request before any optional provider call."""
 
-    allowed = {"api_key", "model_name", "events", "hardware_result"}
+    allowed = {"api_key", "model_name", "events", "hardware_result", "diagnosis_mode"}
     unexpected = set(payload or {}) - allowed
     if unexpected:
         raise ValueError("Agent 请求包含未允许字段")
     api_key = str((payload or {}).get("api_key") or "").strip()
     model_name = str((payload or {}).get("model_name") or "").strip()
+    diagnosis_mode = str((payload or {}).get("diagnosis_mode") or "fast").strip().lower()
+    if diagnosis_mode not in {"fast", "deep"}:
+        raise ValueError("diagnosis_mode只能是fast或deep")
     if len(api_key) > 512:
         raise ValueError("API Key 长度无效")
     if len(model_name) > 240:
@@ -207,6 +211,7 @@ def validate_agent_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "model_name": model_name,
         "events": clean_events,
         "hardware_result": _clean_hardware_result((payload or {}).get("hardware_result")),
+        "diagnosis_mode": diagnosis_mode,
     }
 
 
@@ -923,6 +928,7 @@ def _run_interface_diagnoses_uncached(
     acquisition_status: dict[str, Any] | None = None,
     transport: Any = None,
     use_environment_credentials: bool = True,
+    diagnosis_mode: str = "fast",
 ) -> dict[str, Any]:
     """Run local fallback rules, then select offline or tool-calling diagnosis."""
 
@@ -951,7 +957,7 @@ def _run_interface_diagnoses_uncached(
         api_key, model_name, use_environment=use_environment_credentials
     )
     if model_caller is None:
-        from agentic_diagnosis import run_agentic_diagnoses
+        from agentic_diagnosis import run_agentic_diagnoses, run_siliconflow_fast_diagnosis
         from diagnostic_tools import DiagnosticToolContext
 
         source_result = deepcopy(hardware_result) if isinstance(hardware_result, dict) else {}
@@ -1011,6 +1017,14 @@ def _run_interface_diagnoses_uncached(
             discovery=discovery or {},
             acquisition_status=acquisition_status or {"running": False, "sensors": source_result.get("sensors", [])},
         )
+        if str(diagnosis_mode or "fast").lower() != "deep":
+            return run_siliconflow_fast_diagnosis(
+                clean_key,
+                clean_model,
+                context,
+                diagnoses,
+                transport=transport,
+            )
         return run_agentic_diagnoses(
             context,
             diagnoses,
@@ -1070,6 +1084,8 @@ def _run_interface_diagnoses_uncached(
 
 _DIAGNOSIS_SINGLE_FLIGHT_LOCK = threading.Lock()
 _DIAGNOSIS_SINGLE_FLIGHT: dict[str, dict[str, Any]] = {}
+_DIAGNOSIS_RESULT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_DIAGNOSIS_RESULT_CACHE_TTL = 300.0
 
 
 def _diagnosis_request_key(
@@ -1078,12 +1094,11 @@ def _diagnosis_request_key(
     model_name: str,
     *,
     use_environment_credentials: bool = True,
+    diagnosis_mode: str = "fast",
 ) -> str:
     clean_key, clean_model = _resolve_agent_credentials(
         api_key, model_name, use_environment=use_environment_credentials
     )
-    if not clean_key or not clean_model:
-        return ""
     signatures = []
     for event in events or []:
         if not isinstance(event, dict):
@@ -1097,6 +1112,8 @@ def _diagnosis_request_key(
                 "protocol": str(event.get("protocol") or ""),
                 "channels": sorted(str(value) for value in event.get("channels") or []),
                 "state": str(event.get("state") or ""),
+                "message": str(event.get("message") or ""),
+                "evidence": event.get("evidence") if isinstance(event.get("evidence"), dict) else {},
             }
         )
     signatures.sort(key=lambda item: (item["interface_id"], item["endpoint"]))
@@ -1104,6 +1121,7 @@ def _diagnosis_request_key(
         "model": clean_model,
         "key_hash": hashlib.sha256(clean_key.encode("utf-8")).hexdigest(),
         "events": signatures,
+        "mode": str(diagnosis_mode or "fast").lower(),
     }
     return hashlib.sha256(
         json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -1121,6 +1139,7 @@ def run_interface_diagnoses(
     acquisition_status: dict[str, Any] | None = None,
     transport: Any = None,
     use_environment_credentials: bool = True,
+    diagnosis_mode: str = "fast",
 ) -> dict[str, Any]:
     """Collapse identical concurrent UI requests into one external model call."""
 
@@ -1135,19 +1154,19 @@ def run_interface_diagnoses(
         api_key,
         model_name,
         use_environment_credentials=use_environment_credentials,
+        diagnosis_mode=diagnosis_mode,
     )
-    if not request_key:
-        return _run_interface_diagnoses_uncached(
-            effective_events,
-            api_key=api_key,
-            model_name=model_name,
-            model_caller=model_caller,
-            hardware_result=hardware_result,
-            discovery=discovery,
-            acquisition_status=acquisition_status,
-            transport=transport,
-            use_environment_credentials=use_environment_credentials,
-        )
+    if model_caller is None:
+        now = time.monotonic()
+        with _DIAGNOSIS_SINGLE_FLIGHT_LOCK:
+            cached = _DIAGNOSIS_RESULT_CACHE.get(request_key)
+            if cached and now - cached[0] <= _DIAGNOSIS_RESULT_CACHE_TTL:
+                result = deepcopy(cached[1])
+                result["cache_hit"] = True
+                result["cache_age_seconds"] = round(max(0.0, now - cached[0]), 3)
+                return result
+            if cached:
+                _DIAGNOSIS_RESULT_CACHE.pop(request_key, None)
     with _DIAGNOSIS_SINGLE_FLIGHT_LOCK:
         job = _DIAGNOSIS_SINGLE_FLIGHT.get(request_key)
         owner = job is None
@@ -1155,8 +1174,8 @@ def run_interface_diagnoses(
             job = {"event": threading.Event(), "result": None, "error": None}
             _DIAGNOSIS_SINGLE_FLIGHT[request_key] = job
     if not owner:
-        if not job["event"].wait(220):
-            raise AgentGateError("等待同一批接口异常的模型诊断超时")
+        if not job["event"].wait(90):
+            raise AgentGateError("等待同一批接口异常的模型诊断超过90秒限制")
         if job["error"] is not None:
             raise job["error"]
         return deepcopy(job["result"])
@@ -1171,7 +1190,15 @@ def run_interface_diagnoses(
             acquisition_status=acquisition_status,
             transport=transport,
             use_environment_credentials=use_environment_credentials,
+            diagnosis_mode=diagnosis_mode,
         )
+        if model_caller is None:
+            result.setdefault("cache_hit", False)
+            result.setdefault("cache_age_seconds", 0.0)
+            with _DIAGNOSIS_SINGLE_FLIGHT_LOCK:
+                _DIAGNOSIS_RESULT_CACHE[request_key] = (time.monotonic(), deepcopy(result))
+                while len(_DIAGNOSIS_RESULT_CACHE) > 128:
+                    _DIAGNOSIS_RESULT_CACHE.pop(next(iter(_DIAGNOSIS_RESULT_CACHE)))
         job["result"] = deepcopy(result)
         return result
     except BaseException as error:

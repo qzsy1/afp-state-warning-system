@@ -27,6 +27,10 @@ class RemoteAcquisitionMirror:
         }
         self._last_batch_at: float | None = None
         self._total_received_rows = 0
+        self._stream_version = 0
+        self._latest_sample_at: float | None = None
+        self._helper_batch_created_at: float | None = None
+        self._helper_queue_depth = 0
 
     def _reset_locked(self, capture_uuid: str) -> None:
         self._rows.clear()
@@ -41,6 +45,9 @@ class RemoteAcquisitionMirror:
         }
         self._last_batch_at = None
         self._total_received_rows = 0
+        self._latest_sample_at = None
+        self._helper_batch_created_at = None
+        self._helper_queue_depth = 0
 
     def ingest(self, batch: dict[str, Any]) -> dict[str, Any]:
         capture_uuid = str(batch.get("capture_uuid") or "").strip()
@@ -96,8 +103,26 @@ class RemoteAcquisitionMirror:
             if isinstance(status, dict):
                 self._status = deepcopy(status)
             self._expected_sequence += 1
-            self._last_batch_at = time.time()
+            received_at = time.time()
+            self._last_batch_at = received_at
             self._total_received_rows += len(rows)
+            self._stream_version += 1
+            if numeric_timestamps:
+                self._latest_sample_at = max(numeric_timestamps)
+            transport = batch.get("transport")
+            if isinstance(transport, dict):
+                try:
+                    self._helper_batch_created_at = float(
+                        transport.get("helper_batch_created_at")
+                    )
+                except (TypeError, ValueError):
+                    self._helper_batch_created_at = None
+                try:
+                    self._helper_queue_depth = max(
+                        0, int(transport.get("helper_queue_depth") or 0)
+                    )
+                except (TypeError, ValueError):
+                    self._helper_queue_depth = 0
             return {
                 "ok": True,
                 "duplicate": False,
@@ -105,7 +130,12 @@ class RemoteAcquisitionMirror:
                 "ack_sequence": sequence,
                 "expected_sequence": self._expected_sequence,
                 "received_rows": len(rows),
+                "server_received_at": received_at,
             }
+
+    def stream_version(self) -> int:
+        with self._lock:
+            return self._stream_version
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -118,6 +148,11 @@ class RemoteAcquisitionMirror:
                     "remote_buffered_rows": len(self._rows),
                     "remote_expected_sequence": self._expected_sequence,
                     "remote_last_batch_at": self._last_batch_at,
+                    "remote_stream_version": self._stream_version,
+                    "remote_latest_sample_at": self._latest_sample_at,
+                    "remote_helper_batch_created_at": self._helper_batch_created_at,
+                    "remote_helper_queue_depth": self._helper_queue_depth,
+                    "remote_server_received_at": self._last_batch_at,
                     "first_sample_received": bool(self._rows),
                 }
             )

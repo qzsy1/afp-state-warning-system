@@ -20,6 +20,119 @@ should_repair_pairing = helper_entry.should_repair_pairing
 
 
 class HelperTransportTests(unittest.TestCase):
+    def test_ack_driven_sample_pump_sends_next_batch_immediately_after_ack(self):
+        pump_type = getattr(helper_entry, "HelperSamplePump", None)
+        self.assertIsNotNone(pump_type, "helper must expose an ACK-driven sample pump")
+        agent = Mock()
+        first = {
+            "capture_uuid": "capture-a", "sequence": 0,
+            "rows": [{"温度": float(index)} for index in range(25)],
+            "timestamps": [index / 50.0 for index in range(25)],
+            "status": {"running": True, "config": {"sample_rate": 50.0}},
+        }
+        second = {
+            "capture_uuid": "capture-a", "sequence": 1,
+            "rows": [{"温度": 25.0}], "timestamps": [0.5],
+            "status": {"running": True, "config": {"sample_rate": 50.0}},
+        }
+        agent.next_sample_batch.side_effect = [first, second]
+        agent.ack_sample_batch.return_value = True
+        agent.stream_metrics.return_value = {"queued_rows": 26, "sample_rate_hz": 50.0}
+        pump = pump_type(agent)
+
+        message_one = pump.next_message(now=10.0)
+        self.assertEqual(message_one["batch"]["sequence"], 0)
+        self.assertIsNone(pump.next_message(now=10.1), "only one batch may be in flight")
+        self.assertTrue(pump.acknowledge("capture-a", 0, now=10.1))
+        message_two = pump.next_message(now=10.1)
+
+        self.assertEqual(message_two["batch"]["sequence"], 1)
+        self.assertEqual(agent.next_sample_batch.call_args_list[0].kwargs["limit"], 25)
+
+    def test_ack_driven_sample_pump_replays_pending_batch_after_reconnect(self):
+        pump_type = getattr(helper_entry, "HelperSamplePump", None)
+        self.assertIsNotNone(pump_type, "helper must expose an ACK-driven sample pump")
+        pending = {
+            "capture_uuid": "capture-a", "sequence": 4,
+            "rows": [{"温度": 350.0}], "timestamps": [1.0],
+            "status": {"running": True},
+        }
+        agent = Mock()
+        agent.next_sample_batch.return_value = pending
+        agent.stream_metrics.return_value = {"queued_rows": 1, "sample_rate_hz": 10.0}
+        pump = pump_type(agent)
+
+        first = pump.next_message(now=1.0)
+        pump.connection_lost()
+        replay = pump.next_message(now=1.1)
+
+        self.assertEqual(first["batch"], replay["batch"])
+        agent.ack_sample_batch.assert_not_called()
+
+    def test_ack_driven_sample_pump_keeps_up_with_ten_minutes_at_50hz(self):
+        class QueuedAgent:
+            def __init__(self):
+                self.rows = []
+                self.cursor = 0
+                self.sequence = 0
+                self.pending = None
+
+            def produce_until(self, count):
+                while len(self.rows) < count:
+                    index = len(self.rows)
+                    self.rows.append((index / 50.0, {"温度": float(index)}))
+
+            def stream_metrics(self):
+                return {
+                    "queued_rows": len(self.rows) - self.cursor,
+                    "sample_rate_hz": 50.0,
+                }
+
+            def next_sample_batch(self, *, limit):
+                if self.pending is not None:
+                    return dict(self.pending)
+                if self.cursor >= len(self.rows):
+                    return None
+                selected = self.rows[self.cursor:self.cursor + limit]
+                self.pending = {
+                    "capture_uuid": "capture-50hz",
+                    "sequence": self.sequence,
+                    "timestamps": [item[0] for item in selected],
+                    "rows": [item[1] for item in selected],
+                    "status": {"running": True},
+                }
+                return dict(self.pending)
+
+            def ack_sample_batch(self, capture_uuid, sequence):
+                if capture_uuid != "capture-50hz" or sequence != self.sequence:
+                    return False
+                self.cursor += len(self.pending["rows"])
+                self.sequence += 1
+                self.pending = None
+                return True
+
+        agent = QueuedAgent()
+        pump = helper_entry.HelperSamplePump(agent)
+        latencies = []
+        for tick in range(1, 2401):
+            now = tick * 0.25
+            agent.produce_until(min(30_000, int(now * 50)))
+            while True:
+                message = pump.next_message(now=now)
+                if message is None:
+                    break
+                batch = message["batch"]
+                latencies.extend(now - timestamp for timestamp in batch["timestamps"])
+                self.assertTrue(
+                    pump.acknowledge(batch["capture_uuid"], batch["sequence"], now=now)
+                )
+
+        ordered = sorted(latencies)
+        p95 = ordered[int(len(ordered) * 0.95) - 1]
+        self.assertEqual(agent.cursor, 30_000)
+        self.assertEqual(agent.stream_metrics()["queued_rows"], 0)
+        self.assertLessEqual(p95, 1.0)
+
     def test_http_sample_flush_acknowledges_only_accepted_batch(self):
         agent = Mock()
         agent.next_sample_batch.return_value = {
@@ -105,6 +218,45 @@ class HelperTransportTests(unittest.TestCase):
         self.assertFalse(result["payload"]["ok"])
         self.assertIn("设备枚举失败", result["payload"]["error"])
 
+    def test_mysql_profile_commands_persist_locally_and_preflight_without_browser_password(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "helper-config.json"
+            helper_entry.save_runtime_config(
+                "https://afp.example.test", "pair-token", path=path
+            )
+            agent = Mock()
+            agent.mysql_preflight.return_value = {"ok": True, "database": "afp_state_warning"}
+            save_command = {
+                "type": "command",
+                "request_id": "save-1",
+                "command": "mysql_profile_save",
+                "payload": {
+                    "mysql_enabled": True,
+                    "mysql_host": "127.0.0.1",
+                    "mysql_port": 3306,
+                    "mysql_user": "root",
+                    "mysql_password": "local-secret",
+                    "mysql_database": "afp_state_warning",
+                },
+            }
+            preflight_command = {
+                "type": "command",
+                "request_id": "test-1",
+                "command": "mysql_preflight",
+                "payload": {"use_saved_profile": True, "write_test": False},
+            }
+            with patch.object(helper_entry, "default_runtime_config_path", return_value=path):
+                saved = dispatch_command(agent, json.dumps(save_command))
+                tested = dispatch_command(agent, json.dumps(preflight_command))
+
+        self.assertTrue(saved["payload"]["configured"])
+        self.assertTrue(tested["payload"]["ok"])
+        self.assertEqual(tested["payload"]["scope"], "helper_local")
+        self.assertEqual(tested["payload"]["execution_host"], "visitor_local_computer")
+        settings = agent.mysql_preflight.call_args.args[0]
+        self.assertEqual(settings.password, "local-secret")
+        self.assertEqual(settings.host, "127.0.0.1")
+
     def test_helper_cli_without_arguments_returns_setup_guidance_instead_of_argparse_exit(self):
         output = []
         result = resolve_runtime_args(
@@ -188,6 +340,62 @@ class HelperTransportTests(unittest.TestCase):
                 },
             )
             self.assertEqual(payload["version"], 1)
+
+    def test_local_mysql_profile_round_trips_without_plaintext_password(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "helper-config.json"
+            helper_entry.save_runtime_config(
+                "https://afp.example.test",
+                "secret-pairing-token",
+                "local-helper",
+                path=path,
+            )
+            metadata = helper_entry.save_local_mysql_profile(
+                {
+                    "mysql_enabled": True,
+                    "mysql_host": "127.0.0.1",
+                    "mysql_port": 3306,
+                    "mysql_user": "root",
+                    "mysql_password": "machine-only-secret",
+                    "mysql_database": "afp_state_warning",
+                },
+                path=path,
+            )
+            loaded = helper_entry.load_local_mysql_profile(path=path)
+            raw = path.read_text(encoding="utf-8")
+
+        self.assertTrue(metadata["configured"])
+        self.assertEqual(metadata["scope"], "helper_local")
+        self.assertNotIn("machine-only-secret", raw)
+        self.assertEqual(loaded["mysql_password"], "machine-only-secret")
+        self.assertEqual(loaded["mysql_host"], "127.0.0.1")
+
+    def test_unreadable_local_mysql_profile_is_unconfigured_not_empty_password(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "helper-config.json"
+            helper_entry.save_runtime_config(
+                "https://afp.example.test",
+                "secret-pairing-token",
+                "local-helper",
+                path=path,
+            )
+            helper_entry.save_local_mysql_profile(
+                {
+                    "mysql_enabled": True,
+                    "mysql_host": "127.0.0.1",
+                    "mysql_port": 3306,
+                    "mysql_user": "root",
+                    "mysql_password": "secret",
+                    "mysql_database": "afp_state_warning",
+                },
+                path=path,
+            )
+            with patch.object(helper_entry, "_unprotect_secret", side_effect=OSError("DPAPI")):
+                self.assertIsNone(helper_entry.load_local_mysql_profile(path=path))
+                metadata = helper_entry.local_mysql_profile_metadata(path=path)
+
+        self.assertFalse(metadata["configured"])
+        self.assertEqual(metadata["state"], "decrypt_failed")
 
     def test_helper_cli_shows_setup_gui_for_saved_config_when_double_clicked(self):
         with tempfile.TemporaryDirectory() as directory:

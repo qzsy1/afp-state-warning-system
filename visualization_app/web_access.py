@@ -89,6 +89,7 @@ AUTHORIZED_POST = {
     "/api/acquisition/process-parameters",
     "/api/acquisition/select-folder",
     "/api/acquisition/select-source",
+    "/api/acquisition/upload-source",
     "/api/acquisition/integrate",
     "/api/training/import",
     "/api/training/start",

@@ -8,6 +8,7 @@ import ctypes
 import ctypes.wintypes as wintypes
 from concurrent.futures import ThreadPoolExecutor
 import json
+import math
 import os
 import sys
 import threading
@@ -23,6 +24,71 @@ from local_capture_agent import HelperTransport, LocalCaptureAgent
 
 class PairingRequiredError(RuntimeError):
     """Raised when the saved helper credential is no longer accepted."""
+
+
+def adaptive_sample_batch_limit(agent: LocalCaptureAgent) -> int:
+    """Size a half-second batch while retaining strict memory bounds."""
+
+    try:
+        metrics = agent.stream_metrics()
+        sample_rate = float(metrics.get("sample_rate_hz") or 10.0)
+    except (AttributeError, TypeError, ValueError):
+        sample_rate = 10.0
+    return max(20, min(200, int(math.ceil(sample_rate * 0.5))))
+
+
+class HelperSamplePump:
+    """Keep one replayable sample batch in flight and advance only on ACK."""
+
+    def __init__(self, agent: LocalCaptureAgent) -> None:
+        self.agent = agent
+        self._in_flight: tuple[str, int] | None = None
+        self._last_sent_at: float | None = None
+        self._last_ack_at: float | None = None
+
+    def next_message(self, *, now: float | None = None) -> dict[str, Any] | None:
+        if self._in_flight is not None:
+            return None
+        batch = self.agent.next_sample_batch(limit=adaptive_sample_batch_limit(self.agent))
+        if not isinstance(batch, dict):
+            return None
+        capture_uuid = str(batch.get("capture_uuid") or "")
+        sequence = int(batch.get("sequence", -1))
+        self._in_flight = (capture_uuid, sequence)
+        self._last_sent_at = time.monotonic() if now is None else float(now)
+        return {"type": "sample_batch", "batch": batch}
+
+    def acknowledge(
+        self,
+        capture_uuid: str,
+        sequence: int,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        expected = self._in_flight
+        if expected != (str(capture_uuid), int(sequence)):
+            return False
+        accepted = self.agent.ack_sample_batch(str(capture_uuid), int(sequence))
+        if accepted:
+            self._in_flight = None
+            self._last_ack_at = time.monotonic() if now is None else float(now)
+        return bool(accepted)
+
+    def connection_lost(self) -> None:
+        # LocalCaptureAgent intentionally retains its pending batch.  Clearing
+        # only the wire state makes the same capture/sequence replay on reconnect.
+        self._in_flight = None
+
+    def metrics(self) -> dict[str, Any]:
+        value = dict(self.agent.stream_metrics())
+        value.update(
+            {
+                "unacknowledged": self._in_flight is not None,
+                "last_sent_monotonic": self._last_sent_at,
+                "last_ack_monotonic": self._last_ack_at,
+            }
+        )
+        return value
 
 
 def default_runtime_config_path() -> Path:
@@ -128,6 +194,13 @@ def save_runtime_config(
     config_path = Path(path) if path is not None else default_runtime_config_path()
     config_path = config_path.expanduser().resolve()
     config_path.parent.mkdir(parents=True, exist_ok=True)
+    existing: dict[str, Any] = {}
+    try:
+        loaded = json.loads(config_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            existing = loaded
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, UnicodeError):
+        pass
     payload = {
         "version": 1,
         "server": str(server).strip().rstrip("/"),
@@ -135,6 +208,9 @@ def save_runtime_config(
         "device_id": str(device_id or "local-helper"),
         "transport": str(transport or "auto"),
     }
+    if isinstance(existing.get("local_mysql_profile"), dict):
+        payload["version"] = 2
+        payload["local_mysql_profile"] = existing["local_mysql_profile"]
     temporary = config_path.with_name(config_path.name + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
     os.replace(temporary, config_path)
@@ -143,6 +219,110 @@ def save_runtime_config(
     except OSError:
         pass
     return config_path
+
+
+def save_local_mysql_profile(
+    values: dict[str, Any], *, path: str | Path | None = None
+) -> dict[str, Any]:
+    """Persist visitor-local MySQL credentials under the Windows user scope."""
+
+    settings = MySQLSettings.from_mapping(values)
+    config_path = Path(path) if path is not None else default_runtime_config_path()
+    config_path = config_path.expanduser().resolve()
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, UnicodeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    password_envelope = json.dumps(
+        {"password": settings.password}, ensure_ascii=False, separators=(",", ":")
+    )
+    payload["version"] = 2
+    payload["local_mysql_profile"] = {
+        "scope": "helper_local",
+        "host": settings.host,
+        "port": settings.port,
+        "user": settings.user,
+        "database": settings.database,
+        "charset": settings.charset,
+        "connect_timeout": settings.connect_timeout,
+        "password_encrypted": _protect_secret(password_envelope),
+    }
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = config_path.with_name(config_path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+    )
+    os.replace(temporary, config_path)
+    try:
+        os.chmod(config_path, 0o600)
+    except OSError:
+        pass
+    return local_mysql_profile_metadata(path=config_path)
+
+
+def load_local_mysql_profile(
+    *, path: str | Path | None = None
+) -> dict[str, Any] | None:
+    config_path = Path(path) if path is not None else default_runtime_config_path()
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        profile = payload.get("local_mysql_profile") if isinstance(payload, dict) else None
+        if not isinstance(profile, dict):
+            return None
+        envelope = json.loads(
+            _unprotect_secret(str(profile.get("password_encrypted") or ""))
+        )
+        if not isinstance(envelope, dict) or "password" not in envelope:
+            return None
+        return {
+            "mysql_enabled": True,
+            "mysql_host": str(profile.get("host") or "127.0.0.1"),
+            "mysql_port": int(profile.get("port") or 3306),
+            "mysql_user": str(profile.get("user") or "root"),
+            "mysql_password": str(envelope.get("password") or ""),
+            "mysql_database": str(profile.get("database") or "afp_state_warning"),
+            "mysql_charset": str(profile.get("charset") or "utf8mb4"),
+            "mysql_connect_timeout": int(profile.get("connect_timeout") or 5),
+        }
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        json.JSONDecodeError,
+        UnicodeError,
+    ):
+        return None
+
+
+def local_mysql_profile_metadata(
+    *, path: str | Path | None = None
+) -> dict[str, Any]:
+    config_path = Path(path) if path is not None else default_runtime_config_path()
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        raw = payload.get("local_mysql_profile") if isinstance(payload, dict) else None
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, UnicodeError):
+        raw = None
+    if not isinstance(raw, dict):
+        return {"scope": "helper_local", "configured": False, "state": "missing"}
+    loaded = load_local_mysql_profile(path=config_path)
+    if loaded is None:
+        return {
+            "scope": "helper_local",
+            "configured": False,
+            "state": "decrypt_failed",
+        }
+    return {
+        "scope": "helper_local",
+        "configured": True,
+        "state": "configured",
+        "host": loaded["mysql_host"],
+        "port": loaded["mysql_port"],
+        "user": loaded["mysql_user"],
+        "database": loaded["mysql_database"],
+    }
 
 
 def load_saved_runtime_config(*, path: str | Path | None = None) -> dict[str, str] | None:
@@ -201,6 +381,40 @@ def _config_from_payload(payload: dict[str, Any]) -> AcquisitionConfig:
     return AcquisitionConfig(**{key: value for key, value in payload.items() if key in allowed})
 
 
+def helper_capabilities() -> dict[str, Any]:
+    return {
+        "hardware_discovery": True,
+        "real_capture": True,
+        "process_parameter_read": True,
+        "local_csv_save": True,
+        "local_mysql_save": True,
+        "local_mysql_profile": local_mysql_profile_metadata(),
+    }
+
+
+def _settings_from_saved_profile() -> MySQLSettings:
+    saved = load_local_mysql_profile()
+    if saved is None:
+        raise RuntimeError("本机 MySQL 未配置或凭据无法解密，请在当前电脑重新填写并保存")
+    return MySQLSettings.from_mapping(saved)
+
+
+def _inject_saved_local_mysql(payload: dict[str, Any]) -> dict[str, Any]:
+    values = dict(payload)
+    if not bool(values.get("mysql_local_enabled")):
+        return values
+    saved = load_local_mysql_profile()
+    if saved is None:
+        raise RuntimeError("本机 MySQL 未配置或凭据无法解密，请在当前电脑重新填写并保存")
+    for suffix in (
+        "host", "port", "user", "password", "database", "charset", "connect_timeout"
+    ):
+        source_key = f"mysql_{suffix}"
+        if source_key in saved:
+            values[f"mysql_local_{suffix}"] = saved[source_key]
+    return values
+
+
 def dispatch_command(agent: LocalCaptureAgent, raw: str | bytes) -> dict[str, Any]:
     command = HelperTransport.decode_command(raw)
     name = command["command"]
@@ -211,25 +425,49 @@ def dispatch_command(agent: LocalCaptureAgent, raw: str | bytes) -> dict[str, An
         elif name == "status":
             result = agent.status()
         elif name == "mysql_preflight":
+            settings = (
+                _settings_from_saved_profile()
+                if bool(payload.get("use_saved_profile"))
+                else MySQLSettings.from_mapping(payload)
+            )
             result = agent.mysql_preflight(
-                MySQLSettings.from_mapping(payload),
+                settings,
                 write_test=bool(payload.get("write_test", False)),
             )
+            if isinstance(result, dict):
+                result.setdefault("scope", "helper_local")
+                result.setdefault("execution_host", "visitor_local_computer")
+        elif name == "mysql_profile_save":
+            result = save_local_mysql_profile(payload)
+        elif name == "mysql_profile_status":
+            result = local_mysql_profile_metadata()
         elif name == "check_capture":
-            result = agent.check_capture(_config_from_payload(payload))
+            result = agent.check_capture(
+                _config_from_payload(_inject_saved_local_mysql(payload))
+            )
         elif name == "read_process_parameters":
             result = agent.read_process_parameters(_config_from_payload(payload))
         elif name == "mysql_relation_map":
+            settings = (
+                _settings_from_saved_profile()
+                if bool(payload.get("use_saved_profile"))
+                else MySQLSettings.from_mapping(payload)
+            )
             result = agent.mysql_relation_map(
-                MySQLSettings.from_mapping(payload),
+                settings,
                 limit=int(payload.get("limit", 1000)),
             )
+            if isinstance(result, dict):
+                result.setdefault("scope", "helper_local")
+                result.setdefault("execution_host", "visitor_local_computer")
         elif name == "check_save_root":
             result = agent.check_save_root(str(payload.get("path") or ""))
         elif name == "select_folder":
             result = agent.select_folder(str(payload.get("initial_path") or ""))
         elif name == "start_capture":
-            result = agent.start_capture(_config_from_payload(payload))
+            result = agent.start_capture(
+                _config_from_payload(_inject_saved_local_mysql(payload))
+            )
         elif name == "stop_capture":
             result = agent.stop_capture()
         else:  # decode_command already guards this; retain a defensive branch.
@@ -286,7 +524,7 @@ def flush_http_sample_batch(
 ) -> dict[str, Any]:
     """Send at most one pending sample batch and advance only after ACK."""
 
-    batch = agent.next_sample_batch(limit=20)
+    batch = agent.next_sample_batch(limit=adaptive_sample_batch_limit(agent))
     if not isinstance(batch, dict):
         return {"ok": True, "idle": True}
     result = transport.http_json(
@@ -362,6 +600,7 @@ def run_forever(
 ) -> bool:
     agent = agent or LocalCaptureAgent()
     transport = HelperTransport(server_url, pairing_token, device_id=device_id)
+    sample_pump = HelperSamplePump(agent)
     delay = 1.0
     failures = 0
     while True:
@@ -380,7 +619,7 @@ def run_forever(
             failures = 0
             send_json(
                 transport.hello(
-                    capabilities=agent.discover().get("capabilities", {})
+                    capabilities=helper_capabilities()
                 )
             )
             delay = 1.0
@@ -389,14 +628,10 @@ def run_forever(
             except Exception:
                 pass
             last_heartbeat = time.monotonic()
-            last_sample_send = 0.0
             while True:
-                now = time.monotonic()
-                if now - last_sample_send >= 1.0:
-                    pending = agent.next_sample_batch(limit=20)
-                    if pending is not None:
-                        send_json({"type": "sample_batch", "batch": pending})
-                    last_sample_send = now
+                pending_message = sample_pump.next_message()
+                if pending_message is not None:
+                    send_json(pending_message)
                 try:
                     raw = connection.recv()
                 except Exception as exc:
@@ -421,7 +656,7 @@ def run_forever(
                     continue
                 if message.get("type") == "sample_ack":
                     if message.get("ok"):
-                        agent.ack_sample_batch(
+                        sample_pump.acknowledge(
                             str(message.get("capture_uuid") or ""),
                             int(message.get("ack_sequence", -1)),
                         )
@@ -442,6 +677,7 @@ def run_forever(
             time.sleep(delay)
             delay = min(delay * 2.0, 30.0)
         finally:
+            sample_pump.connection_lost()
             if executor is not None:
                 executor.shutdown(wait=False, cancel_futures=True)
             if connection is not None:
@@ -647,9 +883,11 @@ def _run_main() -> None:
         bootstrap = HelperTransport(args.server, "", device_id=args.device_id)
         paired = bootstrap.http_json(
             "api/helper/pair/complete",
-            {"challenge": args.pairing_challenge, "device_id": args.device_id, "capabilities": {
-                "hardware_discovery": True, "real_capture": True, "process_parameter_read": True, "local_csv_save": True, "local_mysql_save": True,
-            }},
+            {
+                "challenge": args.pairing_challenge,
+                "device_id": args.device_id,
+                "capabilities": helper_capabilities(),
+            },
             authorized=False,
         )
         if not paired.get("ok"):
@@ -682,9 +920,11 @@ def _run_main() -> None:
             bootstrap = HelperTransport(repaired.server, "", device_id=repaired.device_id)
             paired = bootstrap.http_json(
                 "api/helper/pair/complete",
-                {"challenge": repaired.pairing_challenge, "device_id": repaired.device_id, "capabilities": {
-                    "hardware_discovery": True, "real_capture": True, "process_parameter_read": True, "local_csv_save": True, "local_mysql_save": True,
-                }},
+                {
+                    "challenge": repaired.pairing_challenge,
+                    "device_id": repaired.device_id,
+                    "capabilities": helper_capabilities(),
+                },
                 authorized=False,
             )
             if not paired.get("ok"):

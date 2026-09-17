@@ -87,6 +87,7 @@ from web_auth import AuthenticationError, SecurityStore
 from control_lease import RealControlLease
 from json_safety import json_safe_value
 from websocket_live import (
+    VersionedPayloadCache,
     encode_json_frame,
     encode_server_frame,
     recv_client_frame,
@@ -154,6 +155,28 @@ def local_mysql_profile() -> dict:
             "database": "afp_state_warning",
         },
     }
+
+
+def public_mysql_profiles() -> dict:
+    """Return connection defaults without ever returning a password."""
+    payload = local_mysql_profile()
+    if not isinstance(payload, dict):
+        return {"target": {}, "local": {}}
+    safe = deepcopy(payload)
+    for section in ("target", "local"):
+        values = safe.get(section)
+        if isinstance(values, dict):
+            values.pop("password", None)
+            values.pop("mysql_password", None)
+    return safe
+
+
+def decorate_server_mysql_result(result: dict) -> dict:
+    """Annotate server-side MySQL responses without exposing credentials."""
+    payload = dict(result or {})
+    payload.setdefault("scope", "server_target")
+    payload.setdefault("execution_host", "server")
+    return payload
 APP_VERSION = "1.12.0"
 BUILD_ID = "20260823-schema-contract-fix"
 EXECUTABLE_DIR = (
@@ -4173,6 +4196,11 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def _request_acquisition(self, requested_mode: str = ""):
         identity = self._identity()
+        if (
+            str(requested_mode or "").lower() == "simulation"
+            and identity.role != "local_admin"
+        ):
+            return self.guest_manager.acquisition(identity.guest_id)
         return select_acquisition_for_identity(
             identity.role,
             identity.session_id,
@@ -4186,7 +4214,7 @@ class AppHandler(BaseHTTPRequestHandler):
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         identity = self._identity()
         acquisition_status = deepcopy(self._request_acquisition().status())
-        if not uses_local_capture_helper(identity.role):
+        if identity.role == "local_admin":
             return (
                 deepcopy(self.dashboard.acquisition.discover_interfaces()),
                 acquisition_status,
@@ -4208,7 +4236,11 @@ class AppHandler(BaseHTTPRequestHandler):
             )
         return (
             {
-                "source": "local_helper",
+                "source": (
+                    "local_helper"
+                    if uses_local_capture_helper(identity.role)
+                    else "remote_browser_snapshot"
+                ),
                 "physical_interfaces": physical_interfaces,
             },
             acquisition_status,
@@ -4436,11 +4468,17 @@ class AppHandler(BaseHTTPRequestHandler):
         acquisition = None
         if self.path.split("?", 1)[0] == "/api/simulation/ws":
             acquisition = self.guest_manager.acquisition(self._identity().guest_id)
+        if acquisition is None:
+            acquisition = self._request_acquisition(
+                self._one(query, "acquisition_mode", "")
+            )
         try:
             next_push = 0.0
+            next_heartbeat = time.monotonic() + 5.0
+            payload_cache = VersionedPayloadCache()
             while True:
                 now = time.monotonic()
-                wait_for = max(0.0, min(0.25, next_push - now))
+                wait_for = max(0.0, min(0.05, next_push - now))
                 readable, _, _ = select.select([self.request], [], [], wait_for)
                 if readable:
                     try:
@@ -4459,12 +4497,24 @@ class AppHandler(BaseHTTPRequestHandler):
                 if time.monotonic() < next_push:
                     continue
                 try:
-                    payload = self._live_payload(query, acquisition=acquisition)
+                    payload = payload_cache.payload_for(
+                        acquisition,
+                        lambda: self._live_payload(query, acquisition=acquisition),
+                    )
+                    if payload is None:
+                        if time.monotonic() < next_heartbeat:
+                            next_push = time.monotonic() + 0.05
+                            continue
+                        payload = {
+                            "type": "heartbeat",
+                            "stream_version": payload_cache.version,
+                        }
+                        next_heartbeat = time.monotonic() + 5.0
                     frame = encode_json_frame(payload)
                 except Exception as exc:
                     frame = encode_json_frame({"type": "error", "error": str(exc)})
                 self.request.sendall(frame)
-                next_push = time.monotonic() + 0.25
+                next_push = time.monotonic() + 0.05
         except (BrokenPipeError, ConnectionResetError, OSError, TimeoutError):
             return
 
@@ -4747,10 +4797,13 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/bootstrap":
             identity = self._identity()
-            # The simulation UI needs the same interface-to-physical mapping in
-            # guest mode as it does locally.  This is an interface inventory
-            # only; guest requests never receive permission to open hardware.
-            bootstrap = self.dashboard.bootstrap(include_discovery=True)
+            # Server hardware belongs only to the loopback administrator.
+            # Remote roles either use their paired helper or browser uploads;
+            # probing PLC/ABB/RTSP here adds several seconds and the result is
+            # discarded below for helper-backed sessions anyway.
+            bootstrap = self.dashboard.bootstrap(
+                include_discovery=identity.role == "local_admin"
+            )
             acquisition = bootstrap.get("acquisition") or {}
             demo = acquisition.get("new_collection_demo") or {}
             # Use the same administrator-approved CSV as the initial source in
@@ -4809,7 +4862,7 @@ class AppHandler(BaseHTTPRequestHandler):
             self._send_json(bootstrap)
             return
         if parsed.path == "/api/mysql/defaults":
-            self._send_json(local_mysql_profile())
+            self._send_json(public_mysql_profiles())
             return
         if parsed.path == "/api/helper/status":
             self._send_json(
@@ -5180,11 +5233,11 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/simulation/select-source":
                 self._send_json(
-                    self.guest_manager.select_source(
-                        self._identity().guest_id,
-                        str(payload.get("source_type") or "single_csv"),
-                        str(payload.get("initial_path") or ""),
-                    )
+                    {
+                        "error": "remote_path_not_accessible",
+                        "message": "远程路径不可由服务器直接访问，请使用浏览器选择并上传",
+                    },
+                    HTTPStatus.BAD_REQUEST,
                 )
                 return
             if parsed.path == "/api/simulation/upload-source":
@@ -5219,14 +5272,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     stored_key, stored_model = "", DEFAULT_SILICONFLOW_MODEL
                 api_key = request_data["api_key"] or stored_key
                 model_name = request_data["model_name"] or stored_model
-                if not api_key or not model_name:
-                    self._send_json({"error": "model_not_configured"}, HTTPStatus.BAD_REQUEST)
-                    return
                 session_id = str(identity.session_id or "local-admin")
-                if self.model_limiter.count("model", session_id, 60.0) >= 3:
-                    self._send_json({"error": "model_rate_limited"}, HTTPStatus.TOO_MANY_REQUESTS)
-                    return
-                self.model_limiter.allow("model", session_id, 3, 60.0)
                 events = deepcopy(request_data["events"])
                 hardware_result = deepcopy(request_data["hardware_result"])
                 discovery, acquisition_status = self._diagnostic_context(
@@ -5245,6 +5291,39 @@ class AppHandler(BaseHTTPRequestHandler):
                     ).encode("utf-8")
                 ).hexdigest()
 
+                # Freeze a deterministic local result before any provider call
+                # so the page can render facts even when the model is slow or
+                # unavailable.  It is intentionally never labeled as a
+                # confirmed hardware diagnosis.
+                local_result = run_interface_diagnoses(
+                    events,
+                    api_key="",
+                    model_name=DEFAULT_SILICONFLOW_MODEL,
+                    hardware_result=hardware_result,
+                    discovery=discovery,
+                    acquisition_status=acquisition_status,
+                    diagnosis_mode="fast",
+                    use_environment_credentials=False,
+                )
+                local_result["model_used"] = False
+                if not api_key or not model_name:
+                    self._send_json(
+                        {
+                            "job_id": "",
+                            "fingerprint": fingerprint,
+                            "state": "success",
+                            "phase": "local_complete",
+                            "result": local_result,
+                            "local_result": local_result,
+                            "cache_hit": bool(local_result.get("cache_hit")),
+                        }
+                    )
+                    return
+                if self.model_limiter.count("model", session_id, 60.0) >= 3:
+                    self._send_json({"error": "model_rate_limited", "local_result": local_result}, HTTPStatus.TOO_MANY_REQUESTS)
+                    return
+                self.model_limiter.allow("model", session_id, 3, 60.0)
+
                 def run_model() -> dict:
                     if not self.model_call_lock.acquire(blocking=False):
                         raise RuntimeError("模型调用正在进行，请稍后重试")
@@ -5257,6 +5336,7 @@ class AppHandler(BaseHTTPRequestHandler):
                             hardware_result=hardware_result,
                             discovery=discovery,
                             acquisition_status=acquisition_status,
+                            diagnosis_mode=str(request_data.get("diagnosis_mode") or "fast"),
                             use_environment_credentials=False,
                         )
                         result["model_used"] = str(
@@ -5276,7 +5356,12 @@ class AppHandler(BaseHTTPRequestHandler):
                     finally:
                         self.model_call_lock.release()
 
-                snapshot = self.diagnosis_jobs.submit(session_id, fingerprint, run_model)
+                snapshot = self.diagnosis_jobs.submit(
+                    session_id,
+                    fingerprint,
+                    run_model,
+                    local_result=local_result,
+                )
                 self._send_json(snapshot, HTTPStatus.ACCEPTED)
                 return
             if parsed.path == "/api/agent/diagnose":
@@ -5317,6 +5402,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         hardware_result=request_data["hardware_result"],
                         discovery=discovery,
                         acquisition_status=acquisition_status,
+                        diagnosis_mode="fast",
                         use_environment_credentials=False,
                     )
                     local_result["model_used"] = False
@@ -5361,6 +5447,7 @@ class AppHandler(BaseHTTPRequestHandler):
                             hardware_result=request_data["hardware_result"],
                             discovery=discovery,
                             acquisition_status=acquisition_status,
+                            diagnosis_mode=str(request_data.get("diagnosis_mode") or "fast"),
                             use_environment_credentials=use_environment,
                         )
                         result["model_used"] = str(
@@ -5384,6 +5471,22 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._send_json(result)
                 return
             if parsed.path == "/api/acquisition/test":
+                identity = self._identity()
+                remote_simulation = (
+                    str(payload.get("acquisition_mode") or "").lower() == "simulation"
+                    and identity.role != "local_admin"
+                )
+                if remote_simulation:
+                    config = self.guest_manager.safe_config(identity.guest_id, payload)
+                    model_validation = self.dashboard.validate_prediction_setup(
+                        config, load_model=False
+                    )
+                    result = self.guest_manager.acquisition(
+                        identity.guest_id
+                    ).test_connection(config)
+                    result["prediction_model"] = model_validation
+                    self._send_json(result)
+                    return
                 if str(payload.get("simulation_source_type", "")).lower() == "mysql":
                     payload["simulation_mysql_query"] = validate_read_only_mysql_query(
                         str(payload.get("simulation_mysql_query", ""))
@@ -5397,6 +5500,17 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._send_json(result)
                 return
             if parsed.path == "/api/acquisition/process-parameters":
+                identity = self._identity()
+                if (
+                    str(payload.get("acquisition_mode") or "").lower() == "simulation"
+                    and identity.role != "local_admin"
+                ):
+                    self._send_json(
+                        self.guest_manager.read_process_parameters(
+                            identity.guest_id, payload
+                        )
+                    )
+                    return
                 demo = (
                     (self.dashboard.bootstrap(include_discovery=False).get("acquisition") or {})
                     .get("new_collection_demo") or {}
@@ -5440,6 +5554,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     if bool(payload.get("read_only", False))
                     else store.test_connection()
                 )
+                result = decorate_server_mysql_result(result)
                 if not result.get("ok"):
                     result["error_detail"] = classify_mysql_error(result.get("error"))
                 self._send_json(result)
@@ -5472,7 +5587,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     require_schema=bool(payload.get("require_schema", True)),
                     write_test=bool(payload.get("write_test", False)),
                 )
-                self._send_json(result)
+                self._send_json(decorate_server_mysql_result(result))
                 return
             if parsed.path == "/api/mysql/relation-map":
                 settings = mysql_settings_from_mapping(payload)
@@ -5480,6 +5595,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     int(payload.get("limit", 1000)),
                     auto_initialize=True,
                 )
+                result = decorate_server_mysql_result(result)
                 if not result.get("ok"):
                     result["error_detail"] = classify_mysql_error(result.get("error"))
                 self._send_json(result)
@@ -5549,6 +5665,15 @@ class AppHandler(BaseHTTPRequestHandler):
                 )
                 return
             if parsed.path == "/api/acquisition/select-source":
+                if self._identity().role != "local_admin":
+                    self._send_json(
+                        {
+                            "error": "remote_path_not_accessible",
+                            "message": "远程路径不可由服务器直接访问，请使用浏览器选择并上传",
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
                 source_type = str(payload.get("source_type", "single_csv"))
                 if source_type == "mysql":
                     self._send_json({"selected": False, "path": ""})
@@ -5557,6 +5682,23 @@ class AppHandler(BaseHTTPRequestHandler):
                     source_type, str(payload.get("initial_path", ""))
                 )
                 self._send_json({"selected": bool(selected), "path": selected})
+                return
+            if parsed.path == "/api/acquisition/upload-source":
+                identity = self._identity()
+                if identity.role == "local_admin":
+                    self._send_json(
+                        {"error": "browser_upload_not_required"},
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                files = payload.get("files")
+                self._send_json(
+                    self.guest_manager.upload_source(
+                        identity.guest_id,
+                        str(payload.get("source_type") or "single_csv"),
+                        files if isinstance(files, list) else [],
+                    )
+                )
                 return
             if parsed.path == "/api/acquisition/integrate":
                 if str(payload.get("source_type", "")).lower() == "mysql":
@@ -5575,6 +5717,21 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._send_json(result)
                 return
             if parsed.path == "/api/acquisition/start":
+                identity = self._identity()
+                remote_simulation = (
+                    str(payload.get("acquisition_mode") or "").lower() == "simulation"
+                    and identity.role != "local_admin"
+                )
+                if remote_simulation:
+                    config = self.guest_manager.safe_config(identity.guest_id, payload)
+                    model_validation = self.dashboard.validate_prediction_setup(
+                        config, load_model=True
+                    )
+                    result = self.guest_manager.start(identity.guest_id, payload)
+                    result["prediction_model"] = model_validation
+                    self._replay_put(replay_key, HTTPStatus.OK, result)
+                    self._send_json(result)
+                    return
                 demo = (
                     (self.dashboard.bootstrap(include_discovery=False).get("acquisition") or {})
                     .get("new_collection_demo") or {}
@@ -5596,7 +5753,14 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._send_json(result)
                 return
             if parsed.path == "/api/acquisition/stop":
-                result = self.dashboard.acquisition.stop()
+                identity = self._identity()
+                if (
+                    str(payload.get("acquisition_mode") or "").lower() == "simulation"
+                    and identity.role != "local_admin"
+                ):
+                    result = self.guest_manager.stop(identity.guest_id)
+                else:
+                    result = self.dashboard.acquisition.stop()
                 self._replay_put(replay_key, HTTPStatus.OK, result)
                 self._send_json(result)
                 return

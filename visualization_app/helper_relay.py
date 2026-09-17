@@ -23,6 +23,8 @@ ALLOWED_HELPER_COMMANDS = frozenset(
         "read_process_parameters",
         "mysql_preflight",
         "mysql_relation_map",
+        "mysql_profile_save",
+        "mysql_profile_status",
         "check_save_root",
         "select_folder",
         "start_capture",

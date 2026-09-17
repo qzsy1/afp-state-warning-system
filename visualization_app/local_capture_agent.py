@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import ipaddress
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -138,10 +139,16 @@ class LocalCaptureAgent:
     def mysql_preflight(
         self, settings: MySQLSettings, *, write_test: bool = False
     ) -> dict[str, Any]:
-        return MySQLCaptureStore(settings).preflight(write_test=write_test)
+        result = MySQLCaptureStore(settings).preflight(write_test=write_test)
+        result["scope"] = "helper_local"
+        result["execution_host"] = "visitor_local_computer"
+        return result
 
     def mysql_relation_map(self, settings: MySQLSettings, *, limit: int = 1000) -> dict[str, Any]:
-        return MySQLCaptureStore(settings).relation_map(max(1, min(int(limit), 1000)), auto_initialize=False)
+        result = MySQLCaptureStore(settings).relation_map(max(1, min(int(limit), 1000)), auto_initialize=False)
+        result["scope"] = "helper_local"
+        result["execution_host"] = "visitor_local_computer"
+        return result
 
     def check_save_root(self, path: str) -> dict[str, Any]:
         return check_capture_save_root(str(path or ""))
@@ -187,6 +194,10 @@ class LocalCaptureAgent:
                 "rows": [json_safe_value(dict(row)) for row in rows[self._stream_cursor:end]],
                 "timestamps": [float(value) for value in timestamps[self._stream_cursor:end]],
                 "status": json_safe_value(self.manager.status()),
+                "transport": {
+                    "helper_batch_created_at": time.time(),
+                    "helper_queue_depth": max(0, len(rows) - end),
+                },
             }
             self._pending_batch = pending
             self._pending_status_revision = self._status_revision
@@ -208,6 +219,29 @@ class LocalCaptureAgent:
                 self._status_dirty = False
             self._pending_status_revision = -1
             return True
+
+    def stream_metrics(self) -> dict[str, Any]:
+        """Return safe transport counters without exposing samples or credentials."""
+
+        with self._stream_lock:
+            rows, _timestamps = self.manager.numeric_matrix()
+            status = self.manager.status()
+            config = status.get("config") if isinstance(status, dict) else {}
+            try:
+                sample_rate = float((config or {}).get("sample_rate") or 10.0)
+            except (TypeError, ValueError):
+                sample_rate = 10.0
+            return {
+                "capture_uuid": self._capture_uuid,
+                "queued_rows": max(0, len(rows) - self._stream_cursor),
+                "pending_sequence": (
+                    int(self._pending_batch["sequence"])
+                    if isinstance(self._pending_batch, dict)
+                    else None
+                ),
+                "next_sequence": self._stream_sequence,
+                "sample_rate_hz": max(0.1, sample_rate),
+            }
 
     def check_capture(self, config: Any) -> dict[str, Any]:
         return self.manager.test_connection(config)

@@ -6,6 +6,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 class WebSocketLiveProtocolTests(unittest.TestCase):
+    def test_versioned_payload_cache_reuses_payload_until_stream_changes(self):
+        from websocket_live import VersionedPayloadCache
+
+        class Acquisition:
+            version = 0
+
+            def stream_version(self):
+                return self.version
+
+        acquisition = Acquisition()
+        builds = []
+        cache = VersionedPayloadCache()
+
+        first = cache.payload_for(acquisition, lambda: builds.append(0) or {"value": 1})
+        unchanged = cache.payload_for(acquisition, lambda: builds.append(1) or {"value": 2})
+        acquisition.version = 1
+        changed = cache.payload_for(acquisition, lambda: builds.append(2) or {"value": 3})
+
+        self.assertEqual(first, {"value": 1})
+        self.assertIsNone(unchanged)
+        self.assertEqual(changed, {"value": 3})
+        self.assertEqual(builds, [0, 2])
+
     def test_rfc6455_accept_value_matches_reference(self):
         from websocket_live import websocket_accept_value
 

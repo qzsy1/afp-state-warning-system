@@ -46,6 +46,26 @@ class WindowsDpapiProtector:
     _CRYPTPROTECT_UI_FORBIDDEN = 0x01
 
     @staticmethod
+    def _configure_function(function) -> None:
+        """Bind this module's DATA_BLOB type before every DPAPI call.
+
+        ``ctypes.windll`` caches function objects process-wide.  The packaged
+        local helper defines its own equivalent structure, so leaving argtypes
+        from that module in place can make a later web-auth call reject a
+        perfectly valid blob solely because the Python class identity differs.
+        """
+        function.argtypes = [
+            ctypes.POINTER(_DataBlob),
+            wintypes.LPCWSTR,
+            ctypes.POINTER(_DataBlob),
+            wintypes.LPVOID,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(_DataBlob),
+        ]
+        function.restype = wintypes.BOOL
+
+    @staticmethod
     def _input_blob(value: bytes) -> tuple[_DataBlob, Any]:
         raw = bytes(value)
         buffer = (ctypes.c_ubyte * len(raw)).from_buffer_copy(raw)
@@ -66,7 +86,9 @@ class WindowsDpapiProtector:
             raise RuntimeError("Windows DPAPI is available only on Windows")
         input_blob, input_buffer = self._input_blob(value)
         output_blob = _DataBlob()
-        ok = ctypes.windll.crypt32.CryptProtectData(
+        crypt_protect = ctypes.windll.crypt32.CryptProtectData
+        self._configure_function(crypt_protect)
+        ok = crypt_protect(
             ctypes.byref(input_blob),
             None,
             None,
@@ -85,7 +107,9 @@ class WindowsDpapiProtector:
             raise RuntimeError("Windows DPAPI is available only on Windows")
         input_blob, input_buffer = self._input_blob(value)
         output_blob = _DataBlob()
-        ok = ctypes.windll.crypt32.CryptUnprotectData(
+        crypt_unprotect = ctypes.windll.crypt32.CryptUnprotectData
+        self._configure_function(crypt_unprotect)
+        ok = crypt_unprotect(
             ctypes.byref(input_blob),
             None,
             None,

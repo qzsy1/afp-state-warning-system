@@ -52,6 +52,17 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertNotIn("downloadSimulationButton", index)
         self.assertNotIn("downloadSimulationSource", text)
 
+    def test_every_remote_role_uses_browser_upload_for_simulation_sources(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("async function selectSimulationSource()")
+        end = text.index("function readSimulationFile", start)
+        body = text[start:end]
+        self.assertIn('state.accessRole !== "local_admin"', body)
+        self.assertNotIn('state.accessRole === "guest"', body)
+        self.assertIn('"/api/acquisition/upload-source"', text)
+        self.assertIn("simulationSourceId", text)
+
     def test_pairing_feedback_is_rendered_in_helper_panel(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
@@ -98,8 +109,8 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         start = text.index("async function testMysqlConnection")
         end = text.index("async function refreshRelationMap", start)
         body = text[start:end]
-        self.assertIn('mysql_host: settings.mysql_host', body)
-        self.assertIn('mysql_port: settings.mysql_port', body)
+        self.assertIn('requestLocalHelper("mysql_profile_save"', body)
+        self.assertIn('use_saved_profile: true', body)
         self.assertNotIn('settings.mysql_local_host', body)
         self.assertNotIn('settings.mysql_local_port', body)
 
@@ -305,12 +316,17 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         self.assertIn("autoAssignPhysicalInterfaces", text)
         self.assertIn("只识别接口，不检查传感器连接", text)
 
-    def test_guest_bootstrap_includes_only_read_only_interface_inventory(self):
+    def test_remote_bootstrap_skips_server_hardware_discovery(self):
         source = Path(__file__).with_name("app.py")
         text = source.read_text(encoding="utf-8")
-        self.assertIn("bootstrap = self.dashboard.bootstrap(include_discovery=True)", text)
-        self.assertIn('acquisition["interface_discovery"] = {', text)
-        self.assertIn('"physical_interfaces": physical_interfaces', text)
+        start = text.index('if parsed.path == "/api/bootstrap"')
+        end = text.index('if parsed.path == "/api/mysql/defaults"', start)
+        body = text[start:end]
+        self.assertIn(
+            'include_discovery=identity.role == "local_admin"',
+            body,
+        )
+        self.assertNotIn("bootstrap(include_discovery=True)", body)
 
     def test_public_read_only_relation_refresh_does_not_require_capture_control(self):
         source = Path(__file__).with_name("app.py")
@@ -538,6 +554,16 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         status_body = text[status_start:status_end]
         self.assertIn('requestLocalHelper("check_save_root"', status_body)
 
+    def test_remote_local_mysql_uses_helper_encrypted_profile(self):
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        self.assertIn("localMysqlProfile", text)
+        self.assertIn('requestLocalHelper("mysql_profile_save"', text)
+        self.assertIn("use_saved_profile: true", text)
+        config_start = text.index("function acquisitionConfig()")
+        config_end = text.index("async function readProcessParameters", config_start)
+        config_body = text[config_start:config_end]
+        self.assertIn('usesLocalCaptureHelper() ? ""', config_body)
+
     def test_helper_backed_real_capture_does_not_repeat_server_export(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
@@ -552,7 +578,8 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         source = Path(__file__).with_name("app.py").read_text(encoding="utf-8")
         self.assertIn("def _diagnostic_context", source)
         self.assertIn("uses_local_capture_helper(identity.role)", source)
-        self.assertIn('"source": "local_helper"', source)
+        self.assertIn('"local_helper"', source)
+        self.assertIn('"remote_browser_snapshot"', source)
         self.assertNotIn(
             "discovery = deepcopy(self.dashboard.acquisition.discover_interfaces())",
             source,

@@ -552,7 +552,7 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertIn("unknowns", script)
         self.assertIn("agentRequestId", script)
         self.assertIn("agentController", script)
-        self.assertIn("timeoutMs: 210000", script)
+        self.assertIn("timeoutMs: 120000", script)
         self.assertIn("薄膜压力", html)
         self.assertIn("LangChain", html)
         self.assertIn("硅基流动", html)
@@ -674,6 +674,32 @@ class InterfaceAgentTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "未允许字段"):
             validate_agent_payload(payload)
+
+    def test_diagnosis_cache_uses_evidence_fingerprint_without_key_material(self) -> None:
+        event = interface_agent.build_agent_event(m3232_result())
+        self.assertIsNotNone(event)
+        interface_agent._DIAGNOSIS_RESULT_CACHE.clear()
+        with patch.object(
+            interface_agent,
+            "_run_interface_diagnoses_uncached",
+            return_value={"execution_mode": "local_rules", "diagnoses": []},
+        ) as runner:
+            first = interface_agent.run_interface_diagnoses(
+                [event],
+                api_key="sk-cache-test-only",
+                model_name="deepseek-ai/DeepSeek-V3",
+                use_environment_credentials=False,
+            )
+            second = interface_agent.run_interface_diagnoses(
+                [event],
+                api_key="sk-cache-test-only",
+                model_name="deepseek-ai/DeepSeek-V3",
+                use_environment_credentials=False,
+            )
+        self.assertEqual(runner.call_count, 1)
+        self.assertFalse(first["cache_hit"])
+        self.assertTrue(second["cache_hit"])
+        self.assertNotIn("sk-cache-test-only", json.dumps(second, ensure_ascii=False))
 
 
 if __name__ == "__main__":

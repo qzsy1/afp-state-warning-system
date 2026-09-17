@@ -30,10 +30,16 @@ class RemoteMySQLSetupTests(unittest.TestCase):
 
     def test_classify_mysql_error_distinguishes_auth_schema_and_network(self) -> None:
         self.assertEqual(classify_mysql_error("1045 Access denied" )["category"], "authentication")
+        detailed = classify_mysql_error(
+            "1045 Access denied for user 'root'@'192.168.1.20' (using password: YES)"
+        )
+        self.assertEqual(detailed["category"], "authentication")
+        self.assertIn("root@192.168.1.20", detailed["message"])
         self.assertEqual(classify_mysql_error("1044 Access denied to database")["category"], "authorization")
         self.assertEqual(classify_mysql_error("1044 Access denied for user")["category"], "authorization")
         self.assertEqual(classify_mysql_error("1049 Unknown database")["category"], "database")
         self.assertEqual(classify_mysql_error("2003 Can't connect")["category"], "network")
+        self.assertEqual(classify_mysql_error("1130 Host '10.0.0.2' is not allowed to connect")["category"], "host")
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ class _DiagnosisJob:
     finished_at: float | None = None
     state: str = "pending"
     result: dict[str, Any] | None = None
+    local_result: dict[str, Any] | None = None
     error: str = ""
     done: threading.Event = field(default_factory=threading.Event)
 
@@ -36,6 +37,7 @@ class DiagnosisJobStore:
         owner_id: str,
         fingerprint: str,
         runner: Callable[[], dict[str, Any]],
+        local_result: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         owner = str(owner_id or "")
         key = str(fingerprint or "")
@@ -50,7 +52,12 @@ class DiagnosisJobStore:
                 ):
                     return self._snapshot(job_id, job)
             job_id = uuid.uuid4().hex
-            job = _DiagnosisJob(owner_id=owner, fingerprint=key, runner=runner)
+            job = _DiagnosisJob(
+                owner_id=owner,
+                fingerprint=key,
+                runner=runner,
+                local_result=dict(local_result) if isinstance(local_result, dict) else None,
+            )
             self._jobs[job_id] = job
             self._prune_locked()
             thread = threading.Thread(
@@ -115,6 +122,11 @@ class DiagnosisJobStore:
             "started_at": job.started_at,
             "finished_at": job.finished_at,
             "result": dict(job.result) if isinstance(job.result, dict) else None,
+            "local_result": dict(job.local_result) if isinstance(job.local_result, dict) else None,
+            "phase": "complete" if job.state in {"success", "failed"} else "model_pending",
+            "elapsed_seconds": round(
+                max(0.0, (job.finished_at or time.time()) - job.created_at), 3
+            ),
             "error": job.error,
         }
 

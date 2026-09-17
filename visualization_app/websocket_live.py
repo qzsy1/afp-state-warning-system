@@ -18,6 +18,30 @@ from typing import Any
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
+class VersionedPayloadCache:
+    """Build a live payload only when a version-aware source advances."""
+
+    def __init__(self) -> None:
+        self._version: int | None = None
+        self._initialized = False
+
+    def payload_for(self, acquisition: Any, builder) -> dict[str, Any] | None:
+        version_reader = getattr(acquisition, "stream_version", None)
+        if not callable(version_reader):
+            return builder()
+        version = int(version_reader())
+        if self._initialized and version == self._version:
+            return None
+        payload = builder()
+        self._version = version
+        self._initialized = True
+        return payload
+
+    @property
+    def version(self) -> int | None:
+        return self._version
+
+
 def websocket_accept_value(client_key: str) -> str:
     """Return the RFC 6455 ``Sec-WebSocket-Accept`` value."""
     if not str(client_key or "").strip():

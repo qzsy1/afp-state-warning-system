@@ -366,15 +366,20 @@ class PublicWebHttpTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
         source = root / "simulation.csv"
-        source.write_bytes("温度,压力\n350,400\n".encode("utf-8"))
+        source.write_bytes(
+            "转速,位移,温度1,温度2,温度3,温度4,温度5,温度6,温度7,温度8,压力,振动\n"
+            "100,1,350,350,350,350,350,350,350,350,400,0\n".encode("utf-8")
+        )
         self.default_simulation_source = source.resolve()
         self.hardware_start_calls = 0
+        self.hardware_discovery_calls = 0
 
         class FakeAcquisition:
             def status(inner_self):
                 return {"running": False, "sensors": []}
 
             def discover_interfaces(inner_self):
+                self.hardware_discovery_calls += 1
                 return {"interfaces": [{"endpoint": "COM-secret"}]}
 
             def latest_check_result(inner_self):
@@ -698,8 +703,11 @@ class PublicWebHttpTests(unittest.TestCase):
             "POST", "/api/real/control/acquire", {}, headers={"X-Forwarded-Proto": "https"}
         )
         payload = {"acquisition_mode": "simulation", "driver": "simulator"}
+        guest_acquisition = self.server.guest_manager.ensure_session(
+            self.cookies["afp_guest"]
+        ).acquisition
         with patch.object(
-            self.server.dashboard.acquisition,
+            guest_acquisition,
             "start",
             return_value={"running": True},
         ) as start:
@@ -734,7 +742,7 @@ class PublicWebHttpTests(unittest.TestCase):
             "start",
             return_value={"running": True},
         ) as start:
-            status, _, _ = self.request_json(
+            status, response_payload, _ = self.request_json(
                 "POST",
                 "/api/acquisition/start",
                 {
@@ -747,10 +755,9 @@ class PublicWebHttpTests(unittest.TestCase):
                 headers={"X-Forwarded-Proto": "https"},
             )
 
-        self.assertEqual(status, 200)
-        config = start.call_args.args[0]
-        self.assertEqual(config.simulation_source_path, str(self.default_simulation_source))
-        self.assertEqual(config.source_file, str(self.default_simulation_source))
+        self.assertEqual(status, 400)
+        self.assertEqual(response_payload["error"], "remote_path_not_accessible")
+        start.assert_not_called()
 
 
 class RealControlLeaseTests(unittest.TestCase):
@@ -813,6 +820,7 @@ class ModelCredentialTests(PublicWebHttpTests):
             )
         self.assertEqual(status, 200)
         self.assertEqual(run.call_args.kwargs["api_key"], "")
+        self.assertEqual(self.hardware_discovery_calls, 0)
         self.assertNotEqual(
             run.call_args.kwargs["model_name"], "attacker/model"
         )
