@@ -46,6 +46,12 @@ class TailscaleFunnelWatchdogContractTests(unittest.TestCase):
         self.assertIn("WaitForExit", text)
         self.assertIn("Stop-Process -Id $process.Id -Force", text)
 
+    def test_public_health_has_windows_tls_fallback(self):
+        text = self.source.read_text(encoding="utf-8-sig")
+        self.assertIn("curl.exe", text)
+        self.assertIn("--fail", text)
+        self.assertIn("--max-time", text)
+
     def test_helper_build_updates_watchdog_in_existing_delivery(self):
         build = Path(__file__).with_name("build_local_capture_helper.ps1")
         text = build.read_text(encoding="utf-8-sig")

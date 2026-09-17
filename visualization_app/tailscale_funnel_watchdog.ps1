@@ -138,6 +138,13 @@ function Test-PublicFunnel([string]$PublicUrl) {
             $response = Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 12
             if ($response.StatusCode -eq 200) { return $true }
         } catch {
+            # Windows PowerShell may fail Schannel renegotiation used by Funnel;
+            # curl.exe is the TLS-compatible fallback on supported Windows.
+            $curl = Get-Command "curl.exe" -ErrorAction SilentlyContinue
+            if ($curl) {
+                & $curl.Source --fail --silent --show-error --max-time 12 $healthUrl | Out-Null
+                if ($LASTEXITCODE -eq 0) { return $true }
+            }
             if ($attempt -lt 3) { Start-Sleep -Seconds 2 }
         }
     }
