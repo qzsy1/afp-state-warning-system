@@ -53,6 +53,8 @@ from acquisition import (
     select_simulation_source,
 )
 from mysql_storage import MySQLCaptureStore, mysql_settings_from_mapping
+from server_target_mysql import ServerTargetProfiles
+from server_capture_journal import ServerCaptureJournal, TargetMySQLSaveCoordinator
 from remote_mysql_setup import classify_mysql_error
 from online_health_features import OnlineWindowFeatureEngine
 from causal_online_runtime import CausalOnlineConsistency
@@ -90,6 +92,7 @@ from websocket_live import (
     VersionedPayloadCache,
     encode_json_frame,
     encode_server_frame,
+    synchronized_json_sender,
     recv_client_frame,
     websocket_handshake_headers,
 )
@@ -177,6 +180,27 @@ def decorate_server_mysql_result(result: dict) -> dict:
     payload.setdefault("scope", "server_target")
     payload.setdefault("execution_host", "server")
     return payload
+
+
+def helper_real_capture_payload(payload: dict) -> dict:
+    """Remove server-target credentials before forwarding a real capture to helper."""
+    clean = dict(payload or {})
+    for key in (
+        "mysql_host", "mysql_port", "mysql_user", "mysql_password",
+        "mysql_database", "mysql_target_config_id",
+        "simulation_mysql_host", "simulation_mysql_port", "simulation_mysql_user",
+        "simulation_mysql_password", "simulation_mysql_database",
+    ):
+        clean.pop(key, None)
+    clean["mysql_enabled"] = False
+    return clean
+
+
+def authorized_target_selection(identity: RequestIdentity, profiles: ServerTargetProfiles, payload: dict):
+    """Resolve a remote target profile once, without making the browser own its password."""
+    if identity.role in REAL_ACCESS_ROLES and identity.role != "local_admin":
+        return profiles.for_request(str(identity.session_id or ""), payload)
+    return None
 APP_VERSION = "1.12.0"
 BUILD_ID = "20260823-schema-contract-fix"
 EXECUTABLE_DIR = (
@@ -4209,6 +4233,51 @@ class AppHandler(BaseHTTPRequestHandler):
             requested_mode=requested_mode,
         )
 
+    def _target_status(self, session_id: str, status: dict[str, Any]) -> dict[str, Any]:
+        """Attach only public server-target progress to helper-backed status."""
+        value = dict(status or {})
+        capture_uuid = str(value.get("capture_uuid") or "")
+        if capture_uuid:
+            target = self.target_capture_journal.capture_status(session_id, capture_uuid)
+            if target is not None:
+                value["server_target"] = target
+        return value
+
+    def _schedule_target_save(self, session_id: str, capture_uuid: str) -> None:
+        state = self.target_capture_journal.capture_status(session_id, capture_uuid)
+        if not state or state.get("state") not in {"ready", "failed"}:
+            return
+        threading.Thread(
+            target=self.target_saver.save_now,
+            args=(session_id, capture_uuid),
+            name="AFP-server-target-save",
+            daemon=True,
+        ).start()
+
+    def _ingest_helper_sample(self, session_id: str, batch: dict[str, Any]) -> dict[str, Any]:
+        capture_uuid = str(batch.get("capture_uuid") or "") if isinstance(batch, dict) else ""
+        if self.target_capture_journal.manages(session_id, capture_uuid):
+            accepted = self.target_capture_journal.ingest(
+                session_id, batch if isinstance(batch, dict) else {},
+                self.dashboard.remote_acquisitions,
+            )
+            if accepted.get("ok"):
+                self._schedule_target_save(session_id, capture_uuid)
+            return accepted
+        return self.dashboard.remote_acquisitions.ingest(
+            session_id, batch if isinstance(batch, dict) else {}
+        )
+
+    def _accept_helper_result(
+        self, device_id: str, token: str, request_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        session_id = self.dashboard.helper_registry.authenticate(device_id, token)
+        if session_id is not None:
+            self.target_capture_journal.bind_start_result(session_id, request_id, payload)
+        return self.dashboard.helper_registry.accept_result(
+            device_id, token, request_id, payload
+        )
+
     def _diagnostic_context(
         self, hardware_result: dict[str, Any]
     ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -4389,10 +4458,15 @@ class AppHandler(BaseHTTPRequestHandler):
         query: dict[str, list[str]],
         acquisition: AcquisitionManager | None = None,
     ) -> dict:
-        acquisition = acquisition or self._request_acquisition(
-            self._one(query, "acquisition_mode", "")
+        requested_mode = self._one(query, "acquisition_mode", "")
+        public_simulation = (
+            self.path.split("?", 1)[0] in {"/api/simulation/live", "/api/simulation/ws"}
+            or (requested_mode == "simulation" and self._identity().role != "local_admin")
         )
-        return self.dashboard.live(
+        acquisition = acquisition or self._request_acquisition(
+            requested_mode
+        )
+        payload = self.dashboard.live(
             sensor_id=int(self._one(query, "sensor", "2")),
             history=int(self._one(query, "history", "240")),
             step=int(self._one(query, "step", "1")),
@@ -4435,6 +4509,11 @@ class AppHandler(BaseHTTPRequestHandler):
             ),
             acquisition=acquisition,
         )
+        if public_simulation and isinstance(payload.get("acquisition"), dict):
+            payload["acquisition"] = self.guest_manager.public_status(
+                self._identity().guest_id, payload["acquisition"]
+            )
+        return payload
 
     def _serve_live_websocket(self, query: dict[str, list[str]]) -> None:
         """Push live dashboard payloads over one RFC 6455 connection.
@@ -4556,8 +4635,7 @@ class AppHandler(BaseHTTPRequestHandler):
             self.protocol_version = previous_protocol
         self.close_connection = True
 
-        def sender(message: dict[str, Any]) -> None:
-            self.request.sendall(encode_json_frame(message))
+        sender = synchronized_json_sender(self.request)
 
         if not self.dashboard.helper_registry.attach(
             session_id, device_id, token, sender
@@ -4606,9 +4684,8 @@ class AppHandler(BaseHTTPRequestHandler):
                         sender({"type": "error", "error": "helper_authentication_failed"})
                         return
                 elif message_type == "result":
-                    accepted = self.dashboard.helper_registry.accept_result(
-                        device_id,
-                        token,
+                    accepted = self._accept_helper_result(
+                        device_id, token,
                         str(message.get("request_id") or ""),
                         message.get("payload")
                         if isinstance(message.get("payload"), dict)
@@ -4617,17 +4694,14 @@ class AppHandler(BaseHTTPRequestHandler):
                     sender({"type": "result_ack", **accepted})
                 elif message_type == "sample_batch":
                     batch = message.get("batch")
-                    accepted = self.dashboard.remote_acquisitions.ingest(
-                        session_id,
-                        batch if isinstance(batch, dict) else {},
-                    )
+                    accepted = self._ingest_helper_sample(session_id, batch if isinstance(batch, dict) else {})
                     sender({"type": "sample_ack", **accepted})
                 else:
                     sender({"type": "error", "error": "helper消息类型不受支持"})
         except (BrokenPipeError, ConnectionResetError, ConnectionError, OSError, TimeoutError, ValueError):
             return
         finally:
-            self.dashboard.helper_registry.detach(session_id)
+            self.dashboard.helper_registry.detach(session_id, sender=sender)
 
     def do_GET(self) -> None:  # noqa: N802
         if not self._is_allowed_host():
@@ -4818,8 +4892,12 @@ class AppHandler(BaseHTTPRequestHandler):
                 # Real acquisition for remote operators belongs to the paired
                 # visitor helper.  Never seed its panel with server hardware
                 # or a server-local save folder while the helper reconnects.
+                # Static sensor roles/defaults do not probe server hardware;
+                # keep them so the browser does not fall back to custom JSON.
                 bootstrap = deepcopy(bootstrap)
                 acquisition = bootstrap.get("acquisition") or {}
+                acquisition["interface_defaults"] = default_capture_interfaces()
+                acquisition["sensor_types"] = sensor_interface_profiles()
                 acquisition["interface_discovery"] = {"physical_interfaces": []}
                 acquisition["default_save_root"] = ""
                 bootstrap["acquisition"] = acquisition
@@ -4879,11 +4957,15 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/acquisition/status":
             query = parse_qs(parsed.query)
-            self._send_json(
-                self._request_acquisition(
-                    self._one(query, "acquisition_mode", "")
-                ).status()
-            )
+            requested_mode = self._one(query, "acquisition_mode", "")
+            identity = self._identity()
+            if requested_mode == "simulation" and identity.role != "local_admin":
+                self._send_json(self.guest_manager.status(identity.guest_id))
+            else:
+                status = self._request_acquisition(requested_mode).status()
+                if identity.role in REAL_ACCESS_ROLES and identity.role != "local_admin":
+                    status = self._target_status(str(identity.session_id or ""), status)
+                self._send_json(status)
             return
         if parsed.path == "/api/acquisition/save-status":
             query = parse_qs(parsed.query)
@@ -5048,14 +5130,12 @@ class AppHandler(BaseHTTPRequestHandler):
                         result = {"ok": False, "error": "helper_authentication_failed"}
                     else:
                         batch = payload.get("batch")
-                        result = self.dashboard.remote_acquisitions.ingest(
-                            session_id,
-                            batch if isinstance(batch, dict) else {},
+                        result = self._ingest_helper_sample(
+                            session_id, batch if isinstance(batch, dict) else {}
                         )
                 else:
-                    result = self.dashboard.helper_registry.accept_result(
-                        device_id,
-                        token,
+                    result = self._accept_helper_result(
+                        device_id, token,
                         str(payload.get("request_id") or ""),
                         payload.get("payload") if isinstance(payload.get("payload"), dict) else {},
                     )
@@ -5200,7 +5280,15 @@ class AppHandler(BaseHTTPRequestHandler):
                 "/api/training/start",
                 "/api/training/stop",
             }
-            if parsed.path in controlled_paths and not self._require_real_control():
+            simulation_session_control = (
+                parsed.path in {"/api/acquisition/start", "/api/acquisition/stop"}
+                and str(payload.get("acquisition_mode") or "").lower() == "simulation"
+            )
+            if (
+                parsed.path in controlled_paths
+                and not simulation_session_control
+                and not self._require_real_control()
+            ):
                 return
             replay_key = self._replay_key(parsed.path)
             replayed = self._replay_get(replay_key)
@@ -5477,7 +5565,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     and identity.role != "local_admin"
                 )
                 if remote_simulation:
-                    config = self.guest_manager.safe_config(identity.guest_id, payload)
+                    config = self.guest_manager.safe_config(identity.guest_id, payload, authorized=True)
                     model_validation = self.dashboard.validate_prediction_setup(
                         config, load_model=False
                     )
@@ -5547,7 +5635,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._send_json({"selected": bool(selected), "path": selected})
                 return
             if parsed.path == "/api/mysql/test":
-                settings = mysql_settings_from_mapping(payload)
+                identity = self._identity()
+                selection = authorized_target_selection(identity, self.target_profiles, payload)
+                settings = selection.settings if selection else mysql_settings_from_mapping(payload)
                 store = MySQLCaptureStore(settings)
                 result = (
                     mysql_test_existing_database(store)
@@ -5555,6 +5645,8 @@ class AppHandler(BaseHTTPRequestHandler):
                     else store.test_connection()
                 )
                 result = decorate_server_mysql_result(result)
+                if selection is not None:
+                    result.update(selection.public())
                 if not result.get("ok"):
                     result["error_detail"] = classify_mysql_error(result.get("error"))
                 self._send_json(result)
@@ -5571,46 +5663,110 @@ class AppHandler(BaseHTTPRequestHandler):
                 if not session_id:
                     self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
                     return
+                command_name = str(payload.get("command") or "").strip().lower()
+                command_payload = (
+                    payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+                )
+                if command_name == "start_capture":
+                    if str(command_payload.get("acquisition_mode") or "real").lower() != "real":
+                        self._send_json({"ok": False, "error": "helper_only_supports_real_capture"})
+                        return
+                    target_enabled = mysql_settings_from_mapping(command_payload).enabled
+                    if target_enabled:
+                        selection = self.target_profiles.for_request(session_id, command_payload)
+                        helper_payload = helper_real_capture_payload(command_payload)
+                        result = self.dashboard.helper_registry.command(
+                            session_id, command_name, helper_payload
+                        )
+                        if result.get("ok") and result.get("request_id"):
+                            self.target_capture_journal.arm_start(
+                                session_id, str(result["request_id"]), selection.config_id,
+                                config=helper_payload, target=selection.public(),
+                            )
+                        self._send_json(result)
+                        return
+                    self.target_capture_journal.disarm(session_id)
+                    command_payload = helper_real_capture_payload(command_payload)
                 self._send_json(
-                    self.dashboard.helper_registry.command(
-                        session_id,
-                        str(payload.get("command") or ""),
-                        payload.get("payload")
-                        if isinstance(payload.get("payload"), dict)
-                        else {},
-                    )
+                    self.dashboard.helper_registry.command(session_id, command_name, command_payload)
                 )
                 return
             if parsed.path == "/api/mysql/preflight":
-                settings = mysql_settings_from_mapping(payload)
+                identity = self._identity()
+                selection = authorized_target_selection(identity, self.target_profiles, payload)
+                settings = selection.settings if selection else mysql_settings_from_mapping(payload)
                 result = MySQLCaptureStore(settings).preflight(
                     require_schema=bool(payload.get("require_schema", True)),
                     write_test=bool(payload.get("write_test", False)),
                 )
-                self._send_json(decorate_server_mysql_result(result))
+                result = decorate_server_mysql_result(result)
+                if selection is not None:
+                    result.update(selection.public())
+                self._send_json(result)
+                return
+            if parsed.path == "/api/mysql/target/retry":
+                identity = self._identity()
+                session_id = str(identity.session_id or "")
+                capture_uuid = str(payload.get("capture_uuid") or "").strip()
+                if identity.role not in {"authorized", "lan_operator"} or not session_id:
+                    self._send_json(
+                        {"ok": False, "error": "目标 MySQL 重试仅适用于已配对的本机辅助采集会话"},
+                        HTTPStatus.FORBIDDEN,
+                    )
+                    return
+                state = self.target_capture_journal.capture_status(session_id, capture_uuid)
+                if state is None:
+                    self._send_json(
+                        {"ok": False, "error": "未找到本会话可重试的目标 MySQL 采集记录"},
+                        HTTPStatus.NOT_FOUND,
+                    )
+                    return
+                if state.get("state") not in {"ready", "failed"}:
+                    self._send_json(
+                        {"ok": False, "error": "目标 MySQL 当前不可重试", "server_target": state},
+                        HTTPStatus.CONFLICT,
+                    )
+                    return
+                self._schedule_target_save(session_id, capture_uuid)
+                self._send_json(
+                    {
+                        "ok": True,
+                        "server_target": self.target_capture_journal.capture_status(
+                            session_id, capture_uuid
+                        ),
+                    }
+                )
                 return
             if parsed.path == "/api/mysql/relation-map":
-                settings = mysql_settings_from_mapping(payload)
+                selection = authorized_target_selection(self._identity(), self.target_profiles, payload)
+                settings = selection.settings if selection else mysql_settings_from_mapping(payload)
                 result = MySQLCaptureStore(settings).relation_map(
                     int(payload.get("limit", 1000)),
                     auto_initialize=True,
                 )
                 result = decorate_server_mysql_result(result)
+                if selection is not None:
+                    result.update(selection.public())
                 if not result.get("ok"):
                     result["error_detail"] = classify_mysql_error(result.get("error"))
                 self._send_json(result)
                 return
             if parsed.path == "/api/mysql/query":
-                settings = mysql_settings_from_mapping(payload)
+                selection = authorized_target_selection(self._identity(), self.target_profiles, payload)
+                settings = selection.settings if selection else mysql_settings_from_mapping(payload)
                 result = mysql_read_only_rows(
                     MySQLCaptureStore(settings),
                     str(payload.get("query", "")),
                     max(1, min(int(payload.get("limit", MYSQL_PREVIEW_LIMIT)), 1000)),
                 )
+                result = decorate_server_mysql_result(result)
+                if selection is not None:
+                    result.update(selection.public())
                 self._send_json(result)
                 return
             if parsed.path == "/api/mysql/export-csv":
-                settings = mysql_settings_from_mapping(payload)
+                selection = authorized_target_selection(self._identity(), self.target_profiles, payload)
+                settings = selection.settings if selection else mysql_settings_from_mapping(payload)
                 result = mysql_read_only_rows(
                     MySQLCaptureStore(settings),
                     str(payload.get("query", "")),
@@ -5723,11 +5879,16 @@ class AppHandler(BaseHTTPRequestHandler):
                     and identity.role != "local_admin"
                 )
                 if remote_simulation:
+                    if bool(payload.get("mysql_enabled")) and identity.role in REAL_ACCESS_ROLES:
+                        selection = self.target_profiles.for_request(
+                            str(identity.session_id or ""), payload
+                        )
+                        payload = {**payload, "mysql_password": selection.settings.password}
                     config = self.guest_manager.safe_config(identity.guest_id, payload)
                     model_validation = self.dashboard.validate_prediction_setup(
                         config, load_model=True
                     )
-                    result = self.guest_manager.start(identity.guest_id, payload)
+                    result = self.guest_manager.start(identity.guest_id, payload, authorized=True)
                     result["prediction_model"] = model_validation
                     self._replay_put(replay_key, HTTPStatus.OK, result)
                     self._send_json(result)
@@ -5821,6 +5982,12 @@ def create_server(
     )
     active_dashboard.helper_registry = helper_registry
     active_dashboard.remote_acquisitions = RemoteAcquisitionRegistry()
+    target_profiles = ServerTargetProfiles(local_mysql_profile)
+    target_capture_journal = ServerCaptureJournal(
+        runtime_root / "server_target_capture_journal.sqlite3"
+    )
+    target_saver = TargetMySQLSaveCoordinator(target_capture_journal, target_profiles)
+    active_dashboard.target_capture_journal = target_capture_journal
     replay_cache: dict[str, tuple[int, dict]] = {}
     replay_lock = threading.Lock()
     model_limiter = SlidingWindowLimiter()
@@ -5839,6 +6006,9 @@ def create_server(
             "model_limiter": model_limiter,
             "model_call_lock": model_call_lock,
             "diagnosis_jobs": diagnosis_jobs,
+            "target_profiles": target_profiles,
+            "target_capture_journal": target_capture_journal,
+            "target_saver": target_saver,
             "access_context": str(access_context),
             "public_web_config": dict(public_web_config or {}),
             "login_limiter": SlidingWindowLimiter(),
@@ -5856,6 +6026,7 @@ def create_server(
     server.access_context = handler.access_context
     server.public_web_config = dict(public_web_config or {})
     server.diagnosis_jobs = diagnosis_jobs
+    server.target_capture_journal = target_capture_journal
     return server
 
 

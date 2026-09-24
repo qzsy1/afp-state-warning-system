@@ -1,5 +1,6 @@
 import unittest
 import sys
+import json
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -49,6 +50,17 @@ class WebSocketLiveProtocolTests(unittest.TestCase):
         frame = encode_server_frame(payload)
         self.assertEqual(frame[:4], b"\x81\x7e\x00\x7e")
         self.assertEqual(frame[4:].decode("utf-8"), payload)
+
+    def test_live_frame_replaces_nonfinite_prediction_values_like_http(self):
+        from websocket_live import encode_json_frame
+
+        frame = encode_json_frame({"type": "live", "prediction": {"score": float("nan"), "upper": float("inf"), "lower": float("-inf")}})
+        self.assertEqual(frame[0], 0x81)
+        size = frame[1] & 0x7F
+        self.assertEqual(
+            json.loads(frame[2:2 + size].decode("utf-8")),
+            {"type": "live", "prediction": {"score": None, "upper": None, "lower": None}},
+        )
 
 
 if __name__ == "__main__":

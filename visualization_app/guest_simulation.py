@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from acquisition import AcquisitionConfig, AcquisitionManager
+from acquisition import AcquisitionConfig, AcquisitionManager, default_capture_interfaces
 
 
 DEFAULT_PER_SESSION_BYTES = 256 * 1024 * 1024
@@ -425,7 +425,9 @@ class GuestSimulationManager:
         config = self.safe_config(session_id, payload)
         return session.acquisition.read_process_parameters(config)
 
-    def safe_config(self, session_id: str, payload: dict[str, Any]) -> AcquisitionConfig:
+    def safe_config(
+        self, session_id: str, payload: dict[str, Any], *, authorized: bool = False
+    ) -> AcquisitionConfig:
         session = self.ensure_session(session_id)
         requested_source_id = str(payload.get("simulation_source_id") or "").strip()
         if requested_source_id:
@@ -450,22 +452,49 @@ class GuestSimulationManager:
             if key in self._SAFE_CONFIG_FIELDS
         }
         source_path = str(profile.get("path") or "").strip()
+        if authorized and bool(payload.get("mysql_local_enabled")):
+            raise GuestSimulationError(
+                "simulation_helper_local_mysql_unsupported",
+                "远程模拟数据在服务器回放，当前不能写入访问电脑本机 MySQL；请取消本机 MySQL，改用服务器/目标 MySQL 或 CSV 保存",
+            )
+        # A simulation file is one data source, not one sensor protocol.  Keep
+        # the five original logical interfaces for routing and display while
+        # AcquisitionConfig's simulation driver reads only the approved file.
+        interfaces = default_capture_interfaces() if authorized else [{
+            "id": "guest_simulator", "enabled": True, "role": "custom",
+            "driver": "simulator", "endpoint": source_path, "channel_map": {},
+        }]
+        assignments: dict[str, list[str]] = {}
+        if authorized:
+            requested = payload.get("interfaces")
+            if isinstance(requested, list) and requested:
+                if len(requested) > 16:
+                    raise GuestSimulationError("too_many_interfaces", "接口数量超过上限")
+                allowed_keys = {
+                    "id", "enabled", "role", "driver", "endpoint", "baudrate",
+                    "channel_map", "register_map", "slave_id", "channel_types",
+                }
+                interfaces = [
+                    {key: value for key, value in item.items() if key in allowed_keys}
+                    for item in requested if isinstance(item, dict)
+                ]
+                if not interfaces or len({str(item.get("id")) for item in interfaces}) != len(interfaces):
+                    raise GuestSimulationError("invalid_interfaces", "模拟接口编号缺失或重复")
+            raw_assignments = payload.get("interface_channel_assignments")
+            if isinstance(raw_assignments, dict):
+                known_ids = {item["id"] for item in interfaces}
+                assignments = {
+                    str(key): [str(name) for name in names]
+                    for key, names in raw_assignments.items()
+                    if key in known_ids and isinstance(names, list)
+                }
         values.update(
             {
                 "acquisition_mode": "simulation",
                 "driver": "simulator",
                 "endpoint": source_path,
-                "interfaces": [
-                    {
-                        "id": "guest_simulator",
-                        "enabled": True,
-                        "role": "custom",
-                        "driver": "simulator",
-                        "endpoint": source_path,
-                        "channel_map": {},
-                    }
-                ],
-                "interface_channel_assignments": {},
+                "interfaces": interfaces,
+                "interface_channel_assignments": assignments,
                 "save_root": str(session.save_root),
                 "source_file": source_path,
                 "simulation_source_type": source_type,
@@ -478,9 +507,13 @@ class GuestSimulationManager:
                 "simulation_mysql_database": str(
                     profile.get("database") or "afp_state_warning"
                 ),
-                "mysql_enabled": False,
+                "mysql_enabled": authorized and bool(payload.get("mysql_enabled")),
+                "mysql_host": str(payload.get("mysql_host") or "127.0.0.1") if authorized else "127.0.0.1",
+                "mysql_port": (payload.get("mysql_port") or 3306) if authorized else 3306,
+                "mysql_user": str(payload.get("mysql_user") or "root") if authorized else "root",
+                "mysql_password": str(payload.get("mysql_password") or "") if authorized else "",
+                "mysql_database": str(payload.get("mysql_database") or "afp_state_warning") if authorized else "afp_state_warning",
                 "mysql_local_enabled": False,
-                "mysql_password": "",
                 "mysql_local_password": "",
             }
         )
@@ -492,7 +525,9 @@ class GuestSimulationManager:
             for session in self._sessions.values()
         )
 
-    def start(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def start(
+        self, session_id: str, payload: dict[str, Any], *, authorized: bool = False
+    ) -> dict[str, Any]:
         session = self.ensure_session(session_id)
         with self._lock:
             self._assert_quota(session)
@@ -503,7 +538,7 @@ class GuestSimulationManager:
                 raise GuestSimulationError(
                     "guest_capacity_reached", "公共模拟任务数量已达到上限"
                 )
-            config = self.safe_config(session_id, payload)
+            config = self.safe_config(session_id, payload, authorized=authorized)
             result = session.acquisition.start(config)
             session.last_access_at = time.time()
             return self._public_status(session, result)
@@ -523,6 +558,14 @@ class GuestSimulationManager:
         session = self.ensure_session(session_id)
         session.last_access_at = time.time()
         return self._public_status(session, session.acquisition.status())
+
+    def public_status(
+        self, session_id: str, status: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Project an already sampled acquisition status into its public scope."""
+        session = self.ensure_session(session_id)
+        session.last_access_at = time.time()
+        return self._public_status(session, status)
 
     @staticmethod
     def _public_status(

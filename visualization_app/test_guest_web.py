@@ -6,6 +6,7 @@ import io
 import json
 import base64
 import tempfile
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -179,6 +180,101 @@ class GuestSimulationTests(unittest.TestCase):
         self.assertEqual(config.simulation_source_type, "single_csv")
         self.assertEqual(config.simulation_mysql_password, "")
         self.assertFalse(config.mysql_enabled)
+
+    def test_authorized_simulation_preserves_five_sensor_protocols_and_target_mysql(self):
+        from acquisition import SimulatorDriver, build_driver, default_capture_interfaces
+
+        manager = self._manager()
+        interfaces = default_capture_interfaces()
+        config = manager.safe_config(
+            "a" * 32,
+            {
+                "dataset_schema": "new_collection_v11_3",
+                "selected_sensors": ["温度1", "压力", "ROI平均温度", "ABB_X", "薄膜压力"],
+                "interfaces": interfaces,
+                "interface_channel_assignments": {
+                    "thermocouple_8ch": ["温度1"],
+                    "plc_process": ["压力"],
+                    "uvc_temperature": ["ROI平均温度"],
+                    "abb_motion": ["ABB_X"],
+                    "m3232_pressure": ["薄膜压力"],
+                },
+                "mysql_enabled": True,
+                "mysql_host": "192.0.2.10",
+                "mysql_user": "afp_app",
+                "mysql_password": "test-secret",
+            },
+            authorized=True,
+        )
+
+        self.assertEqual(config.acquisition_mode, "simulation")
+        self.assertEqual(
+            [(item["role"], item["driver"]) for item in config.interfaces],
+            [(item["role"], item["driver"]) for item in interfaces],
+        )
+        self.assertEqual(len(config.interface_channel_assignments), 5)
+        self.assertTrue(config.mysql_enabled)
+        self.assertEqual(config.mysql_host, "192.0.2.10")
+        self.assertEqual(config.mysql_password, "test-secret")
+        self.assertIsInstance(build_driver(config), SimulatorDriver)
+
+    def test_authorized_simulation_rejects_helper_local_mysql_before_start(self):
+        manager = self._manager()
+        with self.assertRaises(self._module().GuestSimulationError) as raised:
+            manager.safe_config("a" * 32, {"mysql_local_enabled": True}, authorized=True)
+        self.assertEqual(raised.exception.code, "simulation_helper_local_mysql_unsupported")
+
+    def test_authorized_simulation_retains_additional_custom_sensor_card(self):
+        from acquisition import default_capture_interfaces
+
+        manager = self._manager()
+        custom = {
+            "id": "custom_aux", "enabled": False, "role": "custom",
+            "driver": "serial_json", "endpoint": "COM9", "channel_map": {},
+            "physical_interface_id": "serial:COM9",
+        }
+        config = manager.safe_config(
+            "a" * 32,
+            {"interfaces": [*default_capture_interfaces(), custom], "selected_sensors": ["温度", "压力"]},
+            authorized=True,
+        )
+
+        self.assertEqual(len(config.interfaces), 6)
+        self.assertEqual(config.interfaces[-1]["id"], "custom_aux")
+        self.assertFalse(config.interfaces[-1]["enabled"])
+        self.assertEqual(config.interfaces[-1]["physical_interface_id"], "")
+
+    def test_authorized_simulation_stop_writes_preflighted_target_mysql(self):
+        manager = self._manager()
+        session_id = "a" * 32
+        with patch("acquisition.MySQLCaptureStore") as store_type:
+            store = store_type.return_value
+            store.save_layer.side_effect = lambda _config, **kwargs: {
+                "ok": True, "saved_rows": len(kwargs["rows"]),
+            }
+            manager.start(
+                session_id,
+                {
+                    "processing_mode": "capture_only",
+                    "selected_sensors": ["温度", "压力"],
+                    "sample_rate_hz": 50,
+                    "mysql_enabled": True,
+                    "mysql_host": "192.0.2.10",
+                    "mysql_user": "afp_app",
+                    "mysql_password": "test-secret",
+                },
+                authorized=True,
+            )
+            time.sleep(0.15)
+            stopped = manager.stop(session_id)
+
+        self.assertFalse(stopped["running"])
+        self.assertTrue(stopped["capture_saved"])
+        self.assertTrue(stopped["mysql"]["enabled"])
+        self.assertTrue(stopped["mysql"]["ok"])
+        self.assertGreater(stopped["mysql"]["saved_rows"], 0)
+        self.assertTrue(store.save_layer.called)
+        self.assertNotIn("test-secret", json.dumps(stopped, ensure_ascii=False))
 
     def test_public_simulation_status_never_exposes_server_absolute_paths(self):
         """A remote start/status/stop response must contain only public scopes."""

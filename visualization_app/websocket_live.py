@@ -12,7 +12,10 @@ import base64
 import hashlib
 import json
 import socket
+import threading
 from typing import Any
+
+from json_safety import json_safe_value
 
 
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -70,12 +73,25 @@ def encode_json_frame(payload: dict[str, Any]) -> bytes:
     """Serialize a dashboard payload as one compact WebSocket text frame."""
     return encode_server_frame(
         json.dumps(
-            payload,
+            json_safe_value(payload),
             ensure_ascii=False,
             separators=(",", ":"),
             allow_nan=False,
         )
     )
+
+
+def synchronized_json_sender(connection: socket.socket):
+    """Return a sender that cannot interleave frames across handler threads."""
+
+    lock = threading.Lock()
+
+    def send(payload: dict[str, Any]) -> None:
+        frame = encode_json_frame(payload)
+        with lock:
+            connection.sendall(frame)
+
+    return send
 
 
 def decode_client_frame(frame: bytes) -> tuple[int, bytes]:

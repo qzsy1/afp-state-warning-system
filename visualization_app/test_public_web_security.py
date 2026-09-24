@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -401,6 +402,7 @@ class PublicWebHttpTests(unittest.TestCase):
 
         dashboard = SimpleNamespace(
             acquisition=FakeAcquisition(),
+            live=lambda **kwargs: {"acquisition": kwargs["acquisition"].status()},
             validate_prediction_setup=lambda config, load_model=False: {},
             bootstrap=lambda **kwargs: {
                 "manifest": {
@@ -446,6 +448,35 @@ class PublicWebHttpTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=2)
         self.temp.cleanup()
+
+    def test_authorized_target_preflight_uses_matching_server_secret_but_does_not_return_it(self):
+        self.request_json("GET", "/api/auth/session")
+        login, _, _ = self.request_json(
+            "POST", "/api/auth/login", {"password": "Correct-Horse-2026"},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        self.assertEqual(login, 200)
+        self.server.RequestHandlerClass.target_profiles._profile_loader = lambda: {
+            "target": {"host": "db.test", "port": 3306, "user": "afp_app",
+                       "database": "afp", "password": "only-on-server"}
+        }
+        seen = []
+
+        def verify(store):
+            seen.append(store.settings.password)
+            return {"ok": store.settings.password == "only-on-server", "database": "afp"}
+
+        with patch("app.mysql_test_existing_database", side_effect=verify):
+            status, result, _ = self.request_json("POST", "/api/mysql/test", {
+                "mysql_enabled": True, "mysql_host": "db.test", "mysql_port": 3306,
+                "mysql_user": "afp_app", "mysql_database": "afp",
+                "mysql_password": "", "read_only": True,
+            })
+        self.assertEqual(status, 200)
+        self.assertTrue(result["ok"])
+        self.assertEqual(seen, ["only-on-server"])
+        self.assertTrue(result["config_id"])
+        self.assertNotIn("only-on-server", json.dumps(result))
 
     def request_json(
         self,
@@ -553,6 +584,142 @@ class PublicWebHttpTests(unittest.TestCase):
         self.assertTrue(remote_status["remote_source"])
         self.assertTrue(remote_status["first_sample_received"])
         self.assertEqual(remote_status["capture_uuid"], "capture-a")
+
+    def test_real_helper_target_mysql_is_server_only_and_finalizes_after_last_batch(self):
+        self.request_json("GET", "/api/auth/session")
+        login, _, _ = self.request_json(
+            "POST", "/api/auth/login", {"password": "Correct-Horse-2026"},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        self.assertEqual(login, 200)
+        _, challenge, _ = self.request_json("POST", "/api/helper/pair/start", {})
+        _, paired, _ = self.request_json("POST", "/api/helper/pair/complete", {
+            "challenge": challenge["challenge"], "device_id": "visitor-pc",
+            "capabilities": {"real_capture": True},
+        })
+        handler = self.server.RequestHandlerClass
+        handler.target_profiles._profile_loader = lambda: {"target": {
+            "host": "db.test", "port": 3306, "user": "afp_app",
+            "database": "afp", "password": "server-only-secret",
+        }}
+        saved = []
+
+        class Store:
+            def __init__(self, settings):
+                self.settings = settings
+
+            def save_layer(self, _config, **kwargs):
+                saved.append((self.settings.password, list(kwargs["rows"])))
+                return {"ok": True, "saved_rows": len(saved[-1][1]), "database": "afp"}
+
+        handler.target_saver.store_factory = Store
+        start_payload = {
+            "processing_mode": "capture_only", "acquisition_mode": "real",
+            "dataset_schema": "new_collection_v11_3", "driver": "m3232_pressure",
+            "endpoint": "COM4", "selected_sensors": ["薄膜压力"],
+            "interfaces": [{"id": "m3232_pressure", "role": "pressure", "enabled": True,
+                            "driver": "m3232_pressure", "endpoint": "COM4", "channel_map": {}}],
+            "interface_channel_assignments": {"m3232_pressure": ["薄膜压力"]},
+            "specimen_id": "specimen-a", "mysql_enabled": True,
+            "mysql_host": "db.test", "mysql_port": 3306, "mysql_user": "afp_app",
+            "mysql_database": "afp", "mysql_password": "",
+        }
+        _, command, _ = self.request_json("POST", "/api/helper/command", {
+            "command": "start_capture", "payload": start_payload,
+        })
+        self.assertTrue(command["ok"])
+        _, polled, _ = self.request_json("POST", "/api/helper/poll", {"device_id": "visitor-pc"},
+                                         headers={"Authorization": f"Bearer {paired['pairing_token']}"}, csrf=False)
+        self.assertNotIn("server-only-secret", json.dumps(polled))
+        self.assertFalse(polled["command"]["payload"]["mysql_enabled"])
+        request_id = polled["command"]["request_id"]
+        self.request_json("POST", "/api/helper/result", {
+            "device_id": "visitor-pc", "request_id": request_id,
+            "payload": {"running": True, "capture_uuid": "capture-target-a"},
+        }, headers={"Authorization": f"Bearer {paired['pairing_token']}"}, csrf=False)
+        _, accepted, _ = self.request_json("POST", "/api/helper/samples", {
+            "device_id": "visitor-pc", "batch": {
+                "capture_uuid": "capture-target-a", "sequence": 0,
+                "rows": [{"薄膜压力": 10.0}], "timestamps": [10.0],
+                "status": {"running": False, "finalization_complete": True, "sample_count": 1},
+            },
+        }, headers={"Authorization": f"Bearer {paired['pairing_token']}"}, csrf=False)
+        self.assertTrue(accepted["ok"])
+        for _ in range(20):
+            if saved:
+                break
+            time.sleep(0.05)
+        status_code, status, _ = self.request_json("GET", "/api/acquisition/status")
+        self.assertEqual(status_code, 200)
+        self.assertEqual(saved, [("server-only-secret", [{"薄膜压力": 10.0, "timestamp_unix": 10.0}])], status)
+        self.assertEqual(status["server_target"]["state"], "saved")
+        self.assertNotIn("server-only-secret", json.dumps(status))
+
+    def test_authorized_session_can_retry_only_its_failed_server_target_capture(self):
+        self.request_json("GET", "/api/auth/session")
+        login, _, _ = self.request_json(
+            "POST", "/api/auth/login", {"password": "Correct-Horse-2026"},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        self.assertEqual(login, 200)
+        handler = self.server.RequestHandlerClass
+        handler.target_profiles._profile_loader = lambda: {"target": {
+            "host": "db.test", "port": 3306, "user": "afp_app",
+            "database": "afp", "password": "server-only-secret",
+        }}
+        session = self.server.security_store.resolve_session(self.cookies["afp_session"])
+        self.assertIsNotNone(session)
+        selection = handler.target_profiles.resolve(session.session_id, {
+            "mysql_enabled": True, "mysql_host": "db.test", "mysql_port": 3306,
+            "mysql_user": "afp_app", "mysql_database": "afp", "mysql_password": "",
+        })
+        handler.target_capture_journal.arm(
+            session.session_id, selection.config_id,
+            config={"dataset_schema": "new_collection_v11_3", "driver": "simulator",
+                    "processing_mode": "capture_only", "selected_sensors": ["温度"],
+                    "specimen_id": "retry-specimen"},
+            target=selection.public(),
+        )
+        capture_uuid = "retry-capture"
+        accepted = handler.target_capture_journal.ingest(session.session_id, {
+            "capture_uuid": capture_uuid, "sequence": 0,
+            "rows": [{"温度": 10.0}], "timestamps": [10.0],
+            "status": {"running": False, "finalization_complete": True, "sample_count": 1},
+        }, handler.dashboard.remote_acquisitions)
+        self.assertTrue(accepted["ok"], accepted)
+        calls = []
+
+        class Store:
+            def __init__(self, settings):
+                self.settings = settings
+
+            def save_layer(self, _config, **_kwargs):
+                calls.append(self.settings.password)
+                return {"ok": len(calls) > 1, "saved_rows": 1, "error": "temporary"}
+
+        handler.target_saver.store_factory = Store
+        self.assertFalse(handler.target_saver.save_now(session.session_id, capture_uuid)["ok"])
+        original_session_cookie = self.cookies["afp_session"]
+        other_token, _other_session = self.server.security_store.authenticate(
+            "Correct-Horse-2026", "test-agent", "other-client"
+        )
+        self.cookies["afp_session"] = other_token
+        foreign_status, foreign_payload, _ = self.request_json(
+            "POST", "/api/mysql/target/retry", {"capture_uuid": capture_uuid}
+        )
+        self.assertEqual(foreign_status, 404, foreign_payload)
+        self.cookies["afp_session"] = original_session_cookie
+        status, payload, _ = self.request_json(
+            "POST", "/api/mysql/target/retry", {"capture_uuid": capture_uuid}
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertNotIn("server-only-secret", json.dumps(payload))
+        for _ in range(20):
+            if handler.target_capture_journal.capture_status(session.session_id, capture_uuid)["state"] == "saved":
+                break
+            time.sleep(0.05)
+        self.assertEqual(handler.target_capture_journal.capture_status(session.session_id, capture_uuid)["state"], "saved")
+        self.assertEqual(calls, ["server-only-secret", "server-only-secret"])
 
     def test_loopback_login_and_forwarded_https_login_succeed(self):
         self.request_json("GET", "/api/auth/session")
@@ -670,6 +837,38 @@ class PublicWebHttpTests(unittest.TestCase):
         self.assertNotIn("C:\\private", encoded)
         self.assertEqual(payload["acquisition"]["default_save_root"], "")
 
+    def test_authorized_remote_bootstrap_keeps_sensor_catalog_without_server_discovery(self):
+        self.request_json("GET", "/api/auth/session")
+        login_status, _, _ = self.request_json(
+            "POST", "/api/auth/login", {"password": "Correct-Horse-2026"},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        self.assertEqual(login_status, 200)
+
+        status, payload, _ = self.request_json(
+            "GET", "/api/bootstrap", headers={"X-Forwarded-Proto": "https"}
+        )
+
+        self.assertEqual(status, 200)
+        acquisition = payload["acquisition"]
+        self.assertEqual(
+            {item["role"]: item["driver"] for item in acquisition.get("interface_defaults", [])},
+            {
+                "thermocouple": "smrf_hid",
+                "plc": "modbus_tcp",
+                "thermal_uvc": "uvc_thermal",
+                "robot": "abb_robot",
+                "pressure": "m3232_pressure",
+            },
+        )
+        self.assertTrue(
+            {"thermocouple", "plc", "thermal_uvc", "robot", "pressure"}.issubset(
+                {item["id"] for item in acquisition.get("sensor_types", [])}
+            )
+        )
+        self.assertEqual(acquisition["interface_discovery"], {"physical_interfaces": []})
+        self.assertEqual(self.hardware_discovery_calls, 0)
+
     def test_authorized_session_must_acquire_real_control_lease(self):
         self.request_json("GET", "/api/auth/session")
         self.request_json(
@@ -690,6 +889,37 @@ class PublicWebHttpTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertIsNotNone(payload["owner_id"])
+
+    def test_authorized_simulation_start_does_not_require_real_control_lease(self):
+        self.request_json("GET", "/api/auth/session")
+        login_status, _, _ = self.request_json(
+            "POST",
+            "/api/auth/login",
+            {"password": "Correct-Horse-2026"},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        self.assertEqual(login_status, 200)
+        self.assertIsNone(self.server.control_lease.status()["owner_id"])
+
+        guest_acquisition = self.server.guest_manager.ensure_session(
+            self.cookies["afp_guest"]
+        ).acquisition
+        with patch.object(
+            guest_acquisition,
+            "start",
+            return_value={"running": True},
+        ) as start:
+            status, result, _ = self.request_json(
+                "POST",
+                "/api/acquisition/start",
+                {"acquisition_mode": "simulation", "driver": "simulator"},
+                headers={"X-Forwarded-Proto": "https"},
+            )
+
+        self.assertEqual(status, 200, result)
+        self.assertTrue(result["running"])
+        self.assertEqual(start.call_count, 1)
+        self.assertEqual(self.hardware_start_calls, 0)
 
     def test_duplicate_real_start_request_is_replayed_without_second_hardware_call(self):
         self.request_json("GET", "/api/auth/session")
@@ -725,6 +955,97 @@ class PublicWebHttpTests(unittest.TestCase):
         self.assertEqual(second_status, 200)
         self.assertEqual(first, second)
         self.assertEqual(start.call_count, 1)
+
+    def test_authorized_simulation_stop_survives_real_control_lease_expiry(self):
+        self.request_json("GET", "/api/auth/session")
+        self.request_json(
+            "POST", "/api/auth/login", {"password": "Correct-Horse-2026"},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        self.request_json(
+            "POST", "/api/real/control/acquire", {},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        guest_id = self.cookies["afp_guest"]
+        self.server.guest_manager.start(
+            guest_id,
+            {"processing_mode": "capture_only", "selected_sensors": ["温度", "压力"]},
+        )
+        self.server.control_lease.release(self.server.control_lease.status()["owner_id"])
+
+        status, stopped, _ = self.request_json(
+            "POST", "/api/acquisition/stop", {"acquisition_mode": "simulation"},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(stopped["running"])
+        self.assertEqual(self.hardware_start_calls, 0)
+
+        real_status, real_result, _ = self.request_json(
+            "POST", "/api/acquisition/stop", {"acquisition_mode": "real"},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        self.assertEqual(real_status, 409)
+        self.assertEqual(real_result["error"], "real_control_required")
+
+    def test_remote_simulation_live_and_status_hide_server_paths(self):
+        self.request_json("GET", "/api/auth/session")
+        guest_id = self.cookies["afp_guest"]
+        self.server.guest_manager.start(
+            guest_id,
+            {"processing_mode": "capture_only", "selected_sensors": ["温度", "压力"]},
+        )
+        try:
+            session = self.server.guest_manager.ensure_session(guest_id)
+            private_status = {
+                "running": True,
+                "config": {
+                    "source_file": str(self.default_simulation_source),
+                    "save_root": str(session.save_root),
+                },
+                "files": [str(session.save_root / "capture.csv")],
+            }
+            with patch.object(session.acquisition, "status", return_value=private_status):
+                status_code, guest_live, _ = self.request_json("GET", "/api/simulation/live")
+                self.assertEqual(status_code, 200)
+                self.assertEqual(guest_live["acquisition"]["config"]["source_file"], "管理员批准的模拟数据源")
+                self.assertEqual(
+                    guest_live["acquisition"]["files"][0],
+                    f"public_simulation/{guest_id}/capture.csv",
+                )
+                guest_encoded = json.dumps(guest_live, ensure_ascii=False)
+                self.assertNotIn(str(self.default_simulation_source), guest_encoded)
+                self.assertNotIn(str(self.server.guest_manager.root), guest_encoded)
+
+                self.request_json(
+                    "POST", "/api/auth/login", {"password": "Correct-Horse-2026"},
+                    headers={"X-Forwarded-Proto": "https"},
+                )
+                status_code, authorized_status, _ = self.request_json(
+                    "GET", "/api/acquisition/status?acquisition_mode=simulation",
+                    headers={"X-Forwarded-Proto": "https"},
+                )
+                self.assertEqual(status_code, 200)
+                self.assertEqual(authorized_status["config"]["source_file"], "管理员批准的模拟数据源")
+                self.assertEqual(
+                    authorized_status["files"][0],
+                    f"public_simulation/{guest_id}/capture.csv",
+                )
+                encoded = json.dumps(authorized_status, ensure_ascii=False)
+                self.assertNotIn(str(self.default_simulation_source), encoded)
+                self.assertNotIn(str(self.server.guest_manager.root), encoded)
+
+                status_code, authorized_live, _ = self.request_json(
+                    "GET", "/api/live?acquisition_mode=simulation",
+                    headers={"X-Forwarded-Proto": "https"},
+                )
+                self.assertEqual(status_code, 200)
+                self.assertEqual(
+                    authorized_live["acquisition"]["config"]["source_file"],
+                    "管理员批准的模拟数据源",
+                )
+        finally:
+            self.server.guest_manager.stop(guest_id)
 
     def test_authorized_default_simulation_filename_resolves_to_bootstrap_path(self):
         self.request_json("GET", "/api/auth/session")
@@ -885,6 +1206,11 @@ class BuildManifestTests(unittest.TestCase):
     def test_build_script_packages_edge_capture_runtime(self):
         script = (Path(__file__).resolve().parent.parent / "modular_runtime" / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
         self.assertIn('"edge_capture.py"', script)
+
+    def test_build_script_packages_server_target_mysql_runtime(self):
+        script = (Path(__file__).resolve().parent.parent / "modular_runtime" / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn('"server_target_mysql.py"', script)
+        self.assertIn('"server_capture_journal.py"', script)
 
 
 if __name__ == "__main__":

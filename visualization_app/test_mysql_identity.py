@@ -26,6 +26,9 @@ class _FakeCursor:
         else:
             self._rows = []
 
+    def executemany(self, sql, values) -> None:
+        self.executed.append((str(sql), tuple(values)))
+
     def fetchone(self):
         return self._rows.pop(0) if self._rows else None
 
@@ -48,8 +51,54 @@ class _FakeConnection:
     def close(self) -> None:
         self.closed = True
 
+    def commit(self) -> None:
+        pass
+
+    def rollback(self) -> None:
+        pass
+
 
 class MySQLIdentityTests(unittest.TestCase):
+    def test_save_layer_streams_reiterable_rows_in_bounded_batches(self) -> None:
+        settings = MySQLSettings(enabled=True, database="afp_remote")
+        store = MySQLCaptureStore(settings)
+        connection = _FakeConnection()
+        config = AcquisitionConfig(
+            specimen_id="specimen-a", capture_uuid="capture-a", layer=0,
+            selected_sensors=["温度1"],
+        )
+
+        def rows():
+            for index in range(2_501):
+                yield {"温度1": float(index), "timestamp_unix": float(index)}
+
+        with mock.patch.object(store, "_connect", return_value=("fake", connection)):
+            result = store.save_layer(
+                config, rows=rows(), layer_file=None, full_specimen_file=None,
+                timestamp_file=None, folder_path=None, summary={},
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["saved_rows"], 2_501)
+        batches = [values for sql, values in connection.cursor_instance.executed
+                   if "INSERT INTO AFP_SENSOR_SAMPLE" in sql.upper()]
+        self.assertEqual([len(values) for values in batches], [1000, 1000, 501])
+        self.assertEqual(batches[0][0][2], 0)
+        self.assertEqual(batches[-1][-1][2], 2500)
+        statements = [sql.upper() for sql, _ in connection.cursor_instance.executed]
+        layer_insert = next(
+            index for index, sql in enumerate(statements)
+            if "INSERT INTO AFP_LAYER" in sql
+        )
+        first_sample_insert = next(
+            index for index, sql in enumerate(statements)
+            if "INSERT INTO AFP_SENSOR_SAMPLE" in sql
+        )
+        self.assertLess(
+            layer_insert,
+            first_sample_insert,
+            "the parent layer row must exist before foreign-keyed sample rows",
+        )
     def test_non_tls_profile_keeps_connector_security_negotiation_available(self) -> None:
         """caching_sha2_password must be able to negotiate TLS/RSA itself."""
         settings = MySQLSettings(

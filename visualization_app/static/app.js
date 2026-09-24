@@ -31,6 +31,7 @@ const state = {
   hardwareCheckTimer: null,
   mysqlConnectionTests: {local: null, target: null},
   localMysqlProfile: {scope: "helper_local", configured: false, state: "missing"},
+  localMysqlFormDirty: false,
   agentEvents: [],
   agentResult: null,
   agentFingerprint: "",
@@ -44,6 +45,8 @@ const state = {
   // switches must not force a second pairing just to redraw the cards.
   realInterfaceSnapshot: null,
   realInterfaceSnapshotAt: 0,
+  simulationInterfaceCatalog: null,
+  interfaceModeRendered: "",
   lanStatusTimer: null,
   accessRole: "guest",
   authenticated: false,
@@ -53,6 +56,8 @@ const state = {
   realControlOwner: null,
   realHeartbeatTimer: null,
   guestSimulationStarted: false,
+  simulationStatusBusy: false,
+  simulationStatusLastAt: 0,
   guestSimulationStoppedByUser: false,
   simulationDatasetCache: null,
   simulationDatasetPromise: null,
@@ -70,6 +75,7 @@ const state = {
   helperPairingChallenge: "",
   helperStatusTimer: null,
   processParameterBusy: false,
+  stopBusy: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -503,6 +509,7 @@ const controls = {
   mysqlPassword: $("mysqlPasswordInput"),
   mysqlDatabase: $("mysqlDatabaseInput"),
   testMysql: $("testMysqlButton"),
+  retryTargetMysql: $("retryTargetMysqlButton"),
   remoteMysqlQuery: $("remoteMysqlQueryInput"),
   remoteMysqlLimit: $("remoteMysqlLimitInput"),
   remoteMysqlStatus: $("remoteMysqlStatus"),
@@ -551,6 +558,7 @@ function unifiedMysqlSettings(extra = {}) {
     mysql_user: controls.mysqlUser?.value.trim() || "afp_app",
     mysql_password: controls.mysqlPassword?.value ?? "",
     mysql_database: controls.mysqlDatabase?.value.trim() || "afp_state_warning",
+    mysql_target_config_id: state.mysqlConnectionTests.target?.config_id || "",
     mysql_charset: "utf8mb4",
     ...extra,
   };
@@ -569,18 +577,20 @@ function unifiedLocalMysqlSettings(extra = {}) {
   };
 }
 
-function applyLocalMysqlProfileMetadata(profile) {
+function applyLocalMysqlProfileMetadata(profile, {afterSave = false} = {}) {
   if (!profile || typeof profile !== "object") return;
   state.localMysqlProfile = {...profile};
   const assign = (control, value) => {
     if (control && value !== undefined && value !== null) control.value = String(value);
   };
-  assign(controls.mysqlLocalHost, profile.host);
-  assign(controls.mysqlLocalPort, profile.port);
-  assign(controls.mysqlLocalUser, profile.user);
-  assign(controls.mysqlLocalDatabase, profile.database);
+  if (!state.localMysqlFormDirty || afterSave) {
+    assign(controls.mysqlLocalHost, profile.host);
+    assign(controls.mysqlLocalPort, profile.port);
+    assign(controls.mysqlLocalUser, profile.user);
+    assign(controls.mysqlLocalDatabase, profile.database);
+  }
   if (usesLocalCaptureHelper() && controls.mysqlLocalPassword) {
-    controls.mysqlLocalPassword.value = "";
+    if (afterSave) controls.mysqlLocalPassword.value = "";
     controls.mysqlLocalPassword.placeholder = profile.configured
       ? "已由本机辅助程序加密保存；留空沿用"
       : "当前电脑尚未配置，请输入（允许空密码）";
@@ -927,7 +937,7 @@ function renderAcquisitionStatus(status) {
       }
     });
   }
-  renderMysqlStatus(status.mysql);
+  renderMysqlStatus(status.mysql, status.server_target);
   const healthy = selected.filter((item) => item.ok);
   const captureOnly = status.config?.processing_mode === "capture_only"
     || controls.processingMode.value === "capture_only";
@@ -1226,10 +1236,9 @@ function renderSaveRootStatus(status) {
   const node = controls.saveRootStatus;
   if (!node) return;
   let payload = status || {};
-  // Guest acquisition always has a writable server session directory, but
-  // that is not the visitor's local folder.  Never let that server status
-  // make an empty/un-authorized local path appear green.
-  if (state.accessRole === "guest") {
+  // Remote simulation saves to its server session even when the visitor has
+  // not authorized an additional folder on the computer viewing this page.
+  if (state.accessRole !== "local_admin" && controls.acquisitionMode?.value === "simulation") {
     const localPath = controls.saveRoot?.value.trim() || "";
     payload = state.localSaveAuthorized && state.localSaveDirectoryHandle
       ? {
@@ -1239,8 +1248,8 @@ function renderSaveRootStatus(status) {
       : {
         ok: false,
         message: localPath
-          ? "已填写保存位置，但尚未授权本机文件夹；当前采集不保存到本机"
-          : "保存位置为空，当前采集不保存数据",
+          ? "当前会话的服务器目录可保存；已填写本机位置但尚未授权，未保存到访问电脑"
+          : "当前会话的服务器目录可保存；尚未授权本机文件夹，未保存到访问电脑",
       };
   }
   node.textContent = payload.message || "保存位置为空，当前采集不保存数据";
@@ -1310,21 +1319,22 @@ async function confirmLocalSave() {
   }
 }
 
-async function saveFinishedCaptureLocally() {
+async function saveFinishedCaptureLocally(mode = controls.acquisitionMode?.value || "real") {
   // In real helper-backed mode the edge gateway writes the capture directly
   // on the visitor PC.  A second server export would duplicate files and may
   // accidentally export another session's data.
-  if (usesLocalCaptureHelper() && state.acquisitionMode !== "simulation") return;
+  if (usesLocalCaptureHelper() && mode !== "simulation") return;
   if (!state.localSaveAuthorized || !state.localSaveDirectoryHandle || state.localSaveBusy) return;
   state.localSaveBusy = true;
   try {
-    const base = state.accessRole === "guest" ? "/api/simulation" : "/api/acquisition";
+    const base = state.accessRole !== "local_admin" && mode === "simulation"
+      ? "/api/simulation" : "/api/acquisition";
     const manifestResponse = await fetch(`${base}/export-manifest`, {cache: "no-store", credentials: "same-origin"});
     const manifest = await manifestResponse.json();
     if (!manifestResponse.ok) throw new Error(manifest.error || "读取采集文件清单失败");
     if (!manifest.ready || !Array.isArray(manifest.files) || !manifest.files.length) {
       updateLocalSaveStatus("本次没有生成有效采集文件，因此未保存到本地。", true);
-      return;
+      throw new Error("当前会话没有可导出的采集文件");
     }
     for (const item of manifest.files) {
       const parts = String(item.path || "").split("/").filter(Boolean);
@@ -1351,6 +1361,7 @@ async function saveFinishedCaptureLocally() {
     }
     updateLocalSaveStatus(`本地保存失败：${error.message || error}`, true);
     toast("本地保存失败，请重新授权目录");
+    throw error;
   } finally {
     state.localSaveBusy = false;
   }
@@ -1363,18 +1374,26 @@ async function testMysqlConnection(local = false) {
     : "服务器/目标电脑";
   const status = local ? $("mysqlLocalStatus") : $("mysqlTargetStatus");
   try {
-    status.textContent = `正在检查${label} MySQL 数据库（不会创建或修改表）……`;
+    status.textContent = local && usesLocalCaptureHelper()
+      ? `正在检查${label} MySQL 数据库（首次使用会创建缺失的 AFP 表）……`
+      : `正在检查${label} MySQL 数据库（不会创建或修改表）……`;
     const settings = local ? unifiedLocalMysqlSettings() : unifiedMysqlSettings();
     let result;
     if (local && usesLocalCaptureHelper()) {
-      if (!state.localMysqlProfile?.configured || settings.mysql_password !== "") {
+      const changed = state.localMysqlFormDirty || settings.mysql_password !== "";
+      if (changed && state.localMysqlProfile?.configured && settings.mysql_password === "") {
+        throw new Error("本机 MySQL 配置已修改：请重新输入密码再保存和预检，避免误用旧配置");
+      }
+      if (!state.localMysqlProfile?.configured || changed) {
         const profile = await requestLocalHelper("mysql_profile_save", settings, {timeoutMs: 20000});
-        applyLocalMysqlProfileMetadata(profile);
+        state.localMysqlFormDirty = false;
+        applyLocalMysqlProfileMetadata(profile, {afterSave: true});
       }
       result = await requestLocalHelper("mysql_preflight", {
         use_saved_profile: true,
         require_schema: true,
-        write_test: false,
+        write_test: true,
+        initialize_if_missing: true,
       }, {timeoutMs: 20000});
     } else {
       result = await postJson("/api/mysql/test", {...settings, read_only: true});
@@ -1390,7 +1409,7 @@ async function testMysqlConnection(local = false) {
         ? "账号或密码错误，或用户@来源主机未授权：请核对 MySQL 账户授权范围"
         : errorText);
     status.textContent = result.ok
-      ? `${label} MySQL 已连接：${settings.mysql_host}:${settings.mysql_port}/${result.database}（${result.driver}）${result.schema_ready === false ? "，但AFP表结构不完整" : ""}`
+      ? `${label} MySQL 已连接：${settings.mysql_host}:${settings.mysql_port}/${result.database}（${result.driver}）${result.schema_initialized ? "；已完成首次 AFP 表初始化" : ""}${result.schema_ready === false ? "，但AFP表结构不完整" : ""}`
       : `${label} MySQL 连接失败：${friendlyError}`;
     return result;
   } catch (error) {
@@ -1593,9 +1612,32 @@ async function downloadRemoteMysqlCsv() {
   }
 }
 
-function renderMysqlStatus(mysql) {
+function renderMysqlStatus(mysql, serverTarget = null) {
   const status = $("mysqlStatus");
-  if (!status || !mysql) return;
+  if (!status || (!mysql && !serverTarget)) return;
+  const target = serverTarget || mysql?.server_target;
+  if (target) {
+    const stateLabel = {
+      receiving: "正在接收完整采集数据",
+      ready: "采集已结束，等待服务器写入",
+      saving: "服务器正在写入",
+      saved: "已写入",
+      failed: "写入失败，可重试",
+    }[target.state] || "等待服务器处理";
+    const targetError = target.error_detail?.message
+      ? `：${target.error_detail.message}`
+      : (target.error ? `：${target.error}` : "");
+    controls.retryTargetMysql?.classList.toggle("hidden", target.state !== "failed");
+    if (controls.retryTargetMysql) controls.retryTargetMysql.disabled = target.state !== "failed";
+    const localText = mysql?.enabled
+      ? `；访问电脑本机 MySQL：${mysql.ok ? "已完成" : (mysql.state === "pending" ? "待处理" : "请查看本机结果")}`
+      : "";
+    status.classList.toggle("ok", target.state === "saved");
+    status.classList.toggle("error", target.state === "failed");
+    status.textContent = `服务器/目标 MySQL（服务器执行）：${stateLabel}，已接收 ${target.received_rows || 0} 行，已写入 ${target.saved_rows || 0} 行${targetError}${localText}`;
+    return;
+  }
+  controls.retryTargetMysql?.classList.toggle("hidden", true);
   const selectedInUi = Boolean(
     controls.mysqlEnabled?.checked || controls.mysqlLocalEnabled?.checked
   );
@@ -1619,7 +1661,10 @@ function renderMysqlStatus(mysql) {
     Boolean(mysql.enabled && mysql.ok === false && mysql.state !== "pending")
   );
   if (!mysql.enabled) {
-    status.textContent = "MySQL 保存未启用；原始文件已完成本地保存。";
+    status.textContent = state.accessRole !== "local_admin"
+      && controls.acquisitionMode?.value === "simulation"
+      ? "MySQL 保存未启用；采集文件保存到当前会话的服务器目录，访问电脑本机另存需单独授权。"
+      : "MySQL 保存未启用；原始文件已完成本地保存。";
   } else if (mysql.state === "pending" || mysql.ok === null || mysql.ok === undefined) {
     status.textContent = "MySQL 已启用；等待本次采集完成后批量写入。";
   } else if (mysql.ok) {
@@ -2001,6 +2046,14 @@ async function testSensorConnection({automatic = false} = {}) {
 
 async function startAcquisition() {
   try {
+    const simulation = controls.acquisitionMode?.value === "simulation";
+    if (
+      state.accessRole !== "guest" && state.accessRole !== "local_admin"
+      && simulation
+      && controls.mysqlLocalEnabled?.checked
+    ) {
+      throw new Error("远程模拟采集暂不支持写入访问电脑本机 MySQL；请改用服务器/目标 MySQL 或 CSV 保存");
+    }
     if (controls.autoProcessParameters?.checked) {
       await readProcessParameters({automatic: true});
     }
@@ -2022,11 +2075,11 @@ async function startAcquisition() {
       return;
     }
     await validateEnabledMysqlBeforeStart();
-    await acquireRealControl();
-    if (state.hardwareCheckInProgress) {
-      throw new Error("接口与传感器通道检查正在进行，请等待检查完成");
-    }
-    if (controls.acquisitionMode?.value !== "simulation") {
+    if (!simulation) {
+      await acquireRealControl();
+      if (state.hardwareCheckInProgress) {
+        throw new Error("接口与传感器通道检查正在进行，请等待检查完成");
+      }
       const fingerprint = hardwareConfigFingerprint();
       if (!state.hardwareCheck || state.hardwareCheckFingerprint !== fingerprint || !state.hardwareCheck.ok) {
         const check = await testSensorConnection({automatic: false});
@@ -2042,7 +2095,7 @@ async function startAcquisition() {
       resetLiveEvidenceDisplay();
     }
     state.liveScopeKey = nextScope;
-    const helperBackedReal = usesLocalCaptureHelper() && controls.acquisitionMode?.value !== "simulation";
+    const helperBackedReal = usesLocalCaptureHelper() && !simulation;
     const result = helperBackedReal
       ? await requestLocalHelper("start_capture", acquisitionConfig(), {timeoutMs: 30000})
       : await postJson("/api/acquisition/start", acquisitionConfig());
@@ -2067,25 +2120,127 @@ async function startAcquisition() {
   }
 }
 
+async function waitForServerTargetSave(stopResult, timeoutMs = 90000) {
+  if (!controls.mysqlEnabled?.checked || !usesLocalCaptureHelper()
+      || controls.acquisitionMode?.value === "simulation") {
+    return stopResult;
+  }
+  const captureUuid = String(stopResult?.capture_uuid || "");
+  const deadline = Date.now() + timeoutMs;
+  let lastTarget = null;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch("/api/acquisition/status?acquisition_mode=real", {
+        cache: "no-store", credentials: "same-origin",
+      });
+      if (response.ok) {
+        const current = await response.json();
+        if (!captureUuid || !current.capture_uuid || current.capture_uuid === captureUuid) {
+          lastTarget = current.server_target || null;
+          if (lastTarget && ["saved", "failed"].includes(lastTarget.state)) {
+            return {...stopResult, server_target: lastTarget};
+          }
+        }
+      }
+    } catch (_) {
+      // Preserve the helper result and keep polling until the server has a
+      // terminal target-MySQL state or the bounded timeout is reached.
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 500));
+  }
+  return {
+    ...stopResult,
+    server_target: lastTarget || {
+      enabled: true, scope: "server_target", execution_host: "server",
+      state: "saving", received_rows: 0, saved_rows: 0,
+    },
+  };
+}
+
+async function retryServerTargetMysql() {
+  const captureUuid = String(state.acquisitionStatus?.capture_uuid || "");
+  const target = state.acquisitionStatus?.server_target;
+  if (!captureUuid || target?.state !== "failed") {
+    toast("当前没有可重试的服务器目标 MySQL 保存记录。");
+    return;
+  }
+  const button = controls.retryTargetMysql;
+  if (button) button.disabled = true;
+  try {
+    const queued = await postJson("/api/mysql/target/retry", {capture_uuid: captureUuid});
+    const completed = await waitForServerTargetSave({
+      capture_uuid: captureUuid,
+      server_target: queued.server_target,
+    });
+    const serverTarget = completed?.server_target || queued.server_target;
+    state.acquisitionStatus = {...state.acquisitionStatus, server_target: serverTarget};
+    renderMysqlStatus(null, serverTarget);
+    if (serverTarget?.state === "failed") {
+      throw new Error(serverTarget.error || "服务器目标 MySQL 重试失败");
+    }
+    toast("服务器正在重试目标 MySQL 保存；页面将显示最终结果。");
+  } catch (error) {
+    if (button) button.disabled = false;
+    toast(`目标 MySQL 重试失败：${error.message}`);
+  }
+}
+
 async function stopAcquisition() {
+  if (state.stopBusy) return;
+  state.stopBusy = true;
+  const stopButton = $("stopAcquisitionButton");
+  if (stopButton) {
+    stopButton.disabled = true;
+    stopButton.textContent = "正在停止并保存…";
+  }
+  const statusNode = $("acquisitionStatus");
+  if (statusNode) statusNode.textContent = "正在停止采集并保存文件，请勿关闭页面…";
   try {
     stopLocalSimulationReplay();
     const layerControl = controls.datasetSchema.value === "new_collection_v11_3"
       ? controls.newLayer
       : controls.liveLayer;
     const completedLayer = Number(layerControl.value) || 0;
-    const result = usesLocalCaptureHelper() && controls.acquisitionMode?.value !== "simulation"
-      ? await requestLocalHelper("stop_capture", {}, {timeoutMs: 30000})
-      : await postJson(
-        state.accessRole === "guest" ? "/api/simulation/stop" : "/api/acquisition/stop",
-        {acquisition_mode: controls.acquisitionMode?.value || "real"},
-      );
+    const mode = controls.acquisitionMode?.value || "real";
+    let result;
+    if (usesLocalCaptureHelper() && mode !== "simulation") {
+      result = await requestLocalHelper("stop_capture", {}, {timeoutMs: 30000});
+      result = await waitForServerTargetSave(result);
+    } else {
+      try {
+        result = await postJson(
+          state.accessRole === "guest" ? "/api/simulation/stop" : "/api/acquisition/stop",
+          {acquisition_mode: mode},
+          {timeoutMs: 90000},
+        );
+      } catch (error) {
+        if (mode !== "simulation" || !String(error.message).startsWith("请求超时")) throw error;
+        const statusUrl = state.accessRole === "local_admin"
+          ? "/api/acquisition/status?acquisition_mode=simulation"
+          : "/api/simulation/status";
+        for (let attempt = 0; attempt < 10; attempt += 1) {
+          await new Promise((resolve) => window.setTimeout(resolve, 2000));
+          const response = await fetch(statusUrl, {cache: "no-store", credentials: "same-origin"});
+          if (!response.ok) continue;
+          const current = await response.json();
+          if (!current.running && (current.capture_saved || Number(current.mysql?.saved_rows || 0) > 0)) {
+            result = current;
+            break;
+          }
+        }
+        if (!result) throw new Error("停止请求超时，尚未确认保存完成；请查看会话状态后重试");
+      }
+    }
     if (state.accessRole === "guest") {
       state.guestSimulationStarted = false;
       state.guestSimulationStoppedByUser = true;
     }
     renderAcquisitionStatus(result);
-    renderMysqlStatus(result.mysql);
+    renderMysqlStatus(result.mysql, result.server_target);
+    if (result.running || (!result.capture_saved && result.server_target?.state !== "saved"
+        && Number(result.mysql?.saved_rows || 0) <= 0)) {
+      throw new Error(result.last_error || "停止请求已返回，但本次采集未完成保存；请检查采样点数和数据源");
+    }
     if (
       Array.isArray(result.completed_layers) &&
       result.completed_layers.includes(completedLayer + 1)
@@ -2095,10 +2250,21 @@ async function stopAcquisition() {
     } else if (Array.isArray(result.completed_layers) && result.completed_layers.length) {
       toast(`已完成第${completedLayer + 1}层并保存；当前试样已采集${result.completed_layers.length}层`);
     }
-    await saveFinishedCaptureLocally();
+    await saveFinishedCaptureLocally(mode);
     await loadRealtime();
   } catch (error) {
+    if (statusNode) {
+      statusNode.classList.add("error");
+      statusNode.classList.remove("ok");
+      statusNode.textContent = `停止并保存失败：${error.message}`;
+    }
     toast(error.message);
+  } finally {
+    state.stopBusy = false;
+    if (stopButton) {
+      stopButton.disabled = false;
+      stopButton.textContent = "停止并保存";
+    }
   }
 }
 
@@ -2585,6 +2751,28 @@ function renderCachedSimulationSample(index) {
   return true;
 }
 
+async function refreshGuestSimulationStatus() {
+  if (!state.simulationLocalReplay || !state.guestSimulationStarted || state.simulationStatusBusy) return;
+  state.simulationStatusBusy = true;
+  const captureUuid = String(state.acquisitionStatus?.capture_uuid || "");
+  try {
+    const response = await fetch("/api/simulation/status", {
+      cache: "no-store", credentials: "same-origin",
+    });
+    if (!response.ok) return;
+    const status = await response.json();
+    if (state.simulationLocalReplay && state.guestSimulationStarted
+      && (!captureUuid || (captureUuid === state.acquisitionStatus?.capture_uuid
+        && captureUuid === status.capture_uuid))) {
+      renderAcquisitionStatus(status);
+    }
+  } catch (_error) {
+    // Keep playback responsive during a transient status request failure.
+  } finally {
+    state.simulationStatusBusy = false;
+  }
+}
+
 function startLocalSimulationReplay() {
   if (!isGuestSimulationMode() || !state.simulationDatasetCache || !state.payload) return;
   state.simulationLocalReplay = true;
@@ -2597,10 +2785,16 @@ function startLocalSimulationReplay() {
   stopPlayback();
   const total = state.simulationDatasetCache.rows.length;
   state.simulationPlaybackIndex = -1;
+  state.simulationStatusLastAt = 0;
   const tick = () => {
     if (!state.simulationLocalReplay || !state.guestSimulationStarted) return;
     const next = Math.min(total - 1, state.simulationPlaybackIndex + 1);
     renderCachedSimulationSample(next);
+    const now = Date.now();
+    if (now - state.simulationStatusLastAt >= 1000) {
+      state.simulationStatusLastAt = now;
+      void refreshGuestSimulationStatus();
+    }
     if (next >= total - 1) {
       state.simulationLocalReplay = false;
       $("streamStatus").textContent = "模拟数据已播放完成";
@@ -3577,6 +3771,7 @@ controls.readProcessParameters?.addEventListener(
   "click", () => readProcessParameters()
 );
 $("testMysqlButton")?.addEventListener("click", () => testMysqlConnection(false));
+controls.retryTargetMysql?.addEventListener("click", () => retryServerTargetMysql());
 $("testLocalMysqlButton")?.addEventListener("click", () => testMysqlConnection(true));
 $("refreshLocalRelationMapButton")?.addEventListener("click", () => refreshRelationMap("local"));
 $("refreshTargetRelationMapButton")?.addEventListener("click", () => refreshRelationMap("target"));
@@ -3601,6 +3796,7 @@ controls.mysqlLocalEnabled?.addEventListener("change", () => {
     if ([controls.mysqlLocalHost, controls.mysqlLocalPort, controls.mysqlLocalUser,
       controls.mysqlLocalPassword, controls.mysqlLocalDatabase].includes(control)) {
       state.mysqlConnectionTests.local = null;
+      state.localMysqlFormDirty = true;
     } else {
       state.mysqlConnectionTests.target = null;
     }
@@ -4252,32 +4448,14 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
   const current = preferredId || select.value;
   const profile = sensorTypeProfile(role);
   if (controls.acquisitionMode?.value === "simulation") {
-    const options = candidates.map((item) => {
-      const node = option(item.id, `${item.label || item.endpoint || item.id} · 模拟映射`);
-      node.dataset.kind = item.kind || "";
-      node.dataset.detected = String(item.detected !== false);
-      node.dataset.assignable = String(Boolean(item.auto_assignable || item.driver_available));
-      node.dataset.fallback = String(item.kind === "serial" && profile.physical_kind !== "serial");
-      node.dataset.endpoint = item.endpoint || "";
-      return node;
-    });
-    if (options.length) {
-      select.replaceChildren(...options);
-      select.value = options.some((node) => node.value === current)
-        ? current : options[0].value;
-      select.disabled = false;
-    } else {
-      select.replaceChildren(option("simulation_source", "逻辑模拟接口（未发现实际接口）"));
-      select.value = "simulation_source";
-      select.disabled = false;
-    }
+    select.replaceChildren(option("", `${profile.label || role}：模拟源供数（不占用物理接口）`));
+    select.value = "";
+    select.disabled = true;
     const enabled = row.querySelector(".interface-enabled");
     if (enabled) {
       enabled.disabled = false;
-      // Simulation mode validates the imported data mapping, not whether a
-      // physical sensor is plugged in.  All logical interface slots remain
-      // enabled so the supplied CSV can be replayed normally.
-      enabled.checked = true;
+      // The operator's five independent logical interface choices remain
+      // intact; a CSV source does not alter which sensor roles are enabled.
     }
     let warning = row.querySelector(".interface-physical-warning");
     if (!warning) {
@@ -4285,10 +4463,7 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
       warning.className = "interface-physical-warning control-note";
       row.append(warning);
     }
-    const selected = select.selectedOptions?.[0];
-    warning.textContent = selected?.value === "simulation_source"
-      ? "模拟采集：未检查传感器是否接入，使用逻辑模拟接口和导入数据"
-      : `模拟映射：${selected.textContent}；不检查传感器是否接入`;
+    warning.textContent = `保留${profile.label || role}的独立协议和通道映射；模拟采集仅替换数据来源`;
     warning.classList.remove("hidden");
     return;
   }
@@ -4563,9 +4738,10 @@ async function discoverInterfaces() {
 }
 
 function rememberRealInterfaceSnapshot() {
-  if (!usesLocalCaptureHelper() || !Array.isArray(state.interfaceCatalog) || !state.interfaceCatalog.length) return;
+  if (!Array.isArray(state.interfaceCatalog) || !state.interfaceCatalog.length) return;
   state.realInterfaceSnapshot = {
-    catalog: state.interfaceCatalog.map((item) => ({...item})),
+    catalog: (state.interfaceModeRendered === "real"
+      ? interfaceConfigs().interfaces : state.interfaceCatalog).map((item) => ({...item})),
     physical: (state.physicalInterfaces || []).map((item) => ({...item})),
     available: (state.availableInterfaces || []).map((item) => ({...item})),
   };
@@ -4683,23 +4859,25 @@ function updateSimulationSettings() {
   }
   updateRealAcquisitionVisibility();
   if (simulation) {
-    rememberRealInterfaceSnapshot();
-    const current = buildSimulationInterfaceCatalog();
-    if (state.physicalInterfaces.length) {
-      state.interfaceCatalog = autoAssignPhysicalInterfaces(current, {allowSerialFallback: false});
-    } else {
-      state.interfaceCatalog = current;
+    if (state.interfaceModeRendered !== "simulation") {
+      if (state.interfaceModeRendered === "real") rememberRealInterfaceSnapshot();
+      state.interfaceCatalog = (state.simulationInterfaceCatalog?.length
+        ? state.simulationInterfaceCatalog : buildSimulationInterfaceCatalog())
+        .map((item) => ({...item}));
+      renderInterfacePanel(state.interfaceCatalog);
     }
-    renderInterfacePanel(state.interfaceCatalog);
   } else {
-    // Repaint the last real mapping immediately, then refresh status and
-    // physical interfaces in the background.  This avoids a blank/unassigned
-    // interval when switching back from simulation. The realInterfaceSnapshot
-    // is display-only until the helper confirms a fresh discovery.
-    restoreCachedRealInterfaceSnapshot();
-    loadHelperStatus().catch(() => {});
-    discoverInterfaces().catch(() => {});
+    if (state.interfaceModeRendered !== "real") {
+      if (state.interfaceModeRendered === "simulation") {
+        state.simulationInterfaceCatalog = interfaceConfigs().interfaces;
+      }
+      // The saved real mapping is display-only until helper discovery confirms it.
+      restoreCachedRealInterfaceSnapshot();
+      loadHelperStatus().catch(() => {});
+      discoverInterfaces().catch(() => {});
+    }
   }
+  state.interfaceModeRendered = simulation ? "simulation" : "real";
 }
 
 function updateIntegrationSource() {
@@ -4907,6 +5085,7 @@ function acquisitionConfig() {
     mysql_user: controls.mysqlUser?.value.trim() || "afp_app",
     mysql_password: controls.mysqlPassword?.value ?? "",
     mysql_database: controls.mysqlDatabase?.value.trim() || "afp_state_warning",
+    mysql_target_config_id: state.mysqlConnectionTests.target?.config_id || "",
     mysql_local_enabled: Boolean(controls.mysqlLocalEnabled?.checked),
     mysql_local_host: controls.mysqlLocalHost?.value.trim() || "127.0.0.1",
     mysql_local_port: Number(controls.mysqlLocalPort?.value) || 3306,
@@ -5364,7 +5543,7 @@ async function testSensorConnection({automatic = false} = {}) {
     toast("采集运行中正在持续监控，无需另开接口检查");
     return null;
   }
-  if (state.accessRole === "guest" && controls.acquisitionMode?.value === "simulation") {
+  if (controls.acquisitionMode?.value === "simulation") {
     const sourceChannels = new Set(state.simulationSourceChannels || []);
     const selected = selectedAcquisitionChannelsForInterfaces();
     const sensors = selected.map((name) => ({
@@ -5385,7 +5564,7 @@ async function testSensorConnection({automatic = false} = {}) {
       return {
         id: row.dataset.interfaceId,
         role,
-        driver: "simulator",
+        driver: row.querySelector(".interface-driver")?.value || profile.driver || "serial_json",
         endpoint: "模拟数据源",
         enabled: row.querySelector(".interface-enabled")?.checked !== false,
         expected_channels: expected,

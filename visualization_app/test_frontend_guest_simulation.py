@@ -1,8 +1,312 @@
 from pathlib import Path
+import subprocess
 import unittest
 
 
 class GuestSimulationFrontendContractTests(unittest.TestCase):
+    def test_target_mysql_preflight_identifier_is_reused_for_start_and_server_save_state(self):
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        settings_start = text.index("function unifiedMysqlSettings")
+        settings_end = text.index("function unifiedLocalMysqlSettings", settings_start)
+        settings = text[settings_start:settings_end]
+        self.assertIn("mysql_target_config_id", settings)
+        acquire_start = text.index("function acquisitionConfig()")
+        acquire_end = text.index("function renderProcessParameterReadStatus", acquire_start)
+        acquisition = text[acquire_start:acquire_end]
+        self.assertIn("mysql_target_config_id", acquisition)
+        render_start = text.index("function renderMysqlStatus(mysql")
+        render_end = text.index("function agentEscapeHtml", render_start)
+        rendered = text[render_start:render_end]
+        self.assertIn("serverTarget", rendered)
+        self.assertIn("服务器/目标 MySQL（服务器执行）", rendered)
+        self.assertIn("target.error_detail?.message", rendered)
+
+    def test_real_helper_stop_waits_for_server_target_mysql_terminal_state(self):
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        start = text.index("async function waitForServerTargetSave(")
+        end = text.index("async function stopAcquisition()", start)
+        function = text[start:end]
+        script = """
+const controls = {mysqlEnabled: {checked: true}, acquisitionMode: {value: "real"}};
+const usesLocalCaptureHelper = () => true;
+const window = {setTimeout: (fn) => { fn(); return 1; }};
+const fetch = async (url, options) => ({ok: true, json: async () => ({
+  capture_uuid: "capture-a", server_target: {state: "saved", saved_rows: 3, received_rows: 3}
+})});
+""" + function + """
+(async () => {
+  const result = await waitForServerTargetSave({capture_uuid: "capture-a", capture_saved: true});
+  if (result.server_target?.state !== "saved" || result.server_target.saved_rows !== 3) process.exit(1);
+})().catch((error) => { console.error(error); process.exit(2); });
+"""
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_failed_server_target_mysql_has_a_session_bound_retry_control(self):
+        html = (Path(__file__).with_name("static") / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="retryTargetMysqlButton"', html)
+        self.assertIn('/app.js?v=20260923-mysql-init-1', html)
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        start = text.index("async function retryServerTargetMysql()")
+        end = text.index("async function stopAcquisition()", start)
+        function = text[start:end]
+        script = """
+const calls = [];
+const state = {acquisitionStatus: {capture_uuid: "capture-a", server_target: {state: "failed"}}};
+const controls = {retryTargetMysql: {disabled: false}};
+const postJson = async (url, payload) => { calls.push([url, payload]); return {ok: true, server_target: {state: "saving"}}; };
+const waitForServerTargetSave = async () => ({server_target: {state: "saved", saved_rows: 3}});
+const renderMysqlStatus = () => {};
+const toast = () => {};
+""" + function + """
+(async () => {
+  await retryServerTargetMysql();
+  if (calls.length !== 1 || calls[0][0] !== "/api/mysql/target/retry" ||
+      calls[0][1].capture_uuid !== "capture-a" || state.acquisitionStatus.server_target.state !== "saved") process.exit(1);
+})().catch((error) => { console.error(error); process.exit(2); });
+"""
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_guest_replay_polls_server_progress_at_most_once_per_second(self):
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        start = text.index("function startLocalSimulationReplay()")
+        end = text.index("function stopLocalSimulationReplay()", start)
+        function = text[start:end]
+        script = """
+const state = {simulationDatasetCache: {rows: [{}, {}, {}, {}]}, payload: {},
+  guestSimulationStarted: true, simulationLocalReplay: false, simulationStatusLastAt: 0};
+const isGuestSimulationMode = () => true;
+const stopPlayback = () => {};
+const closeLiveWebSocket = () => {};
+const renderCachedSimulationSample = () => true;
+const playbackInterval = () => 100;
+let now = 1000;
+Date.now = () => now;
+let nextTick;
+const window = {clearInterval(){}, clearTimeout(){}, setTimeout(callback) {nextTick = callback; return 1;}};
+const $ = () => ({textContent: ""});
+const document = {querySelector: () => ({classList: {add(){}, remove(){}}})};
+let statusRequests = 0;
+const refreshGuestSimulationStatus = () => {statusRequests += 1;};
+""" + function + """
+startLocalSimulationReplay();
+if (statusRequests !== 1) process.exit(1);
+now = 1500;
+nextTick();
+if (statusRequests !== 1) process.exit(2);
+now = 2100;
+nextTick();
+if (statusRequests !== 2) process.exit(3);
+"""
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_guest_local_replay_refreshes_actual_server_sample_progress_without_stale_stop_update(self):
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        try:
+            start = text.index("async function refreshGuestSimulationStatus()")
+        except ValueError:
+            self.fail("访客本地回放没有同步服务器实际采样进度")
+        end = text.index("function startLocalSimulationReplay()", start)
+        function = text[start:end]
+        script = """
+const state = {simulationLocalReplay: true, guestSimulationStarted: true,
+  simulationStatusBusy: false, acquisitionStatus: {capture_uuid: "old"}};
+let requests = 0;
+let shown = [];
+let release;
+const fetch = async (url, options) => {
+  if (url !== "/api/simulation/status" || options.credentials !== "same-origin") process.exit(1);
+  requests += 1;
+  const captureUuid = state.acquisitionStatus.capture_uuid;
+  await new Promise((resolve) => {release = resolve;});
+  return {ok: true, json: async () => ({running: true, capture_uuid: captureUuid, sample_count: 123})};
+};
+const renderAcquisitionStatus = (payload) => {shown.push(payload.sample_count);};
+""" + function + """
+(async () => {
+  const active = refreshGuestSimulationStatus();
+  await Promise.resolve();
+  const duplicate = refreshGuestSimulationStatus();
+  release();
+  await Promise.all([active, duplicate]);
+  if (requests !== 1 || shown.join() !== "123" || state.simulationStatusBusy) process.exit(2);
+  const stale = refreshGuestSimulationStatus();
+  await Promise.resolve();
+  state.simulationLocalReplay = false;
+  release();
+  await stale;
+  if (shown.join() !== "123") process.exit(3);
+  state.simulationLocalReplay = true;
+  const oldRun = refreshGuestSimulationStatus();
+  await Promise.resolve();
+  state.acquisitionStatus = {capture_uuid: "new"};
+  release();
+  await oldRun;
+  if (shown.join() !== "123") process.exit(5);
+})().catch((error) => {console.error(error); process.exit(4);});
+"""
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_helper_status_poll_does_not_erase_unsaved_mysql_edits(self):
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        start = text.index("function applyLocalMysqlProfileMetadata(profile")
+        end = text.index("async function loadMysqlDefaults", start)
+        function = text[start:end]
+        script = """
+const state = {localMysqlFormDirty: true, localMysqlProfile: null};
+const field = (value) => ({value, placeholder: ""});
+const controls = {
+  mysqlLocalHost: field("192.0.2.44"), mysqlLocalPort: field("3307"),
+  mysqlLocalUser: field("new_user"), mysqlLocalDatabase: field("new_db"),
+  mysqlLocalPassword: field("new-secret")
+};
+const $ = () => ({classList: {remove(){}, add(){}}, textContent: ""});
+const usesLocalCaptureHelper = () => true;
+""" + function + """
+applyLocalMysqlProfileMetadata({configured: true, host: "127.0.0.1", port: 3306,
+  user: "old_user", database: "old_db"});
+if (controls.mysqlLocalHost.value !== "192.0.2.44" ||
+    controls.mysqlLocalPassword.value !== "new-secret") process.exit(1);
+state.localMysqlFormDirty = false;
+applyLocalMysqlProfileMetadata({configured: true, host: "127.0.0.1", port: 3306,
+  user: "old_user", database: "old_db"}, {afterSave: true});
+if (controls.mysqlLocalHost.value !== "127.0.0.1" ||
+    controls.mysqlLocalPassword.value !== "") process.exit(2);
+"""
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_simulation_cards_keep_distinct_roles_without_shared_physical_binding(self):
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        start = text.index("function refreshPhysicalInterfaceOptions")
+        end = text.index("function itemEnabledForSimulation", start)
+        function = text[start:end]
+        script = """
+const controls = {acquisitionMode: {value: "simulation"}};
+const state = {physicalInterfaces: []};
+const profiles = {plc: {label: "PLC", physical_kind: "ethernet"},
+  robot: {label: "ABB", physical_kind: "ethernet"}};
+const sensorTypeProfile = (role) => profiles[role];
+const physicalCandidatesForRole = () => [];
+const option = (value, label) => ({value, textContent: label, dataset: {}});
+const document = {createElement: () => ({classList: {remove(){}, toggle(){}}, textContent: ""})};
+""" + function + """
+function rowFor(role) {
+  const select = {value: "stale-binding", disabled: false, replaceChildren(...items) {
+    this.items = items;
+  }};
+  const enabled = {checked: false, disabled: true};
+  const row = {querySelector(name) {
+    return name === ".interface-physical" ? select
+      : name === ".interface-role" ? {value: role}
+      : name === ".interface-enabled" ? enabled : null;
+  }, append(node) {this.warning = node;}};
+  return {row, select, enabled};
+}
+const plc = rowFor("plc"), abb = rowFor("robot");
+refreshPhysicalInterfaceOptions(plc.row);
+refreshPhysicalInterfaceOptions(abb.row);
+if (plc.select.value || abb.select.value || !plc.select.disabled || !abb.select.disabled) process.exit(1);
+if (plc.select.items[0].textContent === abb.select.items[0].textContent) process.exit(2);
+if (plc.enabled.checked || abb.enabled.checked) process.exit(3);
+"""
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_simulation_connection_result_reports_each_original_protocol(self):
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        start = text.rindex("async function testSensorConnection(")
+        end = text.index("async function ", start + 1)
+        body = text[start:end]
+        self.assertIn('driver: row.querySelector(".interface-driver")?.value', body)
+        self.assertNotIn('driver: "simulator",', body)
+
+    def test_changing_simulation_source_keeps_five_interface_card_choices(self):
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        start = text.index("function updateSimulationSettings()")
+        end = text.index("function updateIntegrationSource()", start)
+        function = text[start:end]
+        script = """
+const state = {accessRole: "authorized", interfaceModeRendered: "real",
+  interfaceCatalog: [{id: "plc", role: "plc"}]};
+let current = [{id: "plc", role: "plc", driver: "modbus_tcp", enabled: true,
+  physical_interface_id: "ethernet:plant"}];
+let savedReal = null;
+let renders = 0;
+const controls = {acquisitionMode: {value: "real"},
+  simulationSourceType: {value: "single_csv"},
+  simulationSettings: {classList: {toggle(){}}},
+  simulationMysqlSettings: {classList: {toggle(){}}},
+  simulationSourcePathLabel: {classList: {toggle(){}}}};
+const document = {querySelector() {return null;}, querySelectorAll() {return [];}};
+const rememberRealInterfaceSnapshot = () => {savedReal = current.map((item) => ({...item}));};
+const buildSimulationInterfaceCatalog = () => [{id: "plc", role: "plc", driver: "modbus_tcp", enabled: true}];
+const interfaceConfigs = () => ({interfaces: current.map((item) => ({...item}))});
+const renderInterfacePanel = (items) => {renders += 1; current = items.map((item) => ({...item}));};
+const restoreCachedRealInterfaceSnapshot = () => {current = savedReal.map((item) => ({...item})); return true;};
+const loadHelperStatus = async () => {};
+const discoverInterfaces = async () => {};
+const updateRealAcquisitionVisibility = () => {};
+""" + function + """
+controls.acquisitionMode.value = "simulation";
+updateSimulationSettings();
+current[0].enabled = false;
+controls.simulationSourceType.value = "folder_csv";
+updateSimulationSettings();
+if (current[0].enabled !== false || current[0].driver !== "modbus_tcp") process.exit(1);
+controls.acquisitionMode.value = "real";
+updateSimulationSettings();
+if (current[0].physical_interface_id !== "ethernet:plant") process.exit(3);
+controls.acquisitionMode.value = "simulation";
+updateSimulationSettings();
+if (current[0].enabled !== false || current[0].driver !== "modbus_tcp") process.exit(2);
+"""
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_stop_and_save_has_visible_progress_and_does_not_repeat_request(self):
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        start = text.index("async function stopAcquisition()")
+        end = text.index("function buildSensorChecklist", start)
+        function = text[start:end]
+        script = """
+const state = {stopBusy: false, accessRole: "authorized"};
+const status = {textContent: "", classList: {add(){}, remove(){}}};
+const button = {disabled: false, textContent: "停止并保存"};
+const $ = (name) => name === "stopAcquisitionButton" ? button : status;
+const controls = {datasetSchema: {value: "legacy_original"}, liveLayer: {value: "0"},
+  newLayer: {value: "0"}, acquisitionMode: {value: "simulation"}};
+const stopLocalSimulationReplay = () => {};
+const usesLocalCaptureHelper = () => false;
+let count = 0;
+const postJson = async (url) => {
+  count += 1;
+  if (url !== "/api/acquisition/stop") throw Error("wrong endpoint");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  return {running: false, capture_saved: true, mysql: {}, completed_layers: []};
+};
+const requestLocalHelper = async () => {throw Error("unexpected helper");};
+const renderAcquisitionStatus = () => {};
+const renderMysqlStatus = () => {};
+const saveFinishedCaptureLocally = async (mode) => {if (mode !== "simulation") throw Error("wrong mode");};
+const loadRealtime = async () => {};
+const toast = () => {};
+const window = {setTimeout};
+""" + function + """
+(async () => {
+  const first = stopAcquisition();
+  if (!button.disabled || !status.textContent.includes("正在停止")) process.exit(1);
+  const second = stopAcquisition();
+  await Promise.all([first, second]);
+  if (count !== 1 || button.disabled || state.stopBusy) process.exit(2);
+})().catch(() => process.exit(3));
+"""
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_render_acquisition_status_records_running_state(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
@@ -111,6 +415,8 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         body = text[start:end]
         self.assertIn('requestLocalHelper("mysql_profile_save"', body)
         self.assertIn('use_saved_profile: true', body)
+        self.assertIn('initialize_if_missing: true', body)
+        self.assertIn('write_test: true', body)
         self.assertNotIn('settings.mysql_local_host', body)
         self.assertNotIn('settings.mysql_local_port', body)
 
@@ -129,6 +435,34 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         end = text.index("async function stopAcquisition()", start)
         start_body = text[start:end]
         self.assertIn("await validateEnabledMysqlBeforeStart();", start_body)
+
+    def test_authorized_simulation_never_waits_for_physical_hardware_check(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+
+        start = text.index("async function startAcquisition()")
+        end = text.index("async function stopAcquisition()", start)
+        start_body = text[start:end]
+        self.assertIn(
+            'const simulation = controls.acquisitionMode?.value === "simulation";',
+            start_body,
+        )
+        real_gate = start_body.index("if (!simulation) {")
+        next_scope = start_body.index("const nextScope", real_gate)
+        self.assertIn("state.hardwareCheckInProgress", start_body[real_gate:next_scope])
+        self.assertNotIn("state.hardwareCheckInProgress", start_body[:real_gate])
+        self.assertIn("await acquireRealControl();", start_body[real_gate:next_scope])
+
+        check_start = text.index("async function testSensorConnection({automatic = false} = {})", 5000)
+        check_body = text[check_start:]
+        self.assertIn(
+            'if (controls.acquisitionMode?.value === "simulation")',
+            check_body,
+        )
+        self.assertNotIn(
+            'state.accessRole === "guest" && controls.acquisitionMode?.value === "simulation"',
+            check_body,
+        )
 
     def test_public_authorized_page_does_not_replace_visitor_mysql_defaults(self):
         source = Path(__file__).with_name("static") / "app.js"
@@ -288,8 +622,9 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         start = text.index("function refreshPhysicalInterfaceOptions")
         end = text.index("function itemEnabledForSimulation", start)
         body = text[start:end]
-        self.assertIn("enabled.checked = true;", body)
-        self.assertIn("不检查传感器是否接入", body)
+        self.assertNotIn("enabled.checked = true;", body)
+        self.assertIn("保留${profile.label || role}的独立协议和通道映射", body)
+        self.assertIn('select.value = "";', body)
 
     def test_simulation_channels_present_in_source_are_auto_enabled_for_collection(self):
         source = Path(__file__).with_name("static") / "app.js"
@@ -474,7 +809,9 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         body = text[start:end]
         self.assertIn("loadHelperStatus()", body)
         self.assertIn("discoverInterfaces()", body)
-        self.assertIn("realInterfaceSnapshot", body)
+        self.assertIn("rememberRealInterfaceSnapshot()", body)
+        self.assertIn("restoreCachedRealInterfaceSnapshot()", body)
+        self.assertIn('state.interfaceModeRendered = simulation ? "simulation" : "real"', body)
 
     def test_local_save_picker_does_not_require_a_prior_name_and_refreshes_status(self):
         source = Path(__file__).with_name("static") / "app.js"
@@ -492,10 +829,52 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
         text = source.read_text(encoding="utf-8")
         start = text.index("function renderSaveRootStatus")
         end = text.index("async function refreshSaveRootStatus", start)
-        body = text[start:end]
-        self.assertIn('state.accessRole === "guest"', body)
-        self.assertIn("state.localSaveAuthorized", body)
-        self.assertIn("保存位置为空，当前采集不保存数据", body)
+        function = text[start:end]
+        script = """
+const node = {textContent: "", classList: {toggle(name, enabled) {
+  this[name] = enabled;
+}}};
+const controls = {saveRootStatus: node, saveRoot: {value: ""},
+  acquisitionMode: {value: "simulation"}};
+const state = {accessRole: "guest", localSaveAuthorized: false,
+  localSaveDirectoryHandle: null};
+""" + function + """
+renderSaveRootStatus({ok: false, message: "保存位置为空，当前采集不保存数据"});
+if (!node.textContent.includes("当前会话的服务器目录") ||
+    !node.textContent.includes("未保存到访问电脑") ||
+    node.textContent.includes("当前采集不保存数据") || !node.classList.error) process.exit(1);
+state.accessRole = "authorized";
+renderSaveRootStatus({ok: false, message: "保存位置为空，当前采集不保存数据"});
+if (!node.textContent.includes("当前会话的服务器目录") ||
+    node.textContent.includes("当前采集不保存数据")) process.exit(3);
+state.accessRole = "local_admin";
+renderSaveRootStatus({ok: false, message: "保存位置为空，当前采集不保存数据"});
+if (node.textContent !== "保存位置为空，当前采集不保存数据") process.exit(2);
+"""
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_remote_simulation_mysql_off_does_not_claim_visitor_local_save(self):
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        start = text.index("function renderMysqlStatus(mysql, serverTarget = null)")
+        end = text.index("function agentEscapeHtml", start)
+        function = text[start:end]
+        script = """
+const status = {textContent: "", classList: {toggle(){}}};
+const $ = () => status;
+const state = {accessRole: "guest", mysqlConnectionTests: {target: null, local: null}};
+const controls = {mysqlEnabled: {checked: false}, mysqlLocalEnabled: {checked: false},
+  acquisitionMode: {value: "simulation"}};
+""" + function + """
+renderMysqlStatus({enabled: false, ok: false});
+if (!status.textContent.includes("当前会话的服务器目录") ||
+    status.textContent.includes("已完成本地保存")) process.exit(1);
+state.accessRole = "local_admin";
+renderMysqlStatus({enabled: false, ok: false});
+if (status.textContent !== "MySQL 保存未启用；原始文件已完成本地保存。") process.exit(2);
+"""
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_save_directory_status_is_checked_against_server_folder(self):
         source = Path(__file__).with_name("static") / "app.js"
@@ -567,11 +946,13 @@ class GuestSimulationFrontendContractTests(unittest.TestCase):
     def test_helper_backed_real_capture_does_not_repeat_server_export(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
-        start = text.index("async function saveFinishedCaptureLocally()")
+        start = text.index("async function saveFinishedCaptureLocally(")
         end = text.index("async function testMysqlConnection", start)
         body = text[start:end]
         self.assertIn("usesLocalCaptureHelper()", body)
-        self.assertIn('state.acquisitionMode !== "simulation"', body)
+        self.assertIn('mode !== "simulation"', body)
+        self.assertIn('mode === "simulation"', body)
+        self.assertIn('"/api/simulation" : "/api/acquisition"', body)
         self.assertIn("return", body)
 
     def test_diagnosis_uses_helper_hardware_evidence_and_remote_acquisition_status(self):

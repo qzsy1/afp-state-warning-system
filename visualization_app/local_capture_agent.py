@@ -27,6 +27,7 @@ from acquisition import (
 from helper_relay import ALLOWED_HELPER_COMMANDS
 from mysql_storage import MySQLCaptureStore
 from json_safety import json_safe_value
+from remote_mysql_setup import classify_mysql_error
 
 
 _ROLE_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
@@ -137,9 +138,35 @@ class LocalCaptureAgent:
         }
 
     def mysql_preflight(
-        self, settings: MySQLSettings, *, write_test: bool = False
+        self,
+        settings: MySQLSettings,
+        *,
+        write_test: bool = False,
+        initialize_if_missing: bool = False,
     ) -> dict[str, Any]:
-        result = MySQLCaptureStore(settings).preflight(write_test=write_test)
+        store = MySQLCaptureStore(settings)
+        result = store.preflight(write_test=write_test)
+        schema_initialized = False
+        if (
+            initialize_if_missing
+            and not result.get("ok")
+            and result.get("stage") == "schema"
+            and bool(result.get("missing_objects"))
+        ):
+            initialized = store.initialize_schema(create_database=False)
+            if initialized.get("ok"):
+                result = store.preflight(write_test=write_test)
+                schema_initialized = bool(result.get("ok"))
+            else:
+                initialization_error = initialized.get("error") or "AFP数据库表结构初始化失败"
+                result = {
+                    **result,
+                    "error": initialization_error,
+                    "error_detail": initialized.get("error_detail")
+                    or classify_mysql_error(initialization_error),
+                    "initialization_error": initialization_error,
+                }
+        result["schema_initialized"] = schema_initialized
         result["scope"] = "helper_local"
         result["execution_host"] = "visitor_local_computer"
         return result

@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import local_capture_helper_entry as helper_entry  # noqa: E402
+import local_capture_agent  # noqa: E402
 
 dispatch_command = helper_entry.dispatch_command
 resolve_runtime_args = helper_entry.resolve_runtime_args
@@ -20,6 +21,63 @@ should_repair_pairing = helper_entry.should_repair_pairing
 
 
 class HelperTransportTests(unittest.TestCase):
+    def test_helper_local_mysql_explicit_first_check_initializes_missing_afp_schema(self):
+        store = Mock()
+        store.preflight.side_effect = [
+            {
+                "ok": False,
+                "stage": "schema",
+                "schema_ready": False,
+                "missing_objects": ["afp_condition", "afp_sensor_sample"],
+                "error": "AFP数据库表结构不完整",
+            },
+            {
+                "ok": True,
+                "stage": "ready",
+                "schema_ready": True,
+                "missing_objects": [],
+                "write_test": True,
+            },
+        ]
+        store.initialize_schema.return_value = {"ok": True, "initialized": True}
+        settings = Mock()
+
+        with patch.object(local_capture_agent, "MySQLCaptureStore", return_value=store):
+            result = local_capture_agent.LocalCaptureAgent(Mock()).mysql_preflight(
+                settings,
+                write_test=True,
+                initialize_if_missing=True,
+            )
+
+        store.initialize_schema.assert_called_once_with(create_database=False)
+        self.assertEqual(store.preflight.call_count, 2)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["schema_initialized"])
+        self.assertEqual(result["scope"], "helper_local")
+
+    def test_helper_local_mysql_schema_initialization_failure_is_not_hidden(self):
+        store = Mock()
+        store.preflight.return_value = {
+            "ok": False,
+            "stage": "schema",
+            "schema_ready": False,
+            "missing_objects": ["afp_condition"],
+            "error": "AFP数据库表结构不完整",
+        }
+        store.initialize_schema.return_value = {
+            "ok": False,
+            "error": "1142 (42000): CREATE command denied",
+        }
+
+        with patch.object(local_capture_agent, "MySQLCaptureStore", return_value=store):
+            result = local_capture_agent.LocalCaptureAgent(Mock()).mysql_preflight(
+                Mock(), initialize_if_missing=True
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("1142", result["error"])
+        self.assertEqual(result["error_detail"]["category"], "authorization")
+
     def test_ack_driven_sample_pump_sends_next_batch_immediately_after_ack(self):
         pump_type = getattr(helper_entry, "HelperSamplePump", None)
         self.assertIsNotNone(pump_type, "helper must expose an ACK-driven sample pump")
@@ -243,7 +301,11 @@ class HelperTransportTests(unittest.TestCase):
                 "type": "command",
                 "request_id": "test-1",
                 "command": "mysql_preflight",
-                "payload": {"use_saved_profile": True, "write_test": False},
+                "payload": {
+                    "use_saved_profile": True,
+                    "write_test": True,
+                    "initialize_if_missing": True,
+                },
             }
             with patch.object(helper_entry, "default_runtime_config_path", return_value=path):
                 saved = dispatch_command(agent, json.dumps(save_command))
@@ -256,6 +318,8 @@ class HelperTransportTests(unittest.TestCase):
         settings = agent.mysql_preflight.call_args.args[0]
         self.assertEqual(settings.password, "local-secret")
         self.assertEqual(settings.host, "127.0.0.1")
+        self.assertTrue(agent.mysql_preflight.call_args.kwargs["write_test"])
+        self.assertTrue(agent.mysql_preflight.call_args.kwargs["initialize_if_missing"])
 
     def test_helper_cli_without_arguments_returns_setup_guidance_instead_of_argparse_exit(self):
         output = []

@@ -1,0 +1,25 @@
+<Configuration>
+  <MemoryInMB>4096</MemoryInMB>
+  <Networking>Enable</Networking>
+  <VGpu>Disable</VGpu>
+  <AudioInput>Disable</AudioInput>
+  <VideoInput>Disable</VideoInput>
+  <PrinterRedirection>Disable</PrinterRedirection>
+  <ClipboardRedirection>Disable</ClipboardRedirection>
+  <ProtectedClient>Enable</ProtectedClient>
+  <MappedFolders>
+    <MappedFolder>
+      <HostFolder>{{INPUT_HOST_FOLDER}}</HostFolder>
+      <SandboxFolder>C:\AFP-Lab\Input</SandboxFolder>
+      <ReadOnly>true</ReadOnly>
+    </MappedFolder>
+    <MappedFolder>
+      <HostFolder>{{RESULTS_HOST_FOLDER}}</HostFolder>
+      <SandboxFolder>C:\AFP-Lab\Results</SandboxFolder>
+      <ReadOnly>false</ReadOnly>
+    </MappedFolder>
+  </MappedFolders>
+  <LogonCommand>
+    <Command>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\AFP-Lab\Input\scripts\Initialize-ClientLab.ps1</Command>
+  </LogonCommand>
+</Configuration>

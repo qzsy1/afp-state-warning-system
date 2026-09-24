@@ -122,6 +122,31 @@ class HelperRelayTests(unittest.TestCase):
         self.assertTrue(registry.status("session-a")["online"])
         self.assertTrue(registry.status("session-a")["capabilities"]["hardware_discovery"])
 
+    def test_stale_websocket_detach_cannot_offline_new_connection(self):
+        registry = HelperRegistry()
+        challenge = registry.start_pairing("session-a")
+        paired = registry.complete_pairing(challenge["challenge"], "device-a", {})
+        first_messages = []
+        second_messages = []
+
+        first_sender = first_messages.append
+        second_sender = second_messages.append
+        self.assertTrue(
+            registry.attach("session-a", "device-a", paired["pairing_token"], first_sender)
+        )
+        self.assertTrue(
+            registry.attach("session-a", "device-a", paired["pairing_token"], second_sender)
+        )
+
+        registry.detach("session-a", sender=first_sender)
+        status = registry.status("session-a")
+        request = registry.command("session-a", "status", {})
+
+        self.assertTrue(status["online"])
+        self.assertTrue(request["queued"])
+        self.assertEqual(first_messages, [])
+        self.assertEqual(second_messages[0]["request_id"], request["request_id"])
+
 
 if __name__ == "__main__":
     unittest.main()

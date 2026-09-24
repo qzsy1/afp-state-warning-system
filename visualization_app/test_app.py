@@ -31,7 +31,7 @@ from app import (
     _OPERATION_LOCK_STARTED,
     create_server,
 )
-from online_inference import inspect_prediction_model
+from online_inference import NEW_MODEL_SENSOR_COLUMNS, inspect_prediction_model
 
 
 class PoolingTests(unittest.TestCase):
@@ -530,6 +530,8 @@ class DashboardTests(unittest.TestCase):
             original_manager = self.dashboard.acquisition
             manager = AcquisitionManager(Path(temporary))
             self.dashboard.acquisition = manager
+            save_root = Path(temporary) / "capture"
+            save_root.mkdir(parents=True, exist_ok=True)
             config = AcquisitionConfig(
                 processing_mode="capture_only",
                 dataset_schema="new_collection_v11_3",
@@ -540,6 +542,7 @@ class DashboardTests(unittest.TestCase):
                 sample_rate_hz=1000.0,
                 specimen_id="NEW_CAPTURE_ONLY",
                 condition_id="H06",
+                save_root=str(save_root),
             )
             stopped = None
             try:
@@ -559,10 +562,13 @@ class DashboardTests(unittest.TestCase):
                     "TC-HI", "random_forest", 24,
                 )
                 self.assertEqual(payload["mode"], "capture_only")
-                # The new collection plan intentionally acquires 16 physical
-                # channels; rotation speed, displacement and vibration are
-                # excluded from the new dataset.
-                self.assertEqual(len(payload["channels"]), 16)
+                # The new collection plan acquires 17 channels, including
+                # separate PLC pressure and pressure-film channels. Rotation
+                # speed, displacement and vibration remain excluded.
+                self.assertEqual(len(payload["channels"]), 17)
+                self.assertIn(
+                    "薄膜压力", [channel["name"] for channel in payload["channels"]]
+                )
                 self.assertEqual(payload["forecast"]["returned_horizon"], 0)
                 self.assertEqual(
                     payload["feature_generation"]["mode"], "capture_only"
@@ -590,7 +596,11 @@ class DashboardTests(unittest.TestCase):
                 str(NEW_DEMO_CHECKPOINT)
             )
             self.assertEqual(profile["enc_in"], 20)
-            self.assertEqual(profile["input_sensors"], NEW_COLLECTION_SENSOR_COLUMNS)
+            # This checkpoint predates the pressure-film model input. Capture
+            # keeps all 17 channels while inference uses its declared 16-input
+            # subset instead of inventing an untrained feature.
+            self.assertEqual(profile["input_sensors"], NEW_MODEL_SENSOR_COLUMNS)
+            self.assertNotIn("薄膜压力", profile["input_sensors"])
             config = AcquisitionConfig(
                 processing_mode="prediction_warning",
                 dataset_schema="new_collection_v11_3",
@@ -624,7 +634,15 @@ class DashboardTests(unittest.TestCase):
                     "TC-HI", "random_forest", 24,
                 )
                 self.assertEqual(payload["mode"], "live_acquisition")
-                self.assertEqual(len(payload["channels"]), 16)
+                self.assertEqual(len(payload["channels"]), 17)
+                self.assertEqual(
+                    sum(bool(channel["prediction_enabled"]) for channel in payload["channels"]),
+                    len(NEW_MODEL_SENSOR_COLUMNS),
+                )
+                pressure_film = next(
+                    channel for channel in payload["channels"] if channel["name"] == "薄膜压力"
+                )
+                self.assertFalse(pressure_film["prediction_enabled"])
                 self.assertEqual(payload["forecast"]["returned_horizon"], 24)
                 self.assertTrue(payload["window"]["complete"])
                 self.assertTrue(

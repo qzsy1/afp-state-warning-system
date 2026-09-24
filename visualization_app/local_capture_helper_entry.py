@@ -433,6 +433,7 @@ def dispatch_command(agent: LocalCaptureAgent, raw: str | bytes) -> dict[str, An
             result = agent.mysql_preflight(
                 settings,
                 write_test=bool(payload.get("write_test", False)),
+                initialize_if_missing=bool(payload.get("initialize_if_missing", False)),
             )
             if isinstance(result, dict):
                 result.setdefault("scope", "helper_local")

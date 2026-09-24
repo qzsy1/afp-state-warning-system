@@ -17,6 +17,7 @@ class RemoteMySQLSetupTests(unittest.TestCase):
         self.assertIn("CREATE USER IF NOT EXISTS 'afp_app'@'192.168.101.%'", sql)
         self.assertIn("IDENTIFIED BY 'p@ss''word'", sql)
         self.assertIn("ON `afp_remote_2026`.*", sql)
+        self.assertIn("DROP", sql)
         self.assertIn("FLUSH PRIVILEGES", sql)
 
     def test_build_remote_setup_sql_rejects_invalid_identifiers(self) -> None:

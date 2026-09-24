@@ -1,0 +1,30 @@
+{
+  "run_at": "2026-09-22T00:14:00+08:00",
+  "command": "py -3.11 -m unittest discover -s visualization_app -p \"test_*.py\" -q",
+  "python": "3.11",
+  "tests_run": 342,
+  "exit_code": 1,
+  "failures": 0,
+  "errors": 1,
+  "error_groups": [
+    {
+      "test": "test_app.DashboardTests.setUpClass",
+      "count": 1,
+      "classification": "source-development-data-missing",
+      "details": [
+        "outputs_tc_hi_soft_consistency_v13_8/TC_HI_soft_window_results.csv",
+        "outputs_tc_hi_soft_consistency_v13_8/TC_HI_soft_layer_results_130.csv",
+        "outputs_tc_hi_soft_consistency_v13_8/TC_HI_soft_specimen_results_26.csv",
+        "outputs_causal_online_consistency_v13_9/causal_online_consistency_artifact.joblib"
+      ]
+    }
+  ],
+  "change_scope_regressions": 0,
+  "supporting_passes": {
+    "remote_workflow_core_tests": 261,
+    "acquisition_prediction_boundary_tests": 46,
+    "health_and_mysql_regression_tests": 63,
+    "delivery_self_test_modules": 9,
+    "delivery_file_hashes": 6480
+  }
+}

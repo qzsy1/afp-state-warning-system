@@ -1197,7 +1197,7 @@ class MySQLCaptureStore:
         self,
         config: Any,
         *,
-        rows: list[dict[str, Any]],
+        rows: Iterable[dict[str, Any]],
         layer_file: str | None,
         full_specimen_file: str | None,
         timestamp_file: str | None,
@@ -1278,27 +1278,6 @@ class MySQLCaptureStore:
                     saved_at,
                 ),
             )
-            cursor.execute(
-                """
-                INSERT INTO afp_layer
-                (specimen_key, layer_no, layer_file, timestamp_file,
-                 sample_count, summary_json, saved_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s)
-                ON DUPLICATE KEY UPDATE
-                  layer_file=VALUES(layer_file), timestamp_file=VALUES(timestamp_file),
-                  sample_count=VALUES(sample_count), summary_json=VALUES(summary_json),
-                  saved_at=VALUES(saved_at)
-                """,
-                (
-                    specimen_key,
-                    layer_no,
-                    layer_file,
-                    timestamp_file,
-                    len(rows),
-                    json.dumps(summary, ensure_ascii=False),
-                    saved_at,
-                ),
-            )
             sensor_names = list(getattr(config, "schema_sensors", []))
             process_names = list(getattr(config, "process_columns", []))
             sample_sql = """
@@ -1312,7 +1291,48 @@ class MySQLCaptureStore:
                   sensor_json=VALUES(sensor_json), process_json=VALUES(process_json),
                   saved_at=VALUES(saved_at)
             """
-            sample_values = []
+            # Delete before inserting and keep one bounded batch in memory.
+            # The same batch is written to both compatible tables so callers
+            # may supply a one-pass disk iterator instead of a giant list.
+            for target in ("afp_sensor_sample", "afp_sample_all"):
+                cursor.execute(
+                    f"DELETE FROM {target} WHERE specimen_key=%s AND layer_no=%s",
+                    (specimen_key, layer_no),
+                )
+
+            # The sample tables reference afp_layer.  Establish the parent
+            # row inside this same transaction before streaming any child
+            # rows, then update the final count after the iterator is drained.
+            cursor.execute(
+                """
+                INSERT INTO afp_layer
+                (specimen_key, layer_no, layer_file, timestamp_file,
+                 sample_count, summary_json, saved_at)
+                VALUES (%s,%s,%s,%s,0,%s,%s)
+                ON DUPLICATE KEY UPDATE
+                  layer_file=VALUES(layer_file), timestamp_file=VALUES(timestamp_file),
+                  sample_count=0, summary_json=VALUES(summary_json),
+                  saved_at=VALUES(saved_at)
+                """,
+                (
+                    specimen_key,
+                    layer_no,
+                    layer_file,
+                    timestamp_file,
+                    json.dumps(summary, ensure_ascii=False),
+                    saved_at,
+                ),
+            )
+
+            sample_values: list[tuple[Any, ...]] = []
+            saved_rows = 0
+
+            def write_sample_batch(values: list[tuple[Any, ...]]) -> None:
+                if not values:
+                    return
+                for target in ("afp_sensor_sample", "afp_sample_all"):
+                    cursor.executemany(sample_sql.replace("afp_sensor_sample", target), values)
+
             for index, row in enumerate(rows):
                 sensor_values = {
                     name: _finite(row.get(name))
@@ -1340,29 +1360,34 @@ class MySQLCaptureStore:
                         saved_at,
                     )
                 )
+                if len(sample_values) >= 1000:
+                    write_sample_batch(sample_values)
+                    saved_rows += len(sample_values)
+                    sample_values = []
             if sample_values:
-                # Keep the historical table for compatibility and maintain a
-                # clearly named all-data table for downstream analysis.
-                for target in ("afp_sensor_sample", "afp_sample_all"):
-                    # A repeated save of the same physical layer replaces the
-                    # complete point sequence.  Without this delete, a shorter
-                    # retry would leave stale high-index rows from the earlier
-                    # capture in MySQL.
-                    cursor.execute(
-                        f"DELETE FROM {target} WHERE specimen_key=%s AND layer_no=%s",
-                        (specimen_key, layer_no),
-                    )
-                    cursor.executemany(
-                        sample_sql.replace("afp_sensor_sample", target),
-                        sample_values,
-                    )
+                write_sample_batch(sample_values)
+                saved_rows += len(sample_values)
+            cursor.execute(
+                """
+                UPDATE afp_layer
+                SET sample_count=%s, summary_json=%s, saved_at=%s
+                WHERE specimen_key=%s AND layer_no=%s
+                """,
+                (
+                    saved_rows,
+                    json.dumps(summary, ensure_ascii=False),
+                    saved_at,
+                    specimen_key,
+                    layer_no,
+                ),
+            )
             cursor.execute(
                 """
                 INSERT INTO afp_mysql_upload_log
                 (specimen_key, layer_no, success, row_count, error_text, created_at)
                 VALUES (%s,%s,1,%s,NULL,%s)
                 """,
-                (specimen_key, layer_no, len(sample_values), saved_at),
+                (specimen_key, layer_no, saved_rows, saved_at),
             )
             connection.commit()
             return {
@@ -1372,7 +1397,7 @@ class MySQLCaptureStore:
                 "driver": driver,
                 "specimen_key": specimen_key,
                 "layer": layer_no,
-                "saved_rows": len(sample_values),
+                "saved_rows": saved_rows,
                 "elapsed_seconds": round(time.time() - started, 3),
             }
         except Exception as exc:

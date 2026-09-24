@@ -73,7 +73,7 @@ def build_remote_setup_sql(
             f"CREATE USER IF NOT EXISTS {account_sql} IDENTIFIED BY '{secret}';",
             f"ALTER USER {account_sql} IDENTIFIED BY '{secret}';",
             f"GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX,",
-            f"      REFERENCES, CREATE VIEW, SHOW VIEW ON `{db}`.*",
+            f"      REFERENCES, CREATE VIEW, SHOW VIEW, DROP ON `{db}`.*",
             f"      TO {account_sql};",
             "",
             "FLUSH PRIVILEGES;",
@@ -96,7 +96,7 @@ def classify_mysql_error(error: Any) -> dict[str, str]:
             "message": "当前运行环境没有可用的MySQL驱动，请安装mysql-connector-python或PyMySQL",
         }
     code = ""
-    match = re.search(r"\b(10(?:44|45|49)|1130|1146|2003|2005|2061)\b", text)
+    match = re.search(r"\b(10(?:44|45|49)|1130|1142|1146|2003|2005|2061)\b", text)
     if match:
         code = match.group(1)
     if code == "1130" or "host is not allowed" in lowered:
@@ -119,11 +119,11 @@ def classify_mysql_error(error: Any) -> dict[str, str]:
             "code": code or "1045",
             "message": "用户名/密码错误，或该用户没有从当前客户端主机登录的账号记录" + suffix,
         }
-    if code == "1044" or "access denied" in lowered and "database" in lowered:
+    if code in {"1044", "1142"} or "access denied" in lowered and "database" in lowered:
         return {
             "category": "authorization",
             "code": code or "1044",
-            "message": "账号已登录，但没有该数据库的权限",
+            "message": "账号已登录，但没有该数据库或建表操作的权限",
         }
     if "access denied" in lowered:
         return {

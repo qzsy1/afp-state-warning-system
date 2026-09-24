@@ -180,8 +180,17 @@ def _finite(value: Any, default: float = 0.0) -> float:
 
 
 def _integral(values: np.ndarray) -> float:
-    trapezoid = getattr(np, "trapezoid", np.trapz)
-    return float(trapezoid(values))
+    # NumPy 2.x removed ``np.trapz`` while older supported versions do not
+    # expose ``np.trapezoid``.  Avoid evaluating a missing fallback eagerly
+    # and keep the same unit-spacing trapezoidal integral on both versions.
+    trapezoid = getattr(np, "trapezoid", None)
+    if trapezoid is not None:
+        return float(trapezoid(values))
+    legacy_trapz = getattr(np, "trapz", None)
+    if legacy_trapz is not None:
+        return float(legacy_trapz(values))
+    values = np.asarray(values, dtype=float)
+    return float(np.sum((values[:-1] + values[1:]) * 0.5))
 
 
 def _indices(names: list[str]) -> list[int]:

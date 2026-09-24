@@ -217,10 +217,23 @@ class HelperRegistry:
                 self._persist_helpers_locked()
             return True
 
-    def detach(self, session_id: str) -> None:
+    def detach(
+        self,
+        session_id: str,
+        *,
+        sender: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        """Detach only the connection that is actually closing.
+
+        A reconnect can attach a new WebSocket before the old request handler
+        reaches its ``finally`` block.  The stale handler must not clear the
+        new sender or mark the replacement connection offline.
+        """
         with self._lock:
             helper = self._helpers.get(session_id)
             if helper:
+                if sender is not None and helper.sender is not sender:
+                    return
                 helper.online = False
                 helper.sender = None
 
