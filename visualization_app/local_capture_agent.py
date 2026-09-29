@@ -147,13 +147,29 @@ class LocalCaptureAgent:
         store = MySQLCaptureStore(settings)
         result = store.preflight(write_test=write_test)
         schema_initialized = False
-        if (
-            initialize_if_missing
-            and not result.get("ok")
+        error_text = str(result.get("error") or "").lower()
+        unknown_database = (
+            not result.get("ok")
+            and result.get("stage") == "connect"
+            and (
+                "1049" in error_text
+                or "unknown database" in error_text
+                or "doesn't exist" in error_text
+                or "does not exist" in error_text
+            )
+        )
+        missing_schema = (
+            not result.get("ok")
             and result.get("stage") == "schema"
             and bool(result.get("missing_objects"))
-        ):
-            initialized = store.initialize_schema(create_database=False)
+        )
+        if initialize_if_missing and (unknown_database or missing_schema):
+            # This command is only exposed by the explicit helper-local
+            # "检查本机数据库" action.  A missing database may therefore be
+            # created here, while ordinary reads and the server-target path
+            # remain strictly non-DDL.  Authentication, network, driver and
+            # permission failures do not enter this branch.
+            initialized = store.initialize_schema(create_database=unknown_database)
             if initialized.get("ok"):
                 result = store.preflight(write_test=write_test)
                 schema_initialized = bool(result.get("ok"))

@@ -83,6 +83,14 @@ local helper SHALL 使用 Windows 当前用户作用域的 DPAPI 加密保存本
 - **WHEN** 用户已在访问电脑创建目标数据库和最小权限账号，并显式点击本机 MySQL 的“保存并检查”，但该数据库尚无 AFP 关系表
 - **THEN** local helper SHALL 仅在已选择的现有数据库内创建缺失 AFP 表并执行可回滚写测试，MUST NOT 创建其它数据库，也 MUST NOT 把该行为应用到服务器目标 MySQL；成功结果 SHALL 明确标记首次表初始化已完成
 
+#### Scenario: 新电脑本机数据库本身不存在
+- **WHEN** 用户已填写合法的本机数据库名并显式点击“检查本机数据库”，预检在连接阶段返回 MySQL 1049 或等价的 `Unknown database`
+- **THEN** local helper SHALL 仅在本机 helper-local 作用域、当前用户已配置账号具备建库权限时创建该数据库并初始化 AFP 表，随后重新预检并执行回滚写测试；服务器目标 MySQL MUST NOT 通过该按钮自动建库
+
+#### Scenario: 本机数据库不存在但账号无建库权限
+- **WHEN** 本机首次检查发现数据库不存在且 `CREATE DATABASE` 返回 1044/1045/1142 或等价权限错误
+- **THEN** 页面 MUST 显示实际授权错误和所需本机账号权限，不得继续显示“关系结构不存在”作为唯一原因，也不得把失败伪装成预检通过
+
 #### Scenario: 本机账号没有建表权限
 - **WHEN** 本机数据库可连接但账号执行首次 AFP 表初始化返回 1142 或等价权限错误
 - **THEN** 页面 MUST 显示建表授权不足及实际错误码，MUST NOT 继续报告“仅表结构不完整”而隐藏初始化失败；初始化账号 SHALL 对所选数据库具有 `SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, REFERENCES, CREATE VIEW, SHOW VIEW, DROP`，MUST NOT 因此获得全局权限

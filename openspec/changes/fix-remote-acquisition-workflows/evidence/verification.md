@@ -75,3 +75,14 @@
 - 新 helper `--version` 输出 `20260929-isolated-check-v2 (protocol 2)`；阻塞检查子进程在测试中按 1 秒测试时限被终止，状态和开始命令在 0.5 秒断言边界内独立返回。生产总时限为 60 秒。主程序 SHA-256 保持 `AA7BC2F636E862E9F603F7B4D4D9D8FC9B71390FFB20F33A011A42EF9D56FD65`；新 helper 为 `5B0740BA99B6645A1EB1AEF61B86EF8C6F8062D076A15C894E7FB16679E73059`，213075193 bytes。
 - `SHA256SUMS.txt` 覆盖 6277 个非可变文件并通过验证：0 missing、0 mismatched、0 malformed。PLC Modbus TCP、ABB RWS、SMRF 热电偶 HID、M3232 串口、UVC 热成像接口代码及通道映射没有修改，相关接口/采集/M3232/预测/MySQL/公网安全回归均通过。
 - 真实第二台电脑最新版 helper 握手、检查超时后控制响应、真实 50 Hz、MySQL 和五类物理设备保持待现场确认；不得由本机或公网模拟结果替代。
+
+## 2026-09-29 检查超时诊断与本机数据库首次建库
+
+- RED 阶段新增三个定向测试并分别稳定捕获旧行为：模型供应商异常会让快速诊断作业失败；helper-local 遇到 1049 未知数据库不会初始化；helper 检查超时/不完整结果会显示接口和通道 0/0 且没有诊断事件。修复后三个测试全部转绿。
+- 相关完整回归 257 项、53.296 秒，全部通过；覆盖 Agent/LangChain、helper 传输与命令、前端模拟/真实分流、MySQL 诊断与作用域、五类接口、公网权限、原生集成入口。Python 编译、`git diff --check` 和 OpenSpec 严格校验同时通过。
+- helper 检查异常现在按页面当前五类接口和已选通道补齐 `hardware_check_timeout/no_data` 事实，供本地诊断和模型综合使用；真实采集仍因 `ok=false` 被原门禁阻止，模拟采集原有豁免不变。
+- 快速模型路径的供应商、工具或结构化响应异常现在返回 `failed_offline_fallback`，保留已生成的本地规则诊断并结束加载状态；默认模型调用次数仍为一次。
+- helper-local 只有在用户明确点击首次检查、预检阶段为连接且错误为 1049/Unknown database 时才调用 `initialize_schema(create_database=True)`，随后重新执行表结构和回滚写测试。已有数据库缺表仍只执行建表；服务器目标库、1045、网络、服务、驱动和权限错误不进入自动建库分支。
+- 交付目录七个运行副本与源码逐文件 SHA-256 一致；`SHA256SUMS.txt` 覆盖 6277 个非可变文件，`--verify-files` 退出码 0。主程序 EXE 未重建，SHA-256 为 `AA7BC2F636E862E9F603F7B4D4D9D8FC9B71390FFB20F33A011A42EF9D56FD65`；helper 重建后为 `272FB53A4A622882E83CB86C5BDC3EDE13C7B4BBF745627BAEF65E17D5026001`，213078355 bytes，版本仍为 `20260929-isolated-check-v2 (protocol 2)`。
+- 服务以 PID 32628 重启，8770/8771 由同一进程监听。本机与公网健康接口均正常；公网首页和脚本均加载 `20260929-lan-ws-helper-v3-diagnosis-mysql`，包含检查结果规范化和“模型增强诊断”文案。回环 WebSocket 握手为 8.5 ms，公网 WSS 握手为 49.6 ms；当前推荐局域网地址为 `http://192.168.101.31:8770/`。
+- 本轮没有使用用户真实供应商 Key 发起模型请求，也没有代替第二台电脑创建其实际数据库；有效 Key/模型/公网出口、第二台电脑 MySQL 权限、真实 helper 与五类实物接口仍按现场验收项单独确认。

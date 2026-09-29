@@ -155,7 +155,7 @@ def tool_definitions() -> list[dict[str, Any]]:
         ),
         _function(
             "check_network_path",
-            "读取已配置PLC或ABB端点、共用网卡和可达性；不扫描其他地址",
+            "仅对 interface_id=plc_process 或 abb_motion 读取已配置端点、共用网卡和可达性；其它接口不得调用，不扫描其他地址",
             {"interface_id": interface_id},
             ["interface_id"],
         ),

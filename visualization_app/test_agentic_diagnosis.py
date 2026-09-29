@@ -482,6 +482,25 @@ class SiliconFlowAgentTests(unittest.TestCase):
         )
         return context
 
+    def test_fast_diagnosis_provider_failure_keeps_local_result(self) -> None:
+        context = self._plc_context()
+
+        def unavailable(_payload):
+            raise agentic_diagnosis.AgentToolCallError("当前硅基流动模型名称无效或请求不受支持")
+
+        result = agentic_diagnosis.run_siliconflow_fast_diagnosis(
+            "sk-test-only",
+            "deepseek-ai/DeepSeek-V3",
+            context,
+            [],
+            transport=unavailable,
+        )
+
+        self.assertEqual(result["model_status"], "failed_offline_fallback")
+        self.assertEqual(result["execution_mode"], "offline_test")
+        self.assertIn("模型名称无效", result["model_message"])
+        self.assertEqual(len(result["diagnoses"]), 1)
+
     def test_streaming_response_reassembles_fragmented_tool_call(self) -> None:
         chunks = [
             b'data: {"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"check_network_","arguments":"{\\"interface_id\\":\\"plc_"}}]},"finish_reason":null}]}\n',

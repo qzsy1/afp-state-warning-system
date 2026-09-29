@@ -457,6 +457,19 @@ const window = {setTimeout};
         self.assertNotIn('settings.mysql_local_host', body)
         self.assertNotIn('settings.mysql_local_port', body)
 
+    def test_helper_check_timeout_keeps_configured_interfaces_for_diagnosis(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("function normalizeHardwareCheckResult")
+        end = text.index("async function testSensorConnection", start)
+        body = text[start:end]
+        self.assertIn("hardware_check_timed_out", body)
+        self.assertIn("interfaces", body)
+        self.assertIn("sensors", body)
+        check_start = text.index('requestLocalHelper("check_capture"')
+        check_end = text.index("updateAgentFromHardwareResult", check_start)
+        self.assertIn("state.hardwareCheck = result", text[check_start:check_end])
+
     def test_start_preflights_every_enabled_mysql_destination(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")

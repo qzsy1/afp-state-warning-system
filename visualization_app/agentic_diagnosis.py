@@ -1152,17 +1152,32 @@ def run_siliconflow_fast_diagnosis(
         if isinstance(item, dict) and item.get("evidence_id")
     }
     caller = transport or (lambda payload: _request_siliconflow(api_key, payload))
-    response = caller(_build_structured_payload(model_name, context, offline_result))
-    message = _assistant_message(response)
-    parsed = _parse_final_json(_final_message_content(message))
-    result = _validate_final_result(
-        parsed,
-        context,
-        evidence_by_id,
-        local_diagnoses,
-        model_name,
-        0,
-    )
+    try:
+        response = caller(_build_structured_payload(model_name, context, offline_result))
+        message = _assistant_message(response)
+        parsed = _parse_final_json(_final_message_content(message))
+        result = _validate_final_result(
+            parsed,
+            context,
+            evidence_by_id,
+            local_diagnoses,
+            model_name,
+            0,
+        )
+    except AgentToolCallError as error:
+        result = offline_result
+        result["model_status"] = "failed_offline_fallback"
+        result["model_message"] = f"{error.public_message}；已保留本地规则诊断"
+        result["model_name"] = str(model_name).strip()
+        result["model_error"] = error.public_message
+        return result
+    except Exception:
+        result = offline_result
+        result["model_status"] = "failed_offline_fallback"
+        result["model_message"] = "模型调用或响应格式异常；已保留本地规则诊断"
+        result["model_name"] = str(model_name).strip()
+        result["model_error"] = "模型调用或响应格式异常"
+        return result
     result["execution_mode"] = "siliconflow_fast"
     result["model_status"] = "success"
     result["model_message"] = "已基于本地证据完成单次模型综合"

@@ -186,6 +186,41 @@ class HelperTransportTests(unittest.TestCase):
         self.assertIn("1142", result["error"])
         self.assertEqual(result["error_detail"]["category"], "authorization")
 
+    def test_helper_local_mysql_missing_database_is_created_on_explicit_first_check(self):
+        store = Mock()
+        store.preflight.side_effect = [
+            {
+                "ok": False,
+                "stage": "connect",
+                "database": "afp_state_warning",
+                "error": "1049 (42000): Unknown database 'afp_state_warning'",
+            },
+            {
+                "ok": True,
+                "stage": "ready",
+                "schema_ready": True,
+                "write_test": True,
+                "database": "afp_state_warning",
+            },
+        ]
+        store.initialize_schema.return_value = {
+            "ok": True,
+            "initialized": True,
+            "database_creation_requested": True,
+        }
+
+        with patch.object(local_capture_agent, "MySQLCaptureStore", return_value=store):
+            result = local_capture_agent.LocalCaptureAgent(Mock()).mysql_preflight(
+                Mock(),
+                write_test=True,
+                initialize_if_missing=True,
+            )
+
+        store.initialize_schema.assert_called_once_with(create_database=True)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["schema_initialized"])
+        self.assertEqual(result["scope"], "helper_local")
+
     def test_ack_driven_sample_pump_sends_next_batch_immediately_after_ack(self):
         pump_type = getattr(helper_entry, "HelperSamplePump", None)
         self.assertIsNotNone(pump_type, "helper must expose an ACK-driven sample pump")

@@ -1818,7 +1818,7 @@ function renderAgentGate() {
     status.textContent = state.agentBusy
       ? "诊断中"
       : !eventPresent ? "等待异常"
-        : configured ? "模型工具诊断" : (keyPresent || modelPresent) ? "离线诊断（未调用模型）" : "离线测试诊断";
+        : configured ? "模型增强诊断" : (keyPresent || modelPresent) ? "离线诊断（未调用模型）" : "离线测试诊断";
   }
   if (agentDiagnoseButton) agentDiagnoseButton.disabled = !ready;
   return ready;
@@ -5440,6 +5440,7 @@ function hardwareStateLabel(value) {
     open_failed: "接口无法打开或读取",
     invalid_protocol: "协议数据无效",
     invalid_data: "采集数据无效", partial: "部分通道异常", partial_data: "部分通道异常",
+    hardware_check_timeout: "辅助程序检查超时",
     stale: "数据已中断", not_selected: "未选择",
   })[value] || "异常";
 }
@@ -5559,6 +5560,64 @@ function scheduleAutomaticHardwareCheck(delay = 700) {
   }, Math.max(0, delay));
 }
 
+function normalizeHardwareCheckResult(result) {
+  const current = result && typeof result === "object" ? result : {};
+  const interfaces = Array.isArray(current.interfaces) ? current.interfaces : [];
+  const sensors = Array.isArray(current.sensors) ? current.sensors : [];
+  if (interfaces.length && sensors.length) return current;
+
+  // A terminated helper check can only return an error envelope.  Keep the
+  // operator's current five-interface/selected-channel configuration visible
+  // so the same failure becomes a real diagnostic event instead of a
+  // misleading 0/0 summary and an empty LangChain gate.
+  const reason = String(
+    current.error || current.message || "本地辅助程序未返回完整接口检查结果",
+  );
+  const selected = selectedAcquisitionChannelsForInterfaces();
+  const rows = [...(controls.interfacePanel?.querySelectorAll(".interface-config-row") || [])];
+  const fallbackInterfaces = rows.map((row) => {
+    const role = row.querySelector(".interface-role")?.value || "custom";
+    const profile = sensorTypeProfile(role);
+    const expected = (profile.channels || []).filter((name) => selected.includes(name));
+    return {
+      id: row.dataset.interfaceId,
+      role,
+      driver: row.querySelector(".interface-driver")?.value || profile.driver || "",
+      endpoint: row.querySelector(".interface-endpoint")?.value || "未填写地址",
+      physical_interface_id: row.querySelector(".interface-physical")?.value || "",
+      physical_interface_kind: profile.interface_kind || "",
+      enabled: row.querySelector(".interface-enabled")?.checked !== false,
+      expected_channels: expected,
+      detected_channels: [],
+      missing_channels: expected,
+      invalid_channels: [],
+      state: "hardware_check_timeout",
+      message: `辅助程序检查未返回结果：${reason}`,
+      ok: false,
+    };
+  });
+  const fallbackSensors = selected.map((name) => ({
+    name,
+    selected: true,
+    state: "no_data",
+    message: `辅助程序检查未返回结果：${reason}`,
+    observed_samples: 0,
+    received_samples: 0,
+    invalid_samples: 0,
+    blocking: true,
+    ok: false,
+  }));
+  return {
+    ...current,
+    ok: false,
+    interfaces: interfaces.length ? interfaces : fallbackInterfaces,
+    sensors: sensors.length ? sensors : fallbackSensors,
+    errors: [...(Array.isArray(current.errors) ? current.errors : []), reason],
+    hardware_check_timed_out: current.error === "hardware_check_timed_out"
+      || /超时|timed.?out/i.test(reason),
+  };
+}
+
 async function testSensorConnection({automatic = false} = {}) {
   if (state.hardwareCheckInProgress) return state.hardwareCheck;
   if (state.acquisitionStatus?.running) {
@@ -5618,13 +5677,24 @@ async function testSensorConnection({automatic = false} = {}) {
       // drivers to time out one by one.  The helper keeps its heartbeat on a
       // separate thread, so allow the command enough time to finish instead
       // of reporting a client-side timeout while the check is still running.
-      const result = await requestLocalHelper("check_capture", acquisitionConfig(), {timeoutMs: 120000});
+      const result = normalizeHardwareCheckResult(
+        await requestLocalHelper("check_capture", acquisitionConfig(), {timeoutMs: 120000}),
+      );
       state.hardwareCheck = result;
       state.hardwareCheckFingerprint = hardwareConfigFingerprint();
       renderHardwareCheckResult(result, {automatic});
       updateAgentFromHardwareResult(result, {automatic});
       return result;
     } catch (error) {
+      const failedCheck = normalizeHardwareCheckResult({
+        ok: false,
+        error: error.message || "hardware_check_timed_out",
+        hardware_check_timed_out: true,
+      });
+      state.hardwareCheck = failedCheck;
+      state.hardwareCheckFingerprint = hardwareConfigFingerprint();
+      renderHardwareCheckResult(failedCheck, {automatic});
+      updateAgentFromHardwareResult(failedCheck, {automatic});
       if (node) {
         node.className = "hardware-check-status error";
         node.textContent = `本机辅助程序检查失败：${error.message}`;
