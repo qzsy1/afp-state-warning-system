@@ -5,7 +5,7 @@
 ## ADDED Requirements
 
 ### Requirement: 模拟采集保存与 MySQL 预检必须一致
-授权远程模拟采集启用 MySQL 时，停止后的保存结果 MUST 对应此前通过预检的目标作用域；系统 MUST NOT 静默关闭已启用的 MySQL。访问电脑本机 MySQL 仅可由该电脑的 helper 写入；若当前模拟工作流不支持该写入，启动前 MUST 明确拒绝，不能预检通过后报告已保存。访客模拟不得获得 MySQL 写入权限。
+授权远程模拟采集启用 MySQL 时，停止后的保存结果 MUST 对应此前通过预检的目标作用域；系统 MUST NOT 静默关闭已启用的 MySQL。访问电脑本机 MySQL 仅可由该电脑的 helper 写入；已授权远程模拟由兼容 helper 本地回放时 SHALL 支持该写入。若会话在启动前回退到服务器模拟，则本机 MySQL 组合 MUST 被明确拒绝，不能预检通过后报告已保存。访客模拟不得获得 MySQL 写入权限。
 
 #### Scenario: 已授权模拟写入服务器目标库
 - **WHEN** 用户启用服务器目标 MySQL 并通过预检后开始远程模拟采集
@@ -23,9 +23,13 @@
 - **WHEN** 用户正在修改本机 MySQL 主机、用户名或密码，而 helper 状态定时刷新
 - **THEN** 未提交输入 MUST 不被覆盖或清空；预检 MUST 检查当前表单对应的配置，不得静默检查旧配置
 
-#### Scenario: 已授权模拟选择本机 MySQL
-- **WHEN** 该模拟工作流不能在访问电脑 helper 中完成写入
-- **THEN** 系统 MUST 在开始采集前给出明确作用域限制，并保持服务器目标库和 CSV 两种保存路径可用
+#### Scenario: helper 本地模拟选择本机 MySQL
+- **WHEN** 已授权远程模拟会话由兼容 helper 本地回放，且用户启用已通过预检的访问电脑本机 MySQL
+- **THEN** helper MUST 以与真实采集相同的本地铺层事务保存模拟样本，停止结果 MUST 分别显示本机 CSV、本机 MySQL 和服务器目标 MySQL 的实际状态
+
+#### Scenario: 服务器回退模拟选择本机 MySQL
+- **WHEN** helper 不可用使该会话在启动前回退到服务器模拟，但用户仍启用访问电脑本机 MySQL
+- **THEN** 系统 MUST 在开始采集前给出明确作用域限制，并保持服务器目标库和服务器会话 CSV 两种保存路径可用
 
 ### Requirement: MySQL 连接必须标明作用域
 系统 SHALL 将 MySQL 目标明确区分为“访问电脑本机 MySQL”和“服务器或指定目标 MySQL”，界面、配置状态和诊断结果 MUST 始终显示当前作用域与实际主机，且 `127.0.0.1` MUST 按执行连接的机器解释。
@@ -38,8 +42,8 @@
 - **WHEN** 用户选择“服务器或指定目标 MySQL”
 - **THEN** 预检、真实与模拟采集的最终写入 MUST 均由服务器侧执行，并 SHALL 显示服务器实际使用的主机、端口和数据库名；helper MAY 采集并传输样本，但 MUST NOT 持有服务器目标库密码或代替服务器写入该目标库
 
-#### Scenario: 访问电脑 helper 执行真实采集且同时启用本机库和目标库
-- **WHEN** 真实样本由访问电脑 helper 采集，用户同时选择访问电脑本机 MySQL 和服务器目标 MySQL
+#### Scenario: 访问电脑 helper 执行采集且同时启用本机库和目标库
+- **WHEN** 真实样本或 helper 本地模拟样本由访问电脑 helper 采集，用户同时选择访问电脑本机 MySQL 和服务器目标 MySQL
 - **THEN** 本机库预检与写入 MUST 仅由该 helper 执行，目标库预检与写入 MUST 仅由服务器执行，两个结果 MUST 分别报告，任一数据库失败 MUST NOT 伪装成另一数据库成功
 
 ### Requirement: 服务器目标库保存必须覆盖完整采集并可恢复
