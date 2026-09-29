@@ -429,6 +429,26 @@ class OfflineAgentTests(unittest.TestCase):
             self.assertIn("check_network_path", tools)
             self.assertTrue(diagnosis["cross_interface_findings"])
 
+    def test_missing_network_kind_does_not_abort_all_diagnoses(self) -> None:
+        hardware = no_sensor_hardware_result()
+        for item in hardware["interfaces"]:
+            if item["id"] in {"plc_process", "abb_motion"}:
+                item["physical_interface_kind"] = ""
+        context = diagnostic_context_for(hardware)
+
+        result = agentic_diagnosis.run_offline_diagnosis(context, [])
+
+        self.assertEqual(result["model_status"], "offline_success")
+        self.assertEqual(len(result["diagnoses"]), 5)
+        for interface_id in ("plc_process", "abb_motion"):
+            diagnosis = next(
+                item for item in result["diagnoses"] if item["interface_id"] == interface_id
+            )
+            tools = {item["tool"] for item in diagnosis["evidence"]}
+            self.assertIn("get_cross_interface_timeline", tools)
+            self.assertIn("inspect_interface_mapping", tools)
+            self.assertNotIn("check_network_path", tools)
+
     def test_reachable_network_ports_without_data_are_not_called_link_down(self) -> None:
         hardware = no_sensor_hardware_result()
         for item in hardware["interfaces"]:
@@ -500,6 +520,28 @@ class SiliconFlowAgentTests(unittest.TestCase):
         self.assertEqual(result["execution_mode"], "offline_test")
         self.assertIn("模型名称无效", result["model_message"])
         self.assertEqual(len(result["diagnoses"]), 1)
+
+    def test_fast_payload_declares_exact_grounded_output_contract(self) -> None:
+        context = self._plc_context()
+        offline_result = agentic_diagnosis.run_offline_diagnosis(context, [])
+
+        payload = agentic_diagnosis._build_structured_payload(
+            "deepseek-ai/DeepSeek-V3", context, offline_result
+        )
+
+        system_prompt = payload["messages"][0]["content"]
+        self.assertIn("observed_facts每项包含text和evidence_ids", system_prompt)
+        self.assertIn("hypotheses每项包含cause、confidence和evidence_ids", system_prompt)
+        user_input = json.loads(payload["messages"][1]["content"])
+        self.assertEqual(user_input["required_interface_ids"], ["plc_process"])
+        self.assertEqual(
+            user_input["known_evidence_ids_by_interface"]["plc_process"],
+            [item["evidence_id"] for item in user_input["offline_evidence"]],
+        )
+        example = user_input["output_example"]["diagnoses"][0]
+        self.assertEqual(example["interface_id"], "plc_process")
+        self.assertTrue(example["observed_facts"][0]["evidence_ids"])
+        self.assertTrue(example["hypotheses"][0]["evidence_ids"])
 
     def test_streaming_response_reassembles_fragmented_tool_call(self) -> None:
         chunks = [

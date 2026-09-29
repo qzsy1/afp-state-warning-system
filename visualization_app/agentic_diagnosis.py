@@ -90,8 +90,19 @@ def _offline_tool_plan(context: DiagnosticToolContext) -> dict[str, list[tuple[s
                         "window_seconds": 60,
                     },
                 ),
-                ("check_network_path", {"interface_id": interface_id}),
             ]
+            if str(event.get("physical_interface_kind") or "").lower() == "ethernet":
+                plans[interface_id].append(
+                    ("check_network_path", {"interface_id": interface_id})
+                )
+            else:
+                # Older or temporarily disconnected helpers may omit the
+                # physical kind.  Keep the network tool's strict safety gate
+                # and collect mapping evidence instead of aborting every
+                # diagnosis before the model request is submitted.
+                plans[interface_id].append(
+                    ("inspect_interface_mapping", {"interface_id": interface_id})
+                )
         elif state in {"invalid_data", "invalid_protocol"}:
             plans[interface_id] = [
                 ("inspect_interface_mapping", {"interface_id": interface_id}),
@@ -173,7 +184,17 @@ def _diagnosis_content(
             (item for item in evidence if item.get("tool") == "check_network_path"),
             {},
         )
-        if network_evidence.get("endpoint_reachable"):
+        if not network_evidence:
+            cause = "PLC或ABB的物理网络接口类型尚未确认，当前不能执行网络路径检查"
+            actions = [
+                ("重新检查接口映射并确认工控网卡", "本次结果缺少可验证的以太网接口类型"),
+                ("确认网卡后再检查目标端点", "只有已配置的PLC或ABB以太网接口才允许网络路径检查"),
+            ]
+            cross_findings = ["PLC与ABB同时异常，但当前缺少可验证的网络接口绑定信息"]
+            unknowns = ["尚未确认工控网卡、目标端点和网络链路状态"]
+            confidence = 0.55
+            fault_type = "网络接口绑定信息缺失"
+        elif network_evidence.get("endpoint_reachable"):
             protocol_name = "Modbus TCP" if interface_id == "plc_process" else "ABB RWS"
             cause = (
                 f"TCP端口可连接，但未收到有效{protocol_name}数据；"
@@ -404,12 +425,28 @@ def _build_structured_payload(
 ) -> dict[str, Any]:
     """Build a no-tools compatibility request for models without function calling."""
 
+    required_interface_ids = [
+        str(item.get("interface_id"))
+        for item in context.events
+        if str(item.get("state")) not in {"ok", "healthy", "disabled", "video_only"}
+    ]
     evidence = [
         item
         for diagnosis in offline_result.get("diagnoses") or []
         for item in diagnosis.get("evidence") or []
         if isinstance(item, dict)
     ]
+    known_evidence_ids_by_interface = {
+        str(diagnosis.get("interface_id")): [
+            str(item.get("evidence_id"))
+            for item in diagnosis.get("evidence") or []
+            if isinstance(item, dict) and item.get("evidence_id")
+        ]
+        for diagnosis in offline_result.get("diagnoses") or []
+        if isinstance(diagnosis, dict) and diagnosis.get("interface_id")
+    }
+    example_interface_id = required_interface_ids[0] if required_interface_ids else "interface_id"
+    example_evidence_ids = known_evidence_ids_by_interface.get(example_interface_id) or ["EV-001"]
     return {
         "model": model_name,
         "messages": [
@@ -419,15 +456,50 @@ def _build_structured_payload(
                     "你是AFP工业采集接口诊断助手。当前模型不使用工具调用；只能根据给定的本地检查证据输出诊断。"
                     "只输出JSON对象，包含diagnoses数组，必须覆盖全部interface_id。每项包含interface_id、"
                     "observed_facts、hypotheses、cross_interface_findings、recommended_actions和unknowns。"
-                    "observed_facts和hypotheses必须引用给定的evidence_id；没有证据不得写成已确认故障。"
+                    "observed_facts每项包含text和evidence_ids；hypotheses每项包含cause、confidence和"
+                    "evidence_ids；recommended_actions每项包含priority、action、reason和requires_shutdown。"
+                    "每个接口只能引用known_evidence_ids_by_interface中列出的evidence_id；"
+                    "没有证据不得写成已确认故障，也不能省略任何required_interface_ids。"
                 ),
             },
             {
                 "role": "user",
                 "content": json.dumps(
                     {
+                        "required_interface_ids": required_interface_ids,
+                        "known_evidence_ids_by_interface": known_evidence_ids_by_interface,
                         "case": _initial_case_payload(context, include_event_evidence=False),
                         "offline_evidence": evidence,
+                        "output_example": {
+                            "diagnoses": [
+                                {
+                                    "interface_id": example_interface_id,
+                                    "observed_facts": [
+                                        {
+                                            "text": "根据本地检查证据得到的事实",
+                                            "evidence_ids": [example_evidence_ids[0]],
+                                        }
+                                    ],
+                                    "hypotheses": [
+                                        {
+                                            "cause": "仍需验证的可能原因",
+                                            "confidence": 0.5,
+                                            "evidence_ids": [example_evidence_ids[0]],
+                                        }
+                                    ],
+                                    "cross_interface_findings": [],
+                                    "recommended_actions": [
+                                        {
+                                            "priority": 1,
+                                            "action": "下一步只读检查",
+                                            "reason": "用于补充当前证据",
+                                            "requires_shutdown": False,
+                                        }
+                                    ],
+                                    "unknowns": ["仍未确认的信息"],
+                                }
+                            ]
+                        },
                     },
                     ensure_ascii=False,
                     separators=(",", ":"),

@@ -73,3 +73,14 @@
 #### Scenario: 模型增强超过时限
 - **WHEN** 局域网或公网实时数据仍正常显示但外部模型增强超过阶段或总时限
 - **THEN** 页面 MUST 保留本地结果并结束加载状态，MUST NOT 通过扩大 helper、实时传输或浏览器等待时限掩盖失败
+
+### Requirement: 工具规划必须与已确认接口类型一致
+系统 SHALL 只为满足工具安全前置条件的接口计划受限诊断工具。PLC 或 ABB 事件缺少已确认的以太网类型时，系统 MUST 使用安全的映射或状态证据继续诊断，MUST NOT 放宽网络工具的接口类型校验，也 MUST NOT 因该工具不适用而中止全部诊断。
+
+#### Scenario: PLC 与 ABB 异常但物理类型缺失
+- **WHEN** PLC 与 ABB 同时异常且 helper 结果没有提供 `physical_interface_kind=ethernet`
+- **THEN** 本地诊断 MUST 保留跨接口证据并改用接口映射检查，MUST NOT 调用 `check_network_path`，且模型增强任务仍可提交
+
+#### Scenario: 快速模型综合结构化证据
+- **WHEN** 默认快速路径向外部模型提交冻结的本地证据
+- **THEN** 请求 MUST 明确列出全部待诊断接口、各接口允许引用的证据 ID 和完整嵌套输出合同，并 MUST 保持最多一次外部模型调用
