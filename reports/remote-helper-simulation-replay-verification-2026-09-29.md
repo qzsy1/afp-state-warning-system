@@ -1,6 +1,6 @@
 # 访问电脑 helper 本地模拟回放验证报告
 
-日期：2026-09-29  
+日期：2026-09-29
 OpenSpec change：`fix-remote-acquisition-workflows`，任务 17.1–17.8
 
 ## 实现边界
