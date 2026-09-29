@@ -431,7 +431,7 @@ def functional_smoke(context: Any, manager: Any) -> dict[str, Any]:
 
 
 def launch(context: Any, manager: Any, *, server_only: bool = False) -> None:
-    from lan_web import LanWebConfig, discover_lan_urls, safe_network_status
+    from lan_web import LanWebConfig, discover_lan_endpoints, safe_network_status
 
     # The public-web deployment uses one shared dashboard and two explicitly
     # separated listeners: guest/public on 8770 and loopback administration on
@@ -442,15 +442,33 @@ def launch(context: Any, manager: Any, *, server_only: bool = False) -> None:
 
     config = LanWebConfig.from_mapping(context.config.get("lan_web", {}))
     bind_host = config.bind_host if config.enabled else "127.0.0.1"
-    urls = discover_lan_urls(config.port, bind_host) if config.enabled else []
+    endpoints = (
+        discover_lan_endpoints(config.port, bind_host)
+        if config.enabled
+        else {"recommended_url": None, "urls": [], "candidates": []}
+    )
     legacy_app = _legacy_module("app", context)
-    initial_status = safe_network_status(config, urls, started_at=None)
+    initial_status = safe_network_status(config, endpoints, started_at=None)
+
+    def network_status_provider() -> dict[str, Any]:
+        current = (
+            discover_lan_endpoints(config.port, bind_host)
+            if config.enabled
+            else {"recommended_url": None, "urls": [], "candidates": []}
+        )
+        return safe_network_status(config, current, started_at=None)
+
     try:
-        server = legacy_app.create_server(bind_host, config.port, initial_status)
+        server = legacy_app.create_server(
+            bind_host,
+            config.port,
+            initial_status,
+            network_status_provider=network_status_provider,
+        )
     except OSError as exc:
         failed_status = safe_network_status(
             config,
-            urls,
+            endpoints,
             started_at=None,
             error=f"无法绑定局域网端口 {config.port}：{exc}",
         )
@@ -462,7 +480,7 @@ def launch(context: Any, manager: Any, *, server_only: bool = False) -> None:
         context,
         safe_network_status(
             config,
-            urls,
+            endpoints,
             started_at=getattr(server, "service_started_at", time.time()),
         ),
     )
@@ -497,7 +515,7 @@ def launch(context: Any, manager: Any, *, server_only: bool = False) -> None:
 def _launch_public_web(
     context: Any, manager: Any, *, server_only: bool = False
 ) -> None:
-    from lan_web import discover_lan_urls
+    from lan_web import discover_lan_endpoints
     from public_web import PublicWebConfig, public_web_urls
 
     config = PublicWebConfig.from_mapping(context.config.get("public_web", {}))
@@ -528,8 +546,26 @@ def _launch_public_web(
         {"builtin": {"source_type": "single_csv", "path": str(source)}},
     )
     lease = legacy_app.RealControlLease()
-    addresses = discover_lan_urls(config.public_port, config.public_bind_host)
-    urls = public_web_urls(config, [url.split("://", 1)[-1].rsplit(":", 1)[0] for url in addresses])
+    endpoints = discover_lan_endpoints(config.public_port, config.public_bind_host)
+
+    def public_network_status() -> dict[str, Any]:
+        current = discover_lan_endpoints(config.public_port, config.public_bind_host)
+        current_urls = public_web_urls(
+            config,
+            [str(item["address"]) for item in current["candidates"]],
+        )
+        return {
+            "enabled": True,
+            "urls": current_urls["public"],
+            "recommended_url": current.get("recommended_url"),
+            "candidates": current.get("candidates", []),
+            "public": True,
+        }
+
+    urls = public_web_urls(
+        config,
+        [str(item["address"]) for item in endpoints["candidates"]],
+    )
     common = {
         "dashboard": dashboard,
         "security_store": security_store,
@@ -539,10 +575,11 @@ def _launch_public_web(
     public_server = legacy_app.create_server(
         config.public_bind_host,
         config.public_port,
-        {"enabled": True, "urls": urls["public"], "public": True},
+        public_network_status(),
         **common,
         access_context="public",
         public_web_config=context.config.get("public_web", {}),
+        network_status_provider=public_network_status,
     )
     admin_server = legacy_app.create_server(
         config.local_admin_bind_host,

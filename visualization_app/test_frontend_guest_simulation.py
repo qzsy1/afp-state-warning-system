@@ -4,6 +4,43 @@ import unittest
 
 
 class GuestSimulationFrontendContractTests(unittest.TestCase):
+    def test_lan_status_prefers_the_current_private_origin_then_server_recommendation(self):
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        start = text.index("function isPrivateNetworkHost(")
+        end = text.index("async function refreshLanWebStatus()", start)
+        functions = text[start:end]
+        script = r'''
+''' + functions + r'''
+const status = {
+  recommended_url: "http://192.168.101.31:8770/",
+  urls: ["http://192.168.101.31:8770/", "http://172.29.32.1:8770/"]
+};
+const current = chooseLanWebUrl(status, {hostname: "192.168.101.44", origin: "http://192.168.101.44:8770"});
+if (current !== "http://192.168.101.44:8770/") process.exit(1);
+const publicPage = chooseLanWebUrl(status, {hostname: "desktop.example.test", origin: "https://desktop.example.test"});
+if (publicPage !== status.recommended_url) process.exit(2);
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_lan_and_public_pages_both_prefer_websocket_with_bounded_http_fallback(self):
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        start = text.index("function livePollIntervalMs()")
+        end = text.index("function closeLiveWebSocket()", start)
+        functions = text[start:end]
+        script = r'''
+let window = {WebSocket: function(){}, location: {protocol: "http:", hostname: "192.168.1.20"}};
+''' + functions + r'''
+if (!supportsLiveWebSocket()) process.exit(1);
+if (livePollIntervalMs() < 500) process.exit(2);
+window.location = {protocol: "https:", hostname: "desktop.example.test"};
+if (!supportsLiveWebSocket()) process.exit(3);
+window.WebSocket = undefined;
+if (supportsLiveWebSocket()) process.exit(4);
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_target_mysql_preflight_identifier_is_reused_for_start_and_server_save_state(self):
         text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
         settings_start = text.index("function unifiedMysqlSettings")
@@ -45,7 +82,7 @@ const fetch = async (url, options) => ({ok: true, json: async () => ({
     def test_failed_server_target_mysql_has_a_session_bound_retry_control(self):
         html = (Path(__file__).with_name("static") / "index.html").read_text(encoding="utf-8")
         self.assertIn('id="retryTargetMysqlButton"', html)
-        self.assertIn('/app.js?v=20260923-mysql-init-1', html)
+        self.assertIn('/app.js?v=20260929-lan-ws-helper-v2', html)
         text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
         start = text.index("async function retryServerTargetMysql()")
         end = text.index("async function stopAcquisition()", start)

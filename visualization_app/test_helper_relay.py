@@ -122,6 +122,31 @@ class HelperRelayTests(unittest.TestCase):
         self.assertTrue(registry.status("session-a")["online"])
         self.assertTrue(registry.status("session-a")["capabilities"]["hardware_discovery"])
 
+    def test_status_distinguishes_online_but_incompatible_helper(self):
+        registry = HelperRegistry()
+        challenge = registry.start_pairing("session-a")
+        registry.complete_pairing(
+            challenge["challenge"],
+            "device-a",
+            {"protocol_version": 1, "hardware_discovery": True},
+        )
+        status = registry.status("session-a")
+
+        self.assertTrue(status["online"])
+        self.assertFalse(status["protocol_compatible"])
+        self.assertEqual(status["protocol_version"], 1)
+
+        challenge = registry.start_pairing("session-b")
+        registry.complete_pairing(
+            challenge["challenge"],
+            "device-b",
+            {
+                "protocol_version": 2,
+                "command_lifecycle": "isolated_hardware_check",
+            },
+        )
+        self.assertTrue(registry.status("session-b")["protocol_compatible"])
+
     def test_stale_websocket_detach_cannot_offline_new_connection(self):
         registry = HelperRegistry()
         challenge = registry.start_pairing("session-a")

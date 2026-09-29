@@ -154,6 +154,17 @@ class NoSensorTruthTests(unittest.TestCase):
 
 
 class DiagnosisJobStoreTests(unittest.TestCase):
+    def test_diagnosis_start_does_not_wait_for_or_dispatch_helper_commands(self) -> None:
+        app_source = Path(__file__).with_name("app.py").read_text(encoding="utf-8")
+        start = app_source.index('if parsed.path == "/api/agent/diagnose/start":')
+        end = app_source.index('if parsed.path == "/api/agent/diagnose":', start)
+        route = app_source[start:end]
+
+        self.assertIn("local_result = run_interface_diagnoses", route)
+        self.assertIn("self.diagnosis_jobs.submit", route)
+        self.assertNotIn("helper_registry.command", route)
+        self.assertNotIn("check_capture", route)
+
     def test_job_lifecycle_keeps_result_and_enforces_owner(self) -> None:
         self.assertIsNotNone(DiagnosisJobStore, "diagnosis job store must exist")
         store = DiagnosisJobStore()

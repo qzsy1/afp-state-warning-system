@@ -4024,6 +4024,7 @@ class AppHandler(BaseHTTPRequestHandler):
     permission_policy = PermissionPolicy()
     login_limiter = SlidingWindowLimiter()
     network_status: dict[str, Any] = {}
+    network_status_provider: Any = None
     service_started_at: float = 0.0
 
     def log_message(self, fmt: str, *args) -> None:
@@ -4032,7 +4033,7 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def _allowed_hosts(self) -> set[str]:
         hosts = {"localhost", "127.0.0.1"}
-        for url in (self.network_status or {}).get("urls", []):
+        for url in self._current_network_status().get("urls", []):
             try:
                 host = urlsplit(str(url)).hostname
             except ValueError:
@@ -4040,6 +4041,18 @@ class AppHandler(BaseHTTPRequestHandler):
             if host:
                 hosts.add(host.lower())
         return hosts
+
+    def _current_network_status(self) -> dict[str, Any]:
+        provider = self.network_status_provider
+        if callable(provider):
+            try:
+                latest = provider()
+            except Exception:
+                latest = None
+            if isinstance(latest, dict):
+                self.network_status.clear()
+                self.network_status.update(latest)
+        return dict(self.network_status or {})
 
     def _is_allowed_host(self) -> bool:
         host_header = str(self.headers.get("Host", "")).strip()
@@ -4388,7 +4401,7 @@ class AppHandler(BaseHTTPRequestHandler):
         return None
 
     def _send_network_status(self) -> None:
-        payload = dict(self.network_status or {})
+        payload = self._current_network_status()
         payload.pop("api_key", None)
         payload.pop("model_name", None)
         started = float(self.service_started_at or time.time())
@@ -5952,6 +5965,7 @@ def create_server(
     control_lease: RealControlLease | None = None,
     access_context: str = "public",
     public_web_config: dict[str, Any] | None = None,
+    network_status_provider: Any = None,
 ) -> ThreadingHTTPServer:
     active_dashboard = dashboard or DashboardData()
     runtime_root = (APP_DIR.parent / "runtime").resolve()
@@ -6013,6 +6027,7 @@ def create_server(
             "public_web_config": dict(public_web_config or {}),
             "login_limiter": SlidingWindowLimiter(),
             "network_status": dict(network_status or {}),
+            "network_status_provider": network_status_provider,
             "service_started_at": time.time(),
         },
     )

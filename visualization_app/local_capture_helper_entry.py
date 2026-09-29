@@ -9,7 +9,9 @@ import ctypes.wintypes as wintypes
 from concurrent.futures import ThreadPoolExecutor
 import json
 import math
+import multiprocessing
 import os
+import queue
 import sys
 import threading
 import time
@@ -20,6 +22,11 @@ from typing import Any
 from acquisition import AcquisitionConfig, MySQLSettings
 from helper_relay import normalize_pairing_code
 from local_capture_agent import HelperTransport, LocalCaptureAgent
+
+
+HELPER_PROTOCOL_VERSION = 2
+HELPER_BUILD_ID = "20260929-isolated-check-v2"
+HARDWARE_CHECK_TIMEOUT_SECONDS = 60.0
 
 
 class PairingRequiredError(RuntimeError):
@@ -383,6 +390,10 @@ def _config_from_payload(payload: dict[str, Any]) -> AcquisitionConfig:
 
 def helper_capabilities() -> dict[str, Any]:
     return {
+        "protocol_version": HELPER_PROTOCOL_VERSION,
+        "build_id": HELPER_BUILD_ID,
+        "command_lifecycle": "isolated_hardware_check",
+        "hardware_check_timeout_seconds": HARDWARE_CHECK_TIMEOUT_SECONDS,
         "hardware_discovery": True,
         "real_capture": True,
         "process_parameter_read": True,
@@ -390,6 +401,191 @@ def helper_capabilities() -> dict[str, Any]:
         "local_mysql_save": True,
         "local_mysql_profile": local_mysql_profile_metadata(),
     }
+
+
+def _hardware_check_worker(message: dict[str, Any], result_queue: Any) -> None:
+    """Run vendor probes in a disposable process, separate from real capture."""
+
+    try:
+        command = HelperTransport.decode_command(json.dumps(message, ensure_ascii=False))
+        payload = _inject_saved_local_mysql(command["payload"])
+        result = LocalCaptureAgent().check_capture(_config_from_payload(payload))
+        response = {
+            "type": "result",
+            "request_id": command["request_id"],
+            "payload": result if isinstance(result, dict) else {"result": result},
+        }
+    except Exception as exc:
+        response = {
+            "type": "result",
+            "request_id": str(message.get("request_id") or ""),
+            "payload": {"ok": False, "error": str(exc) or exc.__class__.__name__},
+        }
+    result_queue.put(response)
+
+
+class HardwareCheckProcess:
+    """Own at most one timeout-bounded hardware-check child process."""
+
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float = HARDWARE_CHECK_TIMEOUT_SECONDS,
+        context: Any | None = None,
+        worker: Any = _hardware_check_worker,
+    ) -> None:
+        self.timeout_seconds = max(1.0, float(timeout_seconds))
+        self.context = context or multiprocessing.get_context("spawn")
+        self.worker = worker
+        self._lock = threading.Lock()
+        self._process: Any | None = None
+        self._queue: Any | None = None
+        self._callback: Any | None = None
+        self._request_id = ""
+
+    def start(self, message: dict[str, Any], callback) -> bool:
+        with self._lock:
+            if self._process is not None and self._process.is_alive():
+                callback(
+                    {
+                        "type": "result",
+                        "request_id": str(message.get("request_id") or ""),
+                        "payload": {
+                            "ok": False,
+                            "error": "hardware_check_busy",
+                            "stage": "checking",
+                        },
+                    }
+                )
+                return False
+            self._cleanup_locked()
+            result_queue = self.context.Queue(maxsize=1)
+            process = self.context.Process(
+                target=self.worker,
+                args=(dict(message), result_queue),
+                name="AFP-hardware-check",
+                daemon=True,
+            )
+            self._process = process
+            self._queue = result_queue
+            self._callback = callback
+            self._request_id = str(message.get("request_id") or "")
+            process.start()
+        threading.Thread(
+            target=self._monitor,
+            args=(process, result_queue),
+            name="AFP-hardware-check-monitor",
+            daemon=True,
+        ).start()
+        return True
+
+    def _monitor(self, process: Any, result_queue: Any) -> None:
+        try:
+            response = result_queue.get(timeout=self.timeout_seconds)
+        except queue.Empty:
+            response = {
+                "type": "result",
+                "request_id": self._request_id,
+                "payload": {
+                    "ok": False,
+                    "error": "hardware_check_timed_out",
+                    "stage": "timeout",
+                    "timeout_seconds": self.timeout_seconds,
+                },
+            }
+            if process.is_alive():
+                process.terminate()
+        except (EOFError, OSError):
+            response = None
+        process.join(timeout=1.0)
+        callback = None
+        with self._lock:
+            if self._process is process:
+                callback = self._callback
+                self._cleanup_locked()
+        if callback is not None and response is not None:
+            try:
+                callback(response)
+            except Exception:
+                return
+
+    def cancel(self, *, reason: str = "hardware_check_cancelled", notify: bool = True) -> bool:
+        callback = None
+        request_id = ""
+        with self._lock:
+            process = self._process
+            if process is None:
+                return False
+            callback = self._callback
+            request_id = self._request_id
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=1.0)
+            self._cleanup_locked()
+        if notify and callback is not None:
+            try:
+                callback(
+                    {
+                        "type": "result",
+                        "request_id": request_id,
+                        "payload": {"ok": False, "error": reason, "stage": "cancelled"},
+                    }
+                )
+            except Exception:
+                pass
+        return True
+
+    def _cleanup_locked(self) -> None:
+        result_queue = self._queue
+        self._process = None
+        self._queue = None
+        self._callback = None
+        self._request_id = ""
+        if result_queue is not None:
+            try:
+                result_queue.close()
+            except (AttributeError, OSError):
+                pass
+
+    def close(self) -> None:
+        self.cancel(reason="helper_connection_closed", notify=False)
+
+
+class HelperCommandDispatcher:
+    """Keep control/status commands independent of disposable hardware probes."""
+
+    def __init__(self, agent: LocalCaptureAgent, *, check_runner: Any | None = None) -> None:
+        self.agent = agent
+        self.check_runner = check_runner or HardwareCheckProcess()
+        self.executor = ThreadPoolExecutor(
+            max_workers=3,
+            thread_name_prefix="afp-helper-control",
+        )
+
+    def submit(self, message: dict[str, Any], callback) -> None:
+        command = HelperTransport.decode_command(json.dumps(message, ensure_ascii=False))
+        name = command["command"]
+        if name == "check_capture":
+            self.check_runner.start(dict(message), callback)
+            return
+        if name in {"start_capture", "stop_capture"}:
+            self.check_runner.cancel(reason="hardware_check_cancelled_for_capture")
+
+        def run_control() -> None:
+            response = dispatch_command(
+                self.agent,
+                json.dumps(message, ensure_ascii=False),
+            )
+            try:
+                callback(response)
+            except Exception:
+                return
+
+        self.executor.submit(run_control)
+
+    def close(self) -> None:
+        self.check_runner.close()
+        self.executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _settings_from_saved_profile() -> MySQLSettings:
@@ -518,6 +714,28 @@ def _dispatch_and_report(
             delay = min(delay * 2.0, 4.0)
 
 
+def _report_helper_response(
+    transport: HelperTransport,
+    device_id: str,
+    response: dict[str, Any],
+) -> None:
+    result_payload = {
+        "device_id": device_id,
+        "request_id": response["request_id"],
+        "payload": response["payload"],
+    }
+    delay = 0.5
+    for attempt in range(3):
+        try:
+            transport.http_json("api/helper/result", result_payload)
+            return
+        except Exception:
+            if attempt >= 2:
+                return
+            time.sleep(delay)
+            delay = min(delay * 2.0, 4.0)
+
+
 def flush_http_sample_batch(
     agent: LocalCaptureAgent,
     transport: HelperTransport,
@@ -563,7 +781,7 @@ def run_http_forever(
 ) -> None:
     agent = agent or LocalCaptureAgent()
     transport = HelperTransport(server_url, pairing_token, device_id=device_id)
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="afp-helper-command")
+    dispatcher = HelperCommandDispatcher(agent)
     delay = 1.0
     try:
         while True:
@@ -573,10 +791,14 @@ def run_http_forever(
                     raise RuntimeError(polled.get("error") or "辅助服务拒绝连接")
                 command = polled.get("command")
                 if isinstance(command, dict):
-                    # Hardware probes can block on a missing serial/USB/UVC
-                    # endpoint.  Keep the poller free so the server still sees
-                    # a heartbeat while the single command worker finishes.
-                    executor.submit(_dispatch_and_report, agent, transport, device_id, command)
+                    dispatcher.submit(
+                        command,
+                        lambda response: _report_helper_response(
+                            transport,
+                            device_id,
+                            response,
+                        ),
+                    )
                 flush_http_sample_batch(agent, transport, device_id)
                 delay = 1.0
                 time.sleep(0.25)
@@ -588,7 +810,7 @@ def run_http_forever(
                 time.sleep(delay)
                 delay = min(delay * 2.0, 30.0)
     finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+        dispatcher.close()
 
 
 def run_forever(
@@ -606,10 +828,10 @@ def run_forever(
     failures = 0
     while True:
         connection = None
-        executor = None
+        dispatcher = None
         try:
             connection = transport.connect_once()
-            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="afp-helper-wss-command")
+            dispatcher = HelperCommandDispatcher(agent)
             send_lock = threading.Lock()
 
             def send_json(message: dict[str, Any]) -> None:
@@ -666,7 +888,7 @@ def run_forever(
                     if str(message.get("error") or "") == "helper_authentication_failed":
                         raise PairingRequiredError(authentication_failure_message())
                     continue
-                executor.submit(_dispatch_and_send_websocket, agent, message, send_json)
+                dispatcher.submit(message, send_json)
         except KeyboardInterrupt:
             return True
         except PairingRequiredError:
@@ -679,8 +901,8 @@ def run_forever(
             delay = min(delay * 2.0, 30.0)
         finally:
             sample_pump.connection_lost()
-            if executor is not None:
-                executor.shutdown(wait=False, cancel_futures=True)
+            if dispatcher is not None:
+                dispatcher.close()
             if connection is not None:
                 try:
                     connection.close()
@@ -724,6 +946,11 @@ def run_auto_forever(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AFP本地采集辅助程序")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"AFP Local Capture Helper {HELPER_BUILD_ID} (protocol {HELPER_PROTOCOL_VERSION})",
+    )
     parser.add_argument("--server", default="", help="网页服务地址，例如 https://afp.example.com")
     parser.add_argument("--pairing-token", default="")
     parser.add_argument("--pairing-challenge", default="")
@@ -948,4 +1175,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()

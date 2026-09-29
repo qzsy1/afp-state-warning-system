@@ -12,6 +12,7 @@ const state = {
   liveSocketQuery: "",
   liveSocketReconnectTimer: null,
   liveSocketReconnectAttempt: 0,
+  liveHttpFallback: false,
   busy: false,
   reloadQueued: false,
   requestedHorizon: null,
@@ -156,13 +157,18 @@ function renderHelperStatus() {
     return;
   }
   const helper = state.helperStatus || {};
-  badge.textContent = helper.online ? "已连接" : helper.paired ? "已配对，等待连接" : "未配对";
-  badge.className = `helper-status ${helper.online ? "ok" : helper.paired ? "pending" : "error"}`;
+  const incompatible = helper.online && helper.protocol_compatible === false;
+  badge.textContent = incompatible
+    ? "已连接，需更新"
+    : helper.online ? "已连接" : helper.paired ? "已配对，等待连接" : "未配对";
+  badge.className = `helper-status ${helper.online && !incompatible ? "ok" : helper.paired ? "pending" : "error"}`;
   if (note) {
     note.textContent = state.accessRole === "guest"
       ? (state.secureTransport
         ? "当前为访客模拟模式；请先解锁真实模式，再生成配对码。"
         : "当前为访客模拟模式；请使用 HTTPS 公网地址解锁真实模式后，再生成配对码。")
+      : incompatible
+        ? "辅助程序版本过旧，未提供可终止的硬件检查能力；请重新下载并运行最新版辅助程序。"
       : helper.online
         ? "本机辅助程序已连接，可识别本机接口并执行真实采集。"
         : helper.paired
@@ -396,13 +402,29 @@ function setLanWebStatus(mode, url = "", stateClass = "") {
   panel?.classList.toggle("error", stateClass === "error");
 }
 
+function isPrivateNetworkHost(host) {
+  const value = String(host || "").trim().toLowerCase();
+  return /^10\./.test(value)
+    || /^192\.168\./.test(value)
+    || /^172\.(1[6-9]|2\d|3[0-1])\./.test(value);
+}
+
+function chooseLanWebUrl(status, locationLike = window.location) {
+  const host = String(locationLike?.hostname || "").trim().toLowerCase();
+  const origin = String(locationLike?.origin || "").trim().replace(/\/+$/, "");
+  if (origin && isPrivateNetworkHost(host)) return `${origin}/`;
+  if (status?.recommended_url) return String(status.recommended_url);
+  const urls = Array.isArray(status?.urls) ? status.urls : [];
+  return urls[0] || status?.desktop_url || "";
+}
+
 async function refreshLanWebStatus() {
   const response = await fetch("/api/network/status", {cache: "no-store"});
   const status = await response.json();
   if (!response.ok) throw new Error(status.error || "局域网状态读取失败");
   const urls = Array.isArray(status.urls) ? status.urls : [];
   const mode = status.error ? "启动失败" : status.enabled ? "局域网已开启" : "仅本机";
-  setLanWebStatus(mode, urls[0] || status.desktop_url, status.error ? "error" : "connected");
+  setLanWebStatus(mode, chooseLanWebUrl(status), status.error ? "error" : "connected");
   return status;
 }
 
@@ -2076,6 +2098,9 @@ async function startAcquisition() {
     }
     await validateEnabledMysqlBeforeStart();
     if (!simulation) {
+      if (usesLocalCaptureHelper() && state.helperStatus?.protocol_compatible === false) {
+        throw new Error("本地采集辅助程序版本不兼容，请重新下载并运行最新版后再开始真实采集");
+      }
       await acquireRealControl();
       if (state.hardwareCheckInProgress) {
         throw new Error("接口与传感器通道检查正在进行，请等待检查完成");
@@ -2545,12 +2570,10 @@ function configureDataMode() {
     stopPlayback();
     controls.realtimePrediction.checked = true;
     window.clearInterval(state.livePollTimer);
-    if (usePublicLiveWebSocket()) {
+    if (supportsLiveWebSocket()) {
       openLiveWebSocket();
     } else {
-      state.livePollTimer = window.setInterval(() => {
-        if (!state.busy) loadRealtime();
-      }, livePollIntervalMs());
+      startLiveHttpFallback();
     }
   } else {
     stopLocalSimulationReplay();
@@ -2561,34 +2584,30 @@ function configureDataMode() {
   updateRealAcquisitionVisibility();
   configureAutomaticIndicator(true);
   updateDatasetMeta();
-  if (!usePublicLiveWebSocket()) loadRealtime();
 }
 
 function livePollIntervalMs() {
-  // A public HTTPS tunnel adds a variable round trip.  Polling faster than
-  // that only queues stale requests and makes the chart appear to trickle in.
-  // Keep LAN/local refresh responsive while pacing public refreshes.
-  const host = String(window.location.hostname || "").toLowerCase();
-  const isPrivateHost = host === "localhost"
-    || host === "127.0.0.1"
-    || host === "::1"
-    || /^10\./.test(host)
-    || /^192\.168\./.test(host)
-    || /^172\.(1[6-9]|2\d|3[0-1])\./.test(host);
-  return window.location.protocol === "https:" && !isPrivateHost ? 250 : 100;
+  return 500;
 }
 
-function usePublicLiveWebSocket() {
-  const host = String(window.location.hostname || "").toLowerCase();
-  const privateHost = host === "localhost"
-    || host === "127.0.0.1"
-    || host === "::1"
-    || /^10\./.test(host)
-    || /^192\.168\./.test(host)
-    || /^172\.(1[6-9]|2\d|3[0-1])\./.test(host);
-  return typeof window.WebSocket === "function"
-    && window.location.protocol === "https:"
-    && !privateHost;
+function supportsLiveWebSocket() {
+  return typeof window.WebSocket === "function";
+}
+
+function stopLiveHttpFallback() {
+  state.liveHttpFallback = false;
+  window.clearInterval(state.livePollTimer);
+  state.livePollTimer = null;
+}
+
+function startLiveHttpFallback() {
+  if (controls.dataMode.value !== "live") return;
+  state.liveHttpFallback = true;
+  window.clearInterval(state.livePollTimer);
+  state.livePollTimer = window.setInterval(() => {
+    if (!state.busy) void loadRealtime();
+  }, livePollIntervalMs());
+  if (!state.busy) void loadRealtime();
 }
 
 function closeLiveWebSocket() {
@@ -2596,6 +2615,7 @@ function closeLiveWebSocket() {
   state.liveSocketReconnectTimer = null;
   state.liveSocketQuery = "";
   state.liveSocketReconnectAttempt = 0;
+  stopLiveHttpFallback();
   const socket = state.liveSocket;
   state.liveSocket = null;
   if (socket) {
@@ -2816,7 +2836,7 @@ function stopLocalSimulationReplay() {
 }
 
 function openLiveWebSocket() {
-  if (!usePublicLiveWebSocket() || controls.dataMode.value !== "live") return;
+  if (!supportsLiveWebSocket() || controls.dataMode.value !== "live") return;
   const query = queryString();
   if (
     state.liveSocket
@@ -2836,6 +2856,7 @@ function openLiveWebSocket() {
   state.liveSocket = socket;
   socket.onopen = () => {
     state.liveSocketReconnectAttempt = 0;
+    stopLiveHttpFallback();
     $("connectionStatus").textContent = "实时数据推送已连接";
     document.querySelector(".status-dot").classList.add("connected");
   };
@@ -2853,7 +2874,8 @@ function openLiveWebSocket() {
   };
   socket.onclose = () => {
     if (state.liveSocket === socket) state.liveSocket = null;
-    if (!usePublicLiveWebSocket() || controls.dataMode.value !== "live") return;
+    if (!supportsLiveWebSocket() || controls.dataMode.value !== "live") return;
+    startLiveHttpFallback();
     const attempt = Math.min(6, state.liveSocketReconnectAttempt + 1);
     state.liveSocketReconnectAttempt = attempt;
     state.liveSocketReconnectTimer = window.setTimeout(
@@ -2892,7 +2914,7 @@ function queryString() {
 
 async function loadRealtime() {
   if (state.simulationLocalReplay) return state.payload;
-  if (usePublicLiveWebSocket()) {
+  if (supportsLiveWebSocket() && !state.liveHttpFallback) {
     openLiveWebSocket();
     return;
   }

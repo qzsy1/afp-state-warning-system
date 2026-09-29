@@ -20,7 +20,115 @@ resolve_runtime_args = helper_entry.resolve_runtime_args
 should_repair_pairing = helper_entry.should_repair_pairing
 
 
+def _blocking_hardware_check_worker(_message, _result_queue):
+    time.sleep(10.0)
+
+
 class HelperTransportTests(unittest.TestCase):
+    def test_helper_handshake_declares_protocol_and_isolated_check_lifecycle(self):
+        capabilities = helper_entry.helper_capabilities()
+        self.assertGreaterEqual(capabilities["protocol_version"], 2)
+        self.assertTrue(capabilities["build_id"])
+        self.assertEqual(capabilities["command_lifecycle"], "isolated_hardware_check")
+
+    def test_blocking_hardware_check_does_not_delay_status_or_capture_control(self):
+        dispatcher_type = getattr(helper_entry, "HelperCommandDispatcher", None)
+        self.assertIsNotNone(
+            dispatcher_type,
+            "helper must route hardware checks outside the capture-control executor",
+        )
+
+        class BlockingCheckRunner:
+            def __init__(self):
+                self.started = threading.Event()
+                self.cancelled = threading.Event()
+
+            def start(self, _message, _callback):
+                self.started.set()
+                return True
+
+            def cancel(self, **_kwargs):
+                self.cancelled.set()
+                return True
+
+            def close(self):
+                self.cancelled.set()
+
+        runner = BlockingCheckRunner()
+        agent = Mock()
+        agent.status.return_value = {"ok": True, "running": False}
+        agent.start_capture.return_value = {"ok": True, "running": True}
+        dispatcher = dispatcher_type(agent, check_runner=runner)
+        results = []
+        try:
+            dispatcher.submit(
+                {
+                    "type": "command",
+                    "request_id": "check-1",
+                    "command": "check_capture",
+                    "payload": {},
+                },
+                results.append,
+            )
+            self.assertTrue(runner.started.wait(0.2))
+            dispatcher.submit(
+                {
+                    "type": "command",
+                    "request_id": "status-1",
+                    "command": "status",
+                    "payload": {},
+                },
+                results.append,
+            )
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline and not results:
+                time.sleep(0.01)
+            self.assertEqual(results[0]["request_id"], "status-1")
+
+            dispatcher.submit(
+                {
+                    "type": "command",
+                    "request_id": "start-1",
+                    "command": "start_capture",
+                    "payload": {},
+                },
+                results.append,
+            )
+            self.assertTrue(runner.cancelled.wait(0.2))
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline and len(results) < 2:
+                time.sleep(0.01)
+            self.assertEqual(results[1]["request_id"], "start-1")
+        finally:
+            dispatcher.close()
+
+    def test_hardware_check_process_is_terminated_at_its_deadline(self):
+        runner = helper_entry.HardwareCheckProcess(
+            timeout_seconds=1.0,
+            worker=_blocking_hardware_check_worker,
+        )
+        finished = threading.Event()
+        responses = []
+        try:
+            started = runner.start(
+                {
+                    "type": "command",
+                    "request_id": "check-timeout",
+                    "command": "check_capture",
+                    "payload": {},
+                },
+                lambda response: (responses.append(response), finished.set()),
+            )
+            self.assertTrue(started)
+            self.assertTrue(finished.wait(3.0))
+            self.assertEqual(responses[0]["request_id"], "check-timeout")
+            self.assertEqual(
+                responses[0]["payload"]["error"],
+                "hardware_check_timed_out",
+            )
+        finally:
+            runner.close()
+
     def test_helper_local_mysql_explicit_first_check_initializes_missing_afp_schema(self):
         store = Mock()
         store.preflight.side_effect = [
@@ -232,9 +340,10 @@ class HelperTransportTests(unittest.TestCase):
 
     def test_websocket_hardware_commands_run_off_heartbeat_loop(self):
         source = inspect.getsource(helper_entry.run_forever)
-        self.assertIn("ThreadPoolExecutor", source)
-        self.assertIn("executor.submit", source)
-        self.assertIn("_dispatch_and_send_websocket", source)
+        self.assertIn("HelperCommandDispatcher", source)
+        self.assertIn("dispatcher.submit", source)
+        dispatcher_source = inspect.getsource(helper_entry.HelperCommandDispatcher)
+        self.assertIn("HardwareCheckProcess", dispatcher_source)
 
     @patch("local_capture_helper_entry.run_http_forever")
     @patch("local_capture_helper_entry.run_forever", return_value=False)
@@ -615,9 +724,9 @@ class HelperTransportTests(unittest.TestCase):
 
     def test_http_poll_loop_dispatches_hardware_checks_off_the_heartbeat_thread(self):
         source = inspect.getsource(helper_entry.run_http_forever)
-        self.assertIn("ThreadPoolExecutor", source)
-        self.assertIn("max_workers=1", source)
-        self.assertIn("executor.submit", source)
+        self.assertIn("HelperCommandDispatcher", source)
+        self.assertIn("dispatcher.submit", source)
+        self.assertNotIn("max_workers=1", source)
 
     def test_http_poll_loop_keeps_heartbeats_while_command_is_slow(self):
         polls = []
@@ -625,6 +734,8 @@ class HelperTransportTests(unittest.TestCase):
         finished = threading.Event()
 
         class FakeTransport:
+            decode_command = staticmethod(local_capture_agent.HelperTransport.decode_command)
+
             def __init__(self, *_args, **_kwargs):
                 pass
 
@@ -636,8 +747,8 @@ class HelperTransportTests(unittest.TestCase):
                             "ok": True,
                             "command": {
                                 "type": "command",
-                                "request_id": "slow-check",
-                                "command": "check_capture",
+                                "request_id": "slow-discover",
+                                "command": "discover",
                                 "payload": {},
                             },
                         }
@@ -650,7 +761,7 @@ class HelperTransportTests(unittest.TestCase):
 
         def slow_dispatch(_agent, _raw):
             time.sleep(0.7)
-            return {"request_id": "slow-check", "payload": {"ok": False}}
+            return {"request_id": "slow-discover", "payload": {"ok": False}}
 
         with unittest.mock.patch.object(helper_entry, "HelperTransport", FakeTransport), \
              unittest.mock.patch.object(helper_entry, "LocalCaptureAgent", return_value=Mock()), \

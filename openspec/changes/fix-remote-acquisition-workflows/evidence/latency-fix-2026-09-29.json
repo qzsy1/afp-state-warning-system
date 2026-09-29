@@ -1,0 +1,40 @@
+{
+  "date": "2026-09-29",
+  "change": "fix-remote-acquisition-workflows",
+  "network": {
+    "recommended_url": "http://192.168.101.31:8770/",
+    "non_recommended_virtual_url": "http://172.29.32.1:8770/",
+    "lan_health_ms": {"count": 10, "min": 0.92, "average": 1.35, "max": 3.09},
+    "public_health_ms": {"count": 10, "http_200": 10, "min": 9.29, "average": 42.89, "max": 303.94},
+    "websocket_handshake_ms": {"loopback": 30.3, "lan": 9.4, "public": 93.3}
+  },
+  "public_simulation": {
+    "auth_status": 200,
+    "start_status": 200,
+    "observed_samples": 4,
+    "stop_status": 200,
+    "elapsed_ms": 767.0
+  },
+  "tests": {
+    "core_transport_frontend_diagnosis": 156,
+    "other_source_modules": 394,
+    "modular_runtime": 20,
+    "full_discovery": {"ran": 400, "errors": 1, "known_missing_dashboard_artifacts": 4}
+  },
+  "delivery": {
+    "manifest_checked": 6277,
+    "manifest_missing": 0,
+    "manifest_mismatched": 0,
+    "main_exe_sha256": "AA7BC2F636E862E9F603F7B4D4D9D8FC9B71390FFB20F33A011A42EF9D56FD65",
+    "helper_build_id": "20260929-isolated-check-v2",
+    "helper_protocol_version": 2,
+    "helper_exe_sha256": "5B0740BA99B6645A1EB1AEF61B86EF8C6F8062D076A15C894E7FB16679E73059",
+    "helper_exe_bytes": 213075193
+  },
+  "not_covered": [
+    "second_physical_client_latest-helper handshake",
+    "real 50 Hz helper capture",
+    "five physical sensor devices",
+    "second-client MySQL acceptance"
+  ]
+}

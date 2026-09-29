@@ -97,3 +97,44 @@
 #### Scenario: 两个验收会话并行或先后运行
 - **WHEN** 真实 helper 和协议级虚拟 helper 使用各自的一次性配对会话执行验收
 - **THEN** 各会话的 `capture_uuid`、确认序号、状态、文件和数据库结果 MUST 保持隔离，任一会话的断开或停止 MUST NOT 清理或覆盖另一会话
+
+### Requirement: 局域网网址必须指向实际可用的物理网络
+系统 SHALL 动态识别当前可供其它局域网电脑访问的地址并返回唯一推荐网址，同时 MAY 返回其它候选地址。推荐排序 MUST 优先具有 IPv4 默认网关且已启用的物理以太网或 Wi-Fi，MUST NOT 将回环、APIPA、Hyper-V、WSL、Docker、Tailscale、代理隧道或测试网段地址作为首选。系统 MUST NOT 硬编码现场 DHCP 地址。
+
+#### Scenario: 物理网卡与 Hyper-V 同时存在
+- **WHEN** 服务器同时具有 `192.168.101.31` 的物理网卡和 `172.29.32.1` 的 Hyper-V 虚拟网卡，且只有物理网卡具有实际默认网关
+- **THEN** 状态 API 和右上角显示 MUST 推荐 `http://192.168.101.31:8770/`，同时 MAY 在候选列表保留虚拟地址但 MUST 标明其非推荐状态
+
+#### Scenario: DHCP 地址发生变化
+- **WHEN** 物理网卡重连或续租后推荐 IPv4 发生变化
+- **THEN** 状态 API SHALL 在下一次刷新返回新网址，页面 MUST 更新显示和复制目标，不得继续展示旧地址
+
+#### Scenario: 浏览器已通过局域网地址访问
+- **WHEN** 页面当前 origin 是私有 IPv4 且健康接口可用
+- **THEN** 页面 SHALL 将当前 origin 视为已验证可达路径并优先展示，除非服务端明确标记该地址已失效
+
+### Requirement: 局域网与公网必须采用一致的实时传输策略
+支持 WebSocket 的浏览器 SHALL 在公网 HTTPS 使用 `wss://`，在局域网或回环 HTTP 使用 `ws://` 订阅同一实时会话合同。只有 WebSocket 握手或连接失败时 MAY 降级为 HTTP 轮询；降级轮询 MUST 单在途且间隔不得低于 500 ms，MUST NOT 使用 100 ms 高频短连接作为局域网默认路径。
+
+#### Scenario: 局域网实时页面
+- **WHEN** 用户通过 `http://192.168.x.x:8770/` 打开实时页面且浏览器支持 WebSocket
+- **THEN** 页面 MUST 建立 `ws://` 实时连接并停止周期性 `/api/live` 请求，预测载荷、会话权限和心跳行为 SHALL 与公网 `wss://` 一致
+
+#### Scenario: WebSocket 暂时失败
+- **WHEN** WebSocket 握手失败或连接中断
+- **THEN** 页面 SHALL 以单在途低频 HTTP 请求维持可用状态并有界重试 WebSocket，MUST NOT 并发堆积请求或无限缩短轮询间隔
+
+### Requirement: helper 硬件检查不得阻塞采集控制
+helper SHALL 将可能阻塞的真实硬件检查置于独立、可终止且有总时限的执行边界。`start_capture`、`stop_capture`、`status`、心跳和采样确认 MUST NOT 排在卡死检查之后；重复检查 MUST NOT 形成无界 FIFO。真实采集开始前 SHALL 取消或终止仍在运行的旧检查，模拟采集 MUST NOT 创建真实硬件检查任务。
+
+#### Scenario: 供应商驱动在检查中阻塞
+- **WHEN** 任一 PLC、ABB、HID、串口或 UVC 检查超过总时限
+- **THEN** helper MUST 终止检查执行边界并返回超时及对应阶段，心跳 SHALL 继续推进；后续状态或停止命令 MUST 在有界时间内响应
+
+#### Scenario: 检查未结束时开始真实采集
+- **WHEN** 用户在自动检查仍运行时点击开始真实采集
+- **THEN** helper SHALL 请求取消检查并在有界等待后开始采集或返回明确的“检查正在终止”状态，MUST NOT 把开始命令静默排在检查之后直至浏览器超时
+
+#### Scenario: helper 版本不兼容
+- **WHEN** helper 握手缺少系统要求的协议版本或命令生命周期能力
+- **THEN** 页面 MUST 将其与离线状态区分并提示更新 helper；服务器 MUST NOT 将版本不兼容误报为网络掉线

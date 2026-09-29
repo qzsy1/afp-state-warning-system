@@ -16,6 +16,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 
+MINIMUM_HELPER_PROTOCOL_VERSION = 2
+REQUIRED_COMMAND_LIFECYCLE = "isolated_hardware_check"
+
+
 ALLOWED_HELPER_COMMANDS = frozenset(
     {
         "discover",
@@ -285,16 +289,32 @@ class HelperRegistry:
         with self._lock:
             helper = self._helpers.get(session_id)
             if helper is None:
-                return {"paired": False, "online": False, "capabilities": {}}
+                return {
+                    "paired": False,
+                    "online": False,
+                    "capabilities": {},
+                    "protocol_compatible": False,
+                }
             if helper.online and helper.last_seen is not None:
                 if time.time() - helper.last_seen > self.heartbeat_ttl_seconds:
                     helper.online = False
                     helper.sender = None
+            capabilities = dict(helper.capabilities)
+            try:
+                protocol_version = int(capabilities.get("protocol_version") or 0)
+            except (TypeError, ValueError):
+                protocol_version = 0
+            protocol_compatible = (
+                protocol_version >= MINIMUM_HELPER_PROTOCOL_VERSION
+                and capabilities.get("command_lifecycle") == REQUIRED_COMMAND_LIFECYCLE
+            )
             return {
                 "paired": True,
                 "online": bool(helper.online),
                 "device_id": helper.device_id,
-                "capabilities": dict(helper.capabilities),
+                "capabilities": capabilities,
+                "protocol_version": protocol_version,
+                "protocol_compatible": protocol_compatible,
                 "last_seen": helper.last_seen,
             }
 
