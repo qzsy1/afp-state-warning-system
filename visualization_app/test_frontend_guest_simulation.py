@@ -79,10 +79,33 @@ const fetch = async (url, options) => ({ok: true, json: async () => ({
         completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
+    def test_helper_simulation_stop_waits_for_server_target_mysql_terminal_state(self):
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        start = text.index("async function waitForServerTargetSave(")
+        end = text.index("async function stopAcquisition()", start)
+        function = text[start:end]
+        script = """
+const controls = {mysqlEnabled: {checked: true}, acquisitionMode: {value: "simulation"}};
+const state = {acquisitionExecutionHost: "helper_local"};
+const usesLocalCaptureHelper = () => true;
+let requests = 0;
+const window = {setTimeout: (fn) => { fn(); return 1; }};
+const fetch = async () => { requests += 1; return {ok: true, json: async () => ({
+  capture_uuid: "capture-sim", server_target: {state: "saved", saved_rows: 4, received_rows: 4}
+})}; };
+""" + function + """
+(async () => {
+  const result = await waitForServerTargetSave({capture_uuid: "capture-sim", capture_saved: true});
+  if (requests !== 1 || result.server_target?.state !== "saved") process.exit(1);
+})().catch((error) => { console.error(error); process.exit(2); });
+"""
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_failed_server_target_mysql_has_a_session_bound_retry_control(self):
         html = (Path(__file__).with_name("static") / "index.html").read_text(encoding="utf-8")
         self.assertIn('id="retryTargetMysqlButton"', html)
-        self.assertIn('/app.js?v=20260929-lan-ws-helper-v3-diagnosis-mysql', html)
+        self.assertIn('/app.js?v=20260929-helper-simulation-replay-v4', html)
         text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
         start = text.index("async function retryServerTargetMysql()")
         end = text.index("async function stopAcquisition()", start)
@@ -867,7 +890,7 @@ const window = {setTimeout};
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
         start = text.index("async function confirmLocalSave()")
-        end = text.index("async function saveFinishedCaptureLocally", start)
+        end = text.index("function buildSensorChecklist", start)
         body = text[start:end]
         self.assertNotIn("!requestedName || !state.localSaveNameDirty", body)
         self.assertIn("renderSaveRootStatus({", body)
@@ -951,6 +974,42 @@ if (status.textContent !== "MySQL 保存未启用；原始文件已完成本地�
         self.assertIn("timeoutMs: 120000", text)
         self.assertIn("requestLocalHelper(\"start_capture\"", text)
         self.assertIn("requestLocalHelper(\"stop_capture\"", text)
+
+    def test_authorized_remote_simulation_routes_to_compatible_helper_only(self):
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        start = text.index("async function startAcquisition()")
+        end = text.index("async function waitForServerTargetSave", start)
+        body = text[start:end]
+
+        self.assertIn("supportsHelperSimulationReplay()", body)
+        self.assertIn('requestLocalHelper("start_capture"', body)
+        self.assertIn('const executionHost = helperBackedCapture ? "helper_local" : "server"', body)
+        self.assertIn("execution_host: executionHost", body)
+        self.assertIn("helper_simulation_fallback", body)
+        self.assertIn("helperBackedSimulation ? 120000 : 30000", body)
+        self.assertIn("本次模拟采集将在服务器执行", body)
+
+    def test_helper_simulation_stop_never_falls_back_to_server_after_start(self):
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        start = text.index("async function stopAcquisition()")
+        end = text.index("function buildSensorChecklist", start)
+        body = text[start:end]
+
+        self.assertIn('state.acquisitionExecutionHost === "helper_local"', body)
+        self.assertIn('requestLocalHelper("stop_capture"', body)
+        self.assertNotIn("helper_simulation_runtime_fallback", body)
+
+    def test_acquisition_status_displays_helper_replay_host_and_transport_metrics(self):
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        start = text.index("function renderAcquisitionStatus(status)")
+        end = text.index("async function waitForEdgeFirstSample", start)
+        body = text[start:end]
+
+        self.assertIn("helper_local", body)
+        self.assertIn("source_transfer", body)
+        self.assertIn("remote_helper_queue_depth", body)
+        self.assertIn("remote_server_receive_latency_ms", body)
+        self.assertIn("remote_browser_publish_latency_ms", body)
 
     def test_helper_capture_waits_for_server_to_receive_first_sample(self):
         source = Path(__file__).with_name("static") / "app.js"

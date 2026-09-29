@@ -61,6 +61,21 @@ class RemoteAcquisitionMirrorTests(unittest.TestCase):
 
         self.assertIs(selected, local)
 
+    def test_helper_backed_simulation_selects_remote_mirror_after_helper_start(self):
+        registry = RemoteAcquisitionRegistry()
+        local = object()
+
+        selected = select_acquisition_for_identity(
+            "authorized",
+            "session-a",
+            local,
+            registry,
+            requested_mode="simulation",
+            simulation_execution_host="helper_local",
+        )
+
+        self.assertIs(selected, registry.for_session("session-a"))
+
     def test_helper_backed_real_mode_explicitly_selects_remote_mirror(self):
         registry = RemoteAcquisitionRegistry()
         local = object()

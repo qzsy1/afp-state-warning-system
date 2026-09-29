@@ -68,7 +68,11 @@ from new_collection_health import (
 )
 from web_training import WebTrainingManager
 from guest_simulation import GuestSimulationError, GuestSimulationManager
-from helper_relay import HelperRegistry
+from helper_relay import HelperRegistry, select_simulation_execution
+from simulation_source_transfer import (
+    SimulationSourceTicketStore,
+    SimulationSourceTransferError,
+)
 from edge_capture import RemoteAcquisitionRegistry, select_acquisition_for_identity
 from local_capture_agent import LocalCaptureAgent
 from diagnosis_jobs import DiagnosisJobStore
@@ -193,6 +197,37 @@ def helper_real_capture_payload(payload: dict) -> dict:
     ):
         clean.pop(key, None)
     clean["mysql_enabled"] = False
+    return clean
+
+
+def prepare_helper_simulation_payload(
+    guest_manager: GuestSimulationManager,
+    transfer_store: SimulationSourceTicketStore,
+    identity: RequestIdentity,
+    helper_session_id: str,
+    payload: dict,
+) -> dict:
+    """Bind the browser-owned source to one helper without forwarding secrets."""
+
+    source_id = str(payload.get("simulation_source_id") or "").strip()
+    if not source_id:
+        raise GuestSimulationError(
+            "simulation_source_not_found",
+            "请先在当前浏览器选择并上传模拟 CSV 或文件夹",
+        )
+    manifest, source_root = guest_manager.source_transfer_manifest(
+        str(identity.guest_id or ""), source_id
+    )
+    transfer = transfer_store.issue(
+        web_session_id=str(identity.guest_id or ""),
+        helper_session_id=str(helper_session_id or ""),
+        manifest=manifest,
+        source_root=source_root,
+    )
+    clean = helper_real_capture_payload(payload)
+    clean["execution_host"] = "helper_local"
+    clean["simulation_source_transfer"] = transfer
+    clean.pop("simulation_source_path", None)
     return clean
 
 
@@ -4237,6 +4272,14 @@ class AppHandler(BaseHTTPRequestHandler):
             str(requested_mode or "").lower() == "simulation"
             and identity.role != "local_admin"
         ):
+            with self.remote_simulation_hosts_lock:
+                execution_host = self.remote_simulation_hosts.get(
+                    str(identity.session_id or ""), "server"
+                )
+            if execution_host == "helper_local":
+                return self.dashboard.remote_acquisitions.for_session(
+                    str(identity.session_id or "")
+                )
             return self.guest_manager.acquisition(identity.guest_id)
         return select_acquisition_for_identity(
             identity.role,
@@ -4472,9 +4515,18 @@ class AppHandler(BaseHTTPRequestHandler):
         acquisition: AcquisitionManager | None = None,
     ) -> dict:
         requested_mode = self._one(query, "acquisition_mode", "")
+        identity = self._identity()
+        with self.remote_simulation_hosts_lock:
+            simulation_execution_host = self.remote_simulation_hosts.get(
+                str(identity.session_id or ""), "server"
+            )
         public_simulation = (
             self.path.split("?", 1)[0] in {"/api/simulation/live", "/api/simulation/ws"}
-            or (requested_mode == "simulation" and self._identity().role != "local_admin")
+            or (
+                requested_mode == "simulation"
+                and identity.role != "local_admin"
+                and simulation_execution_host != "helper_local"
+            )
         )
         acquisition = acquisition or self._request_acquisition(
             requested_mode
@@ -4522,6 +4574,21 @@ class AppHandler(BaseHTTPRequestHandler):
             ),
             acquisition=acquisition,
         )
+        acquisition_payload = payload.get("acquisition")
+        if isinstance(acquisition_payload, dict):
+            published_at = time.time()
+            acquisition_payload["remote_browser_published_at"] = published_at
+            try:
+                latest_sample_at = float(
+                    acquisition_payload.get("remote_latest_sample_at")
+                )
+            except (TypeError, ValueError):
+                latest_sample_at = 0.0
+            acquisition_payload["remote_browser_publish_latency_ms"] = (
+                max(0.0, (published_at - latest_sample_at) * 1000.0)
+                if latest_sample_at > 0
+                else None
+            )
         if public_simulation and isinstance(payload.get("acquisition"), dict):
             payload["acquisition"] = self.guest_manager.public_status(
                 self._identity().guest_id, payload["acquisition"]
@@ -4972,7 +5039,15 @@ class AppHandler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             requested_mode = self._one(query, "acquisition_mode", "")
             identity = self._identity()
-            if requested_mode == "simulation" and identity.role != "local_admin":
+            with self.remote_simulation_hosts_lock:
+                simulation_execution_host = self.remote_simulation_hosts.get(
+                    str(identity.session_id or ""), "server"
+                )
+            if (
+                requested_mode == "simulation"
+                and identity.role != "local_admin"
+                and simulation_execution_host != "helper_local"
+            ):
                 self._send_json(self.guest_manager.status(identity.guest_id))
             else:
                 status = self._request_acquisition(requested_mode).status()
@@ -5082,6 +5157,7 @@ class AppHandler(BaseHTTPRequestHandler):
             "/api/helper/poll",
             "/api/helper/result",
             "/api/helper/samples",
+            "/api/helper/simulation-source/chunk",
         }
         if not helper_transport_path and not self._require_csrf():
             return
@@ -5131,7 +5207,12 @@ class AppHandler(BaseHTTPRequestHandler):
                 )
                 self._send_json(result)
                 return
-            if parsed.path in {"/api/helper/poll", "/api/helper/result", "/api/helper/samples"}:
+            if parsed.path in {
+                "/api/helper/poll",
+                "/api/helper/result",
+                "/api/helper/samples",
+                "/api/helper/simulation-source/chunk",
+            }:
                 authorization = str(self.headers.get("Authorization", ""))
                 token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
                 device_id = str(payload.get("device_id") or "")
@@ -5146,6 +5227,25 @@ class AppHandler(BaseHTTPRequestHandler):
                         result = self._ingest_helper_sample(
                             session_id, batch if isinstance(batch, dict) else {}
                         )
+                elif parsed.path == "/api/helper/simulation-source/chunk":
+                    session_id = self.dashboard.helper_registry.authenticate(device_id, token)
+                    if session_id is None:
+                        result = {"ok": False, "error": "helper_authentication_failed"}
+                    else:
+                        try:
+                            result = self.simulation_source_transfers.read_chunk(
+                                str(payload.get("ticket") or ""),
+                                session_id,
+                                file_index=int(payload.get("file_index", -1)),
+                                offset=int(payload.get("offset", 0)),
+                                limit=int(payload.get("limit", 256 * 1024)),
+                            )
+                        except SimulationSourceTransferError as exc:
+                            self._send_json(
+                                {"ok": False, "error": str(exc)},
+                                HTTPStatus.BAD_REQUEST,
+                            )
+                            return
                 else:
                     result = self._accept_helper_result(
                         device_id, token,
@@ -5672,7 +5772,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._send_json(self.dashboard.helper_registry.start_pairing(session_id))
                 return
             if parsed.path == "/api/helper/command":
-                session_id = str(self._identity().session_id or "")
+                identity = self._identity()
+                session_id = str(identity.session_id or "")
                 if not session_id:
                     self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
                     return
@@ -5681,16 +5782,45 @@ class AppHandler(BaseHTTPRequestHandler):
                     payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
                 )
                 if command_name == "start_capture":
-                    if str(command_payload.get("acquisition_mode") or "real").lower() != "real":
-                        self._send_json({"ok": False, "error": "helper_only_supports_real_capture"})
+                    capture_mode = str(
+                        command_payload.get("acquisition_mode") or "real"
+                    ).lower()
+                    if capture_mode == "simulation":
+                        execution = select_simulation_execution(
+                            self.dashboard.helper_registry.status(session_id)
+                        )
+                        if execution["execution_host"] != "helper_local":
+                            self._send_json(
+                                {
+                                    "ok": False,
+                                    "error": execution["fallback_reason"],
+                                    **execution,
+                                }
+                            )
+                            return
+                    elif capture_mode != "real":
+                        self._send_json({"ok": False, "error": "helper_capture_mode_invalid"})
                         return
                     target_enabled = mysql_settings_from_mapping(command_payload).enabled
+                    if capture_mode == "simulation":
+                        helper_payload = prepare_helper_simulation_payload(
+                            self.guest_manager,
+                            self.simulation_source_transfers,
+                            identity,
+                            session_id,
+                            command_payload,
+                        )
+                    else:
+                        helper_payload = helper_real_capture_payload(command_payload)
                     if target_enabled:
                         selection = self.target_profiles.for_request(session_id, command_payload)
-                        helper_payload = helper_real_capture_payload(command_payload)
+                        helper_payload["execution_host"] = "helper_local"
                         result = self.dashboard.helper_registry.command(
                             session_id, command_name, helper_payload
                         )
+                        if capture_mode == "simulation" and result.get("ok"):
+                            with self.remote_simulation_hosts_lock:
+                                self.remote_simulation_hosts[session_id] = "helper_local"
                         if result.get("ok") and result.get("request_id"):
                             self.target_capture_journal.arm_start(
                                 session_id, str(result["request_id"]), selection.config_id,
@@ -5699,10 +5829,20 @@ class AppHandler(BaseHTTPRequestHandler):
                         self._send_json(result)
                         return
                     self.target_capture_journal.disarm(session_id)
-                    command_payload = helper_real_capture_payload(command_payload)
-                self._send_json(
-                    self.dashboard.helper_registry.command(session_id, command_name, command_payload)
+                    command_payload = helper_payload
+                    command_payload["execution_host"] = "helper_local"
+                result = self.dashboard.helper_registry.command(
+                    session_id, command_name, command_payload
                 )
+                if (
+                    command_name == "start_capture"
+                    and str(command_payload.get("acquisition_mode") or "").lower()
+                    == "simulation"
+                    and result.get("ok")
+                ):
+                    with self.remote_simulation_hosts_lock:
+                        self.remote_simulation_hosts[session_id] = "helper_local"
+                self._send_json(result)
                 return
             if parsed.path == "/api/mysql/preflight":
                 identity = self._identity()
@@ -5892,6 +6032,10 @@ class AppHandler(BaseHTTPRequestHandler):
                     and identity.role != "local_admin"
                 )
                 if remote_simulation:
+                    with self.remote_simulation_hosts_lock:
+                        self.remote_simulation_hosts[
+                            str(identity.session_id or "")
+                        ] = "server"
                     if bool(payload.get("mysql_enabled")) and identity.role in REAL_ACCESS_ROLES:
                         selection = self.target_profiles.for_request(
                             str(identity.session_id or ""), payload
@@ -6001,12 +6145,15 @@ def create_server(
         runtime_root / "server_target_capture_journal.sqlite3"
     )
     target_saver = TargetMySQLSaveCoordinator(target_capture_journal, target_profiles)
+    simulation_source_transfers = SimulationSourceTicketStore()
     active_dashboard.target_capture_journal = target_capture_journal
     replay_cache: dict[str, tuple[int, dict]] = {}
     replay_lock = threading.Lock()
     model_limiter = SlidingWindowLimiter()
     model_call_lock = threading.Lock()
     diagnosis_jobs = DiagnosisJobStore()
+    remote_simulation_hosts: dict[str, str] = {}
+    remote_simulation_hosts_lock = threading.RLock()
     handler = type(
         "ConfiguredAppHandler",
         (AppHandler,),
@@ -6023,6 +6170,9 @@ def create_server(
             "target_profiles": target_profiles,
             "target_capture_journal": target_capture_journal,
             "target_saver": target_saver,
+            "simulation_source_transfers": simulation_source_transfers,
+            "remote_simulation_hosts": remote_simulation_hosts,
+            "remote_simulation_hosts_lock": remote_simulation_hosts_lock,
             "access_context": str(access_context),
             "public_web_config": dict(public_web_config or {}),
             "login_limiter": SlidingWindowLimiter(),
@@ -6042,6 +6192,7 @@ def create_server(
     server.public_web_config = dict(public_web_config or {})
     server.diagnosis_jobs = diagnosis_jobs
     server.target_capture_journal = target_capture_journal
+    server.simulation_source_transfers = simulation_source_transfers
     return server
 
 

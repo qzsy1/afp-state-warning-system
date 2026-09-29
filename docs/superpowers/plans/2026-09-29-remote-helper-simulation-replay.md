@@ -29,9 +29,9 @@
 - Modify: `visualization_app/helper_relay.py`
 - Modify: `visualization_app/app.py`
 - Modify: `visualization_app/static/app.js`
-- Test: `visualization_app/tests/test_helper_relay.py`
-- Test: `visualization_app/tests/test_frontend_guest_simulation.py`
-- Test: `visualization_app/tests/test_guest_web.py`
+- Test: `visualization_app/test_helper_relay.py`
+- Test: `visualization_app/test_frontend_guest_simulation.py`
+- Test: `visualization_app/test_guest_web.py`
 
 **Interfaces:**
 - Consumes: `HelperRegistry.status(session_id) -> dict`、现有 `/api/helper/command` 和 `/api/acquisition/start`。
@@ -52,7 +52,7 @@ def test_old_or_offline_helper_falls_back_before_start_only():
 
 - [ ] **Step 2: 运行新增测试并确认因缺少能力选择和模拟 helper 路由而失败**
 
-Run: `python -m pytest visualization_app/tests/test_helper_relay.py visualization_app/tests/test_frontend_guest_simulation.py visualization_app/tests/test_guest_web.py -q`
+Run: `python -m pytest visualization_app/test_helper_relay.py visualization_app/test_frontend_guest_simulation.py visualization_app/test_guest_web.py -q`
 
 Expected: FAIL，失败点指向缺少 `simulation_replay_v1`、`execution_host` 或模拟 `start_capture` 被拒绝。
 
@@ -69,14 +69,14 @@ def supports_simulation_replay(status: dict[str, Any]) -> bool:
 
 - [ ] **Step 4: 运行路由测试并确认通过**
 
-Run: `python -m pytest visualization_app/tests/test_helper_relay.py visualization_app/tests/test_frontend_guest_simulation.py visualization_app/tests/test_guest_web.py -q`
+Run: `python -m pytest visualization_app/test_helper_relay.py visualization_app/test_frontend_guest_simulation.py visualization_app/test_guest_web.py -q`
 
 Expected: PASS。
 
 - [ ] **Step 5: 提交路由与能力门禁**
 
 ```powershell
-git add visualization_app/helper_relay.py visualization_app/app.py visualization_app/static/app.js visualization_app/tests/test_helper_relay.py visualization_app/tests/test_frontend_guest_simulation.py visualization_app/tests/test_guest_web.py
+git add visualization_app/helper_relay.py visualization_app/app.py visualization_app/static/app.js visualization_app/test_helper_relay.py visualization_app/test_frontend_guest_simulation.py visualization_app/test_guest_web.py
 git commit -m "feat: route remote simulation through compatible helper"
 ```
 
@@ -88,8 +88,8 @@ git commit -m "feat: route remote simulation through compatible helper"
 - Modify: `visualization_app/app.py`
 - Modify: `visualization_app/local_capture_agent.py`
 - Modify: `visualization_app/local_capture_helper_entry.py`
-- Test: `visualization_app/tests/test_simulation_source_transfer.py`
-- Test: `visualization_app/tests/test_guest_web.py`
+- Test: `visualization_app/test_simulation_source_transfer.py`
+- Test: `visualization_app/test_guest_web.py`
 
 **Interfaces:**
 - Consumes: `GuestSimulationManager.resolve_uploaded_source(session_id, source_id)`。
@@ -112,7 +112,7 @@ def test_ticket_cannot_cross_helper_session(ticket_store):
 
 - [ ] **Step 2: 运行测试并确认缺少传输模块而失败**
 
-Run: `python -m pytest visualization_app/tests/test_simulation_source_transfer.py -q`
+Run: `python -m pytest visualization_app/test_simulation_source_transfer.py -q`
 
 Expected: FAIL with import error for `simulation_source_transfer`。
 
@@ -138,14 +138,14 @@ class SimulationSourceManifest:
 
 - [ ] **Step 4: 运行源交付与公网安全测试**
 
-Run: `python -m pytest visualization_app/tests/test_simulation_source_transfer.py visualization_app/tests/test_guest_web.py visualization_app/tests/test_public_web_security.py -q`
+Run: `python -m pytest visualization_app/test_simulation_source_transfer.py visualization_app/test_guest_web.py visualization_app/test_public_web_security.py -q`
 
 Expected: PASS，响应和日志中不出现服务器暂存绝对路径。
 
 - [ ] **Step 5: 提交模拟源交付**
 
 ```powershell
-git add visualization_app/simulation_source_transfer.py visualization_app/guest_simulation.py visualization_app/app.py visualization_app/local_capture_agent.py visualization_app/local_capture_helper_entry.py visualization_app/tests/test_simulation_source_transfer.py visualization_app/tests/test_guest_web.py
+git add visualization_app/simulation_source_transfer.py visualization_app/guest_simulation.py visualization_app/app.py visualization_app/local_capture_agent.py visualization_app/local_capture_helper_entry.py visualization_app/test_simulation_source_transfer.py visualization_app/test_guest_web.py
 git commit -m "feat: transfer simulation sources to local helper"
 ```
 
@@ -155,8 +155,8 @@ git commit -m "feat: transfer simulation sources to local helper"
 - Create: `visualization_app/simulation_replay.py`
 - Modify: `visualization_app/acquisition.py`
 - Modify: `visualization_app/local_capture_agent.py`
-- Test: `visualization_app/tests/test_simulation_replay.py`
-- Test: `visualization_app/tests/test_acquisition_integrity.py`
+- Test: `visualization_app/test_simulation_replay.py`
+- Test: `visualization_app/test_acquisition_integrity.py`
 
 **Interfaces:**
 - Consumes: helper 缓存返回的本地 CSV/文件夹路径和现有 `AcquisitionConfig`。
@@ -179,7 +179,7 @@ def test_helper_simulation_does_not_discover_physical_interfaces(manager):
 
 - [ ] **Step 2: 运行时钟测试并确认缺少调度器而失败**
 
-Run: `python -m pytest visualization_app/tests/test_simulation_replay.py -q`
+Run: `python -m pytest visualization_app/test_simulation_replay.py -q`
 
 Expected: FAIL with import error for `MonotonicReplayScheduler`。
 
@@ -197,14 +197,14 @@ emit(row)
 
 - [ ] **Step 4: 运行模拟回放和采集完整性测试**
 
-Run: `python -m pytest visualization_app/tests/test_simulation_replay.py visualization_app/tests/test_acquisition_integrity.py -q`
+Run: `python -m pytest visualization_app/test_simulation_replay.py visualization_app/test_acquisition_integrity.py -q`
 
 Expected: PASS，6000 行且速率在 9.8–10.2 Hz。
 
 - [ ] **Step 5: 提交本地回放**
 
 ```powershell
-git add visualization_app/simulation_replay.py visualization_app/acquisition.py visualization_app/local_capture_agent.py visualization_app/tests/test_simulation_replay.py visualization_app/tests/test_acquisition_integrity.py
+git add visualization_app/simulation_replay.py visualization_app/acquisition.py visualization_app/local_capture_agent.py visualization_app/test_simulation_replay.py visualization_app/test_acquisition_integrity.py
 git commit -m "feat: replay simulation locally at stable sample rate"
 ```
 
@@ -215,10 +215,10 @@ git commit -m "feat: replay simulation locally at stable sample rate"
 - Modify: `visualization_app/local_capture_agent.py`
 - Modify: `visualization_app/app.py`
 - Modify: `visualization_app/static/app.js`
-- Test: `visualization_app/tests/test_local_capture_agent.py`
-- Test: `visualization_app/tests/test_helper_transport.py`
-- Test: `visualization_app/tests/test_edge_capture.py`
-- Test: `visualization_app/tests/test_remote_mysql_setup.py`
+- Test: `visualization_app/test_local_capture_agent.py`
+- Test: `visualization_app/test_helper_transport.py`
+- Test: `visualization_app/test_edge_capture.py`
+- Test: `visualization_app/test_remote_mysql_setup.py`
 
 **Interfaces:**
 - Consumes: `AcquisitionManager.stream_rows_since(cursor, limit)` 和既有 `ServerCaptureJournal`。
@@ -242,7 +242,7 @@ def test_local_mysql_failure_does_not_block_server_target_or_csv(result):
 
 - [ ] **Step 2: 运行测试并确认现有 `numeric_matrix()` 全历史复制和模拟本机 MySQL 限制导致失败**
 
-Run: `python -m pytest visualization_app/tests/test_local_capture_agent.py visualization_app/tests/test_helper_transport.py visualization_app/tests/test_edge_capture.py visualization_app/tests/test_remote_mysql_setup.py -q`
+Run: `python -m pytest visualization_app/test_local_capture_agent.py visualization_app/test_helper_transport.py visualization_app/test_edge_capture.py visualization_app/test_remote_mysql_setup.py -q`
 
 Expected: FAIL，断言指出全量快照调用或本机 MySQL 被前端拒绝。
 
@@ -259,14 +259,14 @@ helper 数据泵不再调用全历史 `numeric_matrix()`；断线只增长有界
 
 - [ ] **Step 4: 运行传输、保存与五类接口回归**
 
-Run: `python -m pytest visualization_app/tests/test_local_capture_agent.py visualization_app/tests/test_helper_transport.py visualization_app/tests/test_edge_capture.py visualization_app/tests/test_remote_mysql_setup.py visualization_app/tests/test_interface_agent.py -q`
+Run: `python -m pytest visualization_app/test_local_capture_agent.py visualization_app/test_helper_transport.py visualization_app/test_edge_capture.py visualization_app/test_remote_mysql_setup.py visualization_app/test_interface_agent.py -q`
 
 Expected: PASS，五类接口期望值不变。
 
 - [ ] **Step 5: 提交增量队列与状态**
 
 ```powershell
-git add visualization_app/acquisition.py visualization_app/local_capture_agent.py visualization_app/app.py visualization_app/static/app.js visualization_app/tests/test_local_capture_agent.py visualization_app/tests/test_helper_transport.py visualization_app/tests/test_edge_capture.py visualization_app/tests/test_remote_mysql_setup.py
+git add visualization_app/acquisition.py visualization_app/local_capture_agent.py visualization_app/app.py visualization_app/static/app.js visualization_app/test_local_capture_agent.py visualization_app/test_helper_transport.py visualization_app/test_edge_capture.py visualization_app/test_remote_mysql_setup.py
 git commit -m "perf: stream helper simulation samples incrementally"
 ```
 
@@ -282,19 +282,19 @@ git commit -m "perf: stream helper simulation samples incrementally"
 
 - [ ] **Step 1: 运行针对性测试**
 
-Run: `python -m pytest visualization_app/tests/test_simulation_source_transfer.py visualization_app/tests/test_simulation_replay.py visualization_app/tests/test_local_capture_agent.py visualization_app/tests/test_helper_transport.py visualization_app/tests/test_guest_web.py visualization_app/tests/test_frontend_guest_simulation.py visualization_app/tests/test_remote_mysql_setup.py visualization_app/tests/test_interface_agent.py -q`
+Run: `python -m pytest visualization_app/test_simulation_source_transfer.py visualization_app/test_simulation_replay.py visualization_app/test_local_capture_agent.py visualization_app/test_helper_transport.py visualization_app/test_guest_web.py visualization_app/test_frontend_guest_simulation.py visualization_app/test_remote_mysql_setup.py visualization_app/test_interface_agent.py -q`
 
 Expected: PASS。
 
 - [ ] **Step 2: 运行核心行为回归**
 
-Run: `python -m pytest visualization_app/tests/test_acquisition_integrity.py visualization_app/tests/test_edge_capture.py visualization_app/tests/test_mysql_visibility.py visualization_app/tests/test_mysql_identity.py visualization_app/tests/test_agentic_diagnosis.py visualization_app/tests/test_public_web_security.py -q`
+Run: `python -m pytest visualization_app/test_acquisition_integrity.py visualization_app/test_edge_capture.py visualization_app/test_mysql_visibility.py visualization_app/test_mysql_identity.py visualization_app/test_agentic_diagnosis.py visualization_app/test_public_web_security.py -q`
 
 Expected: PASS。
 
 - [ ] **Step 3: 运行完整测试并保存结果**
 
-Run: `python -m pytest visualization_app/tests -q --junitxml=reports/remote-helper-simulation-replay-pytest-2026-09-29.xml`
+Run: `python -m pytest visualization_app -q --junitxml=reports/remote-helper-simulation-replay-pytest-2026-09-29.xml`
 
 Expected: PASS；若有既有失败，报告必须列出基线复现与不受本变更影响的证据。
 

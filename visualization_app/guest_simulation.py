@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from simulation_source_transfer import build_source_manifest
+
 from acquisition import AcquisitionConfig, AcquisitionManager, default_capture_interfaces
 
 
@@ -296,6 +298,18 @@ class GuestSimulationManager:
                 "远程模拟数据源不存在或不属于当前浏览器会话，请重新选择并上传",
             )
         return dict(selected)
+
+    def source_transfer_manifest(
+        self, session_id: str, source_id: str
+    ) -> tuple[dict[str, Any], Path]:
+        """Return a public manifest plus a private server root for one session."""
+
+        selected = self.resolve_uploaded_source(session_id, source_id)
+        return build_source_manifest(
+            str(selected.get("source_id") or ""),
+            str(selected.get("source_type") or ""),
+            str(selected.get("path") or ""),
+        )
 
     def source_status(self, session_id: str) -> dict[str, Any]:
         session = self.ensure_session(session_id)

@@ -16,6 +16,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import os
+from pathlib import Path
 from typing import Any
 
 from acquisition import (
@@ -28,6 +30,7 @@ from helper_relay import ALLOWED_HELPER_COMMANDS
 from mysql_storage import MySQLCaptureStore
 from json_safety import json_safe_value
 from remote_mysql_setup import classify_mysql_error
+from simulation_source_transfer import SimulationSourceCache
 
 
 _ROLE_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
@@ -42,8 +45,22 @@ _ROLE_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 class LocalCaptureAgent:
     """Expose local discovery, capture, and MySQL operations to a relay."""
 
-    def __init__(self, manager: AcquisitionManager | None = None) -> None:
+    def __init__(
+        self,
+        manager: AcquisitionManager | None = None,
+        *,
+        simulation_cache_root: str | Path | None = None,
+    ) -> None:
         self.manager = manager or AcquisitionManager()
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        default_cache_root = (
+            Path(local_app_data)
+            if local_app_data
+            else Path.home() / "AppData" / "Local"
+        ) / "AFP_Local_Capture_Helper" / "simulation-cache"
+        self._simulation_cache = SimulationSourceCache(
+            simulation_cache_root or default_cache_root
+        )
         self._stream_lock = threading.RLock()
         self._capture_uuid = ""
         self._stream_cursor = 0
@@ -52,6 +69,7 @@ class LocalCaptureAgent:
         self._status_revision = 0
         self._pending_status_revision = -1
         self._status_dirty = False
+        self._source_transfer_status: dict[str, Any] = {"state": "not_required"}
 
     @staticmethod
     def _choose_candidate(
@@ -200,6 +218,35 @@ class LocalCaptureAgent:
         selected = select_capture_folder(str(initial_path or ""))
         return {"selected": bool(selected), "path": selected}
 
+    def prepare_simulation_source(self, transfer: dict[str, Any], fetch_chunk) -> dict[str, Any]:
+        """Materialize one verified browser source inside the helper cache."""
+
+        manifest = transfer.get("manifest") if isinstance(transfer, dict) else None
+        if not isinstance(manifest, dict):
+            raise ValueError("模拟源交付清单缺失")
+        cache_root = self._simulation_cache.materialize(transfer, fetch_chunk)
+        source_type = str(manifest.get("source_type") or "")
+        files = manifest.get("files")
+        if not isinstance(files, list) or not files:
+            raise ValueError("模拟源交付清单没有文件")
+        if source_type == "single_csv":
+            source_path = cache_root / str(files[0].get("relative_path") or "")
+        elif source_type == "folder_csv":
+            source_path = cache_root
+        else:
+            raise ValueError("helper 模拟回放只支持 CSV 或 CSV 文件夹")
+        result = {
+            "path": str(source_path),
+            "source_type": source_type,
+            "content_sha256": str(manifest.get("content_sha256") or ""),
+            "files": len(files),
+            "bytes": int(manifest.get("total_bytes") or 0),
+            "state": "ready",
+        }
+        with self._stream_lock:
+            self._source_transfer_status = dict(result)
+        return result
+
     def start_capture(self, config: Any) -> dict[str, Any]:
         result = self.manager.start(config)
         with self._stream_lock:
@@ -213,6 +260,9 @@ class LocalCaptureAgent:
             capture_uuid = self._capture_uuid
         response = dict(result) if isinstance(result, dict) else {"result": result}
         response["capture_uuid"] = capture_uuid
+        response["execution_host"] = "helper_local"
+        if str(getattr(config, "acquisition_mode", "")) == "simulation":
+            response["source_transfer"] = dict(self._source_transfer_status)
         return response
 
     def next_sample_batch(self, *, limit: int = 20) -> dict[str, Any] | None:
@@ -224,22 +274,41 @@ class LocalCaptureAgent:
                 return dict(self._pending_batch)
             if not self._capture_uuid:
                 return None
-            rows, timestamps = self.manager.numeric_matrix()
-            if self._stream_cursor > len(rows):
-                self._stream_cursor = 0
-                self._stream_sequence = 0
-            end = min(len(rows), self._stream_cursor + batch_limit)
-            if end <= self._stream_cursor and not self._status_dirty:
+            incremental = None
+            reader = getattr(self.manager, "stream_rows_since", None)
+            if callable(reader):
+                candidate = reader(self._stream_cursor, batch_limit)
+                if isinstance(candidate, dict):
+                    incremental = candidate
+            if incremental is not None:
+                rows = list(incremental.get("rows") or [])
+                timestamps = list(incremental.get("timestamps") or [])
+                end_cursor = int(incremental.get("next_cursor", self._stream_cursor))
+                total_count = int(incremental.get("total_count", end_cursor))
+                if bool(incremental.get("truncated")):
+                    raise RuntimeError("helper样本队列已超过内存边界，无法保证完整重传")
+            else:
+                all_rows, all_timestamps = self.manager.numeric_matrix()
+                if self._stream_cursor > len(all_rows):
+                    self._stream_cursor = 0
+                    self._stream_sequence = 0
+                end_cursor = min(len(all_rows), self._stream_cursor + batch_limit)
+                rows = all_rows[self._stream_cursor:end_cursor]
+                timestamps = all_timestamps[self._stream_cursor:end_cursor]
+                total_count = len(all_rows)
+            if end_cursor <= self._stream_cursor and not self._status_dirty:
                 return None
             pending = {
                 "capture_uuid": self._capture_uuid,
                 "sequence": self._stream_sequence,
-                "rows": [json_safe_value(dict(row)) for row in rows[self._stream_cursor:end]],
-                "timestamps": [float(value) for value in timestamps[self._stream_cursor:end]],
-                "status": json_safe_value(self.manager.status()),
+                "cursor_start": self._stream_cursor,
+                "cursor_end": end_cursor,
+                "rows": [json_safe_value(dict(row)) for row in rows],
+                "timestamps": [float(value) for value in timestamps],
+                "status": json_safe_value(self.status()),
                 "transport": {
                     "helper_batch_created_at": time.time(),
-                    "helper_queue_depth": max(0, len(rows) - end),
+                    "helper_queue_depth": max(0, total_count - end_cursor),
                 },
             }
             self._pending_batch = pending
@@ -255,7 +324,9 @@ class LocalCaptureAgent:
                 return False
             if int(sequence) != int(pending["sequence"]):
                 return False
-            self._stream_cursor += len(pending["rows"])
+            self._stream_cursor = int(
+                pending.get("cursor_end", self._stream_cursor + len(pending["rows"]))
+            )
             self._stream_sequence += 1
             self._pending_batch = None
             if self._pending_status_revision == self._status_revision:
@@ -263,20 +334,30 @@ class LocalCaptureAgent:
             self._pending_status_revision = -1
             return True
 
-    def stream_metrics(self) -> dict[str, Any]:
+    def stream_metrics(self, *, status: dict[str, Any] | None = None) -> dict[str, Any]:
         """Return safe transport counters without exposing samples or credentials."""
 
         with self._stream_lock:
-            rows, _timestamps = self.manager.numeric_matrix()
-            status = self.manager.status()
-            config = status.get("config") if isinstance(status, dict) else {}
+            counts = None
+            counter = getattr(self.manager, "stream_counts", None)
+            if callable(counter):
+                candidate = counter()
+                if isinstance(candidate, dict):
+                    counts = candidate
+            if counts is None:
+                rows, _timestamps = self.manager.numeric_matrix()
+                total_count = len(rows)
+            else:
+                total_count = int(counts.get("total_count", 0))
+            current_status = status if isinstance(status, dict) else self.manager.status()
+            config = current_status.get("config") if isinstance(current_status, dict) else {}
             try:
                 sample_rate = float((config or {}).get("sample_rate") or 10.0)
             except (TypeError, ValueError):
                 sample_rate = 10.0
             return {
                 "capture_uuid": self._capture_uuid,
-                "queued_rows": max(0, len(rows) - self._stream_cursor),
+                "queued_rows": max(0, total_count - self._stream_cursor),
                 "pending_sequence": (
                     int(self._pending_batch["sequence"])
                     if isinstance(self._pending_batch, dict)
@@ -300,10 +381,25 @@ class LocalCaptureAgent:
             capture_uuid = self._capture_uuid
         response = dict(result) if isinstance(result, dict) else {"result": result}
         response["capture_uuid"] = capture_uuid
+        response["execution_host"] = "helper_local"
+        response["source_transfer"] = dict(self._source_transfer_status)
         return response
 
     def status(self) -> dict[str, Any]:
-        return self.manager.status()
+        value = dict(self.manager.status())
+        value["execution_host"] = "helper_local"
+        value["source_transfer"] = dict(self._source_transfer_status)
+        value["transport"] = self.stream_metrics(status=value)
+        started_at = value.get("started_at")
+        sample_count = int(value.get("sample_count") or 0)
+        try:
+            elapsed = max(0.0, time.time() - float(started_at)) if started_at else 0.0
+        except (TypeError, ValueError):
+            elapsed = 0.0
+        value["local_effective_rate_hz"] = (
+            round(sample_count / elapsed, 6) if elapsed > 0 else 0.0
+        )
+        return value
 
 
 class HelperTransport:

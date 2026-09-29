@@ -251,6 +251,11 @@ class PublicWebAccessTests(unittest.TestCase):
         self.assertTrue(
             policy.authorize("POST", "/api/helper/samples", guest).allowed
         )
+        self.assertTrue(
+            policy.authorize(
+                "POST", "/api/helper/simulation-source/chunk", guest
+            ).allowed
+        )
 
     def test_authorized_session_can_use_real_routes_but_not_admin_routes(self):
         from web_access import PermissionPolicy, RequestIdentity
@@ -1195,7 +1200,15 @@ class FrontendAccessContractTests(unittest.TestCase):
 class BuildManifestTests(unittest.TestCase):
     def test_build_script_copies_every_public_web_module(self):
         script = (Path(__file__).resolve().parent.parent / "modular_runtime" / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
-        for name in ("web_auth.py", "web_access.py", "public_status.py", "guest_simulation.py", "control_lease.py"):
+        for name in (
+            "web_auth.py",
+            "web_access.py",
+            "public_status.py",
+            "guest_simulation.py",
+            "control_lease.py",
+            "simulation_replay.py",
+            "simulation_source_transfer.py",
+        ):
             self.assertIn(f'"{name}"', script)
 
     def test_build_script_contains_delivery_secret_scan(self):

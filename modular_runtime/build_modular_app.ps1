@@ -149,6 +149,7 @@ $legacyFiles = @(
     "training_data.py", "training_center.py", "training_center_cli.py",
     "native_integrated_app.py", "fit_new_collection_health.py", "websocket_live.py",
     "helper_relay.py", "edge_capture.py", "local_capture_agent.py", "local_capture_helper_entry.py",
+    "simulation_replay.py", "simulation_source_transfer.py",
     "remote_mysql_setup.py", "server_target_mysql.py", "server_capture_journal.py", "generate_pressure_simulation.py",
     "web_auth.py", "web_access.py", "public_status.py", "guest_simulation.py", "control_lease.py", "json_safety.py"
 )
@@ -159,7 +160,10 @@ foreach ($name in $legacyFiles) {
     }
     Copy-Item -LiteralPath $source -Destination $legacyTarget -Force
 }
-foreach ($name in @("web_auth.py", "web_access.py", "public_status.py", "guest_simulation.py", "control_lease.py", "json_safety.py")) {
+foreach ($name in @(
+    "web_auth.py", "web_access.py", "public_status.py", "guest_simulation.py",
+    "control_lease.py", "json_safety.py", "simulation_replay.py", "simulation_source_transfer.py"
+)) {
     $copied = Join-Path $legacyTarget $name
     if (-not (Test-Path -LiteralPath $copied)) {
         throw "Public-web compatibility source was not copied: $copied"

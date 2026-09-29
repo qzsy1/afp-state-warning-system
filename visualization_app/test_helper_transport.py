@@ -30,6 +30,54 @@ class HelperTransportTests(unittest.TestCase):
         self.assertGreaterEqual(capabilities["protocol_version"], 2)
         self.assertTrue(capabilities["build_id"])
         self.assertEqual(capabilities["command_lifecycle"], "isolated_hardware_check")
+        self.assertTrue(capabilities["simulation_replay_v1"])
+
+    def test_dispatcher_materializes_simulation_source_before_start(self):
+        agent = Mock()
+        agent.prepare_simulation_source.return_value = {
+            "path": "C:/helper-cache/content/source.csv",
+            "source_type": "single_csv",
+            "cache_reused": False,
+        }
+        agent.start_capture.return_value = {"ok": True, "running": True}
+        source_fetcher = Mock()
+        dispatcher = helper_entry.HelperCommandDispatcher(
+            agent,
+            source_fetcher=source_fetcher,
+        )
+        responses = []
+        try:
+            dispatcher.submit(
+                {
+                    "type": "command",
+                    "request_id": "simulation-start-1",
+                    "command": "start_capture",
+                    "payload": {
+                        "acquisition_mode": "simulation",
+                        "simulation_source_transfer": {
+                            "ticket": "ticket-a",
+                            "manifest": {
+                                "source_type": "single_csv",
+                                "files": [{"relative_path": "source.csv"}],
+                            },
+                        },
+                    },
+                },
+                responses.append,
+            )
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline and not responses:
+                time.sleep(0.01)
+            self.assertTrue(responses[0]["payload"]["running"])
+            agent.prepare_simulation_source.assert_called_once()
+            config = agent.start_capture.call_args.args[0]
+            self.assertEqual(config.acquisition_mode, "simulation")
+            self.assertEqual(
+                config.simulation_source_path,
+                "C:/helper-cache/content/source.csv",
+            )
+        finally:
+            dispatcher.close()
 
     def test_blocking_hardware_check_does_not_delay_status_or_capture_control(self):
         dispatcher_type = getattr(helper_entry, "HelperCommandDispatcher", None)

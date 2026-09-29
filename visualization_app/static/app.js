@@ -25,6 +25,7 @@ const state = {
   interfaceAssignments: {},
   sensorTypeProfiles: [],
   acquisitionStatus: null,
+  acquisitionExecutionHost: "",
   hardwareCheck: null,
   hardwareCheckFingerprint: "",
   hardwareCheckInProgress: false,
@@ -140,6 +141,15 @@ async function loadAccessSession() {
 
 function usesLocalCaptureHelper() {
   return state.accessRole === "lan_operator" || state.accessRole === "authorized";
+}
+
+function supportsHelperSimulationReplay() {
+  return Boolean(
+    usesLocalCaptureHelper()
+    && state.helperStatus?.online
+    && state.helperStatus?.protocol_compatible
+    && state.helperStatus?.capabilities?.simulation_replay_v1
+  );
 }
 
 function renderHelperStatus() {
@@ -1010,12 +1020,39 @@ function renderAcquisitionStatus(status) {
     ? ` · 实际采样 ${Number(quality.effective_sample_rate_hz || 0).toFixed(2)} Hz` +
       ` · 最大间隔 ${Number(quality.maximum_gap_ms || 0).toFixed(1)} ms`
     : "";
+  const executionHost = status.execution_host || state.acquisitionExecutionHost;
+  const executionText = executionHost === "helper_local"
+    ? " · 执行端：访问电脑 helper"
+    : executionHost === "server" ? " · 执行端：服务器" : "";
+  const sourceTransfer = status.source_transfer || {};
+  const sourceTransferText = sourceTransfer.state === "ready"
+    ? ` · 模拟源已缓存（${Number(sourceTransfer.files || 0)}文件）`
+    : sourceTransfer.state && sourceTransfer.state !== "not_required"
+      ? ` · 模拟源交付：${sourceTransfer.state}` : "";
+  const queueDepth = Number(
+    status.remote_helper_queue_depth ?? status.transport?.queued_rows ?? 0
+  );
+  const serverLatencyRaw = status.remote_server_receive_latency_ms;
+  const browserLatencyRaw = status.remote_browser_publish_latency_ms;
+  const serverLatency = Number(serverLatencyRaw);
+  const browserLatency = Number(browserLatencyRaw);
+  const hasServerLatency = serverLatencyRaw !== null
+    && serverLatencyRaw !== undefined && Number.isFinite(serverLatency);
+  const hasBrowserLatency = browserLatencyRaw !== null
+    && browserLatencyRaw !== undefined && Number.isFinite(browserLatency);
+  const transportText = executionHost === "helper_local"
+    ? ` · 本机速率 ${Number(status.local_effective_rate_hz || 0).toFixed(2)} Hz` +
+      ` · 待传 ${queueDepth}点` +
+      `${hasServerLatency ? ` · 服务端接收 ${serverLatency.toFixed(0)} ms` : ""}` +
+      `${hasBrowserLatency ? ` · 浏览器发布 ${browserLatency.toFixed(0)} ms` : ""}`
+    : "";
   node.textContent =
     `${status.running ? "采集中" : "已停止"} · ${status.sample_count || 0}点 · ` +
     `${captureOnly
       ? `采集通道 ${healthy.length}/${selected.length} 正常`
       : `模型输入 ${expectedInputCount}通道 · 模型输出 ${predictionCount}通道`} · ${readiness}` +
     `${captureUuid ? ` · 试样会话：${captureUuid}` : ""}` +
+    executionText + sourceTransferText + transportText +
     qualityText +
     `${status.archived_previous_session ? " · 已自动归档上一试样，避免混层" : ""}` +
     `${status.layer_file ? ` · 分层文件：${status.layer_file}` : ""}` +
@@ -1345,7 +1382,10 @@ async function saveFinishedCaptureLocally(mode = controls.acquisitionMode?.value
   // In real helper-backed mode the edge gateway writes the capture directly
   // on the visitor PC.  A second server export would duplicate files and may
   // accidentally export another session's data.
-  if (usesLocalCaptureHelper() && mode !== "simulation") return;
+  if (
+    usesLocalCaptureHelper()
+    && (mode !== "simulation" || state.acquisitionExecutionHost === "helper_local")
+  ) return;
   if (!state.localSaveAuthorized || !state.localSaveDirectoryHandle || state.localSaveBusy) return;
   state.localSaveBusy = true;
   try {
@@ -2069,12 +2109,14 @@ async function testSensorConnection({automatic = false} = {}) {
 async function startAcquisition() {
   try {
     const simulation = controls.acquisitionMode?.value === "simulation";
+    const helperBackedSimulation = simulation && supportsHelperSimulationReplay();
     if (
       state.accessRole !== "guest" && state.accessRole !== "local_admin"
       && simulation
       && controls.mysqlLocalEnabled?.checked
+      && !helperBackedSimulation
     ) {
-      throw new Error("远程模拟采集暂不支持写入访问电脑本机 MySQL；请改用服务器/目标 MySQL 或 CSV 保存");
+      throw new Error("当前辅助程序不能在访问电脑本机回放模拟数据，已回退服务器；请更新并连接最新版辅助程序后再启用本机 MySQL");
     }
     if (controls.autoProcessParameters?.checked) {
       await readProcessParameters({automatic: true});
@@ -2120,14 +2162,34 @@ async function startAcquisition() {
       resetLiveEvidenceDisplay();
     }
     state.liveScopeKey = nextScope;
-    const helperBackedReal = usesLocalCaptureHelper() && !simulation;
-    const result = helperBackedReal
-      ? await requestLocalHelper("start_capture", acquisitionConfig(), {timeoutMs: 30000})
-      : await postJson("/api/acquisition/start", acquisitionConfig());
+    const helperBackedCapture = usesLocalCaptureHelper() && (!simulation || helperBackedSimulation);
+    const executionHost = helperBackedCapture ? "helper_local" : "server";
+    const captureConfig = {
+      ...acquisitionConfig(),
+      execution_host: executionHost,
+      ...(simulation && usesLocalCaptureHelper() && !helperBackedSimulation
+        ? {helper_simulation_fallback: state.helperStatus?.online
+          ? "helper_simulation_replay_unsupported" : "helper_offline"}
+        : {}),
+    };
+    if (captureConfig.helper_simulation_fallback) {
+      toast(
+        captureConfig.helper_simulation_fallback === "helper_offline"
+          ? "辅助程序未在线，本次模拟采集将在服务器执行；本机 MySQL 不可用"
+          : "辅助程序版本不支持本机回放，本次模拟采集将在服务器执行；请下载最新版辅助程序",
+      );
+    }
+    const result = helperBackedCapture
+      ? await requestLocalHelper("start_capture", captureConfig, {
+        timeoutMs: helperBackedSimulation ? 120000 : 30000,
+      })
+      : await postJson("/api/acquisition/start", captureConfig);
+    state.acquisitionExecutionHost = executionHost;
+    result.execution_host = result.execution_host || executionHost;
     if (controls.processingMode.value !== "capture_only") {
       applyPredictionModelProfile(result.prediction_model, false);
     }
-    const activeStatus = helperBackedReal
+    const activeStatus = helperBackedCapture
       ? await waitForEdgeFirstSample(result.capture_uuid)
       : result;
     renderAcquisitionStatus(activeStatus);
@@ -2147,7 +2209,8 @@ async function startAcquisition() {
 
 async function waitForServerTargetSave(stopResult, timeoutMs = 90000) {
   if (!controls.mysqlEnabled?.checked || !usesLocalCaptureHelper()
-      || controls.acquisitionMode?.value === "simulation") {
+      || (controls.acquisitionMode?.value === "simulation"
+        && state.acquisitionExecutionHost !== "helper_local")) {
     return stopResult;
   }
   const captureUuid = String(stopResult?.capture_uuid || "");
@@ -2228,7 +2291,9 @@ async function stopAcquisition() {
     const completedLayer = Number(layerControl.value) || 0;
     const mode = controls.acquisitionMode?.value || "real";
     let result;
-    if (usesLocalCaptureHelper() && mode !== "simulation") {
+    if (usesLocalCaptureHelper() && (
+      mode !== "simulation" || state.acquisitionExecutionHost === "helper_local"
+    )) {
       result = await requestLocalHelper("stop_capture", {}, {timeoutMs: 30000});
       result = await waitForServerTargetSave(result);
     } else {

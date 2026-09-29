@@ -153,6 +153,15 @@ class RemoteAcquisitionMirror:
                     "remote_helper_batch_created_at": self._helper_batch_created_at,
                     "remote_helper_queue_depth": self._helper_queue_depth,
                     "remote_server_received_at": self._last_batch_at,
+                    "remote_server_receive_latency_ms": (
+                        max(
+                            0.0,
+                            (self._last_batch_at - self._helper_batch_created_at) * 1000.0,
+                        )
+                        if self._last_batch_at is not None
+                        and self._helper_batch_created_at is not None
+                        else None
+                    ),
                     "first_sample_received": bool(self._rows),
                 }
             )
@@ -192,11 +201,14 @@ def select_acquisition_for_identity(
     local_acquisition: Any,
     remote_registry: RemoteAcquisitionRegistry,
     requested_mode: str = "",
+    simulation_execution_host: str = "server",
 ) -> Any:
     """Select hardware rows without ever falling back for helper-backed roles."""
 
     if str(role or "") in {"lan_operator", "authorized"}:
         if str(requested_mode or "").lower() == "simulation":
+            if str(simulation_execution_host or "") == "helper_local":
+                return remote_registry.for_session(str(session_id or ""))
             return local_acquisition
         return remote_registry.for_session(str(session_id or ""))
     return local_acquisition

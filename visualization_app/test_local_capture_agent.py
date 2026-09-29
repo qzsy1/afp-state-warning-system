@@ -12,6 +12,48 @@ from local_capture_agent import HelperTransport  # noqa: E402
 
 
 class LocalCaptureAgentTests(unittest.TestCase):
+    def test_sample_batch_reads_only_incremental_rows_when_manager_supports_cursor(self):
+        manager = Mock()
+        manager.start.return_value = {"running": True}
+        manager.status.return_value = {"running": True, "config": {"sample_rate_hz": 10.0}}
+        manager.stream_rows_since.side_effect = [
+            {
+                "rows": [{"温度": 350.0}, {"温度": 351.0}],
+                "timestamps": [1.0, 2.0],
+                "next_cursor": 2,
+                "total_count": 3,
+                "buffer_base": 0,
+                "truncated": False,
+            },
+            {
+                "rows": [{"温度": 352.0}],
+                "timestamps": [3.0],
+                "next_cursor": 3,
+                "total_count": 3,
+                "buffer_base": 0,
+                "truncated": False,
+            },
+        ]
+        manager.stream_counts.return_value = {
+            "total_count": 3,
+            "buffered_count": 3,
+            "buffer_base": 0,
+        }
+        agent = LocalCaptureAgent(manager=manager)
+        started = agent.start_capture(Mock())
+
+        first = agent.next_sample_batch(limit=2)
+        agent.ack_sample_batch(started["capture_uuid"], first["sequence"])
+        second = agent.next_sample_batch(limit=2)
+
+        self.assertEqual(first["rows"], [{"温度": 350.0}, {"温度": 351.0}])
+        self.assertEqual(second["rows"], [{"温度": 352.0}])
+        self.assertEqual(
+            [call.args[:2] for call in manager.stream_rows_since.call_args_list],
+            [(0, 2), (2, 2)],
+        )
+        manager.numeric_matrix.assert_not_called()
+
     def test_sample_batch_is_replayed_until_ack_then_advances(self):
         manager = Mock()
         manager.start.return_value = {"running": True, "config": {"acquisition_mode": "real"}}

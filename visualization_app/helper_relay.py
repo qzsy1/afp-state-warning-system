@@ -38,6 +38,28 @@ ALLOWED_HELPER_COMMANDS = frozenset(
 )
 
 
+def select_simulation_execution(helper_status: dict[str, Any] | None) -> dict[str, str]:
+    """Choose a remote simulation host before capture starts."""
+
+    status = helper_status if isinstance(helper_status, dict) else {}
+    if not bool(status.get("online")):
+        return {"execution_host": "server", "fallback_reason": "helper_offline"}
+    if not bool(status.get("protocol_compatible")):
+        return {
+            "execution_host": "server",
+            "fallback_reason": "helper_protocol_incompatible",
+        }
+    capabilities = status.get("capabilities")
+    if not isinstance(capabilities, dict) or not bool(
+        capabilities.get("simulation_replay_v1")
+    ):
+        return {
+            "execution_host": "server",
+            "fallback_reason": "helper_simulation_replay_unsupported",
+        }
+    return {"execution_host": "helper_local", "fallback_reason": ""}
+
+
 def _hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 

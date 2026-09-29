@@ -7,7 +7,7 @@ import json
 import sqlite3
 import threading
 from contextlib import closing, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -31,9 +31,10 @@ def _without_secrets(value: Any) -> Any:
 def _safe_capture_config(config: dict[str, Any] | None) -> dict[str, Any]:
     """Keep only server-side acquisition metadata; target credentials stay elsewhere."""
     value = _without_secrets(dict(config or {}))
+    allowed = {field.name for field in fields(AcquisitionConfig)}
     return {
         key: item for key, item in value.items()
-        if not str(key).lower().startswith("mysql_")
+        if key in allowed and not str(key).lower().startswith("mysql_")
     }
 
 

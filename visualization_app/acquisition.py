@@ -22,6 +22,7 @@ from collections import deque
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ import pandas as pd
 
 from mysql_storage import MySQLCaptureStore, MySQLSettings, validate_database_name
 from smrf_hid import SmrfHidDriver, enumerate_smrf_hid_devices
+from simulation_replay import MonotonicReplayScheduler
 
 
 APP_DIR = Path(os.environ.get("AFP_LEGACY_APP_DIR") or Path(__file__).resolve().parent).resolve()
@@ -3495,7 +3497,15 @@ class AcquisitionManager:
                 )
                 writer.writeheader()
                 timestamp_writer.writeheader()
-                next_deadline = time.perf_counter()
+                replay_scheduler = (
+                    MonotonicReplayScheduler(
+                        config.sample_rate_hz,
+                        clock=time.perf_counter,
+                        wait=self.stop_event.wait,
+                    )
+                    if config.driver == "simulator" or config.acquisition_mode == "simulation"
+                    else None
+                )
                 empty_since: float | None = None
                 while not self.stop_event.is_set():
                     try:
@@ -3588,11 +3598,8 @@ class AcquisitionManager:
                             self.last_error = "没有连接到传感器，3秒内没有检测到有效采集数据；请检查接口、串口和数据格式"
                             break
                         time.sleep(0.005)
-                    if config.driver == "simulator" or config.acquisition_mode == "simulation":
-                        next_deadline += 1.0 / config.sample_rate_hz
-                        self.stop_event.wait(
-                            max(0.0, next_deadline - time.perf_counter())
-                        )
+                    if replay_scheduler is not None:
+                        replay_scheduler.wait_next()
         except Exception as exc:
             self.last_error = str(exc)
         finally:
@@ -4376,3 +4383,41 @@ class AcquisitionManager:
     def numeric_matrix(self) -> tuple[list[dict[str, Any]], list[float]]:
         with self.lock:
             return list(self.rows), list(self.timestamps)
+
+    def stream_counts(self) -> dict[str, int]:
+        """Return O(1) counters for helper transport without copying samples."""
+
+        with self.lock:
+            buffered = len(self.rows)
+            total = int(self.total_sample_count)
+            return {
+                "total_count": total,
+                "buffered_count": buffered,
+                "buffer_base": max(0, total - buffered),
+            }
+
+    def stream_rows_since(self, cursor: int, limit: int) -> dict[str, Any]:
+        """Copy only the bounded absolute row range requested by the helper."""
+
+        with self.lock:
+            rows = self.rows
+            timestamps = self.timestamps
+            total = int(self.total_sample_count)
+            buffered = len(rows)
+            base = max(0, total - buffered)
+            requested = max(0, int(cursor))
+            truncated = requested < base
+            start = max(requested, base)
+            end = min(total, start + max(1, min(int(limit), 200)))
+            relative_start = start - base
+            relative_end = end - base
+            row_values = list(islice(rows, relative_start, relative_end))
+            timestamp_values = list(islice(timestamps, relative_start, relative_end))
+            return {
+                "rows": row_values,
+                "timestamps": timestamp_values,
+                "next_cursor": end,
+                "total_count": total,
+                "buffer_base": base,
+                "truncated": truncated,
+            }

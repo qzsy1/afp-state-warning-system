@@ -57,6 +57,7 @@ PUBLIC_POST = {
     "/api/helper/poll",
     "/api/helper/result",
     "/api/helper/samples",
+    "/api/helper/simulation-source/chunk",
 }
 AUTHORIZED_GET = {
     "/api/real/control/status",

@@ -25,7 +25,7 @@ from local_capture_agent import HelperTransport, LocalCaptureAgent
 
 
 HELPER_PROTOCOL_VERSION = 2
-HELPER_BUILD_ID = "20260929-isolated-check-v2"
+HELPER_BUILD_ID = "20260929-helper-simulation-replay-v1"
 HARDWARE_CHECK_TIMEOUT_SECONDS = 60.0
 
 
@@ -399,6 +399,7 @@ def helper_capabilities() -> dict[str, Any]:
         "process_parameter_read": True,
         "local_csv_save": True,
         "local_mysql_save": True,
+        "simulation_replay_v1": True,
         "local_mysql_profile": local_mysql_profile_metadata(),
     }
 
@@ -554,9 +555,16 @@ class HardwareCheckProcess:
 class HelperCommandDispatcher:
     """Keep control/status commands independent of disposable hardware probes."""
 
-    def __init__(self, agent: LocalCaptureAgent, *, check_runner: Any | None = None) -> None:
+    def __init__(
+        self,
+        agent: LocalCaptureAgent,
+        *,
+        check_runner: Any | None = None,
+        source_fetcher: Any | None = None,
+    ) -> None:
         self.agent = agent
         self.check_runner = check_runner or HardwareCheckProcess()
+        self.source_fetcher = source_fetcher
         self.executor = ThreadPoolExecutor(
             max_workers=3,
             thread_name_prefix="afp-helper-control",
@@ -572,10 +580,42 @@ class HelperCommandDispatcher:
             self.check_runner.cancel(reason="hardware_check_cancelled_for_capture")
 
         def run_control() -> None:
+            prepared_source = None
+            dispatch_message = dict(message)
+            dispatch_payload = dict(dispatch_message.get("payload") or {})
+            transfer = dispatch_payload.get("simulation_source_transfer")
+            if name == "start_capture" and isinstance(transfer, dict):
+                if self.source_fetcher is None:
+                    response = {
+                        "type": "result",
+                        "request_id": command["request_id"],
+                        "payload": {"ok": False, "error": "模拟源下载器不可用"},
+                    }
+                    callback(response)
+                    return
+                try:
+                    prepared_source = self.agent.prepare_simulation_source(
+                        transfer, self.source_fetcher
+                    )
+                    dispatch_payload["simulation_source_type"] = prepared_source["source_type"]
+                    dispatch_payload["simulation_source_path"] = prepared_source["path"]
+                    dispatch_payload.pop("simulation_source_id", None)
+                    dispatch_payload.pop("simulation_source_transfer", None)
+                    dispatch_message["payload"] = dispatch_payload
+                except Exception as exc:
+                    response = {
+                        "type": "result",
+                        "request_id": command["request_id"],
+                        "payload": {"ok": False, "error": str(exc) or exc.__class__.__name__},
+                    }
+                    callback(response)
+                    return
             response = dispatch_command(
                 self.agent,
-                json.dumps(message, ensure_ascii=False),
+                json.dumps(dispatch_message, ensure_ascii=False),
             )
+            if prepared_source is not None and isinstance(response.get("payload"), dict):
+                response["payload"]["source_transfer"] = prepared_source
             try:
                 callback(response)
             except Exception:
@@ -758,6 +798,24 @@ def flush_http_sample_batch(
     return result
 
 
+def simulation_source_fetcher(transport: HelperTransport, device_id: str):
+    """Return the authenticated bounded-chunk reader used by the cache."""
+
+    def fetch(ticket: str, file_index: int, offset: int, limit: int) -> dict[str, Any]:
+        return transport.http_json(
+            "api/helper/simulation-source/chunk",
+            {
+                "device_id": device_id,
+                "ticket": ticket,
+                "file_index": int(file_index),
+                "offset": int(offset),
+                "limit": int(limit),
+            },
+        )
+
+    return fetch
+
+
 def _dispatch_and_send_websocket(
     agent: LocalCaptureAgent,
     message: dict[str, Any],
@@ -781,7 +839,10 @@ def run_http_forever(
 ) -> None:
     agent = agent or LocalCaptureAgent()
     transport = HelperTransport(server_url, pairing_token, device_id=device_id)
-    dispatcher = HelperCommandDispatcher(agent)
+    dispatcher = HelperCommandDispatcher(
+        agent,
+        source_fetcher=simulation_source_fetcher(transport, device_id),
+    )
     delay = 1.0
     try:
         while True:
@@ -831,7 +892,10 @@ def run_forever(
         dispatcher = None
         try:
             connection = transport.connect_once()
-            dispatcher = HelperCommandDispatcher(agent)
+            dispatcher = HelperCommandDispatcher(
+                agent,
+                source_fetcher=simulation_source_fetcher(transport, device_id),
+            )
             send_lock = threading.Lock()
 
             def send_json(message: dict[str, Any]) -> None:

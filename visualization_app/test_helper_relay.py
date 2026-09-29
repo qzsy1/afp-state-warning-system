@@ -9,10 +9,43 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from helper_relay import HelperRegistry  # noqa: E402
+from helper_relay import HelperRegistry, select_simulation_execution  # noqa: E402
 
 
 class HelperRelayTests(unittest.TestCase):
+    def test_remote_simulation_prefers_only_online_compatible_helper(self):
+        compatible = {
+            "online": True,
+            "protocol_compatible": True,
+            "capabilities": {"simulation_replay_v1": True},
+        }
+        old_helper = {
+            "online": True,
+            "protocol_compatible": True,
+            "capabilities": {},
+        }
+        offline = {
+            "online": False,
+            "protocol_compatible": True,
+            "capabilities": {"simulation_replay_v1": True},
+        }
+
+        self.assertEqual(
+            select_simulation_execution(compatible),
+            {"execution_host": "helper_local", "fallback_reason": ""},
+        )
+        self.assertEqual(
+            select_simulation_execution(old_helper),
+            {
+                "execution_host": "server",
+                "fallback_reason": "helper_simulation_replay_unsupported",
+            },
+        )
+        self.assertEqual(
+            select_simulation_execution(offline),
+            {"execution_host": "server", "fallback_reason": "helper_offline"},
+        )
+
     def test_default_heartbeat_window_covers_transient_helper_backoff(self):
         registry = HelperRegistry()
         self.assertGreaterEqual(registry.heartbeat_ttl_seconds, 45)

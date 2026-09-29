@@ -156,6 +156,31 @@ class GuestSimulationTests(unittest.TestCase):
         self.assertEqual(first.save_root, manager.root / first_id)
         self.assertEqual(second.save_root, manager.root / second_id)
 
+    def test_uploaded_source_can_build_helper_manifest_without_leaking_server_path(self):
+        manager = self._manager()
+        session_id = "a" * 32
+        uploaded = manager.upload_source(
+            session_id,
+            "single_csv",
+            [
+                {
+                    "name": "client/source.csv",
+                    "data": base64.b64encode(b"temperature,pressure\n1,2\n").decode("ascii"),
+                }
+            ],
+        )
+
+        manifest, source_root = manager.source_transfer_manifest(
+            session_id, uploaded["source_id"]
+        )
+
+        self.assertEqual(manifest["source_type"], "single_csv")
+        self.assertEqual(manifest["files"][0]["relative_path"], "source.csv")
+        self.assertTrue(source_root.is_dir())
+        self.assertNotIn(str(manager.root), json.dumps(manifest))
+        with self.assertRaisesRegex(Exception, "不属于当前浏览器会话"):
+            manager.source_transfer_manifest("b" * 32, uploaded["source_id"])
+
     def test_guest_payload_cannot_select_real_driver_or_arbitrary_path(self):
         manager = self._manager()
         session_id = "a" * 32
