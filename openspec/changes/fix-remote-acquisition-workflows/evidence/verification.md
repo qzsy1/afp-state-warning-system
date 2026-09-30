@@ -86,3 +86,15 @@
 - 交付目录七个运行副本与源码逐文件 SHA-256 一致；`SHA256SUMS.txt` 覆盖 6277 个非可变文件，`--verify-files` 退出码 0。主程序 EXE 未重建，SHA-256 为 `AA7BC2F636E862E9F603F7B4D4D9D8FC9B71390FFB20F33A011A42EF9D56FD65`；helper 重建后为 `272FB53A4A622882E83CB86C5BDC3EDE13C7B4BBF745627BAEF65E17D5026001`，213078355 bytes，版本仍为 `20260929-isolated-check-v2 (protocol 2)`。
 - 服务以 PID 32628 重启，8770/8771 由同一进程监听。本机与公网健康接口均正常；公网首页和脚本均加载 `20260929-lan-ws-helper-v3-diagnosis-mysql`，包含检查结果规范化和“模型增强诊断”文案。回环 WebSocket 握手为 8.5 ms，公网 WSS 握手为 49.6 ms；当前推荐局域网地址为 `http://192.168.101.31:8770/`。
 - 本轮没有使用用户真实供应商 Key 发起模型请求，也没有代替第二台电脑创建其实际数据库；有效 Key/模型/公网出口、第二台电脑 MySQL 权限、真实 helper 与五类实物接口仍按现场验收项单独确认。
+
+## 2026-09-30 helper 模拟预下载与固定链路低延迟回放
+
+- RED/定向回归覆盖模拟源零字节、无有效表头/数值行、通道不兼容、helper 业务失败立即返回、旧采集在途批次隔离、预下载与开始拆分、内容缓存命中、1 MiB 有界分块、固定服务地址、ACK 事件唤醒和 LAN/公网自适应批量。定向 148 项全部通过。
+- 排除因源码目录既有四个大型仪表盘生成物缺失而不能初始化的 `test_app.DashboardTests` 后，31 个测试模块及 `test_app.PoolingTests/LanServerTests` 共 449 项、48.432 秒，全部通过；覆盖五类接口、真实/模拟采集控制、停止保存、两个 MySQL 作用域、预测兼容、LangChain、本地 helper、WebSocket、公网权限与采集完整性。既有 sklearn 版本警告和一个测试 CSV 句柄警告未形成失败。
+- Python 编译、`node --check static/app.js`、`git diff --check` 和 OpenSpec strict 均通过。`acquisition.py` 的改动只涉及模拟 CSV 流式读取和采集流活动通知，PLC Modbus TCP、ABB RWS、SMRF 热电偶 HID、M3232 串口与 UVC 热成像驱动/协议映射没有改写；预测和 MySQL 表结构文件未修改。
+- 两个合成包通过实际 LAN API 下载并复算：快速包 54,577 字节/240 行，耐久包 1,365,578 字节/6000 行，声明 SHA-256 全部匹配。访客无权读取包目录；LAN/授权角色可见。
+- 经验证的外置业务文件同步到 `app/legacy`，网页文件同时同步到实际运行的 `app/ui`；源与交付副本逐文件 SHA-256 一致。`SHA256SUMS.txt` 覆盖 6282 个不可变文件，主程序 `--verify-files` 退出码 0，0 missing、0 mismatched、0 malformed。
+- 主程序 EXE 未重建，SHA-256 仍为 `AA7BC2F636E862E9F603F7B4D4D9D8FC9B71390FFB20F33A011A42EF9D56FD65`。新 helper 版本为 `20260930-helper-prefetch-low-latency-v1 (protocol 2)`，SHA-256 为 `BB91B23FDC3994485B0305274267958902589B7DE449FBFEDCE530DCACE9BC20`。
+- 交付服务以 PID 15924 重启并由同一进程监听 8770/8771。回环、实际 LAN `http://192.168.101.31:8770/` 与公网健康接口各连续 5 次均为 HTTP 200，平均约 1.4/0.9/6.3 ms；公网 WSS 实际握手 31.1 ms并收到 payload。公网首页已引用 `20260930-helper-prefetch-v2`，在线 `app.js` SHA-256 与源码完全一致。
+- 公网独立访客会话实际完成模拟启动、2 秒后 21 点进度和停止保存，开始/停止约 50.6/52.3 ms。此结果验证服务器访客链路，不替代授权 helper 预下载、本机 MySQL、600 秒第二台电脑持续回放、真实 50 Hz 或五类实物接口。
+- 任务 18.10 保持未完成：需用户在真实第二台电脑以本次 helper 分别经 LAN 与公网执行快速包和 6000 点/600 秒验收，返回行数、速率、序号、队列、P95、浏览器新鲜度和两个 MySQL 作用域的现场证据。

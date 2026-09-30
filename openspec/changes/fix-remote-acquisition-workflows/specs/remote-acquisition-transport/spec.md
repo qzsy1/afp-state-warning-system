@@ -157,3 +157,52 @@ helper SHALL 将可能阻塞的真实硬件检查置于独立、可终止且有�
 #### Scenario: helper 版本不兼容
 - **WHEN** helper 握手缺少系统要求的协议版本或命令生命周期能力
 - **THEN** 页面 MUST 将其与离线状态区分并提示更新 helper；服务器 MUST NOT 将版本不兼容误报为网络掉线
+
+### Requirement: helper 必须保持用户配对时选择的固定服务地址
+局域网和公网授权采集 SHALL 默认使用同一 helper 采集、保存和上传合同，但 helper MUST 持续使用用户配对或保存配置时输入的服务地址。系统 MUST NOT 根据浏览器当前 origin、延迟测量或网卡变化自动切换 helper 的局域网/公网服务地址，也 MUST NOT 静默改写 helper 配置。页面 SHALL 显示 helper 当前服务地址类型、测得往返延迟和与浏览器访问路径是否一致；不一致时 SHALL 提醒用户按当前验收场景重新配对，但 MUST NOT 自动重配。
+
+#### Scenario: 局域网验收使用局域网地址配对
+- **WHEN** 用户通过实际可用的 LAN URL 打开页面并将 helper 配对到该 LAN URL
+- **THEN** helper SHALL 在该固定 LAN 链路上传数据，页面 MUST 显示局域网路径和当前往返延迟，不得改用公网地址
+
+#### Scenario: 公网验收使用公网地址配对
+- **WHEN** 用户通过公网 HTTPS 页面并将 helper 配对到公网服务地址
+- **THEN** helper SHALL 在该固定公网链路上传数据，页面 MUST 显示公网路径和当前往返延迟，不得因同时存在局域网而改用 LAN 地址
+
+#### Scenario: 浏览器和 helper 使用不同路径
+- **WHEN** 浏览器从 LAN URL 打开但 helper 仍配对公网地址，或反之
+- **THEN** 页面 SHALL 显示明确的不一致提醒和重新配对入口，但服务器与 helper MUST 继续使用当前已确认地址直至用户主动更改
+
+### Requirement: 首批样本等待和新采集边界必须可恢复且可诊断
+服务器 SHALL 仅在 helper 明确返回 `ok=true`、`running=true` 和与当前命令一致的 `capture_uuid` 后进入首批样本等待。helper 返回 `ok=false`、缓存未就绪、源无有效样本或身份不一致时，页面 MUST 立即显示原始可操作错误，不得继续固定等待十五秒。开始新采集时 helper SHALL 清除或隔离上一采集的待确认批次、确认序号和唤醒状态，使新 `capture_uuid` 从自身序列边界独立运行。
+
+#### Scenario: helper 拒绝开始命令
+- **WHEN** helper 对 `start_capture` 返回 `ok=false` 或未返回当前 `capture_uuid` 的运行状态
+- **THEN** 服务器 MUST 立即结束开始流程并透传分类后的根因，MUST NOT 将其改写为“十五秒内未收到首批有效采集数据”
+
+#### Scenario: 上一次采集仍存在未确认批次
+- **WHEN** 用户停止或失败后启动新的 `capture_uuid`，且 helper 内仍保留旧采集的未确认批次
+- **THEN** helper MUST 将旧批次归档到旧会话的恢复边界并为新会话重置发送状态，新会话 MUST NOT 因旧批次等待 ACK 而无法发送首批样本
+
+#### Scenario: 首批样本超过目标时间
+- **WHEN** helper 已报告运行但服务器在目标时间内未收到首批样本
+- **THEN** 状态 SHALL 根据 helper 本地产生样本数、队列深度、未确认批次、最后 ACK、连接在线状态和传输错误区分“本地未产生样本”“等待上传或 ACK”“helper 掉线”，不得只返回单一超时提示
+
+### Requirement: helper 样本上传必须由新样本和 ACK 事件驱动
+helper SHALL 在产生新样本或收到 ACK 时唤醒发送循环，并 MUST 保持同一会话最多一个未确认批次。发送循环 MUST NOT 把固定 250 ms 轮询等待作为每批数据的必经延迟。批量大小 MAY 根据当前固定配对链路的实测 RTT 和积压在有界范围内调整，但 MUST NOT 触发服务地址切换；局域网目标发送周期 SHALL 为 100–200 ms，公网 MAY 按 RTT 合并 2–5 个 10 Hz 样本。采样调度、本机 CSV、本机 MySQL、上传 ACK、服务器保存和浏览器绘图 SHALL 解耦，任一较慢环节不得改变 helper 的 10 Hz 样本时间线。
+
+#### Scenario: 局域网低延迟回放
+- **WHEN** helper 通过固定 LAN 地址执行已缓存的 10 Hz 模拟回放且无网络故障
+- **THEN** 新样本 SHALL 在 100–200 ms 发送目标内形成批次，ACK 到达后 SHALL 立即尝试排空下一批，固定空等不得使有效采样率下降
+
+#### Scenario: 公网高 RTT 回放
+- **WHEN** helper 通过固定公网地址执行 10 Hz 回放且 RTT 高于局域网
+- **THEN** helper MAY 将 2–5 个连续样本合并为有界批次以降低请求开销，但 SHALL 保留原始 10 Hz 时间戳、连续序号、单在途 ACK、零重复和断线补传能力
+
+#### Scenario: 浏览器渲染变慢
+- **WHEN** 浏览器标签页降频、绘图耗时或网络发布频率低于 10 Hz
+- **THEN** helper 本地采样与保存 SHALL 继续稳定推进；页面 SHALL 分别显示本地有效采样率、待发队列、服务器接收延迟、浏览器发布延迟和绘图帧率，不得将绘图帧率冒充采样率
+
+#### Scenario: 十分钟耐久验收
+- **WHEN** helper 使用已校验的 6000 点合成数据包以 10 Hz 回放 600 秒
+- **THEN** 本地生成、服务器接受和已启用保存端 SHALL 按各自合同记录 6000 个连续序号，零缺失、零重复，有效采样率 SHALL 为 9.8–10.2 Hz，队列不得持续增长，端到端延迟 P95 SHALL 不超过 1 秒

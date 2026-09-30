@@ -15,6 +15,7 @@ import queue
 import sys
 import threading
 import time
+import urllib.parse
 from dataclasses import fields
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,7 @@ from local_capture_agent import HelperTransport, LocalCaptureAgent
 
 
 HELPER_PROTOCOL_VERSION = 2
-HELPER_BUILD_ID = "20260929-helper-simulation-replay-v1"
+HELPER_BUILD_ID = "20260930-helper-prefetch-low-latency-v1"
 HARDWARE_CHECK_TIMEOUT_SECONDS = 60.0
 
 
@@ -33,34 +34,73 @@ class PairingRequiredError(RuntimeError):
     """Raised when the saved helper credential is no longer accepted."""
 
 
-def adaptive_sample_batch_limit(agent: LocalCaptureAgent) -> int:
-    """Size a half-second batch while retaining strict memory bounds."""
+def adaptive_sample_batch_limit(
+    agent: LocalCaptureAgent,
+    *,
+    route_type: str = "unknown",
+    rtt_ms: float | None = None,
+) -> int:
+    """Bound batches for the already-paired route without changing endpoint."""
 
     try:
         metrics = agent.stream_metrics()
         sample_rate = float(metrics.get("sample_rate_hz") or 10.0)
     except (AttributeError, TypeError, ValueError):
         sample_rate = 10.0
-    return max(20, min(200, int(math.ceil(sample_rate * 0.5))))
+    route = str(route_type or "unknown").lower()
+    if route == "lan":
+        target_seconds = 0.15
+    elif route == "public":
+        try:
+            measured = max(0.0, float(rtt_ms or 0.0)) / 1000.0
+        except (TypeError, ValueError):
+            measured = 0.0
+        target_seconds = min(0.5, max(0.2, measured + 0.1))
+    else:
+        # Preserve the proven legacy bound for callers without route metadata.
+        target_seconds = 0.5
+    lower = 2 if route in {"lan", "public"} else 1
+    upper = 5 if route == "public" else 200
+    return max(lower, min(upper, int(math.ceil(sample_rate * target_seconds))))
 
 
 class HelperSamplePump:
     """Keep one replayable sample batch in flight and advance only on ACK."""
 
-    def __init__(self, agent: LocalCaptureAgent) -> None:
+    def __init__(self, agent: LocalCaptureAgent, *, route_type: str = "unknown") -> None:
         self.agent = agent
+        self.route_type = str(route_type or "unknown")
         self._in_flight: tuple[str, int] | None = None
         self._last_sent_at: float | None = None
         self._last_ack_at: float | None = None
+        self._rtt_ms: float | None = None
+        self._wake = threading.Event()
 
     def next_message(self, *, now: float | None = None) -> dict[str, Any] | None:
         if self._in_flight is not None:
-            return None
-        batch = self.agent.next_sample_batch(limit=adaptive_sample_batch_limit(self.agent))
+            try:
+                active_capture = str(self.agent.stream_metrics().get("capture_uuid") or "")
+            except (AttributeError, TypeError, ValueError):
+                active_capture = ""
+            if not active_capture or active_capture == self._in_flight[0]:
+                return None
+            # LocalCaptureAgent resets its durable pending batch when a new
+            # capture starts. Retire only the obsolete wire marker here so an
+            # ACK from the previous capture cannot block sequence 0.
+            self._in_flight = None
+        batch = self.agent.next_sample_batch(
+            limit=adaptive_sample_batch_limit(
+                self.agent, route_type=self.route_type, rtt_ms=self._rtt_ms
+            )
+        )
         if not isinstance(batch, dict):
             return None
         capture_uuid = str(batch.get("capture_uuid") or "")
         sequence = int(batch.get("sequence", -1))
+        transport = batch.setdefault("transport", {})
+        if isinstance(transport, dict):
+            transport["helper_ack_rtt_ms"] = self._rtt_ms
+            transport["paired_route_type"] = self.route_type
         self._in_flight = (capture_uuid, sequence)
         self._last_sent_at = time.monotonic() if now is None else float(now)
         return {"type": "sample_batch", "batch": batch}
@@ -79,7 +119,20 @@ class HelperSamplePump:
         if accepted:
             self._in_flight = None
             self._last_ack_at = time.monotonic() if now is None else float(now)
+            if self._last_sent_at is not None:
+                measured = max(0.0, (self._last_ack_at - self._last_sent_at) * 1000.0)
+                self._rtt_ms = measured if self._rtt_ms is None else (0.75 * self._rtt_ms + 0.25 * measured)
+            self._wake.set()
         return bool(accepted)
+
+    def wait_for_activity(self, timeout: float = 0.2) -> bool:
+        if self._wake.is_set():
+            self._wake.clear()
+            return True
+        waiter = getattr(self.agent, "wait_for_stream_activity", None)
+        if callable(waiter):
+            return bool(waiter(timeout))
+        return self._wake.wait(timeout=max(0.0, float(timeout)))
 
     def connection_lost(self) -> None:
         # LocalCaptureAgent intentionally retains its pending batch.  Clearing
@@ -93,6 +146,8 @@ class HelperSamplePump:
                 "unacknowledged": self._in_flight is not None,
                 "last_sent_monotonic": self._last_sent_at,
                 "last_ack_monotonic": self._last_ack_at,
+                "rtt_ms": self._rtt_ms,
+                "paired_route_type": self.route_type,
             }
         )
         return value
@@ -123,10 +178,10 @@ def load_current_server_hint(*, path: str | Path | None = None) -> str:
 
 
 def preferred_setup_server(saved_server: str = "", *, server_hint_path: str | Path | None = None) -> str:
-    current = load_current_server_hint(path=server_hint_path)
-    if current:
-        return current
-    return str(saved_server or "")
+    saved = str(saved_server or "").strip()
+    if saved:
+        return saved
+    return load_current_server_hint(path=server_hint_path)
 
 
 class _DataBlob(ctypes.Structure):
@@ -388,8 +443,26 @@ def _config_from_payload(payload: dict[str, Any]) -> AcquisitionConfig:
     return AcquisitionConfig(**{key: value for key, value in payload.items() if key in allowed})
 
 
-def helper_capabilities() -> dict[str, Any]:
-    return {
+def _paired_route(server_url: str) -> tuple[str, str]:
+    parsed = urllib.parse.urlsplit(str(server_url or "").strip())
+    hostname = str(parsed.hostname or "").strip().lower()
+    if not parsed.scheme or not hostname:
+        return "", "unknown"
+    port = f":{parsed.port}" if parsed.port else ""
+    safe_url = f"{parsed.scheme}://{hostname}{port}"
+    if hostname in {"localhost", "127.0.0.1", "::1"}:
+        route_type = "loopback"
+    else:
+        try:
+            route_type = "lan" if __import__("ipaddress").ip_address(hostname).is_private else "public"
+        except ValueError:
+            route_type = "public"
+    return safe_url, route_type
+
+
+def helper_capabilities(server_url: str = "") -> dict[str, Any]:
+    paired_server_url, paired_route_type = _paired_route(server_url)
+    result = {
         "protocol_version": HELPER_PROTOCOL_VERSION,
         "build_id": HELPER_BUILD_ID,
         "command_lifecycle": "isolated_hardware_check",
@@ -400,8 +473,13 @@ def helper_capabilities() -> dict[str, Any]:
         "local_csv_save": True,
         "local_mysql_save": True,
         "simulation_replay_v1": True,
+        "simulation_prefetch_v1": True,
         "local_mysql_profile": local_mysql_profile_metadata(),
     }
+    if paired_server_url:
+        result["paired_server_url"] = paired_server_url
+        result["paired_route_type"] = paired_route_type
+    return result
 
 
 def _hardware_check_worker(message: dict[str, Any], result_queue: Any) -> None:
@@ -584,7 +662,28 @@ class HelperCommandDispatcher:
             dispatch_message = dict(message)
             dispatch_payload = dict(dispatch_message.get("payload") or {})
             transfer = dispatch_payload.get("simulation_source_transfer")
-            if name == "start_capture" and isinstance(transfer, dict):
+            ready_reference = dispatch_payload.get("simulation_source_ready")
+            if name == "start_capture" and isinstance(ready_reference, dict):
+                try:
+                    prepared_source = self.agent.resolve_prepared_simulation_source(
+                        ready_reference,
+                        required_channels=list(dispatch_payload.get("selected_sensors") or []),
+                    )
+                    dispatch_payload["simulation_source_type"] = prepared_source["source_type"]
+                    dispatch_payload["simulation_source_path"] = prepared_source["path"]
+                    dispatch_payload.pop("simulation_source_id", None)
+                    dispatch_payload.pop("simulation_source_ready", None)
+                    dispatch_message["payload"] = dispatch_payload
+                except Exception as exc:
+                    callback(
+                        {
+                            "type": "result",
+                            "request_id": command["request_id"],
+                            "payload": {"ok": False, "error": str(exc) or exc.__class__.__name__},
+                        }
+                    )
+                    return
+            elif name in {"prepare_simulation_source", "start_capture"} and isinstance(transfer, dict):
                 if self.source_fetcher is None:
                     response = {
                         "type": "result",
@@ -595,7 +694,9 @@ class HelperCommandDispatcher:
                     return
                 try:
                     prepared_source = self.agent.prepare_simulation_source(
-                        transfer, self.source_fetcher
+                        transfer,
+                        self.source_fetcher,
+                        required_channels=list(dispatch_payload.get("selected_sensors") or []),
                     )
                     dispatch_payload["simulation_source_type"] = prepared_source["source_type"]
                     dispatch_payload["simulation_source_path"] = prepared_source["path"]
@@ -610,12 +711,39 @@ class HelperCommandDispatcher:
                     }
                     callback(response)
                     return
+            if name == "prepare_simulation_source":
+                if prepared_source is None:
+                    callback(
+                        {
+                            "type": "result",
+                            "request_id": command["request_id"],
+                            "payload": {"ok": False, "error": "模拟源预下载描述缺失"},
+                        }
+                    )
+                    return
+                public_source = {
+                    key: value
+                    for key, value in prepared_source.items()
+                    if key != "path"
+                }
+                callback(
+                    {
+                        "type": "result",
+                        "request_id": command["request_id"],
+                        "payload": {"ok": True, **public_source},
+                    }
+                )
+                return
             response = dispatch_command(
                 self.agent,
                 json.dumps(dispatch_message, ensure_ascii=False),
             )
             if prepared_source is not None and isinstance(response.get("payload"), dict):
-                response["payload"]["source_transfer"] = prepared_source
+                response["payload"]["source_transfer"] = {
+                    key: value
+                    for key, value in prepared_source.items()
+                    if key != "path"
+                }
             try:
                 callback(response)
             except Exception:
@@ -884,12 +1012,14 @@ def run_forever(
 ) -> bool:
     agent = agent or LocalCaptureAgent()
     transport = HelperTransport(server_url, pairing_token, device_id=device_id)
-    sample_pump = HelperSamplePump(agent)
+    sample_pump = HelperSamplePump(agent, route_type=_paired_route(server_url)[1])
     delay = 1.0
     failures = 0
     while True:
         connection = None
         dispatcher = None
+        sender_stop = None
+        sender_thread = None
         try:
             connection = transport.connect_once()
             dispatcher = HelperCommandDispatcher(
@@ -906,19 +1036,43 @@ def run_forever(
             failures = 0
             send_json(
                 transport.hello(
-                    capabilities=helper_capabilities()
+                    capabilities=helper_capabilities(server_url)
                 )
             )
+            sender_stop = threading.Event()
+            sender_errors: list[BaseException] = []
+
+            def send_samples_when_ready() -> None:
+                try:
+                    while not sender_stop.is_set():
+                        pending_message = sample_pump.next_message()
+                        if pending_message is not None:
+                            send_json(pending_message)
+                            continue
+                        sample_pump.wait_for_activity(0.2)
+                except BaseException as exc:
+                    sender_errors.append(exc)
+                    sender_stop.set()
+                    try:
+                        connection.close()
+                    except Exception:
+                        pass
+
+            sender_thread = threading.Thread(
+                target=send_samples_when_ready,
+                name="helper-sample-sender",
+                daemon=True,
+            )
+            sender_thread.start()
             delay = 1.0
             try:
-                connection.settimeout(0.25)
+                connection.settimeout(1.0)
             except Exception:
                 pass
             last_heartbeat = time.monotonic()
             while True:
-                pending_message = sample_pump.next_message()
-                if pending_message is not None:
-                    send_json(pending_message)
+                if sender_errors:
+                    raise sender_errors[0]
                 try:
                     raw = connection.recv()
                 except Exception as exc:
@@ -926,6 +1080,8 @@ def run_forever(
                     # avoid importing its private class and keep the helper
                     # heartbeat portable across package versions.
                     if exc.__class__.__name__ == "WebSocketTimeoutException":
+                        if sender_errors:
+                            raise sender_errors[0]
                         if time.monotonic() - last_heartbeat >= 10.0:
                             send_json({"type": "heartbeat"})
                             last_heartbeat = time.monotonic()
@@ -964,6 +1120,10 @@ def run_forever(
             time.sleep(delay)
             delay = min(delay * 2.0, 30.0)
         finally:
+            if sender_stop is not None:
+                sender_stop.set()
+            if sender_thread is not None:
+                sender_thread.join(timeout=1.0)
             sample_pump.connection_lost()
             if dispatcher is not None:
                 dispatcher.close()
@@ -1178,7 +1338,7 @@ def _run_main() -> None:
             {
                 "challenge": args.pairing_challenge,
                 "device_id": args.device_id,
-                "capabilities": helper_capabilities(),
+                "capabilities": helper_capabilities(args.server),
             },
             authorized=False,
         )
@@ -1215,7 +1375,7 @@ def _run_main() -> None:
                 {
                     "challenge": repaired.pairing_challenge,
                     "device_id": repaired.device_id,
-                    "capabilities": helper_capabilities(),
+                    "capabilities": helper_capabilities(repaired.server),
                 },
                 authorized=False,
             )

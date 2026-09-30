@@ -202,6 +202,20 @@ class PublicWebAccessTests(unittest.TestCase):
         self.assertFalse(denied.allowed)
         self.assertEqual(denied.error, "real_access_required")
 
+    def test_synthetic_package_catalog_download_and_selection_require_real_role(self):
+        from web_access import PermissionPolicy, RequestIdentity
+
+        policy = PermissionPolicy()
+        guest = RequestIdentity("guest", None, "guest-a")
+        authorized = RequestIdentity("authorized", "session-a", "guest-a")
+        for method, path in (
+            ("GET", "/api/simulation/packages"),
+            ("GET", "/api/simulation/package-download"),
+            ("POST", "/api/acquisition/select-package"),
+        ):
+            self.assertFalse(policy.authorize(method, path, guest).allowed)
+            self.assertTrue(policy.authorize(method, path, authorized).allowed)
+
     def test_mysql_preflight_requires_authorized_session(self):
         from web_access import PermissionPolicy, RequestIdentity
 
@@ -917,7 +931,11 @@ class PublicWebHttpTests(unittest.TestCase):
             status, result, _ = self.request_json(
                 "POST",
                 "/api/acquisition/start",
-                {"acquisition_mode": "simulation", "driver": "simulator"},
+                {
+                    "acquisition_mode": "simulation", "driver": "simulator",
+                    "execution_host": "server",
+                    "simulation_execution_choice": "server_explicit",
+                },
                 headers={"X-Forwarded-Proto": "https"},
             )
 
@@ -925,6 +943,23 @@ class PublicWebHttpTests(unittest.TestCase):
         self.assertTrue(result["running"])
         self.assertEqual(start.call_count, 1)
         self.assertEqual(self.hardware_start_calls, 0)
+
+    def test_authorized_server_simulation_rejects_implicit_helper_fallback(self):
+        self.request_json("GET", "/api/auth/session")
+        self.request_json(
+            "POST", "/api/auth/login", {"password": "Correct-Horse-2026"},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+
+        status, result, _ = self.request_json(
+            "POST",
+            "/api/acquisition/start",
+            {"acquisition_mode": "simulation", "driver": "simulator"},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+
+        self.assertEqual(status, 409)
+        self.assertEqual(result["error"], "explicit_server_simulation_required")
 
     def test_duplicate_real_start_request_is_replayed_without_second_hardware_call(self):
         self.request_json("GET", "/api/auth/session")
@@ -937,7 +972,11 @@ class PublicWebHttpTests(unittest.TestCase):
         self.request_json(
             "POST", "/api/real/control/acquire", {}, headers={"X-Forwarded-Proto": "https"}
         )
-        payload = {"acquisition_mode": "simulation", "driver": "simulator"}
+        payload = {
+            "acquisition_mode": "simulation", "driver": "simulator",
+            "execution_host": "server",
+            "simulation_execution_choice": "server_explicit",
+        }
         guest_acquisition = self.server.guest_manager.ensure_session(
             self.cookies["afp_guest"]
         ).acquisition
@@ -1077,6 +1116,8 @@ class PublicWebHttpTests(unittest.TestCase):
                     "simulation_source_type": "single_csv",
                     "simulation_source_path": self.default_simulation_source.name,
                     "source_file": self.default_simulation_source.name,
+                    "execution_host": "server",
+                    "simulation_execution_choice": "server_explicit",
                 },
                 headers={"X-Forwarded-Proto": "https"},
             )

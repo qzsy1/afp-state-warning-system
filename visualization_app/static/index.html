@@ -79,6 +79,12 @@
               </select>
             </label>
             <div id="simulationSettings" class="simulation-settings hidden">
+              <label id="simulationExecutionHostLabel">模拟执行位置
+                <select id="simulationExecutionHostSelect">
+                  <option value="helper_local" selected>访问电脑辅助程序（默认，低延迟）</option>
+                  <option value="server">服务器模拟（明确备用，不支持本机 MySQL）</option>
+                </select>
+              </label>
               <label>模拟数据形式
                 <select id="simulationSourceTypeSelect">
                   <option value="single_csv">单 CSV 文件</option>
@@ -93,6 +99,16 @@
                 </span>
               </label>
               <input id="simulationSourceFileInput" class="hidden" type="file" accept=".csv,text/csv" multiple>
+              <div id="simulationPackagePanel" class="simulation-package-panel hidden">
+                <label>批准的合成模拟数据
+                  <select id="simulationPackageSelect"></select>
+                </label>
+                <div class="path-picker-row">
+                  <button id="prepareSimulationPackageButton" class="primary-button compact-button" type="button">下载到本机辅助程序并校验</button>
+                  <button id="downloadSimulationPackageButton" class="secondary-button compact-button" type="button">另存示例 CSV 到电脑</button>
+                </div>
+                <p id="simulationPackageStatus" class="control-note">下载和校验不会自动开始采集。</p>
+              </div>
               <div id="simulationMysqlSettings" class="simulation-mysql-settings hidden">
                 <p class="control-note shared-mysql-note">使用“真实采集与保存”中的统一 MySQL 连接信息。</p>
                 <div class="compact-input-grid shared-mysql-legacy-fields hidden" aria-hidden="true">
@@ -497,6 +513,6 @@
   </div>
   <script src="/mysql_visibility.js?v=20260909-mysql-toggle-2"></script>
   <script src="/process_parameters.js?v=20260916-auto-process-1"></script>
-  <script src="/app.js?v=20260929-helper-simulation-replay-v4"></script>
+  <script src="/app.js?v=20260930-helper-prefetch-v2"></script>
 </body>
 </html>

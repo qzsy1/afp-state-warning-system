@@ -73,11 +73,16 @@ const state = {
   saveStatusTimer: null,
   simulationSourceChannels: [],
   simulationSourceId: "",
+  simulationSourceReady: null,
+  simulationSourcePackageId: "",
+  simulationPackages: [],
   helperStatus: {paired: false, online: false, capabilities: {}},
   helperPairingChallenge: "",
   helperStatusTimer: null,
   processParameterBusy: false,
   stopBusy: false,
+  browserRenderTimes: [],
+  browserRenderRateHz: 0,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -136,6 +141,7 @@ async function loadAccessSession() {
   state.secureTransport = Boolean(payload.secure_transport);
   state.csrf = readCookie("afp_csrf");
   renderAccessState();
+  void loadSimulationPackages();
   return payload;
 }
 
@@ -150,6 +156,37 @@ function supportsHelperSimulationReplay() {
     && state.helperStatus?.protocol_compatible
     && state.helperStatus?.capabilities?.simulation_replay_v1
   );
+}
+
+function simulationPackageControlsVisible(role = state.accessRole) {
+  return role === "lan_operator" || role === "authorized";
+}
+
+function simulationExecutionSelection(role, requestedHost = "helper_local", helperStatus = {}) {
+  if (role === "guest") return {execution_host: "browser", error: ""};
+  if (role === "local_admin") return {execution_host: "server", error: ""};
+  if (requestedHost === "server") {
+    return {execution_host: "server", error: "", explicit_fallback: true};
+  }
+  if (!helperStatus?.online) {
+    return {
+      execution_host: "helper_local",
+      error: "本机辅助程序未在线；请启动最新版辅助程序，或明确选择“服务器模拟”备用模式",
+    };
+  }
+  if (helperStatus?.protocol_compatible === false) {
+    return {
+      execution_host: "helper_local",
+      error: "本机辅助程序版本不兼容；请重新下载最新版，或明确选择“服务器模拟”备用模式",
+    };
+  }
+  if (!helperStatus?.capabilities?.simulation_replay_v1) {
+    return {
+      execution_host: "helper_local",
+      error: "本机辅助程序不支持模拟回放；请更新辅助程序，或明确选择“服务器模拟”备用模式",
+    };
+  }
+  return {execution_host: "helper_local", error: ""};
 }
 
 function renderHelperStatus() {
@@ -184,6 +221,17 @@ function renderHelperStatus() {
         : helper.paired
           ? "已生成配对信息，请在本机辅助程序中输入配对码并连接。"
           : "真实采集需要在访问此网页的电脑上运行本地采集辅助程序。";
+    const pairedUrl = String(helper.capabilities?.paired_server_url || "");
+    const pairedRoute = String(helper.capabilities?.paired_route_type || "unknown");
+    if (pairedUrl && state.accessRole !== "guest") {
+      const browserRoute = isPrivateNetworkHost(window.location.hostname) ? "lan" : "public";
+      const mismatch = ["lan", "public"].includes(pairedRoute) && pairedRoute !== browserRoute;
+      const routeLabel = pairedRoute === "lan" ? "局域网" : pairedRoute === "public" ? "公网" : pairedRoute;
+      note.textContent += ` 当前配对：${pairedUrl}（${routeLabel}）。`;
+      if (mismatch) {
+        note.textContent += "浏览器与辅助程序路径不一致；如需切换请主动重新配对，系统不会自动改写。";
+      }
+    }
   }
   // Keep the entry visible in guest mode.  Hiding it made a normal
   // permission prerequisite look like a broken pairing-code generator.
@@ -936,7 +984,12 @@ async function requestLocalHelper(command, payload = {}, {timeoutMs = 30000} = {
   while (Date.now() < deadline) {
     const response = await fetch(`/api/helper/result?request_id=${encodeURIComponent(queued.request_id)}`, {cache: "no-store"});
     const result = await response.json();
-    if (result?.ok && result.payload !== null && result.payload !== undefined) return result.payload;
+    if (result?.ok && result.payload !== null && result.payload !== undefined) {
+      if (result.payload?.ok === false) {
+        throw new Error(result.payload.error || "本地辅助程序命令执行失败");
+      }
+      return result.payload;
+    }
     await new Promise((resolve) => window.setTimeout(resolve, 250));
   }
   throw new Error("本地采集辅助程序响应超时");
@@ -1034,17 +1087,23 @@ function renderAcquisitionStatus(status) {
   );
   const serverLatencyRaw = status.remote_server_receive_latency_ms;
   const browserLatencyRaw = status.remote_browser_publish_latency_ms;
+  const helperRttRaw = status.remote_helper_ack_rtt_ms;
   const serverLatency = Number(serverLatencyRaw);
   const browserLatency = Number(browserLatencyRaw);
+  const helperRtt = Number(helperRttRaw);
   const hasServerLatency = serverLatencyRaw !== null
     && serverLatencyRaw !== undefined && Number.isFinite(serverLatency);
   const hasBrowserLatency = browserLatencyRaw !== null
     && browserLatencyRaw !== undefined && Number.isFinite(browserLatency);
+  const hasHelperRtt = helperRttRaw !== null
+    && helperRttRaw !== undefined && Number.isFinite(helperRtt);
   const transportText = executionHost === "helper_local"
     ? ` · 本机速率 ${Number(status.local_effective_rate_hz || 0).toFixed(2)} Hz` +
       ` · 待传 ${queueDepth}点` +
+      `${hasHelperRtt ? ` · ACK RTT ${helperRtt.toFixed(0)} ms` : ""}` +
       `${hasServerLatency ? ` · 服务端接收 ${serverLatency.toFixed(0)} ms` : ""}` +
-      `${hasBrowserLatency ? ` · 浏览器发布 ${browserLatency.toFixed(0)} ms` : ""}`
+      `${hasBrowserLatency ? ` · 浏览器发布 ${browserLatency.toFixed(0)} ms` : ""}` +
+      ` · 绘图 ${Number(state.browserRenderRateHz || 0).toFixed(1)} 帧/秒`
     : "";
   node.textContent =
     `${status.running ? "采集中" : "已停止"} · ${status.sample_count || 0}点 · ` +
@@ -1060,8 +1119,42 @@ function renderAcquisitionStatus(status) {
     `${status.last_error ? ` · 错误：${status.last_error}` : ""}`;
 }
 
-async function waitForEdgeFirstSample(captureUuid, timeoutMs = 15000) {
+function describeFirstSampleFailure(helperConnection, helperCaptureStatus) {
+  if (!helperConnection?.online) {
+    return "本地采集辅助程序已离线，尚未收到首批数据";
+  }
+  const status = helperCaptureStatus || {};
+  if (status.last_error) return `辅助程序采集失败：${status.last_error}`;
+  const sampleCount = Number(status.sample_count || 0);
+  const transport = status.transport || {};
+  const queuedRows = Number(transport.queued_rows || 0);
+  const pendingSequence = transport.pending_sequence;
+  if (sampleCount <= 0 && queuedRows <= 0) {
+    return "辅助程序本地尚未产生有效样本，请检查模拟源内容和通道映射";
+  }
+  if (queuedRows > 0 || pendingSequence !== null && pendingSequence !== undefined) {
+    return "辅助程序本地已产生样本，但正在等待上传或服务器 ACK，请检查配对链路与延迟";
+  }
+  return "辅助程序已产生样本，但服务器尚未确认首批数据，请检查传输和会话状态";
+}
+
+function validateHelperStartResult(result) {
+  if (result?.ok === false) {
+    throw new Error(result.error || "本地辅助程序拒绝开始采集");
+  }
+  if (!result?.running) {
+    throw new Error(result?.error || "辅助程序未确认采集已运行，未进入首批样本等待");
+  }
+  if (!String(result.capture_uuid || "").trim()) {
+    throw new Error("辅助程序未返回本次采集会话标识，未进入首批样本等待");
+  }
+  return result;
+}
+
+async function waitForEdgeFirstSample(captureUuid, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
+  let helperCaptureStatus = null;
+  let nextHelperProbeAt = 0;
   while (Date.now() < deadline) {
     const response = await fetch("/api/acquisition/status?acquisition_mode=real", {
       cache: "no-store",
@@ -1076,9 +1169,20 @@ async function waitForEdgeFirstSample(captureUuid, timeoutMs = 15000) {
     if (!state.helperStatus?.online) {
       throw new Error("本地采集辅助程序已离线，尚未收到首批数据");
     }
+    if (Date.now() >= nextHelperProbeAt) {
+      nextHelperProbeAt = Date.now() + 1000;
+      try {
+        helperCaptureStatus = await requestLocalHelper("status", {}, {timeoutMs: 2000});
+        if (helperCaptureStatus?.last_error) {
+          throw new Error(`辅助程序采集失败：${helperCaptureStatus.last_error}`);
+        }
+      } catch (error) {
+        if (String(error?.message || "").startsWith("辅助程序采集失败：")) throw error;
+      }
+    }
     await new Promise((resolve) => window.setTimeout(resolve, 250));
   }
-  throw new Error("辅助程序已启动，但服务器在15秒内未收到首批有效采集数据");
+  throw new Error(describeFirstSampleFailure(state.helperStatus, helperCaptureStatus));
 }
 
 function renderRuntimeStatus(payload = state.payload) {
@@ -2109,14 +2213,31 @@ async function testSensorConnection({automatic = false} = {}) {
 async function startAcquisition() {
   try {
     const simulation = controls.acquisitionMode?.value === "simulation";
-    const helperBackedSimulation = simulation && supportsHelperSimulationReplay();
+    const simulationSelection = simulation
+      ? simulationExecutionSelection(
+        state.accessRole,
+        controls.simulationExecutionHost?.value || "helper_local",
+        state.helperStatus,
+      )
+      : null;
+    if (simulationSelection?.error) throw new Error(simulationSelection.error);
+    const helperBackedSimulation = simulation
+      && simulationSelection?.execution_host === "helper_local"
+      && supportsHelperSimulationReplay();
+    if (
+      helperBackedSimulation
+      && (!state.simulationSourceReady
+        || state.simulationSourceReady.source_id !== state.simulationSourceId)
+    ) {
+      throw new Error("请先点击“下载到本机辅助程序并校验”，确认当前模拟数据已就绪");
+    }
     if (
       state.accessRole !== "guest" && state.accessRole !== "local_admin"
       && simulation
       && controls.mysqlLocalEnabled?.checked
       && !helperBackedSimulation
     ) {
-      throw new Error("当前辅助程序不能在访问电脑本机回放模拟数据，已回退服务器；请更新并连接最新版辅助程序后再启用本机 MySQL");
+      throw new Error("服务器模拟备用模式不能保存到访问电脑本机 MySQL；请选择辅助程序执行或关闭本机 MySQL");
     }
     if (controls.autoProcessParameters?.checked) {
       await readProcessParameters({automatic: true});
@@ -2162,28 +2283,23 @@ async function startAcquisition() {
       resetLiveEvidenceDisplay();
     }
     state.liveScopeKey = nextScope;
-    const helperBackedCapture = usesLocalCaptureHelper() && (!simulation || helperBackedSimulation);
-    const executionHost = helperBackedCapture ? "helper_local" : "server";
+    const helperBackedCapture = simulation ? helperBackedSimulation : usesLocalCaptureHelper();
+    const executionHost = simulation
+      ? (simulationSelection?.execution_host || "server")
+      : (helperBackedCapture ? "helper_local" : "server");
     const captureConfig = {
       ...acquisitionConfig(),
       execution_host: executionHost,
-      ...(simulation && usesLocalCaptureHelper() && !helperBackedSimulation
-        ? {helper_simulation_fallback: state.helperStatus?.online
-          ? "helper_simulation_replay_unsupported" : "helper_offline"}
+      ...(simulationSelection?.explicit_fallback
+        ? {simulation_execution_choice: "server_explicit"}
         : {}),
     };
-    if (captureConfig.helper_simulation_fallback) {
-      toast(
-        captureConfig.helper_simulation_fallback === "helper_offline"
-          ? "辅助程序未在线，本次模拟采集将在服务器执行；本机 MySQL 不可用"
-          : "辅助程序版本不支持本机回放，本次模拟采集将在服务器执行；请下载最新版辅助程序",
-      );
-    }
     const result = helperBackedCapture
       ? await requestLocalHelper("start_capture", captureConfig, {
-        timeoutMs: helperBackedSimulation ? 120000 : 30000,
+        timeoutMs: helperBackedSimulation ? 10000 : 30000,
       })
       : await postJson("/api/acquisition/start", captureConfig);
+    if (helperBackedCapture) validateHelperStartResult(result);
     state.acquisitionExecutionHost = executionHost;
     result.execution_host = result.execution_host || executionHost;
     if (controls.processingMode.value !== "capture_only") {
@@ -2694,6 +2810,13 @@ function applyRealtimePayload(payload) {
     throw new Error(payload?.error || "实时数据服务异常");
   }
   state.payload = payload;
+  const renderNow = Date.now();
+  state.browserRenderTimes = [...(state.browserRenderTimes || []), renderNow]
+    .filter((value) => renderNow - value <= 5000);
+  const renderSpan = state.browserRenderTimes.length > 1
+    ? (renderNow - state.browserRenderTimes[0]) / 1000 : 0;
+  state.browserRenderRateHz = renderSpan > 0
+    ? (state.browserRenderTimes.length - 1) / renderSpan : 0;
   if (controls.dataMode.value === "replay") {
     controls.cursor.max = payload.progress.total_points;
     controls.cursor.value = payload.progress.cursor;
@@ -4873,12 +4996,19 @@ function addInterface() {
 Object.assign(controls, {
   acquisitionMode: $("acquisitionModeSelect"),
   simulationSettings: $("simulationSettings"),
+  simulationExecutionHost: $("simulationExecutionHostSelect"),
+  simulationExecutionHostLabel: $("simulationExecutionHostLabel"),
   simulationSourceType: $("simulationSourceTypeSelect"),
   simulationSourcePath: $("simulationSourcePathInput"),
   selectSimulationSource: $("selectSimulationSourceButton"),
   simulationSourceFile: $("simulationSourceFileInput"),
   simulationSourceNote: $("simulationSourceNote"),
   simulationSourcePathLabel: $("simulationSourcePathLabel"),
+  simulationPackagePanel: $("simulationPackagePanel"),
+  simulationPackage: $("simulationPackageSelect"),
+  prepareSimulationPackage: $("prepareSimulationPackageButton"),
+  downloadSimulationPackage: $("downloadSimulationPackageButton"),
+  simulationPackageStatus: $("simulationPackageStatus"),
   simulationMysqlSettings: $("simulationMysqlSettings"),
   simulationMysqlHost: $("simulationMysqlHostInput"),
   simulationMysqlPort: $("simulationMysqlPortInput"),
@@ -4919,6 +5049,15 @@ function updateSimulationSettings() {
       "文件夹按工况与独立重复命名；每层保留分层文件，完整试样始终覆盖为同一份当前数据文件。";
   }
   controls.simulationSettings?.classList.toggle("hidden", !simulation);
+  if (controls.simulationExecutionHostLabel) {
+    controls.simulationExecutionHostLabel.classList.toggle(
+      "hidden", !simulation || state.accessRole === "guest" || state.accessRole === "local_admin"
+    );
+  }
+  if (controls.simulationExecutionHost) {
+    if (state.accessRole === "local_admin") controls.simulationExecutionHost.value = "server";
+    controls.simulationExecutionHost.disabled = state.accessRole === "guest" || state.accessRole === "local_admin";
+  }
   if (controls.interfaceDiscoveryStatus && simulation) {
     controls.interfaceDiscoveryStatus.textContent =
       "模拟采集不需要识别物理接口；仅使用当前选择的 CSV/文件夹/MySQL 数据源";
@@ -4932,6 +5071,14 @@ function updateSimulationSettings() {
   const mysql = controls.simulationSourceType?.value === "mysql";
   controls.simulationMysqlSettings?.classList.toggle("hidden", !simulation || !mysql);
   controls.simulationSourcePathLabel?.classList.toggle("hidden", !simulation || mysql);
+  controls.simulationPackagePanel?.classList.toggle(
+    "hidden", !simulation || mysql || !simulationPackageControlsVisible()
+  );
+  if (controls.prepareSimulationPackage) {
+    controls.prepareSimulationPackage.textContent = controls.simulationExecutionHost?.value === "server"
+      ? "在服务器准备并校验"
+      : "下载到本机辅助程序并校验";
+  }
   if (controls.simulationSourceNote) {
     controls.simulationSourceNote.textContent = state.accessRole === "guest"
       ? (mysql
@@ -5014,6 +5161,107 @@ async function runIntegration() {
   }
 }
 
+async function loadSimulationPackages() {
+  state.simulationPackages = [];
+  if (!simulationPackageControlsVisible()) {
+    controls.simulationPackagePanel?.classList.add("hidden");
+    return;
+  }
+  try {
+    const response = await fetch("/api/simulation/packages", {
+      cache: "no-store", credentials: "same-origin",
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload?.ok) throw new Error(payload?.error || "无法读取模拟数据包目录");
+    state.simulationPackages = Array.isArray(payload.packages) ? payload.packages : [];
+    if (controls.simulationPackage) {
+      controls.simulationPackage.innerHTML = "";
+      state.simulationPackages.forEach((item) => {
+        const option = document.createElement("option");
+        option.value = item.package_id;
+        option.textContent = `${item.label} · ${item.channels?.length || 0}通道 · ${item.bytes || 0}字节`;
+        controls.simulationPackage.appendChild(option);
+      });
+    }
+    updateSimulationSettings();
+  } catch (error) {
+    if (controls.simulationPackageStatus) {
+      controls.simulationPackageStatus.textContent = `模拟数据包目录加载失败：${error.message}`;
+    }
+  }
+}
+
+async function prepareSelectedSimulationSource() {
+  if (!simulationPackageControlsVisible()) return;
+  const serverSelected = controls.simulationExecutionHost?.value === "server";
+  if (!serverSelected && (!supportsHelperSimulationReplay() || !state.helperStatus?.capabilities?.simulation_prefetch_v1)) {
+    throw new Error("本机辅助程序未连接或版本不支持预下载，请重新下载最新版辅助程序");
+  }
+  const packageId = String(controls.simulationPackage?.value || "");
+  if (!packageId) throw new Error("请选择一个合成模拟数据包");
+  const button = controls.prepareSimulationPackage;
+  if (button) button.disabled = true;
+  state.simulationSourceReady = null;
+  try {
+    if (controls.simulationPackageStatus) controls.simulationPackageStatus.textContent = "正在将合成数据准备到当前会话……";
+    let selected = null;
+    const useUploadedSource = Boolean(
+      state.simulationSourceId && !state.simulationSourcePackageId
+    );
+    if (!useUploadedSource && state.simulationSourcePackageId !== packageId) {
+      selected = await postJson("/api/acquisition/select-package", {package_id: packageId});
+      state.simulationSourceId = String(selected.source_id || "");
+      state.simulationSourcePackageId = packageId;
+      state.simulationSourceChannels = Array.isArray(selected.channels) ? selected.channels : [];
+      if (controls.simulationSourcePath) controls.simulationSourcePath.value = selected.name || "已选择合成数据包";
+      autoEnableSimulationChannels(state.simulationSourceChannels);
+    }
+    if (serverSelected) {
+      if (controls.simulationPackageStatus) {
+        controls.simulationPackageStatus.textContent =
+          `服务器已校验：${selected?.valid_rows || selected?.rows || "已通过"}，` +
+          `${state.simulationSourceChannels.length}通道；现在可点击“开始采集”。`;
+      }
+      toast("模拟数据已在服务器备用模式就绪");
+      return;
+    }
+    if (controls.simulationPackageStatus) controls.simulationPackageStatus.textContent = "服务器已校验，正在下载到本机辅助程序……";
+    const prepared = await requestLocalHelper("prepare_simulation_source", {
+      ...acquisitionConfig(),
+      acquisition_mode: "simulation",
+      simulation_source_id: state.simulationSourceId,
+    }, {timeoutMs: 120000});
+    if (prepared?.state !== "ready" || !prepared?.content_sha256) {
+      throw new Error(prepared?.error || "本机辅助程序未确认模拟数据已就绪");
+    }
+    state.simulationSourceReady = {
+      ...prepared,
+      source_id: state.simulationSourceId,
+      package_id: state.simulationSourcePackageId,
+    };
+    const cacheText = prepared.cache_hit ? "已命中本机缓存" : "已下载并校验";
+    if (controls.simulationPackageStatus) {
+      controls.simulationPackageStatus.textContent =
+        `${cacheText}：${prepared.files || 0}个文件，${prepared.bytes || 0}字节，` +
+        `${prepared.valid_rows || 0}行，${prepared.channels?.length || 0}通道；现在可点击“开始采集”。`;
+    }
+    toast("模拟数据已在本机辅助程序就绪");
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function downloadSelectedSimulationPackage() {
+  const packageId = String(controls.simulationPackage?.value || "");
+  if (!packageId || !simulationPackageControlsVisible()) return;
+  const link = document.createElement("a");
+  link.href = `/api/simulation/package-download?package_id=${encodeURIComponent(packageId)}`;
+  link.download = "";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
 async function selectSimulationSource() {
   const sourceType = controls.simulationSourceType?.value || "single_csv";
   if (state.accessRole !== "local_admin") {
@@ -5039,6 +5287,8 @@ async function selectSimulationSource() {
     });
     if (result.selected) {
       state.simulationSourceId = "";
+      state.simulationSourceReady = null;
+      state.simulationSourcePackageId = "";
       controls.simulationSourcePath.value = result.path || result.name || "";
       if (controls.autoProcessParameters?.checked) {
         await readProcessParameters({automatic: true});
@@ -5096,9 +5346,12 @@ async function uploadSimulationSource() {
     }, {timeoutMs: 120000});
     controls.simulationSourcePath.value = result.name || result.path || "已导入模拟数据";
     state.simulationSourceId = String(result.source_id || "");
+    state.simulationSourceReady = null;
+    state.simulationSourcePackageId = "";
     state.simulationSourceChannels = Array.isArray(result.channels) ? result.channels : [];
-    if (controls.simulationSourceNote) controls.simulationSourceNote.textContent =
-      `已导入 ${result.name || "模拟数据"}；请点击“开始采集”后才开始读取，预测、预警和保存均基于该数据。`;
+    if (controls.simulationSourceNote) controls.simulationSourceNote.textContent = state.accessRole === "guest"
+      ? `已导入 ${result.name || "模拟数据"}；请点击“开始采集”后才开始读取，预测、预警和保存均基于该数据。`
+      : `已导入 ${result.name || "模拟数据"}；请先点击“下载到本机辅助程序并校验”，确认就绪后再开始采集。`;
     state.guestSimulationStarted = false;
     state.guestSimulationStoppedByUser = false;
     document.querySelectorAll(".interface-config-row").forEach((row) => refreshPhysicalInterfaceOptions(row));
@@ -5134,6 +5387,9 @@ function acquisitionConfig() {
     simulation_source_type: controls.simulationSourceType?.value || "single_csv",
     simulation_source_path: simulation && !remoteSimulation ? (controls.simulationSourcePath?.value.trim() || "") : "",
     ...(remoteSimulation ? {simulation_source_id: state.simulationSourceId || ""} : {}),
+    ...(remoteSimulation && state.simulationSourceReady
+      ? {simulation_source_ready: state.simulationSourceReady}
+      : {}),
     simulation_mysql_query: controls.simulationMysqlQuery?.value.trim() || "",
     simulation_mysql_host: controls.mysqlHost?.value.trim() || "192.168.101.31",
     simulation_mysql_port: Number(controls.mysqlPort?.value) || 3306,
@@ -5282,9 +5538,17 @@ controls.acquisitionMode?.addEventListener("change", () => {
     readProcessParameters({automatic: true});
   }
 });
+controls.simulationExecutionHost?.addEventListener("change", updateSimulationSettings);
 controls.simulationSourceType?.addEventListener("change", updateSimulationSettings);
 controls.selectSimulationSource?.addEventListener("click", selectSimulationSource);
 controls.simulationSourceFile?.addEventListener("change", uploadSimulationSource);
+controls.prepareSimulationPackage?.addEventListener("click", () => {
+  prepareSelectedSimulationSource().catch((error) => {
+    if (controls.simulationPackageStatus) controls.simulationPackageStatus.textContent = `准备失败：${error.message}`;
+    toast(error.message);
+  });
+});
+controls.downloadSimulationPackage?.addEventListener("click", downloadSelectedSimulationPackage);
 controls.integrationSourceType?.addEventListener("change", updateIntegrationSource);
 controls.selectIntegrationFolder?.addEventListener("click", selectIntegrationFolder);
 controls.runIntegration?.addEventListener("click", runIntegration);

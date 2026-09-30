@@ -77,6 +77,8 @@ AUTHORIZED_GET = {
     "/api/acquisition/export-manifest",
     "/api/acquisition/export-file",
     "/api/agent/diagnose/result",
+    "/api/simulation/packages",
+    "/api/simulation/package-download",
 }
 AUTHORIZED_POST = {
     "/api/real/control/acquire",
@@ -91,6 +93,7 @@ AUTHORIZED_POST = {
     "/api/acquisition/select-folder",
     "/api/acquisition/select-source",
     "/api/acquisition/upload-source",
+    "/api/acquisition/select-package",
     "/api/acquisition/integrate",
     "/api/training/import",
     "/api/training/start",

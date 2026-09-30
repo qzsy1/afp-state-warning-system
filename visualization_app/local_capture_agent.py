@@ -30,7 +30,7 @@ from helper_relay import ALLOWED_HELPER_COMMANDS
 from mysql_storage import MySQLCaptureStore
 from json_safety import json_safe_value
 from remote_mysql_setup import classify_mysql_error
-from simulation_source_transfer import SimulationSourceCache
+from simulation_source_transfer import SimulationSourceCache, inspect_csv_source
 
 
 _ROLE_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
@@ -218,12 +218,19 @@ class LocalCaptureAgent:
         selected = select_capture_folder(str(initial_path or ""))
         return {"selected": bool(selected), "path": selected}
 
-    def prepare_simulation_source(self, transfer: dict[str, Any], fetch_chunk) -> dict[str, Any]:
+    def prepare_simulation_source(
+        self,
+        transfer: dict[str, Any],
+        fetch_chunk,
+        *,
+        required_channels: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
         """Materialize one verified browser source inside the helper cache."""
 
         manifest = transfer.get("manifest") if isinstance(transfer, dict) else None
         if not isinstance(manifest, dict):
             raise ValueError("模拟源交付清单缺失")
+        cache_hit = self._simulation_cache.is_ready(transfer)
         cache_root = self._simulation_cache.materialize(transfer, fetch_chunk)
         source_type = str(manifest.get("source_type") or "")
         files = manifest.get("files")
@@ -235,13 +242,71 @@ class LocalCaptureAgent:
             source_path = cache_root
         else:
             raise ValueError("helper 模拟回放只支持 CSV 或 CSV 文件夹")
+        inspected = inspect_csv_source(
+            source_type,
+            source_path,
+            required_channels=required_channels,
+        )
         result = {
             "path": str(source_path),
             "source_type": source_type,
             "content_sha256": str(manifest.get("content_sha256") or ""),
             "files": len(files),
+            "relative_paths": [str(item.get("relative_path") or "") for item in files],
             "bytes": int(manifest.get("total_bytes") or 0),
+            "channels": inspected["channels"],
+            "numeric_channels": inspected["numeric_channels"],
+            "valid_rows": inspected["valid_rows"],
             "state": "ready",
+            "cache_hit": cache_hit,
+        }
+        with self._stream_lock:
+            self._source_transfer_status = dict(result)
+        return result
+
+    def resolve_prepared_simulation_source(
+        self,
+        reference: dict[str, Any],
+        *,
+        required_channels: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
+        digest = str(reference.get("content_sha256") or "").strip().lower()
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise ValueError("helper 模拟源 ready 哈希无效")
+        source_type = str(reference.get("source_type") or "").strip().lower()
+        relative_paths = [
+            str(item or "").replace("\\", "/").strip()
+            for item in (reference.get("relative_paths") or [])
+            if str(item or "").strip()
+        ]
+        cache_root = (self._simulation_cache.root / digest).resolve()
+        marker = cache_root / ".manifest.json"
+        if self._simulation_cache.root not in cache_root.parents or not marker.is_file():
+            raise ValueError("helper 模拟源尚未预下载或缓存已清理，请重新下载并校验")
+        if source_type == "single_csv" and len(relative_paths) == 1:
+            source_path = (cache_root / relative_paths[0]).resolve()
+        elif source_type == "folder_csv" and relative_paths:
+            source_path = cache_root
+        else:
+            raise ValueError("helper 模拟源 ready 描述不完整")
+        if source_path != cache_root and cache_root not in source_path.parents:
+            raise ValueError("helper 模拟源 ready 路径越界")
+        inspected = inspect_csv_source(
+            source_type,
+            source_path,
+            required_channels=required_channels,
+        )
+        result = {
+            "path": str(source_path),
+            "source_type": source_type,
+            "content_sha256": digest,
+            "relative_paths": relative_paths,
+            "files": len(relative_paths),
+            "channels": inspected["channels"],
+            "numeric_channels": inspected["numeric_channels"],
+            "valid_rows": inspected["valid_rows"],
+            "state": "ready",
+            "cache_hit": True,
         }
         with self._stream_lock:
             self._source_transfer_status = dict(result)
@@ -314,6 +379,13 @@ class LocalCaptureAgent:
             self._pending_batch = pending
             self._pending_status_revision = self._status_revision
             return dict(pending)
+
+    def wait_for_stream_activity(self, timeout: float = 0.2) -> bool:
+        waiter = getattr(self.manager, "wait_for_stream_activity", None)
+        if callable(waiter):
+            return bool(waiter(timeout))
+        time.sleep(max(0.0, min(float(timeout), 0.2)))
+        return False
 
     def ack_sample_batch(self, capture_uuid: str, sequence: int) -> bool:
         with self._stream_lock:

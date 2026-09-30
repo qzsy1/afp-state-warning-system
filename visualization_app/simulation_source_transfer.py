@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import base64
+import csv
 import hashlib
 import json
+import math
 import os
 import secrets
 import shutil
@@ -24,6 +26,98 @@ MAX_TRANSFER_CHUNK_BYTES = 1024 * 1024
 
 class SimulationSourceTransferError(ValueError):
     """Raised when a transfer violates its session or integrity contract."""
+
+
+def _numeric_value(value: str) -> bool:
+    try:
+        return math.isfinite(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return False
+
+
+def inspect_csv_file(path: str | Path) -> dict[str, Any]:
+    """Stream one CSV and prove that it contains a header and numeric samples."""
+
+    source = Path(path)
+    if not source.is_file() or int(source.stat().st_size) <= 0:
+        raise SimulationSourceTransferError(f"模拟源 CSV 为空或为 0 字节：{source.name}")
+    last_error: Exception | None = None
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            with source.open("r", encoding=encoding, newline="") as handle:
+                reader = csv.reader(handle)
+                header = [str(item).strip() for item in next(reader, [])]
+                if not header or not any(header) or all(_numeric_value(item) for item in header if item):
+                    raise SimulationSourceTransferError(
+                        f"模拟源 CSV 缺少可解析表头：{source.name}"
+                    )
+                numeric_channels: set[str] = set()
+                valid_rows = 0
+                for row in reader:
+                    row_has_numeric = False
+                    for index, cell in enumerate(row[:len(header)]):
+                        if _numeric_value(cell):
+                            row_has_numeric = True
+                            if header[index]:
+                                numeric_channels.add(header[index])
+                    if row_has_numeric:
+                        valid_rows += 1
+                if valid_rows <= 0:
+                    raise SimulationSourceTransferError(
+                        f"模拟源 CSV 没有有效数值数据行：{source.name}"
+                    )
+                return {
+                    "channels": [item for item in header if item],
+                    "numeric_channels": sorted(numeric_channels),
+                    "valid_rows": valid_rows,
+                }
+        except UnicodeDecodeError as exc:
+            last_error = exc
+            continue
+        except csv.Error as exc:
+            raise SimulationSourceTransferError(
+                f"模拟源 CSV 格式无效：{source.name}"
+            ) from exc
+    raise SimulationSourceTransferError(
+        f"模拟源 CSV 编码无法解析：{source.name}"
+    ) from last_error
+
+
+def inspect_csv_source(
+    source_type: str,
+    source_path: str | Path,
+    *,
+    required_channels: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Validate replay content without loading the complete source into memory."""
+
+    clean_type = str(source_type or "").strip().lower()
+    path = Path(source_path)
+    if clean_type == "single_csv":
+        files = [path]
+    elif clean_type == "folder_csv":
+        files = sorted(path.rglob("*.csv")) if path.is_dir() else []
+    else:
+        raise SimulationSourceTransferError("helper 模拟回放只支持 CSV 或 CSV 文件夹")
+    if not files:
+        raise SimulationSourceTransferError("模拟源中没有 CSV 文件")
+    channels: set[str] = set()
+    numeric_channels: set[str] = set()
+    valid_rows = 0
+    for file in files:
+        result = inspect_csv_file(file)
+        channels.update(result["channels"])
+        numeric_channels.update(result["numeric_channels"])
+        valid_rows += int(result["valid_rows"])
+    required = [str(item).strip() for item in (required_channels or []) if str(item).strip()]
+    missing = [item for item in required if item not in numeric_channels]
+    if missing:
+        raise SimulationSourceTransferError(f"模拟数据缺少有效数值通道：{missing}")
+    return {
+        "channels": sorted(channels),
+        "numeric_channels": sorted(numeric_channels),
+        "valid_rows": valid_rows,
+    }
 
 
 def _safe_relative_path(value: str) -> Path:
@@ -97,6 +191,9 @@ def build_source_manifest(
 
     files: list[dict[str, Any]] = []
     total = 0
+    source_channels: set[str] = set()
+    numeric_channels: set[str] = set()
+    valid_rows = 0
     for relative_name, candidate in candidates:
         relative = _safe_relative_path(relative_name)
         resolved = candidate.resolve()
@@ -108,6 +205,10 @@ def build_source_manifest(
         total += size
         if total > MAX_SOURCE_TOTAL_BYTES:
             raise SimulationSourceTransferError("模拟源总大小超过 64 MB 限制")
+        inspected = inspect_csv_file(resolved)
+        source_channels.update(inspected["channels"])
+        numeric_channels.update(inspected["numeric_channels"])
+        valid_rows += int(inspected["valid_rows"])
         files.append(
             {
                 "relative_path": relative.as_posix(),
@@ -124,6 +225,9 @@ def build_source_manifest(
             "file_count": len(files),
             "total_bytes": total,
             "content_sha256": _content_sha256(files),
+            "channels": sorted(source_channels),
+            "numeric_channels": sorted(numeric_channels),
+            "valid_rows": valid_rows,
         },
         source_root,
     )
@@ -223,7 +327,9 @@ class SimulationSourceTicketStore:
 class SimulationSourceCache:
     """Download and atomically publish a verified content-addressed source."""
 
-    def __init__(self, root: str | Path, *, chunk_bytes: int = 256 * 1024) -> None:
+    def __init__(
+        self, root: str | Path, *, chunk_bytes: int = MAX_TRANSFER_CHUNK_BYTES
+    ) -> None:
         self.root = Path(root).resolve()
         self.chunk_bytes = max(1, min(int(chunk_bytes), MAX_TRANSFER_CHUNK_BYTES))
 
@@ -261,7 +367,7 @@ class SimulationSourceCache:
             relative = _safe_relative_path(str(item.get("relative_path") or ""))
             size = int(item.get("size") or 0)
             digest = str(item.get("sha256") or "").lower()
-            if size < 0 or size > MAX_SOURCE_FILE_BYTES:
+            if size <= 0 or size > MAX_SOURCE_FILE_BYTES:
                 raise SimulationSourceTransferError("模拟源清单文件大小无效")
             if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
                 raise SimulationSourceTransferError("模拟源清单 SHA-256 无效")
@@ -277,6 +383,26 @@ class SimulationSourceCache:
             raise SimulationSourceTransferError("模拟源清单内容 SHA-256 不一致")
         return clean_files
 
+    def is_ready(self, transfer: dict[str, Any]) -> bool:
+        """Return whether the transfer already has a verified cache entry."""
+
+        manifest = deepcopy(transfer.get("manifest")) if isinstance(transfer, dict) else None
+        if not isinstance(manifest, dict):
+            return False
+        try:
+            self._validate_manifest(manifest)
+        except (TypeError, ValueError, SimulationSourceTransferError):
+            return False
+        content_digest = str(manifest.get("content_sha256") or "")
+        marker = (self.root / content_digest / ".manifest.json").resolve()
+        if not marker.is_file():
+            return False
+        try:
+            cached_manifest = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+        return self._content_identity(cached_manifest) == self._content_identity(manifest)
+
     def materialize(
         self,
         transfer: dict[str, Any],
@@ -290,15 +416,8 @@ class SimulationSourceCache:
         content_digest = str(manifest["content_sha256"])
         destination = (self.root / content_digest).resolve()
         marker = destination / ".manifest.json"
-        if marker.is_file():
-            try:
-                cached_manifest = json.loads(marker.read_text(encoding="utf-8"))
-                if self._content_identity(cached_manifest) == self._content_identity(
-                    manifest
-                ):
-                    return destination
-            except (OSError, ValueError, json.JSONDecodeError):
-                pass
+        if self.is_ready(transfer):
+            return destination
 
         self.root.mkdir(parents=True, exist_ok=True)
         temporary = (self.root / f".{content_digest}.{secrets.token_hex(8)}.partial").resolve()

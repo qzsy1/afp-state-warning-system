@@ -105,7 +105,7 @@ const fetch = async () => { requests += 1; return {ok: true, json: async () => (
     def test_failed_server_target_mysql_has_a_session_bound_retry_control(self):
         html = (Path(__file__).with_name("static") / "index.html").read_text(encoding="utf-8")
         self.assertIn('id="retryTargetMysqlButton"', html)
-        self.assertIn('/app.js?v=20260929-helper-simulation-replay-v4', html)
+        self.assertIn('/app.js?v=20260930-helper-prefetch-v2', html)
         text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
         start = text.index("async function retryServerTargetMysql()")
         end = text.index("async function stopAcquisition()", start)
@@ -975,19 +975,38 @@ if (status.textContent !== "MySQL 保存未启用；原始文件已完成本地�
         self.assertIn("requestLocalHelper(\"start_capture\"", text)
         self.assertIn("requestLocalHelper(\"stop_capture\"", text)
 
-    def test_authorized_remote_simulation_routes_to_compatible_helper_only(self):
+    def test_authorized_remote_simulation_requires_explicit_server_fallback(self):
+        html = (Path(__file__).with_name("static") / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="simulationExecutionHostSelect"', html)
+        self.assertIn('<option value="helper_local" selected>', html)
+        self.assertIn('<option value="server">', html)
         text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        selection_start = text.index("function simulationExecutionSelection(")
+        selection_end = text.index("function renderHelperStatus", selection_start)
+        selection = text[selection_start:selection_end]
+        script = selection + r'''
+const offline = simulationExecutionSelection("authorized", "helper_local", {online: false});
+if (offline.execution_host !== "helper_local" || !offline.error) process.exit(1);
+const oldHelper = simulationExecutionSelection("lan_operator", "helper_local", {
+  online: true, protocol_compatible: true, capabilities: {simulation_replay_v1: false}
+});
+if (!oldHelper.error) process.exit(2);
+const explicitServer = simulationExecutionSelection("authorized", "server", {online: false});
+if (explicitServer.execution_host !== "server" || explicitServer.error) process.exit(3);
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
         start = text.index("async function startAcquisition()")
         end = text.index("async function waitForServerTargetSave", start)
         body = text[start:end]
 
         self.assertIn("supportsHelperSimulationReplay()", body)
         self.assertIn('requestLocalHelper("start_capture"', body)
-        self.assertIn('const executionHost = helperBackedCapture ? "helper_local" : "server"', body)
+        self.assertIn("simulationExecutionSelection(", body)
         self.assertIn("execution_host: executionHost", body)
-        self.assertIn("helper_simulation_fallback", body)
-        self.assertIn("helperBackedSimulation ? 120000 : 30000", body)
-        self.assertIn("本次模拟采集将在服务器执行", body)
+        self.assertIn("helperBackedSimulation ? 10000 : 30000", body)
+        self.assertNotIn("helper_simulation_fallback", body)
 
     def test_helper_simulation_stop_never_falls_back_to_server_after_start(self):
         text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
@@ -1009,6 +1028,8 @@ if (status.textContent !== "MySQL 保存未启用；原始文件已完成本地�
         self.assertIn("source_transfer", body)
         self.assertIn("remote_helper_queue_depth", body)
         self.assertIn("remote_server_receive_latency_ms", body)
+        self.assertIn("remote_helper_ack_rtt_ms", body)
+        self.assertIn("browserRenderRateHz", body)
         self.assertIn("remote_browser_publish_latency_ms", body)
 
     def test_helper_capture_waits_for_server_to_receive_first_sample(self):
@@ -1020,6 +1041,119 @@ if (status.textContent !== "MySQL 保存未启用；原始文件已完成本地�
         body = text[start:end]
         self.assertIn("await waitForEdgeFirstSample", body)
         self.assertIn("capture_uuid", body)
+
+    def test_helper_business_error_is_rejected_before_first_sample_wait(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("async function requestLocalHelper")
+        end = text.index("function renderAcquisitionStatus", start)
+        function = text[start:end]
+        script = r'''
+const state = {helperStatus: {paired: true}};
+const usesLocalCaptureHelper = () => true;
+const postJson = async () => ({ok: true, queued: true, request_id: "request-a"});
+let resultReads = 0;
+const fetch = async () => {
+  resultReads += 1;
+  return {json: async () => ({
+    ok: true,
+    payload: {ok: false, error: "模拟数据没有有效数值行"}
+  })};
+};
+const window = {
+  setTimeout: (fn) => { fn(); return 1; },
+  clearTimeout: () => {}
+};
+''' + function + r'''
+(async () => {
+  try {
+    await requestLocalHelper("start_capture", {}, {timeoutMs: 15000});
+    process.exit(1);
+  } catch (error) {
+    if (!String(error.message).includes("没有有效数值行")) process.exit(2);
+    if (resultReads !== 1) process.exit(3);
+  }
+})().catch((error) => { console.error(error); process.exit(4); });
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_helper_start_requires_running_state_and_capture_uuid(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.find("function validateHelperStartResult")
+        self.assertGreaterEqual(start, 0, "helper start validation must be executable and reusable")
+        end = text.find("async function waitForEdgeFirstSample", start)
+        self.assertGreater(end, start)
+        function = text[start:end]
+        script = function + r'''
+let rejectedNotRunning = false;
+let rejectedMissingUuid = false;
+try { validateHelperStartResult({ok: true, running: false, capture_uuid: "capture-a"}); }
+catch (error) { rejectedNotRunning = String(error.message).includes("未确认采集已运行"); }
+try { validateHelperStartResult({ok: true, running: true}); }
+catch (error) { rejectedMissingUuid = String(error.message).includes("会话标识"); }
+const accepted = validateHelperStartResult({ok: true, running: true, capture_uuid: "capture-a"});
+if (!rejectedNotRunning || !rejectedMissingUuid || accepted.capture_uuid !== "capture-a") process.exit(1);
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_first_sample_timeout_explains_local_generation_ack_and_offline_states(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.find("function describeFirstSampleFailure")
+        self.assertGreaterEqual(start, 0, "first-sample timeout needs a pure diagnostic classifier")
+        end = text.find("function validateHelperStartResult", start)
+        self.assertGreater(end, start)
+        function = text[start:end]
+        script = function + r'''
+const noLocal = describeFirstSampleFailure(
+  {online: true},
+  {running: true, sample_count: 0, transport: {queued_rows: 0}}
+);
+const waitingAck = describeFirstSampleFailure(
+  {online: true},
+  {running: true, sample_count: 4, transport: {queued_rows: 4, pending_sequence: 0}}
+);
+const offline = describeFirstSampleFailure({online: false}, null);
+if (!noLocal.includes("本地") || !noLocal.includes("有效样本")) process.exit(1);
+if (!waitingAck.includes("上传") || !waitingAck.includes("ACK")) process.exit(2);
+if (!offline.includes("离线")) process.exit(3);
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_simulation_package_controls_are_available_only_to_helper_roles(self):
+        static = Path(__file__).with_name("static")
+        index = (static / "index.html").read_text(encoding="utf-8")
+        text = (static / "app.js").read_text(encoding="utf-8")
+        self.assertIn('id="prepareSimulationPackageButton"', index)
+        self.assertIn('id="downloadSimulationPackageButton"', index)
+        start = text.find("function simulationPackageControlsVisible")
+        self.assertGreaterEqual(start, 0)
+        end = text.find("function renderHelperStatus", start)
+        self.assertGreater(end, start)
+        function = text[start:end]
+        script = function + r'''
+if (!simulationPackageControlsVisible("authorized")) process.exit(1);
+if (!simulationPackageControlsVisible("lan_operator")) process.exit(2);
+if (simulationPackageControlsVisible("guest")) process.exit(3);
+if (simulationPackageControlsVisible("local_admin")) process.exit(4);
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_prepare_button_uses_helper_command_and_keeps_start_separate(self):
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        start = text.find("async function prepareSelectedSimulationSource")
+        self.assertGreaterEqual(start, 0)
+        end = text.find("async function selectSimulationSource", start)
+        self.assertGreater(end, start)
+        body = text[start:end]
+        self.assertIn('requestLocalHelper("prepare_simulation_source"', body)
+        self.assertNotIn('requestLocalHelper("start_capture"', body)
+        self.assertNotIn("startAcquisition(", body)
 
     def test_helper_backed_bootstrap_does_not_expose_server_interface_inventory(self):
         source = Path(__file__).with_name("app.py").read_text(encoding="utf-8")

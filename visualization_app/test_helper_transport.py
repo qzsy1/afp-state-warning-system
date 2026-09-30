@@ -298,6 +298,51 @@ class HelperTransportTests(unittest.TestCase):
         self.assertEqual(message_two["batch"]["sequence"], 1)
         self.assertEqual(agent.next_sample_batch.call_args_list[0].kwargs["limit"], 25)
 
+    def test_adaptive_batch_limit_uses_fixed_route_rtt_without_switching_endpoint(self):
+        agent = Mock()
+        agent.stream_metrics.return_value = {"sample_rate_hz": 10.0, "queued_rows": 20}
+
+        self.assertEqual(
+            helper_entry.adaptive_sample_batch_limit(
+                agent, route_type="lan", rtt_ms=20.0
+            ),
+            2,
+        )
+        self.assertEqual(
+            helper_entry.adaptive_sample_batch_limit(
+                agent, route_type="public", rtt_ms=50.0
+            ),
+            2,
+        )
+        self.assertEqual(
+            helper_entry.adaptive_sample_batch_limit(
+                agent, route_type="public", rtt_ms=400.0
+            ),
+            5,
+        )
+
+    def test_sample_pump_tracks_ack_rtt_and_waits_on_stream_event(self):
+        batch = {
+            "capture_uuid": "capture-a", "sequence": 0,
+            "rows": [{"温度": 25.0}], "timestamps": [0.0],
+            "status": {"running": True},
+        }
+        agent = Mock()
+        agent.next_sample_batch.return_value = batch
+        agent.ack_sample_batch.return_value = True
+        agent.stream_metrics.return_value = {
+            "capture_uuid": "capture-a", "sample_rate_hz": 10.0, "queued_rows": 1,
+        }
+        agent.wait_for_stream_activity.return_value = True
+        pump = helper_entry.HelperSamplePump(agent, route_type="public")
+
+        self.assertTrue(pump.wait_for_activity(0.25))
+        agent.wait_for_stream_activity.assert_called_once_with(0.25)
+        self.assertIsNotNone(pump.next_message(now=1.0))
+        self.assertTrue(pump.acknowledge("capture-a", 0, now=1.4))
+        self.assertAlmostEqual(pump.metrics()["rtt_ms"], 400.0, places=3)
+        self.assertTrue(pump.wait_for_activity(0.25))
+
     def test_ack_driven_sample_pump_replays_pending_batch_after_reconnect(self):
         pump_type = getattr(helper_entry, "HelperSamplePump", None)
         self.assertIsNotNone(pump_type, "helper must expose an ACK-driven sample pump")
@@ -317,6 +362,142 @@ class HelperTransportTests(unittest.TestCase):
 
         self.assertEqual(first["batch"], replay["batch"])
         agent.ack_sample_batch.assert_not_called()
+
+    def test_new_capture_is_not_blocked_by_previous_capture_wire_batch(self):
+        agent = Mock()
+        old_batch = {
+            "capture_uuid": "capture-old", "sequence": 7,
+            "rows": [{"温度": 350.0}], "timestamps": [1.0],
+            "status": {"running": False},
+        }
+        new_batch = {
+            "capture_uuid": "capture-new", "sequence": 0,
+            "rows": [{"温度": 351.0}], "timestamps": [0.1],
+            "status": {"running": True},
+        }
+        agent.next_sample_batch.side_effect = [old_batch, new_batch]
+        agent.stream_metrics.return_value = {
+            "capture_uuid": "capture-old", "queued_rows": 1, "sample_rate_hz": 10.0,
+        }
+        pump = helper_entry.HelperSamplePump(agent)
+
+        self.assertEqual(pump.next_message(now=1.0)["batch"]["capture_uuid"], "capture-old")
+        agent.stream_metrics.return_value = {
+            "capture_uuid": "capture-new", "queued_rows": 1, "sample_rate_hz": 10.0,
+        }
+        message = pump.next_message(now=1.1)
+
+        self.assertIsNotNone(message, "new capture must retire the previous wire batch")
+        self.assertEqual(message["batch"]["capture_uuid"], "capture-new")
+        self.assertEqual(message["batch"]["sequence"], 0)
+
+    def test_prepare_source_command_downloads_without_starting_capture(self):
+        agent = Mock()
+        agent.prepare_simulation_source.return_value = {
+            "path": "C:/private/cache/source.csv",
+            "source_type": "single_csv",
+            "content_sha256": "a" * 64,
+            "files": 1,
+            "relative_paths": ["source.csv"],
+            "bytes": 128,
+            "channels": ["温度1"],
+            "numeric_channels": ["温度1"],
+            "valid_rows": 240,
+            "state": "ready",
+            "cache_hit": False,
+        }
+        responses = []
+        dispatcher = helper_entry.HelperCommandDispatcher(
+            agent,
+            source_fetcher=lambda *_args: {"ok": True},
+        )
+        try:
+            dispatcher.submit(
+                {
+                    "type": "command",
+                    "request_id": "prepare-a",
+                    "command": "prepare_simulation_source",
+                    "payload": {
+                        "simulation_source_transfer": {"ticket": "ticket-a", "manifest": {}},
+                        "selected_sensors": ["温度1"],
+                    },
+                },
+                responses.append,
+            )
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and not responses:
+                time.sleep(0.01)
+        finally:
+            dispatcher.close()
+
+        self.assertTrue(responses)
+        self.assertTrue(responses[0]["payload"]["ok"])
+        self.assertEqual(responses[0]["payload"]["state"], "ready")
+        self.assertNotIn("path", responses[0]["payload"])
+        agent.start_capture.assert_not_called()
+
+    def test_start_uses_prepared_cache_reference_without_downloading_again(self):
+        agent = Mock()
+        agent.resolve_prepared_simulation_source.return_value = {
+            "path": "C:/private/cache/source.csv",
+            "source_type": "single_csv",
+            "content_sha256": "a" * 64,
+            "state": "ready",
+        }
+        agent.start_capture.return_value = {
+            "ok": True, "running": True, "capture_uuid": "capture-a"
+        }
+        responses = []
+        fetcher = Mock(side_effect=AssertionError("ready start must not download source bytes"))
+        dispatcher = helper_entry.HelperCommandDispatcher(agent, source_fetcher=fetcher)
+        try:
+            dispatcher.submit(
+                {
+                    "type": "command",
+                    "request_id": "start-ready",
+                    "command": "start_capture",
+                    "payload": {
+                        "acquisition_mode": "simulation",
+                        "selected_sensors": ["温度1"],
+                        "simulation_source_ready": {
+                            "content_sha256": "a" * 64,
+                            "source_type": "single_csv",
+                            "relative_paths": ["source.csv"],
+                        },
+                    },
+                },
+                responses.append,
+            )
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and not responses:
+                time.sleep(0.01)
+        finally:
+            dispatcher.close()
+
+        self.assertTrue(responses[0]["payload"]["running"])
+        fetcher.assert_not_called()
+        agent.resolve_prepared_simulation_source.assert_called_once()
+
+    def test_saved_pairing_server_is_not_rewritten_by_tunnel_hint(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            hint = Path(temp_dir) / "funnel-url.txt"
+            hint.write_text("https://new-public.example.test/\n", encoding="utf-8")
+            selected = helper_entry.preferred_setup_server(
+                "http://192.168.10.20:8770",
+                server_hint_path=hint,
+            )
+
+        self.assertEqual(selected, "http://192.168.10.20:8770")
+
+    def test_helper_capabilities_report_fixed_route_without_credentials_or_path(self):
+        capabilities = helper_entry.helper_capabilities(
+            "https://user:secret@desktop.example.test/private?token=bad"
+        )
+
+        self.assertEqual(capabilities["paired_server_url"], "https://desktop.example.test")
+        self.assertEqual(capabilities["paired_route_type"], "public")
+        self.assertNotIn("secret", str(capabilities))
+        self.assertNotIn("private", str(capabilities))
 
     def test_ack_driven_sample_pump_keeps_up_with_ten_minutes_at_50hz(self):
         class QueuedAgent:
@@ -680,7 +861,7 @@ class HelperTransportTests(unittest.TestCase):
             )
             self.assertEqual(result, ("https://afp.example.test", expected))
 
-    def test_helper_cli_prefills_current_tunnel_url_instead_of_stale_saved_url(self):
+    def test_helper_cli_preserves_saved_pairing_url_when_tunnel_hint_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "helper-config.json"
             hint_path = Path(directory) / "quick-tunnel-url.txt"
@@ -704,8 +885,8 @@ class HelperTransportTests(unittest.TestCase):
                 config_path=path,
                 server_hint_path=hint_path,
             )
-            self.assertEqual(result, ("https://current-public.trycloudflare.com/", expected))
-            self.assertEqual(seen["server"], "https://current-public.trycloudflare.com/")
+            self.assertEqual(result, ("https://stale-public.trycloudflare.com", expected))
+            self.assertEqual(seen["server"], "https://stale-public.trycloudflare.com")
 
     def test_helper_accepts_powershell_utf8_bom_in_tunnel_url_file(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -753,7 +934,7 @@ class HelperTransportTests(unittest.TestCase):
             self.assertEqual(result.device_id, "local-helper")
             self.assertEqual(result.transport, "auto")
 
-    def test_background_helper_uses_current_tunnel_instead_of_stale_saved_url(self):
+    def test_background_helper_preserves_saved_pairing_url_when_tunnel_hint_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "helper-config.json"
             hint_path = Path(directory) / "quick-tunnel-url.txt"
@@ -773,7 +954,7 @@ class HelperTransportTests(unittest.TestCase):
                 server_hint_path=hint_path,
             )
 
-            self.assertEqual(result.server, "https://current-public.trycloudflare.com/")
+            self.assertEqual(result.server, "https://stale-public.trycloudflare.com")
             self.assertEqual(result.pairing_token, "secret-pairing-token")
 
     def test_authentication_failure_is_reported_as_repairable_runtime_state(self):

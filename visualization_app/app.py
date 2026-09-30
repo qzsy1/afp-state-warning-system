@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 from copy import deepcopy
 import gzip
@@ -70,8 +71,13 @@ from web_training import WebTrainingManager
 from guest_simulation import GuestSimulationError, GuestSimulationManager
 from helper_relay import HelperRegistry, select_simulation_execution
 from simulation_source_transfer import (
+    MAX_TRANSFER_CHUNK_BYTES,
     SimulationSourceTicketStore,
     SimulationSourceTransferError,
+)
+from simulation_packages import (
+    resolve_simulation_package,
+    simulation_package_catalog,
 )
 from edge_capture import RemoteAcquisitionRegistry, select_acquisition_for_identity
 from local_capture_agent import LocalCaptureAgent
@@ -228,6 +234,47 @@ def prepare_helper_simulation_payload(
     clean["execution_host"] = "helper_local"
     clean["simulation_source_transfer"] = transfer
     clean.pop("simulation_source_path", None)
+    return clean
+
+
+def bind_ready_helper_simulation_payload(
+    guest_manager: GuestSimulationManager,
+    identity: RequestIdentity,
+    payload: dict,
+) -> dict:
+    """Bind a ready receipt to the current session source without retransferring bytes."""
+
+    source_id = str(payload.get("simulation_source_id") or "").strip()
+    ready = payload.get("simulation_source_ready")
+    if not source_id or not isinstance(ready, dict):
+        raise GuestSimulationError(
+            "simulation_source_not_ready",
+            "请先点击“下载到本机辅助程序并校验”，确认数据源已就绪",
+        )
+    manifest, _source_root = guest_manager.source_transfer_manifest(
+        str(identity.guest_id or ""), source_id
+    )
+    if (
+        str(ready.get("source_id") or "") != source_id
+        or str(ready.get("content_sha256") or "")
+        != str(manifest.get("content_sha256") or "")
+    ):
+        raise GuestSimulationError(
+            "simulation_source_not_ready",
+            "模拟数据源已变化，请重新下载到本机辅助程序并校验",
+        )
+    clean = helper_real_capture_payload(payload)
+    clean["execution_host"] = "helper_local"
+    clean["simulation_source_ready"] = {
+        "content_sha256": str(manifest.get("content_sha256") or ""),
+        "source_type": str(manifest.get("source_type") or ""),
+        "relative_paths": [
+            str(item.get("relative_path") or "")
+            for item in (manifest.get("files") or [])
+            if isinstance(item, dict)
+        ],
+    }
+    clean.pop("simulation_source_id", None)
     return clean
 
 
@@ -4865,6 +4912,29 @@ class AppHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/simulation/status":
             self._send_json(self.guest_manager.status(self._identity().guest_id))
             return
+        if parsed.path == "/api/simulation/packages":
+            identity = self._identity()
+            if identity.role not in {"authorized", "lan_operator"}:
+                self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
+                return
+            self._send_json({"ok": True, "packages": simulation_package_catalog()})
+            return
+        if parsed.path == "/api/simulation/package-download":
+            identity = self._identity()
+            if identity.role not in {"authorized", "lan_operator"}:
+                self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
+                return
+            try:
+                package_id = self._one(parse_qs(parsed.query), "package_id", "")
+                package_path = resolve_simulation_package(package_id)
+                self._send_download(
+                    package_path.read_bytes(),
+                    package_path.name,
+                    "text/csv; charset=utf-8",
+                )
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+            return
         if parsed.path == "/api/simulation/dataset":
             try:
                 self._send_json(
@@ -5238,7 +5308,7 @@ class AppHandler(BaseHTTPRequestHandler):
                                 session_id,
                                 file_index=int(payload.get("file_index", -1)),
                                 offset=int(payload.get("offset", 0)),
-                                limit=int(payload.get("limit", 256 * 1024)),
+                                limit=int(payload.get("limit", MAX_TRANSFER_CHUNK_BYTES)),
                             )
                         except SimulationSourceTransferError as exc:
                             self._send_json(
@@ -5450,6 +5520,30 @@ class AppHandler(BaseHTTPRequestHandler):
                         files if isinstance(files, list) else [],
                     )
                 )
+                return
+            if parsed.path == "/api/acquisition/select-package":
+                identity = self._identity()
+                if identity.role not in {"authorized", "lan_operator"}:
+                    self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
+                    return
+                try:
+                    package_id = str(payload.get("package_id") or "")
+                    package_path = resolve_simulation_package(package_id)
+                    result = self.guest_manager.upload_source(
+                        identity.guest_id,
+                        "single_csv",
+                        [
+                            {
+                                "name": package_path.name,
+                                "data": base64.b64encode(package_path.read_bytes()).decode("ascii"),
+                            }
+                        ],
+                    )
+                    result["package_id"] = package_id
+                    result["synthetic"] = True
+                    self._send_json(result)
+                except (ValueError, GuestSimulationError) as exc:
+                    self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 return
             if parsed.path == "/api/simulation/stop":
                 self._send_json(
@@ -5781,6 +5875,23 @@ class AppHandler(BaseHTTPRequestHandler):
                 command_payload = (
                     payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
                 )
+                if command_name == "prepare_simulation_source":
+                    try:
+                        helper_payload = prepare_helper_simulation_payload(
+                            self.guest_manager,
+                            self.simulation_source_transfers,
+                            identity,
+                            session_id,
+                            command_payload,
+                        )
+                    except (ValueError, GuestSimulationError, SimulationSourceTransferError) as exc:
+                        self._send_json({"ok": False, "error": str(exc)})
+                        return
+                    result = self.dashboard.helper_registry.command(
+                        session_id, command_name, helper_payload
+                    )
+                    self._send_json(result)
+                    return
                 if command_name == "start_capture":
                     capture_mode = str(
                         command_payload.get("acquisition_mode") or "real"
@@ -5803,13 +5914,17 @@ class AppHandler(BaseHTTPRequestHandler):
                         return
                     target_enabled = mysql_settings_from_mapping(command_payload).enabled
                     if capture_mode == "simulation":
-                        helper_payload = prepare_helper_simulation_payload(
-                            self.guest_manager,
-                            self.simulation_source_transfers,
-                            identity,
-                            session_id,
-                            command_payload,
-                        )
+                        try:
+                            helper_payload = bind_ready_helper_simulation_payload(
+                                self.guest_manager,
+                                identity,
+                                command_payload,
+                            )
+                        except GuestSimulationError as exc:
+                            self._send_json(
+                                {"ok": False, "error": str(exc), "code": exc.code}
+                            )
+                            return
                     else:
                         helper_payload = helper_real_capture_payload(command_payload)
                     if target_enabled:
@@ -6032,6 +6147,22 @@ class AppHandler(BaseHTTPRequestHandler):
                     and identity.role != "local_admin"
                 )
                 if remote_simulation:
+                    if (
+                        str(payload.get("execution_host") or "") != "server"
+                        or str(payload.get("simulation_execution_choice") or "")
+                        != "server_explicit"
+                    ):
+                        self._send_json(
+                            {
+                                "error": "explicit_server_simulation_required",
+                                "message": (
+                                    "远程模拟默认由本机辅助程序执行；如需服务器备用模式，"
+                                    "请在页面明确选择“服务器模拟”"
+                                ),
+                            },
+                            HTTPStatus.CONFLICT,
+                        )
+                        return
                     with self.remote_simulation_hosts_lock:
                         self.remote_simulation_hosts[
                             str(identity.session_id or "")

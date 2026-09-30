@@ -31,6 +31,8 @@ class RemoteAcquisitionMirror:
         self._latest_sample_at: float | None = None
         self._helper_batch_created_at: float | None = None
         self._helper_queue_depth = 0
+        self._helper_ack_rtt_ms: float | None = None
+        self._helper_route_type = "unknown"
 
     def _reset_locked(self, capture_uuid: str) -> None:
         self._rows.clear()
@@ -48,6 +50,8 @@ class RemoteAcquisitionMirror:
         self._latest_sample_at = None
         self._helper_batch_created_at = None
         self._helper_queue_depth = 0
+        self._helper_ack_rtt_ms = None
+        self._helper_route_type = "unknown"
 
     def ingest(self, batch: dict[str, Any]) -> dict[str, Any]:
         capture_uuid = str(batch.get("capture_uuid") or "").strip()
@@ -123,6 +127,17 @@ class RemoteAcquisitionMirror:
                     )
                 except (TypeError, ValueError):
                     self._helper_queue_depth = 0
+                try:
+                    raw_rtt = transport.get("helper_ack_rtt_ms")
+                    self._helper_ack_rtt_ms = (
+                        max(0.0, float(raw_rtt)) if raw_rtt is not None else None
+                    )
+                except (TypeError, ValueError):
+                    self._helper_ack_rtt_ms = None
+                route_type = str(transport.get("paired_route_type") or "unknown").lower()
+                self._helper_route_type = (
+                    route_type if route_type in {"loopback", "lan", "public"} else "unknown"
+                )
             return {
                 "ok": True,
                 "duplicate": False,
@@ -152,6 +167,8 @@ class RemoteAcquisitionMirror:
                     "remote_latest_sample_at": self._latest_sample_at,
                     "remote_helper_batch_created_at": self._helper_batch_created_at,
                     "remote_helper_queue_depth": self._helper_queue_depth,
+                    "remote_helper_ack_rtt_ms": self._helper_ack_rtt_ms,
+                    "remote_helper_route_type": self._helper_route_type,
                     "remote_server_received_at": self._last_batch_at,
                     "remote_server_receive_latency_ms": (
                         max(

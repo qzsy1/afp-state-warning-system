@@ -118,6 +118,8 @@ class RemoteAcquisitionMirrorTests(unittest.TestCase):
         payload["transport"] = {
             "helper_batch_created_at": 1001.5,
             "helper_queue_depth": 3,
+            "helper_ack_rtt_ms": 42.5,
+            "paired_route_type": "lan",
         }
 
         self.assertEqual(mirror.stream_version(), 0)
@@ -134,6 +136,8 @@ class RemoteAcquisitionMirrorTests(unittest.TestCase):
         self.assertEqual(status["remote_latest_sample_at"], 1000.0)
         self.assertEqual(status["remote_helper_batch_created_at"], 1001.5)
         self.assertEqual(status["remote_helper_queue_depth"], 3)
+        self.assertEqual(status["remote_helper_ack_rtt_ms"], 42.5)
+        self.assertEqual(status["remote_helper_route_type"], "lan")
         self.assertIsInstance(status["remote_server_received_at"], float)
 
     def test_out_of_order_batch_is_rejected_with_expected_sequence(self):

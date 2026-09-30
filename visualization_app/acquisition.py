@@ -1271,52 +1271,91 @@ class SimulatorDriver(SampleDriver):
     def __init__(self, path: Path, sensor_columns: list[str]) -> None:
         self.path = path
         self.sensor_columns = sensor_columns
-        self.records: list[dict[str, Any]] = []
         self.index = 0
+        self._files: list[Path] = []
+        self._file_index = 0
+        self._handle = None
+        self._reader: csv.DictReader | None = None
 
-    def open(self) -> None:
+    def _source_files(self) -> list[Path]:
         if not self.path.exists():
             raise FileNotFoundError(f"模拟数据文件不存在：{self.path}")
+        if not self.path.is_file():
+            raise FileNotFoundError(f"模拟数据文件不存在：{self.path}")
+        return [self.path]
+
+    @staticmethod
+    def _open_reader(path: Path):
+        last_error: UnicodeDecodeError | None = None
+        for encoding in ("utf-8-sig", "gb18030"):
+            handle = path.open("r", encoding=encoding, newline="")
+            try:
+                reader = csv.DictReader(handle)
+                _ = reader.fieldnames
+                return handle, reader
+            except UnicodeDecodeError as exc:
+                last_error = exc
+                handle.close()
+        if last_error is not None:
+            raise last_error
+        raise ValueError(f"无法读取模拟 CSV：{path}")
+
+    @classmethod
+    def _header(cls, path: Path) -> list[str]:
+        handle, reader = cls._open_reader(path)
         try:
-            frame = pd.read_csv(self.path, encoding="utf-8-sig")
-        except UnicodeDecodeError:
-            frame = pd.read_csv(self.path, encoding="gb18030")
-        missing = [
-            name for name in self.sensor_columns if name not in frame.columns
-        ]
+            return [str(name or "").strip() for name in (reader.fieldnames or [])]
+        finally:
+            handle.close()
+
+    def _open_current(self) -> None:
+        self.close()
+        self._handle, self._reader = self._open_reader(self._files[self._file_index])
+
+    def open(self) -> None:
+        self._files = self._source_files()
+        available = set().union(*(set(self._header(path)) for path in self._files))
+        missing = [name for name in self.sensor_columns if name not in available]
         if missing:
             raise ValueError(f"模拟数据缺少传感器列：{missing}")
-        self.records = frame[self.sensor_columns].to_dict(orient="records")
         self.index = 0
+        self._file_index = 0
+        self._open_current()
 
     def read_sample(self) -> dict[str, float] | None:
-        if not self.records:
+        if not self._files or self._reader is None:
             return None
-        record = self.records[self.index % len(self.records)]
-        self.index += 1
-        return normalize_sample(record)
+        for _ in range(len(self._files) + 1):
+            try:
+                record = next(self._reader)
+            except StopIteration:
+                self._file_index = (self._file_index + 1) % len(self._files)
+                self._open_current()
+                continue
+            self.index += 1
+            return normalize_sample(
+                {name: record.get(name) for name in self.sensor_columns}
+            )
+        return None
+
+    def close(self) -> None:
+        handle = self._handle
+        self._handle = None
+        self._reader = None
+        if handle is not None:
+            handle.close()
 
 
 class FolderCsvSimulatorDriver(SimulatorDriver):
     """Replay every CSV in a capture folder in lexical file order."""
-    def open(self) -> None:
+
+    def _source_files(self) -> list[Path]:
         if not self.path.exists() or not self.path.is_dir():
             raise FileNotFoundError(f"模拟采集文件夹不存在：{self.path}")
         files = sorted(self.path.rglob("*.csv"))
         if not files:
             raise FileNotFoundError(f"模拟采集文件夹不包含 CSV：{self.path}")
-        frames = []
-        for file in files:
-            try:
-                frames.append(pd.read_csv(file, encoding="utf-8-sig"))
-            except UnicodeDecodeError:
-                frames.append(pd.read_csv(file, encoding="gb18030"))
-        frame = pd.concat(frames, ignore_index=True, sort=False)
-        missing = [name for name in self.sensor_columns if name not in frame.columns]
-        if missing:
-            raise ValueError(f"模拟采集文件夹缺少传感器列：{missing}")
-        self.records = frame[self.sensor_columns].to_dict(orient="records")
-        self.index = 0
+        return files
 
 
 class MySQLSimulatorDriver(SampleDriver):
@@ -2364,6 +2403,7 @@ class AcquisitionManager:
         self.capture_root = capture_root
         self.capture_root.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self._stream_activity = threading.Condition(self.lock)
         self.lifecycle_lock = threading.RLock()
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
@@ -3591,6 +3631,7 @@ class AcquisitionManager:
                                 if _finite(row.get(name)) is not None:
                                     self.sensor_received[name] += 1
                                     self.sensor_last_time[name] = now
+                            self._stream_activity.notify_all()
                     elif config.acquisition_mode == "real":
                         if empty_since is None:
                             empty_since = time.monotonic()
@@ -4395,6 +4436,12 @@ class AcquisitionManager:
                 "buffered_count": buffered,
                 "buffer_base": max(0, total - buffered),
             }
+
+    def wait_for_stream_activity(self, timeout: float = 0.2) -> bool:
+        """Wait until samples or capture state may have changed."""
+
+        with self._stream_activity:
+            return bool(self._stream_activity.wait(timeout=max(0.0, float(timeout))))
 
     def stream_rows_since(self, cursor: int, limit: int) -> dict[str, Any]:
         """Copy only the bounded absolute row range requested by the helper."""

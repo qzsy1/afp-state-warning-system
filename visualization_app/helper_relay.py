@@ -31,6 +31,7 @@ ALLOWED_HELPER_COMMANDS = frozenset(
         "mysql_profile_status",
         "check_save_root",
         "select_folder",
+        "prepare_simulation_source",
         "start_capture",
         "stop_capture",
         "status",
