@@ -120,11 +120,12 @@ if ($AllowExistingTarget) {
 
 $appTarget = Join-Path $TargetDir "app"
 $legacyTarget = Join-Path $appTarget "legacy"
+$legacyStaticTarget = Join-Path $legacyTarget "static"
 $uiTarget = Join-Path $appTarget "ui"
 $configTarget = Join-Path $TargetDir "config"
 $nativeTarget = Join-Path $TargetDir "native_dll"
 $docsTarget = Join-Path $TargetDir "docs"
-foreach ($path in @($appTarget, $legacyTarget, $uiTarget, $configTarget, $nativeTarget, $docsTarget)) {
+foreach ($path in @($appTarget, $legacyTarget, $legacyStaticTarget, $uiTarget, $configTarget, $nativeTarget, $docsTarget)) {
     New-Item -ItemType Directory -Force -Path $path | Out-Null
 }
 
@@ -150,6 +151,7 @@ $legacyFiles = @(
     "native_integrated_app.py", "fit_new_collection_health.py", "websocket_live.py",
     "helper_relay.py", "edge_capture.py", "local_capture_agent.py", "local_capture_helper_entry.py",
     "simulation_replay.py", "simulation_source_transfer.py",
+    "public_demo_bundles.py",
     "remote_mysql_setup.py", "server_target_mysql.py", "server_capture_journal.py", "generate_pressure_simulation.py",
     "web_auth.py", "web_access.py", "public_status.py", "guest_simulation.py", "control_lease.py", "json_safety.py"
 )
@@ -170,6 +172,7 @@ foreach ($name in @(
     }
 }
 Get-ChildItem -LiteralPath (Join-Path $LegacySource "static") -Force | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination $legacyStaticTarget -Recurse -Force
     Copy-Item -LiteralPath $_.FullName -Destination $uiTarget -Recurse -Force
 }
 
@@ -208,8 +211,10 @@ foreach ($directory in @("logs", "runtime", "rollback", "updates", "verification
 $mutableDirectories = @("logs", "runtime", "rollback", "updates", "verification")
 $forbiddenNames = Get-ChildItem -LiteralPath $TargetDir -Recurse -File | Where-Object {
     $relative = $_.FullName.Substring($TargetDir.Length).TrimStart('\\')
-    $topDirectory = ($relative -split '[\\/]')[0]
-    $topDirectory -notin $mutableDirectories -and (
+    $segments = $relative -split '[\\/]'
+    $topDirectory = $segments[0]
+    $nestedRuntime = $segments.Count -ge 2 -and $segments[0] -eq "app" -and $segments[1] -eq "runtime"
+    $topDirectory -notin $mutableDirectories -and -not $nestedRuntime -and (
         $_.Name -in @("public_web_security.sqlite3", "cert.pem") -or
         $_.Name -like "*.cfargotunnel.com.json"
     )
@@ -220,8 +225,10 @@ if ($forbiddenNames) {
 $textExtensions = @(".py", ".ps1", ".json", ".txt", ".md", ".html", ".js", ".css", ".toml", ".yaml", ".yml")
 foreach ($file in (Get-ChildItem -LiteralPath $TargetDir -Recurse -File | Where-Object {
     $relative = $_.FullName.Substring($TargetDir.Length).TrimStart('\\')
-    $topDirectory = ($relative -split '[\\/]')[0]
-    $topDirectory -notin $mutableDirectories -and $textExtensions -contains $_.Extension.ToLowerInvariant()
+    $segments = $relative -split '[\\/]'
+    $topDirectory = $segments[0]
+    $nestedRuntime = $segments.Count -ge 2 -and $segments[0] -eq "app" -and $segments[1] -eq "runtime"
+    $topDirectory -notin $mutableDirectories -and -not $nestedRuntime -and $textExtensions -contains $_.Extension.ToLowerInvariant()
 })) {
     $text = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction Stop
     if ($text -match 'sk-[A-Za-z0-9_-]{20,}') {
@@ -254,8 +261,10 @@ $hashes = Get-ChildItem -LiteralPath $TargetDir -Recurse -File | Where-Object {
     $relative = $_.FullName.Substring($TargetDir.Length).TrimStart('\')
     $topDirectory = ($relative -split '[\\/]')[0]
     $segments = $relative -split '[\\/]'
+    $nestedRuntime = $segments.Count -ge 2 -and $segments[0] -eq "app" -and $segments[1] -eq "runtime"
     $_.Name -ne "SHA256SUMS.txt" -and
         $topDirectory -notin $mutableDirectories -and
+        -not $nestedRuntime -and
         $_.Extension -ne ".pyc" -and
         "__pycache__" -notin $segments
 } | Get-FileHash -Algorithm SHA256

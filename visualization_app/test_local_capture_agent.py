@@ -112,6 +112,60 @@ class LocalCaptureAgentTests(unittest.TestCase):
         self.assertEqual(final["rows"], [])
         self.assertFalse(final["status"]["running"])
 
+    def test_stop_marks_pending_rows_as_history_and_completes_after_final_ack(self):
+        manager = Mock()
+        manager.start.return_value = {"running": True}
+        manager.stop.return_value = {
+            "running": False,
+            "capture_saved": True,
+            "finalization_complete": True,
+        }
+        manager.status.return_value = {
+            "running": True,
+            "sample_count": 2,
+            "config": {"sample_rate": 10.0},
+        }
+        manager.numeric_matrix.return_value = (
+            [{"温度": 350.0}, {"温度": 351.0}],
+            [1.0, 1.1],
+        )
+        agent = LocalCaptureAgent(manager=manager)
+        started = agent.start_capture(Mock())
+        pending = agent.next_sample_batch(limit=1)
+        self.assertTrue(pending["status"]["running"])
+
+        manager.status.return_value = {
+            "running": False,
+            "sample_count": 2,
+            "capture_saved": True,
+            "finalization_complete": True,
+            "config": {"sample_rate": 10.0},
+        }
+        stopped = agent.stop_capture()
+        replay = agent.next_sample_batch(limit=1)
+
+        self.assertEqual(stopped["flush_state"], "flushing")
+        self.assertEqual(stopped["generated_rows"], 2)
+        self.assertEqual(stopped["queued_rows"], 2)
+        self.assertIsNotNone(stopped["local_stopped_at"])
+        self.assertEqual(replay["capture_uuid"], started["capture_uuid"])
+        self.assertFalse(replay["status"]["running"])
+        self.assertEqual(replay["status"]["flush_state"], "flushing")
+        self.assertFalse(replay["status"]["finalization_complete"])
+
+        self.assertTrue(agent.ack_sample_batch(started["capture_uuid"], replay["sequence"]))
+        second = agent.next_sample_batch(limit=1)
+        self.assertFalse(second["status"]["running"])
+        self.assertFalse(second["status"]["finalization_complete"])
+        self.assertTrue(agent.ack_sample_batch(started["capture_uuid"], second["sequence"]))
+        completed = agent.next_sample_batch(limit=1)
+
+        self.assertEqual(completed["rows"], [])
+        self.assertFalse(completed["status"]["running"])
+        self.assertEqual(completed["status"]["flush_state"], "completed")
+        self.assertTrue(completed["status"]["finalization_complete"])
+        self.assertEqual(completed["transport"]["helper_queue_depth"], 0)
+
     def test_transport_builds_hello_without_secrets(self):
         transport = HelperTransport(
             "wss://example.test/helper", "pairing-secret", device_id="device-a"

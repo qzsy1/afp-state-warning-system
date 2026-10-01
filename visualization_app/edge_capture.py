@@ -33,6 +33,9 @@ class RemoteAcquisitionMirror:
         self._helper_queue_depth = 0
         self._helper_ack_rtt_ms: float | None = None
         self._helper_route_type = "unknown"
+        self._local_stopped_at: float | None = None
+        self._flush_state = "running"
+        self._helper_generated_rows = 0
 
     def _reset_locked(self, capture_uuid: str) -> None:
         self._rows.clear()
@@ -52,6 +55,55 @@ class RemoteAcquisitionMirror:
         self._helper_queue_depth = 0
         self._helper_ack_rtt_ms = None
         self._helper_route_type = "unknown"
+        self._local_stopped_at = None
+        self._flush_state = "running"
+        self._helper_generated_rows = 0
+
+    def observe_helper_status(self, status: dict[str, Any]) -> bool:
+        """Apply control-plane stop facts before slower sample batches drain."""
+
+        capture_uuid = str((status or {}).get("capture_uuid") or "").strip()
+        with self._lock:
+            if not capture_uuid or capture_uuid != self._capture_uuid:
+                return False
+            stopped_at = status.get("local_stopped_at")
+            flush_state = str(status.get("flush_state") or "")
+            if stopped_at is None and flush_state not in {"flushing", "completed"}:
+                return False
+            try:
+                self._local_stopped_at = float(stopped_at)
+            except (TypeError, ValueError):
+                self._local_stopped_at = self._local_stopped_at or time.time()
+            self._flush_state = (
+                flush_state if flush_state in {"flushing", "completed"} else "flushing"
+            )
+            try:
+                self._helper_generated_rows = max(
+                    self._helper_generated_rows,
+                    int(status.get("generated_rows") or 0),
+                )
+            except (TypeError, ValueError):
+                pass
+            try:
+                self._helper_queue_depth = max(
+                    0,
+                    int(status.get("queued_rows") or self._helper_queue_depth),
+                )
+            except (TypeError, ValueError):
+                pass
+            merged = deepcopy(self._status)
+            merged.update(deepcopy(status))
+            merged["running"] = False
+            merged["local_stopped_at"] = self._local_stopped_at
+            merged["flush_state"] = self._flush_state
+            merged["capture_phase"] = (
+                "local_stopped_flushing"
+                if self._flush_state == "flushing"
+                else "completed"
+            )
+            self._status = merged
+            self._stream_version += 1
+            return True
 
     def ingest(self, batch: dict[str, Any]) -> dict[str, Any]:
         capture_uuid = str(batch.get("capture_uuid") or "").strip()
@@ -138,6 +190,31 @@ class RemoteAcquisitionMirror:
                 self._helper_route_type = (
                     route_type if route_type in {"loopback", "lan", "public"} else "unknown"
                 )
+                try:
+                    self._helper_generated_rows = max(
+                        self._helper_generated_rows,
+                        int(transport.get("helper_generated_rows") or 0),
+                    )
+                except (TypeError, ValueError):
+                    pass
+                if transport.get("local_stopped_at") is not None:
+                    try:
+                        self._local_stopped_at = float(transport.get("local_stopped_at"))
+                    except (TypeError, ValueError):
+                        pass
+                incoming_flush = str(transport.get("flush_state") or "")
+                if incoming_flush in {"flushing", "completed"}:
+                    self._flush_state = incoming_flush
+            if self._local_stopped_at is not None:
+                self._status["running"] = False
+                self._status["local_stopped_at"] = self._local_stopped_at
+                self._status["flush_state"] = self._flush_state
+                self._status["capture_phase"] = (
+                    "local_stopped_flushing"
+                    if self._flush_state == "flushing"
+                    else "completed"
+                )
+                self._status["generated_rows"] = self._helper_generated_rows
             return {
                 "ok": True,
                 "duplicate": False,
@@ -169,7 +246,28 @@ class RemoteAcquisitionMirror:
                     "remote_helper_queue_depth": self._helper_queue_depth,
                     "remote_helper_ack_rtt_ms": self._helper_ack_rtt_ms,
                     "remote_helper_route_type": self._helper_route_type,
+                    "remote_helper_generated_rows": self._helper_generated_rows,
+                    "local_stopped_at": self._local_stopped_at,
+                    "flush_state": (
+                        self._flush_state if self._local_stopped_at is not None else None
+                    ),
+                    "capture_phase": (
+                        "local_stopped_flushing"
+                        if self._local_stopped_at is not None and self._flush_state == "flushing"
+                        else "completed"
+                        if self._local_stopped_at is not None
+                        else "running" if value.get("running") else "stopped"
+                    ),
                     "remote_server_received_at": self._last_batch_at,
+                    "remote_server_clock_delta_ms": (
+                        max(
+                            0.0,
+                            (self._last_batch_at - self._helper_batch_created_at) * 1000.0,
+                        )
+                        if self._last_batch_at is not None
+                        and self._helper_batch_created_at is not None
+                        else None
+                    ),
                     "remote_server_receive_latency_ms": (
                         max(
                             0.0,

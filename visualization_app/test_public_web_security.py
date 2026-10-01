@@ -393,6 +393,7 @@ class PublicWebHttpTests(unittest.TestCase):
         self.default_simulation_source = source.resolve()
         self.hardware_start_calls = 0
         self.hardware_discovery_calls = 0
+        self.acquisition_configs = []
 
         class FakeAcquisition:
             def status(inner_self):
@@ -414,6 +415,14 @@ class PublicWebHttpTests(unittest.TestCase):
                         }
                     ],
                 }
+
+            def test_connection(inner_self, config):
+                self.acquisition_configs.append(("test", config))
+                return {"ok": True, "interfaces": [], "channels": []}
+
+            def read_process_parameters(inner_self, config):
+                self.acquisition_configs.append(("parameters", config))
+                return {"ok": True, "parameters": {}}
 
             def start(inner_self, _config):
                 self.hardware_start_calls += 1
@@ -496,6 +505,48 @@ class PublicWebHttpTests(unittest.TestCase):
         self.assertEqual(seen, ["only-on-server"])
         self.assertTrue(result["config_id"])
         self.assertNotIn("only-on-server", json.dumps(result))
+
+    def test_authorized_acquisition_routes_accept_target_profile_identifier(self):
+        self.request_json("GET", "/api/auth/session")
+        login, _, _ = self.request_json(
+            "POST", "/api/auth/login", {"password": "Correct-Horse-2026"},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        self.assertEqual(login, 200)
+        acquired, _, _ = self.request_json(
+            "POST", "/api/real/control/acquire", {},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        self.assertEqual(acquired, 200)
+        request = {
+            "acquisition_mode": "real",
+            "mysql_target_config_id": "opaque-id",
+            "interfaces": [{
+                "id": "plc_process",
+                "enabled": True,
+                "role": "plc",
+                "driver": "modbus_tcp",
+                "endpoint": "192.0.2.10:502",
+                "physical_interface_id": "ethernet-test",
+                "physical_interface_kind": "ethernet",
+            }],
+        }
+
+        test_status, test_result, _ = self.request_json(
+            "POST", "/api/acquisition/test", request
+        )
+        parameter_status, parameter_result, _ = self.request_json(
+            "POST", "/api/acquisition/process-parameters", request
+        )
+
+        self.assertEqual(test_status, 200, test_result)
+        self.assertTrue(test_result["ok"])
+        self.assertEqual(parameter_status, 200, parameter_result)
+        self.assertTrue(parameter_result["ok"])
+        self.assertEqual(
+            [config.mysql_target_config_id for _, config in self.acquisition_configs],
+            ["opaque-id", "opaque-id"],
+        )
 
     def request_json(
         self,
@@ -943,6 +994,54 @@ class PublicWebHttpTests(unittest.TestCase):
         self.assertTrue(result["running"])
         self.assertEqual(start.call_count, 1)
         self.assertEqual(self.hardware_start_calls, 0)
+
+    def test_local_admin_server_simulation_accepts_execution_host_metadata(self):
+        self.request_json("GET", "/api/auth/session")
+        captured = []
+
+        def start(config):
+            captured.append(config)
+            return {"running": True}
+
+        with patch.object(
+            self.server.RequestHandlerClass, "access_context", "local_admin"
+        ), patch.object(
+            self.server.RequestHandlerClass.dashboard.acquisition,
+            "start",
+            side_effect=start,
+        ):
+            status, result, _ = self.request_json(
+                "POST",
+                "/api/acquisition/start",
+                {
+                    "acquisition_mode": "simulation",
+                    "driver": "simulator",
+                    "execution_host": "server",
+                },
+            )
+
+        self.assertEqual(status, 200, result)
+        self.assertTrue(result["running"])
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].acquisition_mode, "simulation")
+
+    def test_local_admin_server_simulation_still_rejects_unknown_config_fields(self):
+        self.request_json("GET", "/api/auth/session")
+        with patch.object(
+            self.server.RequestHandlerClass, "access_context", "local_admin"
+        ):
+            status, result, _ = self.request_json(
+                "POST",
+                "/api/acquisition/start",
+                {
+                    "acquisition_mode": "simulation",
+                    "driver": "simulator",
+                    "unexpected_config_typo": "must-not-be-silently-ignored",
+                },
+            )
+
+        self.assertEqual(status, 400, result)
+        self.assertIn("unexpected_config_typo", result["error"])
 
     def test_authorized_server_simulation_rejects_implicit_helper_fallback(self):
         self.request_json("GET", "/api/auth/session")

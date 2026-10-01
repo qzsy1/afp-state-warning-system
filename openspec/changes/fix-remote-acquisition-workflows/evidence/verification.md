@@ -98,3 +98,56 @@
 - 交付服务以 PID 15924 重启并由同一进程监听 8770/8771。回环、实际 LAN `http://192.168.101.31:8770/` 与公网健康接口各连续 5 次均为 HTTP 200，平均约 1.4/0.9/6.3 ms；公网 WSS 实际握手 31.1 ms并收到 payload。公网首页已引用 `20260930-helper-prefetch-v2`，在线 `app.js` SHA-256 与源码完全一致。
 - 公网独立访客会话实际完成模拟启动、2 秒后 21 点进度和停止保存，开始/停止约 50.6/52.3 ms。此结果验证服务器访客链路，不替代授权 helper 预下载、本机 MySQL、600 秒第二台电脑持续回放、真实 50 Hz 或五类实物接口。
 - 任务 18.10 保持未完成：需用户在真实第二台电脑以本次 helper 分别经 LAN 与公网执行快速包和 6000 点/600 秒验收，返回行数、速率、序号、队列、P95、浏览器新鲜度和两个 MySQL 作用域的现场证据。
+
+## 2026-09-30 公网高 RTT 吞吐与停止补传状态
+
+- RED 阶段先稳定复现三类旧行为：10 Hz、1161 ms ACK 时公网批量上限 5 的理论吞吐只有约 4.3 行/秒；停止后待补传批次仍携带运行中状态且可能覆盖本地停止事实；页面把约 48 秒样本年龄误标为“浏览器发布”。修复后新增的吞吐、停止优先级、最终状态和前端指标测试全部转绿。
+- 公网批量现在至少覆盖 `采样率 × (ACK RTT + 0.2 秒)`，并在队列年龄超过 2 秒时有界追赶，单批最大 50 行。仍保持单在途、服务端完整日志持久接受后 ACK、`capture_uuid + sequence` 幂等、断线重发及固定配对地址；没有增加 LAN 旁路或改变五类接口。
+- helper 停止后立即冻结本地产生数，依次报告 `local_stopped_flushing` 和 `completed`。补传中的所有批次强制 `finalization_complete=false`，只有队列清空后的最终空状态批次可以终结服务器日志及目标 MySQL 保存；迟到的旧运行状态不能重新把页面变成“采集中”。
+- 页面现分别显示队列预计秒数、ACK RTT、服务器墙钟差、样本端到端年龄、页面载荷更新频率和浏览器本机处理耗时；尚未测得的 `null` 延迟不会伪显示为 0 ms。在线公网 `app.js` SHA-256 为 `D8EE1950191862B0115642C9449968FF8FFEB7AD561D0E19B6BE855BE7438120`，与源码、`app/legacy/static` 和实际服务目录 `app/ui` 一致；旧“浏览器发布”字段已移除。
+- 279 项 helper/模拟启停/前端/镜像/五类接口/MySQL/诊断高风险回归和 21 项模块运行时回归全部通过；Python 编译、JavaScript 语法、Git 空白检查及 OpenSpec strict 同时通过。全量发现此前执行 454 项，453 项通过，唯一初始化错误仍是源码目录缺少既有四个仪表盘预生成文件。
+- 交付完整性核验 6279 项，0 missing、0 mismatched、0 malformed。运行状态目录 `app/runtime` 从不可变哈希清单生成规则中排除，避免 helper 配对状态变化造成伪校验失败；不改变运行数据内容或权限。主程序 EXE 保持 `AA7BC2F636E862E9F603F7B4D4D9D8FC9B71390FFB20F33A011A42EF9D56FD65`。
+- 新 helper 构建标识为 `20260930-helper-public-bdp-stop-v2 (protocol 2)`，SHA-256 为 `F59D63966F36B2980D2F80F941B4D3EBA2BFB8D4A46DF9DF3C880FD883336EBA`。本机、实际 LAN `http://192.168.101.31:8770/` 和公网 `https://desktop-410sfvi.tail97fe2c.ts.net/` 均返回 HTTP 200 并加载同一新版缓存键；公网脚本字节哈希与源码一致。
+- 任务 19.6 保持未完成：本轮只完成可控高 RTT 逻辑验证、实际公网部署一致性和服务可达性，没有以真实第二台电脑完成 600 秒 helper 回放。用户现场仍需记录产生/接收/保存行数、队列峰值/最终值、停止阶段和端到端新鲜度，不能由本机自动化替代。
+
+## 2026-09-30 目标 MySQL 配置标识兼容性修复
+
+- 根因已定位为前后端配置契约不一致：页面在目标 MySQL 预检后会把非敏感 `mysql_target_config_id` 传给接口检查、工艺参数读取和采集启动，但 `AcquisitionConfig` 尚无该字段，三个直接构造入口因此返回 `unexpected keyword argument 'mysql_target_config_id'`。该问题不是采集代码被删除；源码和交付副本均存在。源码开发目录另有四个未受 Git 跟踪的仪表盘生成物缺失，属于既有测试夹具问题，与本异常相互独立。
+- RED 测试稳定复现构造失败和 helper 配置字段边界；修复后 `AcquisitionConfig` 接受并规范化该服务器专用 ID，`helper_real_capture_payload` 和 helper 自身配置白名单均删除它。本机 MySQL 字段保持原值，服务器目标密码仍不进入浏览器或 helper。
+- 新增进程内 HTTP 回归，授权会话携带该 ID 调用 `/api/acquisition/test` 与 `/api/acquisition/process-parameters` 均返回 200；采集启动使用同一数据类契约。没有修改 PLC Modbus TCP、ABB RWS、SMRF USB HID、M3232 串口、UVC 热成像五类协议/映射、MySQL 表结构、预测模型或 LangChain 诊断逻辑。
+- 排除无法初始化的 `DashboardTests` 开发夹具后，全部 458 项源码测试在 50.715 秒内通过；21 项模块运行时测试通过。Python 编译、JavaScript 语法、Git 空白检查和 OpenSpec strict 均通过。生产交付已包含仪表盘数据和模型，公网页面烟测实际产生预测及预警结果。
+- 源码与交付 `acquisition.py` SHA-256 均为 `491813DE4A3BFCAC1E34A220E49C921E41B477652EEC1218243E8E13B64B8E0A`；`local_capture_helper_entry.py` 均为 `7450ED27D7CF8734C36CB6406267614D52A9C900A796223D13F34DCBB8B7AB8A`。交付清单验证 6279 项，0 missing、0 mismatched、0 malformed。
+- 主程序重启后，本机、实际 LAN `http://192.168.101.31:8770/` 和公网 `https://desktop-410sfvi.tail97fe2c.ts.net/` 健康接口均返回 `status=ok`。主程序 EXE 仍为 `AA7BC2F636E862E9F603F7B4D4D9D8FC9B71390FFB20F33A011A42EF9D56FD65`；helper EXE 仍为 `F59D63966F36B2980D2F80F941B4D3EBA2BFB8D4A46DF9DF3C880FD883336EBA`，本次无需重新下载 helper。
+- 公网页面实际保留五张接口卡及各自驱动；访客模拟采集约 2.5 秒达到 22 点，停止后固定为 115 点，实际采样 10.00 Hz、最大间隔 111.7 ms，17 通道实测、16 通道预测、预警与分层/完整试样保存均显示，浏览器错误日志为空。
+- 任务 20.4 保持未完成：真实第二台电脑仍需在其已授权会话内复核目标 MySQL 预检后立即检查、模拟开始/停止和真实 helper 开始；五类物理设备与两类 MySQL 的实际连接/写入不能由本机模拟证据替代。
+
+## 2026-09-30 模拟采集执行端元数据兼容性修复
+
+- 用户页面复现 `AcquisitionConfig.__init__() got an unexpected keyword argument 'execution_host'`。数据流追踪确认页面把 `execution_host` 作为浏览器/服务器/helper 路由元数据加入启动载荷；远程授权服务器备用模式经 `GuestSimulationManager.safe_config` 已过滤该字段，但本机管理员服务器模拟和直接采集入口仍把整包载荷交给 `AcquisitionConfig`，因此在启动前返回 400。该异常与模拟 CSV 内容或文件删除无关。
+- RED 回归以本机管理员 HTTP 路径携带 `execution_host=server` 稳定得到同一 400；修复后返回 200 并进入模拟采集。另一个保护测试确认未登记的 `unexpected_config_typo` 仍返回 400，证明实现没有采用“忽略所有未知字段”的宽松处理。
+- 新增严格的 `acquisition_config_from_payload` 边界，只剥离显式列出的执行端、模拟选择和源传输元数据；接口检查、工艺参数、直接启动和服务器采集日志回放统一使用该边界。`execution_host` 没有加入 `AcquisitionConfig`，`mysql_target_config_id` 仍作为服务器配置身份保留。
+- 排除既有四个源码仪表盘生成物夹具后，全部 462 项可运行源码测试在 62.518 秒内通过；21 项模块运行时测试通过。Python 编译、JavaScript 语法、Git 空白检查和 OpenSpec strict 均通过。一次较早的 221 项组合运行出现 Windows 测试 HTTP 套接字 `WinError 10053`，对应用例独立重跑通过，随后完整 462 项运行无失败。
+- 源码与交付 `acquisition.py`、`app.py`、`server_capture_journal.py` 的 SHA-256 逐文件一致；`SHA256SUMS.txt` 共 6279 项并由主程序 `--verify-files` 以退出码 0 验证。主程序 EXE 保持 `AA7BC2F636E862E9F603F7B4D4D9D8FC9B71390FFB20F33A011A42EF9D56FD65`，helper EXE 保持 `F59D63966F36B2980D2F80F941B4D3EBA2BFB8D4A46DF9DF3C880FD883336EBA`，本次无需重新下载 helper。
+- 清理三个同路径旧实例后，以单一 PID 38364 重启交付服务，8770/8771 均加载新外置代码。携带 `execution_host=server` 的本机服务器模拟实跑 3 秒得到 31 点，随后停止为 `running=false`；实际 LAN `http://192.168.101.31:8770/api/health` 与公网首页均返回 HTTP 200。
+- 任务 21.4 保持未完成：真实第二台电脑仍需分别复核 helper 默认模拟与明确服务器备用模拟；本机结果不替代异机 helper、两类 MySQL 或五类真实设备现场验收。
+
+## 2026-09-30 公网预计算合成演示与即时启停
+
+- 公网访客和已授权用户的模拟入口现统一路由到 `browser_precomputed_demo`；局域网/客户端实验室实际模拟仍走 helper，`local_admin` 服务器模拟和公网真实采集仍走原链路。公网演示页面只显示版本化 synthetic/precomputed 数据包和“开始演示/停止演示”，隐藏 helper、文件上传、硬件检查、CSV、两类 MySQL、运行时模型与 LangChain 控件。
+- 确定性生成器产出快速包 240 点/24 秒/83,643 字节，SHA-256 `d164f0752b9cac2f472cae1c0bdd1e57d382c155270eaf90bfd1249bbfa762c3`；耐久包 6000 点/600 秒/2,006,954 字节，SHA-256 `cdf7aaf3e0c4bb5a0ff76753e9876c99691dd28da097bcf0025439605b72e5a6`。两包均为 10 Hz、17 通道并分别保留 SMRF 热电偶、PLC、UVC、ABB、M3232 五类逻辑接口元数据；测试确认不含凭据、绝对路径或生产实采声明。
+- 浏览器本地控制器使用单调时间计算逻辑索引，250 ms 合并绘图，停止先失效播放代次再清理计时器，后台标签页暂停且不追赶。虚拟时钟测试确认准备阶段 1200 ms 延迟不会传入播放阶段，首帧同步生成且小于 200 ms，停止小于 100 ms，停止后 5 秒冻结，600 秒末索引为 5999、逻辑误差小于 0.5 秒，timer/RAF 有界且运行期网络计数为 0。
+- 在线公网浏览器实际打开 `?acceptance=20260930v4` 后，数据包显示已就绪；开始后页面直接出现 17 通道曲线、预测/预警和分层结果。快速包停止于 224 点后等待 5 秒仍为 224 点；6000 点耐久包实际下载校验为已就绪，启停后停止于 32 点并等待 5 秒仍为 32 点。两次均为开始按钮恢复、停止按钮禁用，页面明确显示“未启动采集、保存、MySQL、运行时模型或 LangChain”，浏览器控制台无 warning/error。
+- 静态交付测试确认带哈希 JSON 使用 ETag、gzip 与一年 immutable 缓存；公网快速包 GET 返回 HTTP 200、gzip 30,717 字节，解压后 83,643 字节且 SHA-256 匹配。回环、实际 LAN `http://192.168.101.31:8770/` 和公网域名读取同一快速包均为 HTTP 200、字节数与哈希一致；三条 `/api/health` 同样为 HTTP 200。
+- 公网演示/前端/安全定向回归 174 项全部通过；五类接口、Agent/LangChain、helper 传输和目标 MySQL 定向回归 130 项全部通过；模块运行时 9 项全部通过。JavaScript 语法、Git 空白检查和 OpenSpec strict 均通过。全量源码发现运行 478 项，唯一错误仍为 `test_app.DashboardTests.setUpClass` 找不到源码目录中的 4 个既有仪表盘预生成文件；该夹具缺失早于本改动，交付目录的生产仪表盘数据和本轮相关测试不受影响。
+- 源静态目录与 `app/ui`、`app/legacy/static` 两份交付副本共比较 22 个文件，0 不一致；构建脚本已固定以后同时同步两份静态资产。`SHA256SUMS.txt` 更新为 6293 项并由主程序 `--verify-files` 以退出码 0 验证。主程序 EXE 保持 `AA7BC2F636E862E9F603F7B4D4D9D8FC9B71390FFB20F33A011A42EF9D56FD65`，helper EXE 保持 `F59D63966F36B2980D2F80F941B4D3EBA2BFB8D4A46DF9DF3C880FD883336EBA`，本次无需重新下载 helper；五类驱动、预测模型和 MySQL 表结构未修改。
+- 任务 22.8 保持未完成：本机回环与实际 LAN 已完成健康/静态资产烟测，公网已完成实际浏览器启停烟测；真实第二台电脑仍需由用户验收公网即时开始/停止和长时播放。公网真实采集、两类 MySQL 与五类物理设备继续作为独立现场验收，不以预计算演示结果替代。
+
+## 2026-10-01 公网模拟稳定渲染与真实设置隔离
+
+- RED 测试先复现四个旧行为：预计算载荷没有固定坐标范围和接口成功状态；公网演示每 250 ms 进入完整 `render()`；接口/诊断区被整体隐藏；模拟态再次发现接口会把模拟目录写入真实接口快照。修复后对应 14 项公网演示前端测试全部通过。
+- 演示包现按完整通道序列缓存固定显示范围；首次建立 17 张卡片后只更新现有数值节点和 Canvas，窗口概率及层汇总只在窗口边界变化时刷新。五类逻辑接口、17 个通道和预计算诊断显示成功，同时明确“未连接物理设备、未调用运行时模型或 LangChain”。
+- 真实采集状态与模拟成功状态分离：进入公网模拟前保存真实检查结果，切回时恢复；模拟接口发现不再调用真实快照写入。该轮未修改采集 Python 后端、helper、MySQL、五类真实驱动、预测模型或 LangChain 后端。
+- 公网模拟、数据包、静态交付、模拟包、真实/模拟界面与公网安全共 177 项回归在 Python 3.11 环境全部通过；`node --check`、OpenSpec strict 和交付 `--verify-files` 均退出码 0。
+- 最终审计进一步消除了停止按钮的一次性完整重绘：停止帧也复用稳定增量渲染路径，并增加回归断言。实际公网域名加载缓存键 `20261001-stable-public-demo-v2`，浏览器实跑显示接口 5/5、通道 17/17、预计算诊断成功和 17 张通道卡片；首卡播放与停止后位置及尺寸均为 x=293、y=217、332.5×141，未发生布局位移。停止于 29/240 点后等待 5 秒仍为 29/240，状态与波形冻结，控制台 warning/error 为 0。
+- 源文件 SHA-256：`app.js=6520E5F56EEF67FFEF7E22259D289D85812F7CE77EFF7E568E4D63B7CA6009FC`，`public_demo.js=5C5F4AF522A717D0BC2C899238B39F80F8D386C80116315E464BF509EAD8E721`，`styles.css=CC7164B9F9EE3360126315B85E84C34A9999ECB22002CB46C5953589097A7BBF`，`index.html=CDE0A46CAB80675176868DF810957AD5C862014EAA26B83F4664D1EEC07A9234`；两份交付静态副本与源码一致，清单仍为 6293 项。
+- 主程序 EXE 保持 `AA7BC2F636E862E9F603F7B4D4D9D8FC9B71390FFB20F33A011A42EF9D56FD65`，helper EXE 保持 `F59D63966F36B2980D2F80F941B4D3EBA2BFB8D4A46DF9DF3C880FD883336EBA`，本次无需重新下载 helper。任务 23.7 保持未完成：真实第二台电脑仍需复核公网视觉稳定性和已授权真实/模拟往返，演示成功状态不得代替真实硬件验收。

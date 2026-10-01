@@ -11,7 +11,7 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from acquisition import AcquisitionConfig
+from acquisition import AcquisitionConfig, acquisition_config_from_payload
 from mysql_storage import MySQLCaptureStore, MySQLSettings
 from remote_mysql_setup import classify_mysql_error
 
@@ -364,7 +364,7 @@ class TargetMySQLSaveCoordinator:
                     "mysql_local_enabled": False,
                 }
             )
-            config = AcquisitionConfig(**config_values)
+            config = acquisition_config_from_payload(config_values)
             summary = {
                 "capture_uuid": record.capture_uuid,
                 "sample_count": record.row_count,

@@ -704,6 +704,10 @@ class AcquisitionConfig:
     mysql_user: str = "root"
     mysql_password: str = ""
     mysql_database: str = "afp_state_warning"
+    # Opaque, non-secret identifier for a server-side target profile.  The
+    # server uses it to resolve an already preflighted target without sending
+    # credentials to the browser or local helper.
+    mysql_target_config_id: str = ""
     mysql_local_enabled: bool = False
     mysql_local_host: str = "127.0.0.1"
     mysql_local_port: int = 3306
@@ -730,6 +734,7 @@ class AcquisitionConfig:
         self.simulation_mysql_user = str(self.simulation_mysql_user or "root").strip()
         self.simulation_mysql_password = str(self.simulation_mysql_password or "")
         self.simulation_mysql_database = validate_database_name(self.simulation_mysql_database or "afp_state_warning")
+        self.mysql_target_config_id = str(self.mysql_target_config_id or "").strip()
         if self.processing_mode not in {"capture_only", "prediction_warning"}:
             raise ValueError(
                 "processing_mode必须是capture_only或prediction_warning"
@@ -1004,6 +1009,29 @@ class AcquisitionConfig:
     @property
     def process_columns(self) -> list[str]:
         return list(PROCESS_PARAMETER_COLUMNS)
+
+
+ACQUISITION_TRANSPORT_METADATA_FIELDS = frozenset(
+    {
+        "execution_host",
+        "simulation_execution_choice",
+        "simulation_source_id",
+        "simulation_source_ready",
+        "simulation_source_transfer",
+    }
+)
+
+
+def acquisition_config_from_payload(payload: dict[str, Any] | None) -> AcquisitionConfig:
+    """Build a strict acquisition config after removing known route metadata.
+
+    Unknown acquisition fields deliberately remain in ``values`` so the
+    dataclass raises instead of silently accepting a misspelled configuration.
+    """
+    values = dict(payload or {})
+    for field_name in ACQUISITION_TRANSPORT_METADATA_FIELDS:
+        values.pop(field_name, None)
+    return AcquisitionConfig(**values)
 
 
 def _safe_component(value: Any, max_length: int = 40) -> str:

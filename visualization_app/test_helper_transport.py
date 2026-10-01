@@ -28,7 +28,10 @@ class HelperTransportTests(unittest.TestCase):
     def test_helper_handshake_declares_protocol_and_isolated_check_lifecycle(self):
         capabilities = helper_entry.helper_capabilities()
         self.assertGreaterEqual(capabilities["protocol_version"], 2)
-        self.assertTrue(capabilities["build_id"])
+        self.assertEqual(
+            capabilities["build_id"],
+            "20260930-helper-public-bdp-stop-v2",
+        )
         self.assertEqual(capabilities["command_lifecycle"], "isolated_hardware_check")
         self.assertTrue(capabilities["simulation_replay_v1"])
 
@@ -312,14 +315,31 @@ class HelperTransportTests(unittest.TestCase):
             helper_entry.adaptive_sample_batch_limit(
                 agent, route_type="public", rtt_ms=50.0
             ),
-            2,
+            3,
         )
         self.assertEqual(
             helper_entry.adaptive_sample_batch_limit(
                 agent, route_type="public", rtt_ms=400.0
             ),
-            5,
+            6,
         )
+
+    def test_public_batch_limit_sustains_ten_hz_over_1_2_second_ack(self):
+        agent = Mock()
+        agent.stream_metrics.return_value = {
+            "sample_rate_hz": 10.0,
+            "queued_rows": 450,
+        }
+
+        limit = helper_entry.adaptive_sample_batch_limit(
+            agent,
+            route_type="public",
+            rtt_ms=1161.0,
+        )
+
+        self.assertGreaterEqual(limit, 14)
+        self.assertLessEqual(limit, 50)
+        self.assertGreater(limit / 1.161, 10.0)
 
     def test_sample_pump_tracks_ack_rtt_and_waits_on_stream_event(self):
         batch = {

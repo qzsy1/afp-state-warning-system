@@ -371,6 +371,7 @@ output { color: var(--blue); font-weight: 800; }
 .range-number-row { display: grid; grid-template-columns: 18px 1fr 25px; align-items: center; gap: 5px; color: var(--muted); font-size: 9px; text-align: center; }
 .range-number-row input { text-align: center; }
 .checkbox-row, .toggle { display: flex !important; grid-template-columns: none !important; align-items: center; gap: 6px !important; color: #425c72 !important; line-height: 1.35; }
+.checkbox-row.hidden, .toggle.hidden { display: none !important; }
 .panel-toggle { flex: 0 0 auto; white-space: nowrap; }
 .checkbox-row input, .toggle input { width: 14px; height: 14px; accent-color: var(--blue); }
 .control-note { margin: 0; padding: 7px 8px; color: #667e92; background: var(--surface-soft); border-left: 2px solid #78acd1; border-radius: 3px; font-size: 9px; line-height: 1.55; }
@@ -408,6 +409,10 @@ output { color: var(--blue); font-weight: 800; }
 .auto-indicator-row { padding: 2px 0; font-weight: 800 !important; }
 .recommendation-card.not-recommended, .model-file-status.error, .acquisition-status.error { color: #a23c45; background: #fff0f1; border-color: #f2c6ca; }
 .model-file-status.ok, .acquisition-status.ok { color: #19704f; background: #eefaf5; border-color: #c2e9d8; }
+body.public-precomputed-demo .acquisition-status {
+  min-block-size: 4.6em;
+  font-variant-numeric: tabular-nums;
+}
 .sensor-selector-title { margin-top: 2px; color: var(--navy); font-size: 10px; font-weight: 800; }
 .sensor-checklist {
   width: 100%;
@@ -700,6 +705,13 @@ canvas { display: block; width: 100%; }
 .sensor-live-values { display: flex; gap: 9px; margin: 3px 0 4px; color: #6c8293; font-size: 8px; }
 .sensor-live-values strong { color: var(--ink); }
 .full-channel-chart, .sensor-card canvas { width: 100%; height: 86px; }
+body.public-precomputed-demo .full-sensor-card {
+  min-block-size: 118px;
+  contain: paint;
+}
+body.public-precomputed-demo .full-channel-chart {
+  display: block;
+}
 
 .evidence-dock .panel { min-height: 206px; border-top-left-radius: 0; border-top-right-radius: 0; }
 .evidence-dock .collapsible-panel { min-height: 0; }

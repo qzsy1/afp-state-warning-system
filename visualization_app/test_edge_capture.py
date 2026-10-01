@@ -160,6 +160,31 @@ class RemoteAcquisitionMirrorTests(unittest.TestCase):
         self.assertEqual(mirror.status()["capture_uuid"], "capture-b")
         self.assertEqual(mirror.numeric_matrix()[0], [{"温度": 410.0, "压力": 411.0}])
 
+    def test_late_running_batch_cannot_overwrite_observed_local_stop(self):
+        mirror = RemoteAcquisitionMirror()
+        mirror.ingest(batch("capture-a", 0, [350.0]))
+
+        mirror.observe_helper_status(
+            {
+                "capture_uuid": "capture-a",
+                "running": False,
+                "flush_state": "flushing",
+                "local_stopped_at": 1010.0,
+                "generated_rows": 2,
+                "queued_rows": 1,
+            }
+        )
+        late = batch("capture-a", 1, [351.0])
+        late["status"]["running"] = True
+        late["transport"] = {"helper_queue_depth": 0}
+        mirror.ingest(late)
+
+        status = mirror.status()
+        self.assertFalse(status["running"])
+        self.assertEqual(status["capture_phase"], "local_stopped_flushing")
+        self.assertEqual(status["local_stopped_at"], 1010.0)
+        self.assertEqual(status["generated_rows"], 2)
+
     def test_registry_keeps_sessions_isolated(self):
         registry = RemoteAcquisitionRegistry()
         registry.ingest("session-a", batch("capture-a", 0, [350.0]))

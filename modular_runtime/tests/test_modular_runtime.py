@@ -39,6 +39,19 @@ class ContractTests(unittest.TestCase):
             frame.validate()
 
 
+class BuildScriptContractTests(unittest.TestCase):
+    def test_integrity_manifest_excludes_nested_app_runtime_state(self) -> None:
+        script = (RUNTIME_ROOT / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn('$nestedRuntime = $segments.Count -ge 2 -and $segments[0] -eq "app" -and $segments[1] -eq "runtime"', script)
+        self.assertIn("-not $nestedRuntime", script)
+
+    def test_build_keeps_primary_and_legacy_static_assets_in_sync(self) -> None:
+        script = (RUNTIME_ROOT / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn('$legacyStaticTarget = Join-Path $legacyTarget "static"', script)
+        self.assertIn('Copy-Item -LiteralPath $_.FullName -Destination $legacyStaticTarget -Recurse -Force', script)
+        self.assertIn('Copy-Item -LiteralPath $_.FullName -Destination $uiTarget -Recurse -Force', script)
+
+
 class UpdateTests(unittest.TestCase):
     def test_patch_install_and_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

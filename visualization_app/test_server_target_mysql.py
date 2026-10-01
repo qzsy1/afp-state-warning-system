@@ -2,15 +2,42 @@ from __future__ import annotations
 
 import sys
 import unittest
+from dataclasses import asdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from server_target_mysql import ServerTargetProfiles  # noqa: E402
 from app import helper_real_capture_payload  # noqa: E402
+from acquisition import AcquisitionConfig  # noqa: E402
+from local_capture_helper_entry import _config_from_payload  # noqa: E402
 
 
 class ServerTargetProfilesTests(unittest.TestCase):
+    def test_acquisition_config_accepts_server_target_profile_identifier(self):
+        config = AcquisitionConfig(
+            mysql_enabled=True,
+            mysql_target_config_id="opaque-id",
+            mysql_local_enabled=True,
+            mysql_local_host="127.0.0.1",
+        )
+
+        self.assertEqual(config.mysql_target_config_id, "opaque-id")
+        self.assertEqual(asdict(config)["mysql_target_config_id"], "opaque-id")
+        self.assertTrue(config.mysql_local_enabled)
+        self.assertEqual(config.mysql_local_host, "127.0.0.1")
+
+    def test_helper_config_explicitly_drops_server_target_profile_identifier(self):
+        config = _config_from_payload({
+            "mysql_target_config_id": "opaque-id",
+            "mysql_local_enabled": True,
+            "mysql_local_host": "127.0.0.1",
+        })
+
+        self.assertEqual(config.mysql_target_config_id, "")
+        self.assertTrue(config.mysql_local_enabled)
+        self.assertEqual(config.mysql_local_host, "127.0.0.1")
+
     def test_helper_real_capture_payload_keeps_local_mysql_and_removes_target_secret(self):
         payload = {
             "mysql_enabled": True, "mysql_host": "db.example", "mysql_port": 3306,

@@ -69,6 +69,8 @@ class LocalCaptureAgent:
         self._status_revision = 0
         self._pending_status_revision = -1
         self._status_dirty = False
+        self._local_stopped_at: float | None = None
+        self._flush_state = "idle"
         self._source_transfer_status: dict[str, Any] = {"state": "not_required"}
 
     @staticmethod
@@ -322,6 +324,8 @@ class LocalCaptureAgent:
             self._status_revision += 1
             self._pending_status_revision = -1
             self._status_dirty = True
+            self._local_stopped_at = None
+            self._flush_state = "running"
             capture_uuid = self._capture_uuid
         response = dict(result) if isinstance(result, dict) else {"result": result}
         response["capture_uuid"] = capture_uuid
@@ -374,6 +378,9 @@ class LocalCaptureAgent:
                 "transport": {
                     "helper_batch_created_at": time.time(),
                     "helper_queue_depth": max(0, total_count - end_cursor),
+                    "helper_generated_rows": total_count,
+                    "local_stopped_at": self._local_stopped_at,
+                    "flush_state": self._flush_state,
                 },
             }
             self._pending_batch = pending
@@ -401,7 +408,24 @@ class LocalCaptureAgent:
             )
             self._stream_sequence += 1
             self._pending_batch = None
-            if self._pending_status_revision == self._status_revision:
+            pending_status_revision = self._pending_status_revision
+            if self._local_stopped_at is not None and self._flush_state == "flushing":
+                counts = None
+                counter = getattr(self.manager, "stream_counts", None)
+                if callable(counter):
+                    candidate = counter()
+                    if isinstance(candidate, dict):
+                        counts = candidate
+                if counts is None:
+                    all_rows, _timestamps = self.manager.numeric_matrix()
+                    total_count = len(all_rows)
+                else:
+                    total_count = int(counts.get("total_count", 0))
+                if total_count <= self._stream_cursor:
+                    self._flush_state = "completed"
+                    self._status_revision += 1
+                    self._status_dirty = True
+            if pending_status_revision == self._status_revision:
                 self._status_dirty = False
             self._pending_status_revision = -1
             return True
@@ -410,6 +434,7 @@ class LocalCaptureAgent:
         """Return safe transport counters without exposing samples or credentials."""
 
         with self._stream_lock:
+            current_status = status if isinstance(status, dict) else self.manager.status()
             counts = None
             counter = getattr(self.manager, "stream_counts", None)
             if callable(counter):
@@ -417,19 +442,25 @@ class LocalCaptureAgent:
                 if isinstance(candidate, dict):
                     counts = candidate
             if counts is None:
-                rows, _timestamps = self.manager.numeric_matrix()
-                total_count = len(rows)
+                matrix = self.manager.numeric_matrix()
+                if isinstance(matrix, tuple) and len(matrix) == 2:
+                    rows, _timestamps = matrix
+                    total_count = len(rows)
+                else:
+                    total_count = int((current_status or {}).get("sample_count") or 0)
             else:
                 total_count = int(counts.get("total_count", 0))
-            current_status = status if isinstance(status, dict) else self.manager.status()
             config = current_status.get("config") if isinstance(current_status, dict) else {}
             try:
                 sample_rate = float((config or {}).get("sample_rate") or 10.0)
             except (TypeError, ValueError):
                 sample_rate = 10.0
+            queued_rows = max(0, total_count - self._stream_cursor)
             return {
                 "capture_uuid": self._capture_uuid,
-                "queued_rows": max(0, total_count - self._stream_cursor),
+                "generated_rows": total_count,
+                "queued_rows": queued_rows,
+                "queue_age_seconds": queued_rows / max(0.1, sample_rate),
                 "pending_sequence": (
                     int(self._pending_batch["sequence"])
                     if isinstance(self._pending_batch, dict)
@@ -437,6 +468,8 @@ class LocalCaptureAgent:
                 ),
                 "next_sequence": self._stream_sequence,
                 "sample_rate_hz": max(0.1, sample_rate),
+                "local_stopped_at": self._local_stopped_at,
+                "flush_state": self._flush_state,
             }
 
     def check_capture(self, config: Any) -> dict[str, Any]:
@@ -447,14 +480,47 @@ class LocalCaptureAgent:
 
     def stop_capture(self) -> dict[str, Any]:
         result = self.manager.stop()
+        stopped_at = time.time()
+        response = dict(result) if isinstance(result, dict) else {"result": result}
         with self._stream_lock:
+            self._local_stopped_at = stopped_at
+            self._flush_state = "flushing"
             self._status_revision += 1
             self._status_dirty = True
             capture_uuid = self._capture_uuid
-        response = dict(result) if isinstance(result, dict) else {"result": result}
+            if isinstance(self._pending_batch, dict):
+                pending_status = dict(self._pending_batch.get("status") or {})
+                pending_status.update(response)
+                pending_status.update(
+                    {
+                        "running": False,
+                        "capture_uuid": capture_uuid,
+                        "local_stopped_at": stopped_at,
+                        "flush_state": "flushing",
+                        "capture_phase": "local_stopped_flushing",
+                        "finalization_complete": False,
+                    }
+                )
+                self._pending_batch["status"] = json_safe_value(pending_status)
+                transport = self._pending_batch.setdefault("transport", {})
+                if isinstance(transport, dict):
+                    transport["local_stopped_at"] = stopped_at
+                    transport["flush_state"] = "flushing"
         response["capture_uuid"] = capture_uuid
         response["execution_host"] = "helper_local"
         response["source_transfer"] = dict(self._source_transfer_status)
+        metrics = self.stream_metrics(status=response)
+        response.update(
+            {
+                "running": False,
+                "local_stopped_at": stopped_at,
+                "flush_state": "flushing",
+                "capture_phase": "local_stopped_flushing",
+                "generated_rows": metrics["generated_rows"],
+                "queued_rows": metrics["queued_rows"],
+                "transport": metrics,
+            }
+        )
         return response
 
     def status(self) -> dict[str, Any]:
@@ -462,6 +528,19 @@ class LocalCaptureAgent:
         value["execution_host"] = "helper_local"
         value["source_transfer"] = dict(self._source_transfer_status)
         value["transport"] = self.stream_metrics(status=value)
+        if self._local_stopped_at is not None:
+            value["running"] = False
+            value["local_stopped_at"] = self._local_stopped_at
+            value["flush_state"] = self._flush_state
+            value["capture_phase"] = (
+                "local_stopped_flushing"
+                if self._flush_state == "flushing"
+                else "completed"
+            )
+            value["generated_rows"] = value["transport"]["generated_rows"]
+            value["queued_rows"] = value["transport"]["queued_rows"]
+            if self._flush_state == "flushing":
+                value["finalization_complete"] = False
         started_at = value.get("started_at")
         sample_count = int(value.get("sample_count") or 0)
         try:

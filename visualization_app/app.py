@@ -43,6 +43,7 @@ from acquisition import (
     ACQUISITION_SCHEMAS,
     AcquisitionConfig,
     AcquisitionManager,
+    acquisition_config_from_payload,
     NEW_COLLECTION_SENSOR_COLUMNS,
     SENSOR_COLUMNS,
     check_capture_save_root,
@@ -130,6 +131,44 @@ def encode_json_response(payload: dict, accept_encoding: str = "") -> tuple[byte
     if len(compressed) >= len(raw):
         return raw, False
     return compressed, True
+
+
+def encode_static_file_response(
+    path: Path,
+    accept_encoding: str = "",
+    static_root: Path | None = None,
+) -> tuple[bytes, dict[str, str]]:
+    """Return static bytes and delivery headers without changing ordinary assets.
+
+    Only the generated public-demo directory gets explicit cache semantics.
+    Content-addressed bundles are immutable and gzip-compressed when useful;
+    the stable manifest is short-lived so a deployment can point browsers at a
+    new hash without stale data.
+    """
+
+    resolved_path = Path(path).resolve()
+    resolved_root = Path(static_root or STATIC_DIR).resolve()
+    raw = resolved_path.read_bytes()
+    headers: dict[str, str] = {}
+    try:
+        relative = resolved_path.relative_to(resolved_root)
+    except ValueError:
+        return raw, headers
+    if not relative.parts or relative.parts[0] != "demo":
+        return raw, headers
+    headers["ETag"] = f'"{hashlib.sha256(raw).hexdigest()}"'
+    if relative.name == "manifest-v1.json":
+        headers["Cache-Control"] = "public, max-age=60, must-revalidate"
+        return raw, headers
+    if re.fullmatch(r"[A-Za-z0-9_-]+\.[0-9a-f]{16}\.json", relative.name):
+        headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        if len(raw) >= 1024 and "gzip" in str(accept_encoding or "").lower():
+            compressed = gzip.compress(raw, compresslevel=6, mtime=0)
+            if len(compressed) < len(raw):
+                headers["Content-Encoding"] = "gzip"
+                headers["Vary"] = "Accept-Encoding"
+                return compressed, headers
+    return raw, headers
 
 
 def local_mysql_profile() -> dict:
@@ -4377,6 +4416,9 @@ class AppHandler(BaseHTTPRequestHandler):
         session_id = self.dashboard.helper_registry.authenticate(device_id, token)
         if session_id is not None:
             self.target_capture_journal.bind_start_result(session_id, request_id, payload)
+            self.dashboard.remote_acquisitions.for_session(
+                session_id
+            ).observe_helper_status(payload)
         return self.dashboard.helper_registry.accept_result(
             device_id, token, request_id, payload
         )
@@ -4526,11 +4568,15 @@ class AppHandler(BaseHTTPRequestHandler):
         if not path.exists() or not path.is_file():
             self.send_error(HTTPStatus.NOT_FOUND)
             return
-        raw = path.read_bytes()
+        raw, delivery_headers = encode_static_file_response(
+            path, self.headers.get("Accept-Encoding", ""), STATIC_DIR
+        )
         mime, _ = mimetypes.guess_type(path.name)
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", f"{mime or 'application/octet-stream'}; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
+        for name, value in delivery_headers.items():
+            self.send_header(name, value)
         self._send_security_headers()
         self.end_headers()
         self.wfile.write(raw)
@@ -4631,7 +4677,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 )
             except (TypeError, ValueError):
                 latest_sample_at = 0.0
-            acquisition_payload["remote_browser_publish_latency_ms"] = (
+            acquisition_payload["remote_sample_end_to_end_age_ms"] = (
                 max(0.0, (published_at - latest_sample_at) * 1000.0)
                 if latest_sample_at > 0
                 else None
@@ -5786,7 +5832,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     payload["simulation_mysql_query"] = validate_read_only_mysql_query(
                         str(payload.get("simulation_mysql_query", ""))
                     )
-                config = AcquisitionConfig(**payload)
+                config = acquisition_config_from_payload(payload)
                 model_validation = self.dashboard.validate_prediction_setup(
                     config, load_model=False
                 )
@@ -5813,7 +5859,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 payload = resolve_default_simulation_source(
                     payload, str(demo.get("source_file") or "")
                 )
-                config = AcquisitionConfig(**payload)
+                config = acquisition_config_from_payload(payload)
                 self._send_json(
                     self.dashboard.acquisition.read_process_parameters(config)
                 )
@@ -6192,7 +6238,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     payload["simulation_mysql_query"] = validate_read_only_mysql_query(
                         str(payload.get("simulation_mysql_query", ""))
                     )
-                config = AcquisitionConfig(**payload)
+                config = acquisition_config_from_payload(payload)
                 model_validation = self.dashboard.validate_prediction_setup(
                     config, load_model=True
                 )

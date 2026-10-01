@@ -26,7 +26,7 @@ from local_capture_agent import HelperTransport, LocalCaptureAgent
 
 
 HELPER_PROTOCOL_VERSION = 2
-HELPER_BUILD_ID = "20260930-helper-prefetch-low-latency-v1"
+HELPER_BUILD_ID = "20260930-helper-public-bdp-stop-v2"
 HARDWARE_CHECK_TIMEOUT_SECONDS = 60.0
 
 
@@ -45,8 +45,10 @@ def adaptive_sample_batch_limit(
     try:
         metrics = agent.stream_metrics()
         sample_rate = float(metrics.get("sample_rate_hz") or 10.0)
+        queued_rows = max(0, int(metrics.get("queued_rows") or 0))
     except (AttributeError, TypeError, ValueError):
         sample_rate = 10.0
+        queued_rows = 0
     route = str(route_type or "unknown").lower()
     if route == "lan":
         target_seconds = 0.15
@@ -55,13 +57,23 @@ def adaptive_sample_batch_limit(
             measured = max(0.0, float(rtt_ms or 0.0)) / 1000.0
         except (TypeError, ValueError):
             measured = 0.0
-        target_seconds = min(0.5, max(0.2, measured + 0.1))
+        # A single in-flight batch must contain at least the rows produced
+        # during one ACK round trip.  The previous five-row ceiling could only
+        # move about 4.3 rows/s at 1161 ms RTT, so a 10 Hz source accumulated
+        # delay forever even though local sampling stayed healthy.
+        target_seconds = max(0.2, measured + 0.2)
     else:
         # Preserve the proven legacy bound for callers without route metadata.
         target_seconds = 0.5
     lower = 2 if route in {"lan", "public"} else 1
-    upper = 5 if route == "public" else 200
-    return max(lower, min(upper, int(math.ceil(sample_rate * target_seconds))))
+    upper = 50 if route == "public" else 200
+    limit = int(math.ceil((sample_rate * target_seconds) - 1e-9))
+    if route == "public" and sample_rate > 0:
+        queue_age_seconds = queued_rows / sample_rate
+        if queue_age_seconds > 2.0:
+            recovery_rows = int(math.ceil((queued_rows - (2.0 * sample_rate)) * 0.25))
+            limit = max(limit, limit + max(1, recovery_rows))
+    return max(lower, min(upper, limit))
 
 
 class HelperSamplePump:
@@ -439,7 +451,14 @@ def release_single_instance_lock(handle: int | None) -> None:
 
 
 def _config_from_payload(payload: dict[str, Any]) -> AcquisitionConfig:
-    allowed = {field.name for field in fields(AcquisitionConfig)}
+    # A target profile ID belongs to the server-side credential resolver.  It
+    # is non-secret, but it has no meaning on the visiting computer and must
+    # never become part of helper-local configuration after future rebuilds.
+    server_only = {"mysql_target_config_id"}
+    allowed = {
+        field.name for field in fields(AcquisitionConfig)
+        if field.name not in server_only
+    }
     return AcquisitionConfig(**{key: value for key, value in payload.items() if key in allowed})
 
 

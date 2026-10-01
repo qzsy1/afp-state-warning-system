@@ -5,10 +5,14 @@
 ## ADDED Requirements
 
 ### Requirement: 模拟采集保存与 MySQL 预检必须一致
-授权远程模拟采集启用 MySQL 时，停止后的保存结果 MUST 对应此前通过预检的目标作用域；系统 MUST NOT 静默关闭已启用的 MySQL。访问电脑本机 MySQL 仅可由该电脑的 helper 写入；已授权远程模拟由兼容 helper 本地回放时 SHALL 支持该写入。若会话在启动前回退到服务器模拟，则本机 MySQL 组合 MUST 被明确拒绝，不能预检通过后报告已保存。访客模拟不得获得 MySQL 写入权限。
+局域网/客户端实验室实际模拟采集启用 MySQL 时，停止后的保存结果 MUST 对应此前通过预检的目标作用域；系统 MUST NOT 静默关闭已启用的 MySQL。访问电脑本机 MySQL 仅可由该电脑的 helper 写入；实际模拟由兼容 helper 本地回放时 SHALL 支持该写入。若会话在启动前回退到服务器模拟，则本机 MySQL 组合 MUST 被明确拒绝，不能预检通过后报告已保存。公网预计算演示不是采集或保存会话，MUST 禁用两类 MySQL 并不得获得写入权限。
 
-#### Scenario: 已授权模拟写入服务器目标库
-- **WHEN** 用户启用服务器目标 MySQL 并通过预检后开始远程模拟采集
+#### Scenario: 公网预计算演示不写数据库
+- **WHEN** 访客或已授权用户通过公网进入并开始预计算演示
+- **THEN** 页面 MUST 禁用或隐藏 helper-local 与 server-target MySQL 预检、初始化和保存控件；服务器与 helper MUST 不建立数据库连接、不创建待补传记录，也不得显示“已保存”或伪造行数
+
+#### Scenario: 局域网或客户端实验室模拟写入服务器目标库
+- **WHEN** 用户启用服务器目标 MySQL 并通过预检后开始局域网或客户端实验室实际模拟采集
 - **THEN** 停止结果 MUST 显示该库的实际写入或待补传状态，CSV 保存 MUST 不受数据库故障影响
 
 #### Scenario: 目标库密码框留空但服务器已有匹配配置
@@ -24,7 +28,7 @@
 - **THEN** 未提交输入 MUST 不被覆盖或清空；预检 MUST 检查当前表单对应的配置，不得静默检查旧配置
 
 #### Scenario: helper 本地模拟选择本机 MySQL
-- **WHEN** 已授权远程模拟会话由兼容 helper 本地回放，且用户启用已通过预检的访问电脑本机 MySQL
+- **WHEN** 局域网或客户端实验室实际模拟会话由兼容 helper 本地回放，且用户启用已通过预检的访问电脑本机 MySQL
 - **THEN** helper MUST 以与真实采集相同的本地铺层事务保存模拟样本，停止结果 MUST 分别显示本机 CSV、本机 MySQL 和服务器目标 MySQL 的实际状态
 
 #### Scenario: 服务器回退模拟选择本机 MySQL
@@ -128,6 +132,17 @@ MySQL 配置错误或暂时不可用时，系统 MUST 保持实时采集、预�
 #### Scenario: 已初始化表结构启用外键约束
 - **WHEN** 本机库或服务器目标库使用现有 `afp_layer` 到两张采样表的外键关系保存新铺层
 - **THEN** 同一事务 MUST 先建立或更新父铺层记录，再流式写入 `afp_sensor_sample` 与 `afp_sample_all`，最终更新样本数；MUST NOT 因先写子表触发 1452，也不得通过删除外键规避顺序错误
+
+### Requirement: 服务器目标配置标识必须兼容采集配置契约
+服务器为授权会话签发的 `mysql_target_config_id` SHALL 作为非敏感、服务器专用的配置标识被采集配置构造器接受，从而使接口检查、工艺参数读取、模拟采集和真实采集使用同一参数契约。该标识 MUST NOT 被解释为密码或连接凭据，MUST NOT 发送到 local helper，且不得改变 helper-local MySQL 配置。
+
+#### Scenario: 页面携带目标配置标识执行采集相关操作
+- **WHEN** 页面在目标 MySQL 预检后，携带有效 `mysql_target_config_id` 调用接口检查、工艺参数读取或开始采集
+- **THEN** 服务器 MUST 正常构造采集配置并继续对应流程，不得返回 `unexpected keyword argument 'mysql_target_config_id'`
+
+#### Scenario: 服务器配置与 helper 配置保持隔离
+- **WHEN** 服务器把真实或模拟采集配置转交给 local helper
+- **THEN** helper 载荷 MUST 删除 `mysql_target_config_id` 以及服务器目标库连接字段；helper 构造本地配置时 SHALL 显式忽略该服务器专用标识，本机 MySQL 字段保持原值
 
 ### Requirement: 隔离客户端必须从独立的本机 MySQL 身份开始
 Windows Sandbox 或等价的新 Windows 用户验收环境 SHALL 从没有可用 helper-local MySQL 配置的状态开始。验收 MySQL MUST 只绑定 `127.0.0.1`，凭据只能在隔离客户端内生成和使用，导出的环境、状态、计数和诊断证据 MUST 不包含密码或可复用密文。

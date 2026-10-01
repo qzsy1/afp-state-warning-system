@@ -105,7 +105,7 @@ const fetch = async () => { requests += 1; return {ok: true, json: async () => (
     def test_failed_server_target_mysql_has_a_session_bound_retry_control(self):
         html = (Path(__file__).with_name("static") / "index.html").read_text(encoding="utf-8")
         self.assertIn('id="retryTargetMysqlButton"', html)
-        self.assertIn('/app.js?v=20260930-helper-prefetch-v2', html)
+        self.assertIn('/app.js?v=20261001-stable-public-demo-v2', html)
         text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
         start = text.index("async function retryServerTargetMysql()")
         end = text.index("async function stopAcquisition()", start)
@@ -310,6 +310,9 @@ const restoreCachedRealInterfaceSnapshot = () => {current = savedReal.map((item)
 const loadHelperStatus = async () => {};
 const discoverInterfaces = async () => {};
 const updateRealAcquisitionVisibility = () => {};
+const isPublicPrecomputedSimulationMode = () => false;
+const setPublicDemoControlVisibility = () => {};
+const $ = () => null;
 """ + function + """
 controls.acquisitionMode.value = "simulation";
 updateSimulationSettings();
@@ -333,7 +336,7 @@ if (current[0].enabled !== false || current[0].driver !== "modbus_tcp") process.
         end = text.index("function buildSensorChecklist", start)
         function = text[start:end]
         script = """
-const state = {stopBusy: false, accessRole: "authorized"};
+const state = {stopBusy: false, accessRole: "local_admin"};
 const status = {textContent: "", classList: {add(){}, remove(){}}};
 const button = {disabled: false, textContent: "停止并保存"};
 const $ = (name) => name === "stopAcquisitionButton" ? button : status;
@@ -355,6 +358,8 @@ const saveFinishedCaptureLocally = async (mode) => {if (mode !== "simulation") t
 const loadRealtime = async () => {};
 const toast = () => {};
 const window = {setTimeout};
+const isPublicPrecomputedSimulationMode = () => false;
+const stopPublicDemo = () => {};
 """ + function + """
 (async () => {
   const first = stopAcquisition();
@@ -975,7 +980,7 @@ if (status.textContent !== "MySQL 保存未启用；原始文件已完成本地�
         self.assertIn("requestLocalHelper(\"start_capture\"", text)
         self.assertIn("requestLocalHelper(\"stop_capture\"", text)
 
-    def test_authorized_remote_simulation_requires_explicit_server_fallback(self):
+    def test_public_simulation_uses_browser_demo_while_lan_keeps_explicit_fallback(self):
         html = (Path(__file__).with_name("static") / "index.html").read_text(encoding="utf-8")
         self.assertIn('id="simulationExecutionHostSelect"', html)
         self.assertIn('<option value="helper_local" selected>', html)
@@ -985,13 +990,13 @@ if (status.textContent !== "MySQL 保存未启用；原始文件已完成本地�
         selection_end = text.index("function renderHelperStatus", selection_start)
         selection = text[selection_start:selection_end]
         script = selection + r'''
-const offline = simulationExecutionSelection("authorized", "helper_local", {online: false});
-if (offline.execution_host !== "helper_local" || !offline.error) process.exit(1);
+const publicDemo = simulationExecutionSelection("authorized", "helper_local", {online: false});
+if (publicDemo.execution_host !== "browser_precomputed_demo" || publicDemo.error) process.exit(1);
 const oldHelper = simulationExecutionSelection("lan_operator", "helper_local", {
   online: true, protocol_compatible: true, capabilities: {simulation_replay_v1: false}
 });
 if (!oldHelper.error) process.exit(2);
-const explicitServer = simulationExecutionSelection("authorized", "server", {online: false});
+const explicitServer = simulationExecutionSelection("lan_operator", "server", {online: false});
 if (explicitServer.execution_host !== "server" || explicitServer.error) process.exit(3);
 '''
         completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
@@ -1018,6 +1023,42 @@ if (explicitServer.execution_host !== "server" || explicitServer.error) process.
         self.assertIn('requestLocalHelper("stop_capture"', body)
         self.assertNotIn("helper_simulation_runtime_fallback", body)
 
+    def test_helper_stop_waits_until_history_flush_reaches_completed_state(self):
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        start = text.index("async function waitForHelperFlushComplete(")
+        end = text.index("async function waitForServerTargetSave", start)
+        function = text[start:end]
+        script = r'''
+const states = [
+  {running: false, flush_state: "flushing", queued_rows: 50},
+  {running: false, flush_state: "flushing", queued_rows: 10},
+  {running: false, flush_state: "completed", queued_rows: 0,
+   finalization_complete: true, capture_saved: true}
+];
+let reads = 0;
+const usesLocalCaptureHelper = () => true;
+const requestLocalHelper = async (command) => {
+  if (command !== "status") process.exit(1);
+  reads += 1;
+  return states[reads];
+};
+const shown = [];
+const renderAcquisitionStatus = (status) => shown.push(status.queued_rows);
+const window = {setTimeout: (fn) => {fn(); return 1;}};
+''' + function + r'''
+(async () => {
+  const result = await waitForHelperFlushComplete(states[0], {timeoutMs: 5000});
+  if (result.flush_state !== "completed" || result.queued_rows !== 0) process.exit(2);
+  if (reads !== 2 || shown.join() !== "10,0") process.exit(3);
+})().catch((error) => {console.error(error); process.exit(4);});
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+        stop_start = text.index("async function stopAcquisition()")
+        stop_end = text.index("function buildSensorChecklist", stop_start)
+        self.assertIn("await waitForHelperFlushComplete", text[stop_start:stop_end])
+
     def test_acquisition_status_displays_helper_replay_host_and_transport_metrics(self):
         text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
         start = text.index("function renderAcquisitionStatus(status)")
@@ -1026,11 +1067,47 @@ if (explicitServer.execution_host !== "server" || explicitServer.error) process.
 
         self.assertIn("helper_local", body)
         self.assertIn("source_transfer", body)
-        self.assertIn("remote_helper_queue_depth", body)
-        self.assertIn("remote_server_receive_latency_ms", body)
-        self.assertIn("remote_helper_ack_rtt_ms", body)
-        self.assertIn("browserRenderRateHz", body)
-        self.assertIn("remote_browser_publish_latency_ms", body)
+        self.assertIn("formatTransportMetrics", body)
+        self.assertIn("acquisitionDisplayPhase", body)
+
+    def test_transport_metrics_distinguish_queue_sample_age_and_browser_processing(self):
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        start = text.index("function acquisitionDisplayPhase(")
+        end = text.index("function renderAcquisitionStatus(status)", start)
+        functions = text[start:end]
+        script = r'''
+''' + functions + r'''
+const status = {
+  running: false,
+  flush_state: "flushing",
+  local_stopped_at: 1000,
+  remote_helper_queue_depth: 450,
+  local_effective_rate_hz: 10,
+  remote_helper_ack_rtt_ms: 1161,
+  remote_sample_end_to_end_age_ms: 48001
+};
+const phase = acquisitionDisplayPhase(status);
+const summary = formatTransportMetrics(status, {
+  payloadRateHz: 0.6,
+  processingMs: 4.2
+});
+if (phase.key !== "local_stopped_flushing" || !phase.label.includes("同步历史数据")) process.exit(1);
+if (!summary.includes("队列约 45.0 秒")) process.exit(2);
+if (!summary.includes("样本端到端年龄 48001 ms（含时钟偏差）")) process.exit(3);
+if (!summary.includes("页面更新 0.6 次/秒") || !summary.includes("浏览器处理 4.2 ms")) process.exit(4);
+if (summary.includes("浏览器发布") || summary.includes("绘图")) process.exit(5);
+const unavailable = formatTransportMetrics({
+  remote_helper_queue_depth: 1,
+  local_effective_rate_hz: 10,
+  remote_helper_ack_rtt_ms: null,
+  remote_server_clock_delta_ms: null,
+  remote_sample_end_to_end_age_ms: null
+}, {payloadRateHz: 0, processingMs: 0});
+if (unavailable.includes("ACK RTT") || unavailable.includes("墙钟差")
+    || unavailable.includes("样本端到端年龄")) process.exit(6);
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_helper_capture_waits_for_server_to_receive_first_sample(self):
         source = Path(__file__).with_name("static") / "app.js"
@@ -1124,7 +1201,7 @@ if (!offline.includes("离线")) process.exit(3);
         completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
-    def test_simulation_package_controls_are_available_only_to_helper_roles(self):
+    def test_simulation_package_controls_are_available_to_public_demo_and_helper_roles(self):
         static = Path(__file__).with_name("static")
         index = (static / "index.html").read_text(encoding="utf-8")
         text = (static / "app.js").read_text(encoding="utf-8")
@@ -1138,7 +1215,7 @@ if (!offline.includes("离线")) process.exit(3);
         script = function + r'''
 if (!simulationPackageControlsVisible("authorized")) process.exit(1);
 if (!simulationPackageControlsVisible("lan_operator")) process.exit(2);
-if (simulationPackageControlsVisible("guest")) process.exit(3);
+if (!simulationPackageControlsVisible("guest")) process.exit(3);
 if (simulationPackageControlsVisible("local_admin")) process.exit(4);
 '''
         completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)

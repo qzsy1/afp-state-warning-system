@@ -81,8 +81,17 @@ const state = {
   helperStatusTimer: null,
   processParameterBusy: false,
   stopBusy: false,
-  browserRenderTimes: [],
-  browserRenderRateHz: 0,
+  browserPayloadTimes: [],
+  browserPayloadRateHz: 0,
+  browserProcessingMs: 0,
+  publicDemoManifest: null,
+  publicDemoBundle: null,
+  publicDemoBundlePromise: null,
+  publicDemoPlayback: null,
+  publicDemoReady: false,
+  publicDemoUiActive: false,
+  publicDemoRealStatusSnapshot: null,
+  publicDemoRestoredRealStatus: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -141,7 +150,8 @@ async function loadAccessSession() {
   state.secureTransport = Boolean(payload.secure_transport);
   state.csrf = readCookie("afp_csrf");
   renderAccessState();
-  void loadSimulationPackages();
+  const packagePromise = loadSimulationPackages();
+  if (isPublicPrecomputedSimulationMode()) await packagePromise;
   return payload;
 }
 
@@ -159,11 +169,20 @@ function supportsHelperSimulationReplay() {
 }
 
 function simulationPackageControlsVisible(role = state.accessRole) {
-  return role === "lan_operator" || role === "authorized";
+  return role === "guest" || role === "authorized" || role === "lan_operator";
+}
+
+function isPublicPrecomputedSimulationMode(
+  role = state.accessRole,
+  mode = controls?.acquisitionMode?.value,
+) {
+  return (role === "guest" || role === "authorized") && mode === "simulation";
 }
 
 function simulationExecutionSelection(role, requestedHost = "helper_local", helperStatus = {}) {
-  if (role === "guest") return {execution_host: "browser", error: ""};
+  if (role === "guest" || role === "authorized") {
+    return {execution_host: "browser_precomputed_demo", error: ""};
+  }
   if (role === "local_admin") return {execution_host: "server", error: ""};
   if (requestedHost === "server") {
     return {execution_host: "server", error: "", explicit_fallback: true};
@@ -995,6 +1014,53 @@ async function requestLocalHelper(command, payload = {}, {timeoutMs = 30000} = {
   throw new Error("本地采集辅助程序响应超时");
 }
 
+function acquisitionDisplayPhase(status) {
+  const flushState = String(status?.flush_state || status?.transport?.flush_state || "");
+  const localStopped = status?.local_stopped_at !== null
+    && status?.local_stopped_at !== undefined;
+  if (localStopped && flushState !== "completed") {
+    return {key: "local_stopped_flushing", label: "本地已停止，正在同步历史数据"};
+  }
+  if (status?.running) return {key: "running", label: "采集中"};
+  if (flushState === "completed") return {key: "completed", label: "停止并保存完成"};
+  return {key: "stopped", label: "已停止"};
+}
+
+function optionalFiniteNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function formatTransportMetrics(status, runtimeMetrics = {}) {
+  const queueDepth = Number(
+    status?.remote_helper_queue_depth ?? status?.transport?.queued_rows ?? status?.queued_rows ?? 0
+  );
+  const sampleRate = Math.max(0.1, Number(
+    status?.local_effective_rate_hz || status?.transport?.sample_rate_hz || 10
+  ));
+  const queueAge = optionalFiniteNumber(status?.remote_helper_queue_age_seconds);
+  const queueAgeSeconds = queueAge !== null ? queueAge : queueDepth / sampleRate;
+  const helperRtt = optionalFiniteNumber(status?.remote_helper_ack_rtt_ms);
+  const serverClockDelta = optionalFiniteNumber(status?.remote_server_clock_delta_ms);
+  const sampleAge = optionalFiniteNumber(status?.remote_sample_end_to_end_age_ms);
+  const parts = [
+    `本机速率 ${sampleRate.toFixed(2)} Hz`,
+    `待传 ${queueDepth}点`,
+    `队列约 ${queueAgeSeconds.toFixed(1)} 秒`,
+  ];
+  if (helperRtt !== null) parts.push(`ACK RTT ${helperRtt.toFixed(0)} ms`);
+  if (serverClockDelta !== null) {
+    parts.push(`服务端接收墙钟差 ${serverClockDelta.toFixed(0)} ms（含时钟偏差）`);
+  }
+  if (sampleAge !== null) {
+    parts.push(`样本端到端年龄 ${sampleAge.toFixed(0)} ms（含时钟偏差）`);
+  }
+  parts.push(`页面更新 ${Number(runtimeMetrics.payloadRateHz || 0).toFixed(1)} 次/秒`);
+  parts.push(`浏览器处理 ${Number(runtimeMetrics.processingMs || 0).toFixed(1)} ms`);
+  return ` · ${parts.join(" · ")}`;
+}
+
 function renderAcquisitionStatus(status) {
   state.acquisitionStatus = status;
   if (status?.save_status) renderSaveRootStatus(status.save_status);
@@ -1082,31 +1148,15 @@ function renderAcquisitionStatus(status) {
     ? ` · 模拟源已缓存（${Number(sourceTransfer.files || 0)}文件）`
     : sourceTransfer.state && sourceTransfer.state !== "not_required"
       ? ` · 模拟源交付：${sourceTransfer.state}` : "";
-  const queueDepth = Number(
-    status.remote_helper_queue_depth ?? status.transport?.queued_rows ?? 0
-  );
-  const serverLatencyRaw = status.remote_server_receive_latency_ms;
-  const browserLatencyRaw = status.remote_browser_publish_latency_ms;
-  const helperRttRaw = status.remote_helper_ack_rtt_ms;
-  const serverLatency = Number(serverLatencyRaw);
-  const browserLatency = Number(browserLatencyRaw);
-  const helperRtt = Number(helperRttRaw);
-  const hasServerLatency = serverLatencyRaw !== null
-    && serverLatencyRaw !== undefined && Number.isFinite(serverLatency);
-  const hasBrowserLatency = browserLatencyRaw !== null
-    && browserLatencyRaw !== undefined && Number.isFinite(browserLatency);
-  const hasHelperRtt = helperRttRaw !== null
-    && helperRttRaw !== undefined && Number.isFinite(helperRtt);
+  const phase = acquisitionDisplayPhase(status);
   const transportText = executionHost === "helper_local"
-    ? ` · 本机速率 ${Number(status.local_effective_rate_hz || 0).toFixed(2)} Hz` +
-      ` · 待传 ${queueDepth}点` +
-      `${hasHelperRtt ? ` · ACK RTT ${helperRtt.toFixed(0)} ms` : ""}` +
-      `${hasServerLatency ? ` · 服务端接收 ${serverLatency.toFixed(0)} ms` : ""}` +
-      `${hasBrowserLatency ? ` · 浏览器发布 ${browserLatency.toFixed(0)} ms` : ""}` +
-      ` · 绘图 ${Number(state.browserRenderRateHz || 0).toFixed(1)} 帧/秒`
+    ? formatTransportMetrics(status, {
+      payloadRateHz: state.browserPayloadRateHz,
+      processingMs: state.browserProcessingMs,
+    })
     : "";
   node.textContent =
-    `${status.running ? "采集中" : "已停止"} · ${status.sample_count || 0}点 · ` +
+    `${phase.label} · ${status.sample_count || 0}点 · ` +
     `${captureOnly
       ? `采集通道 ${healthy.length}/${selected.length} 正常`
       : `模型输入 ${expectedInputCount}通道 · 模型输出 ${predictionCount}通道`} · ${readiness}` +
@@ -1949,6 +1999,20 @@ function buildAgentEvents(hardwareResult) {
 }
 
 function renderAgentGate() {
+  if (isPublicPrecomputedSimulationMode()) {
+    const status = $("agentGateStatus");
+    if (status) {
+      status.className = "agent-gate-status ready";
+      status.textContent = "预计算演示诊断成功";
+    }
+    const autoStatus = $("agentAutoStatus");
+    if (autoStatus) {
+      autoStatus.textContent =
+        "预计算 synthetic 演示诊断已就绪；未调用服务器模型或 LangChain。";
+    }
+    if (agentDiagnoseButton) agentDiagnoseButton.disabled = true;
+    return false;
+  }
   const explicitKey = agentApiKeyInput?.value.trim() || "";
   const explicitModel = agentModelNameInput?.value.trim() || "";
   const keyPresent = state.accessRole !== "guest" && (Boolean(explicitKey) || state.modelAccess);
@@ -1969,6 +2033,7 @@ function renderAgentGate() {
 }
 
 function appendAgentDiagnostics(node) {
+  if (isPublicPrecomputedSimulationMode()) return;
   if (!node || (!state.agentBusy && !state.agentResult)) return;
   const container = document.createElement("div");
   container.className = "hardware-agent-results";
@@ -2210,6 +2275,94 @@ async function testSensorConnection({automatic = false} = {}) {
   }
 }
 
+function publicDemoBuildOptions() {
+  return {
+    selectedChannel: controls.sensor?.value || "",
+    history: Number(controls.history?.value || 240),
+    horizon: Number(state.requestedHorizon ?? controls.horizon?.value ?? 24),
+    threshold: Number(controls.threshold?.value || 0.72),
+    rho: Number(controls.rho?.value || 0.35),
+  };
+}
+
+function applyPublicDemoPayload(payload) {
+  const previousPayload = state.payload?.mode === "public_precomputed_demo"
+    ? state.payload : null;
+  applyRealtimePayload(payload, {
+    stablePublicDemo: true,
+    previousPayload,
+  });
+}
+
+function renderPublicDemoIndex(index, bundle = state.publicDemoBundle) {
+  if (!bundle || !window.AFP_PUBLIC_DEMO) return false;
+  const payload = window.AFP_PUBLIC_DEMO.buildRealtimePayload(
+    bundle, index, publicDemoBuildOptions()
+  );
+  applyPublicDemoPayload(payload);
+  return true;
+}
+
+function ensurePublicDemoPlayback() {
+  if (!window.AFP_PUBLIC_DEMO) {
+    throw new Error("浏览器预计算演示模块未加载，请刷新页面");
+  }
+  if (!state.publicDemoPlayback) {
+    state.publicDemoPlayback = window.AFP_PUBLIC_DEMO.createPlaybackController({
+      render: (index, bundle) => renderPublicDemoIndex(index, bundle),
+      renderIntervalMs: 250,
+      onState: (snapshot) => {
+        const startButton = $("startAcquisitionButton");
+        const stopButton = $("stopAcquisitionButton");
+        if (startButton) startButton.disabled = snapshot.running || !snapshot.ready;
+        if (stopButton) stopButton.disabled = !snapshot.running;
+        if (snapshot.ready && !snapshot.running && snapshot.index >= snapshot.points - 1) {
+          $("streamStatus").textContent = "预计算模拟演示已播放完成";
+          document.querySelector(".live-dot")?.classList.remove("active");
+        }
+      },
+    });
+  }
+  return state.publicDemoPlayback;
+}
+
+function startPublicDemo() {
+  if (!state.publicDemoReady || !state.publicDemoBundle) {
+    throw new Error("预计算模拟数据仍在下载或校验，请等待“已就绪”后再开始");
+  }
+  stopLocalSimulationReplay();
+  stopLiveHttpFallback();
+  closeLiveWebSocket();
+  state.acquisitionExecutionHost = "browser_precomputed_demo";
+  controls.dataMode.value = "live";
+  configureDataMode();
+  ensurePublicDemoPlayback().start();
+  $("streamStatus").textContent = "预计算模拟演示中（浏览器本地）";
+  document.querySelector(".live-dot")?.classList.add("active");
+  return true;
+}
+
+function stopPublicDemo() {
+  const snapshot = state.publicDemoPlayback?.stop();
+  if (state.payload?.mode === "public_precomputed_demo") {
+    const payload = {
+      ...state.payload,
+      acquisition: {...state.payload.acquisition, running: false},
+    };
+    applyPublicDemoPayload(payload);
+  }
+  $("streamStatus").textContent = "预计算模拟演示已停止";
+  $("acquisitionStatus").textContent =
+    `演示已停止 · ${Math.max(0, Number(snapshot?.index ?? -1) + 1)}点 · ` +
+    "未启动采集、保存、MySQL、运行时模型或 LangChain";
+  document.querySelector(".live-dot")?.classList.remove("active");
+  const startButton = $("startAcquisitionButton");
+  const stopButton = $("stopAcquisitionButton");
+  if (startButton) startButton.disabled = !state.publicDemoReady;
+  if (stopButton) stopButton.disabled = true;
+  return true;
+}
+
 async function startAcquisition() {
   try {
     const simulation = controls.acquisitionMode?.value === "simulation";
@@ -2221,6 +2374,10 @@ async function startAcquisition() {
       )
       : null;
     if (simulationSelection?.error) throw new Error(simulationSelection.error);
+    if (isPublicPrecomputedSimulationMode()) {
+      startPublicDemo();
+      return;
+    }
     const helperBackedSimulation = simulation
       && simulationSelection?.execution_host === "helper_local"
       && supportsHelperSimulationReplay();
@@ -2323,6 +2480,38 @@ async function startAcquisition() {
   }
 }
 
+async function waitForHelperFlushComplete(stopResult, {timeoutMs = 90000} = {}) {
+  if (!usesLocalCaptureHelper()) return stopResult;
+  const initialState = String(stopResult?.flush_state || "");
+  if (initialState === "completed" || !["flushing", "completed"].includes(initialState)) {
+    return stopResult;
+  }
+  const captureUuid = String(stopResult?.capture_uuid || "");
+  const deadline = Date.now() + Math.max(1000, Number(timeoutMs) || 90000);
+  let latest = stopResult;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => window.setTimeout(resolve, 500));
+    try {
+      const current = await requestLocalHelper("status", {}, {timeoutMs: 3000});
+      if (captureUuid && current?.capture_uuid && current.capture_uuid !== captureUuid) {
+        continue;
+      }
+      latest = {...stopResult, ...current};
+      renderAcquisitionStatus(latest);
+      const queuedRows = Number(current?.queued_rows ?? current?.transport?.queued_rows ?? 0);
+      if (current?.flush_state === "completed" && queuedRows === 0
+          && current?.finalization_complete !== false) {
+        return latest;
+      }
+    } catch (_) {
+      // The local generator is already stopped.  A transient status failure
+      // must not discard the stop result; retry within the bounded deadline.
+    }
+  }
+  const remaining = Number(latest?.queued_rows ?? latest?.transport?.queued_rows ?? 0);
+  throw new Error(`本地采集已停止，但历史数据同步尚未完成（剩余${remaining}点）；请保持辅助程序在线后重试`);
+}
+
 async function waitForServerTargetSave(stopResult, timeoutMs = 90000) {
   if (!controls.mysqlEnabled?.checked || !usesLocalCaptureHelper()
       || (controls.acquisitionMode?.value === "simulation"
@@ -2390,6 +2579,10 @@ async function retryServerTargetMysql() {
 }
 
 async function stopAcquisition() {
+  if (isPublicPrecomputedSimulationMode()) {
+    stopPublicDemo();
+    return;
+  }
   if (state.stopBusy) return;
   state.stopBusy = true;
   const stopButton = $("stopAcquisitionButton");
@@ -2411,6 +2604,8 @@ async function stopAcquisition() {
       mode !== "simulation" || state.acquisitionExecutionHost === "helper_local"
     )) {
       result = await requestLocalHelper("stop_capture", {}, {timeoutMs: 30000});
+      renderAcquisitionStatus(result);
+      result = await waitForHelperFlushComplete(result);
       result = await waitForServerTargetSave(result);
     } else {
       try {
@@ -2622,10 +2817,11 @@ function configureAutomaticIndicator(useRecommendation = true) {
 
 function configureProcessingMode() {
   const captureOnly = controls.processingMode.value === "capture_only";
+  const publicDemo = isPublicPrecomputedSimulationMode();
   controls.autoIndicator.disabled = captureOnly;
   controls.indicator.disabled = captureOnly || controls.autoIndicator.checked;
   document.querySelectorAll(".prediction-setting").forEach((node) => {
-    node.classList.toggle("hidden", captureOnly);
+    node.classList.toggle("hidden", captureOnly || publicDemo);
   });
   document.querySelectorAll(
     ".model-input-sensor-checkbox, .predict-sensor-checkbox"
@@ -2751,7 +2947,11 @@ function configureDataMode() {
     stopPlayback();
     controls.realtimePrediction.checked = true;
     window.clearInterval(state.livePollTimer);
-    if (supportsLiveWebSocket()) {
+    if (isPublicPrecomputedSimulationMode()) {
+      state.livePollTimer = null;
+      stopLiveHttpFallback();
+      closeLiveWebSocket();
+    } else if (supportsLiveWebSocket()) {
       openLiveWebSocket();
     } else {
       startLiveHttpFallback();
@@ -2782,6 +2982,7 @@ function stopLiveHttpFallback() {
 }
 
 function startLiveHttpFallback() {
+  if (isPublicPrecomputedSimulationMode()) return;
   if (controls.dataMode.value !== "live") return;
   state.liveHttpFallback = true;
   window.clearInterval(state.livePollTimer);
@@ -2805,27 +3006,32 @@ function closeLiveWebSocket() {
   }
 }
 
-function applyRealtimePayload(payload) {
+function applyRealtimePayload(payload, renderOptions = {}) {
   if (!payload || payload.type === "error") {
     throw new Error(payload?.error || "实时数据服务异常");
   }
+  const processingStarted = typeof performance !== "undefined" && performance.now
+    ? performance.now() : Date.now();
   state.payload = payload;
   const renderNow = Date.now();
-  state.browserRenderTimes = [...(state.browserRenderTimes || []), renderNow]
+  state.browserPayloadTimes = [...(state.browserPayloadTimes || []), renderNow]
     .filter((value) => renderNow - value <= 5000);
-  const renderSpan = state.browserRenderTimes.length > 1
-    ? (renderNow - state.browserRenderTimes[0]) / 1000 : 0;
-  state.browserRenderRateHz = renderSpan > 0
-    ? (state.browserRenderTimes.length - 1) / renderSpan : 0;
+  const renderSpan = state.browserPayloadTimes.length > 1
+    ? (renderNow - state.browserPayloadTimes[0]) / 1000 : 0;
+  state.browserPayloadRateHz = renderSpan > 0
+    ? (state.browserPayloadTimes.length - 1) / renderSpan : 0;
   if (controls.dataMode.value === "replay") {
     controls.cursor.max = payload.progress.total_points;
     controls.cursor.value = payload.progress.cursor;
   }
-  render(payload);
+  render(payload, renderOptions);
   $("connectionStatus").textContent = "实时数据服务已连接";
   document.querySelector(".status-dot").classList.add("connected");
   if (payload.acquisition) renderAcquisitionStatus(payload.acquisition);
   renderRuntimeStatus(payload);
+  const processingFinished = typeof performance !== "undefined" && performance.now
+    ? performance.now() : Date.now();
+  state.browserProcessingMs = Math.max(0, processingFinished - processingStarted);
   if (payload.progress.finished && state.playing) {
     if (controls.loop.checked) {
       controls.cursor.value = 1;
@@ -3024,6 +3230,7 @@ function stopLocalSimulationReplay() {
 }
 
 function openLiveWebSocket() {
+  if (isPublicPrecomputedSimulationMode()) return;
   if (!supportsLiveWebSocket() || controls.dataMode.value !== "live") return;
   const query = queryString();
   if (
@@ -3101,6 +3308,7 @@ function queryString() {
 }
 
 async function loadRealtime() {
+  if (isPublicPrecomputedSimulationMode()) return state.payload;
   if (state.simulationLocalReplay) return state.payload;
   if (supportsLiveWebSocket() && !state.liveHttpFallback) {
     openLiveWebSocket();
@@ -3283,7 +3491,7 @@ function renderIndicatorVariant(payload) {
   status.innerHTML = `<strong>${variant.variant_id}</strong>：${variant.construction}；当前使用 ${outputs.join("、") || "可用输入通道"}。`;
 }
 
-function render(payload) {
+function render(payload, {stablePublicDemo = false, previousPayload = null} = {}) {
   const captureOnly = payload.mode === "capture_only";
   const progress = payload.progress;
   const windowData = payload.window;
@@ -3320,7 +3528,7 @@ function render(payload) {
     $("recommendationCard").classList.remove("not-recommended");
     $("recommendationCard").innerHTML =
       "<div><strong>仅采集模式</strong><span>预测模型与预警算法均未运行</span></div>";
-  } else {
+  } else if (!stablePublicDemo || !previousPayload) {
     renderRecommendation(payload.candidate);
   }
 
@@ -3371,8 +3579,10 @@ function render(payload) {
       }`
     : `当前窗口已到达 ${progress.sample_in_window}/24 点`;
 
-  renderProcessParameters(process);
-  renderIndicatorVariant(payload);
+  if (!stablePublicDemo || !previousPayload) {
+    renderProcessParameters(process);
+    renderIndicatorVariant(payload);
+  }
 
   const channel = payload.selected_channel;
   const predictionEnabled = channel.prediction_enabled !== false;
@@ -3428,9 +3638,16 @@ function render(payload) {
 
   renderSeriesChart(channel);
   renderTimeline(payload.timeline);
-  renderProbabilities(windowData.type_probabilities);
-  renderSensorCards(payload.channels, payload.selection.sensor);
-  renderLayerProgress(payload.layers);
+  const demoWindowChanged = !previousPayload
+    || previousPayload.progress?.current_window !== progress.current_window
+    || previousPayload.progress?.finished !== progress.finished;
+  if (!stablePublicDemo || demoWindowChanged) {
+    renderProbabilities(windowData.type_probabilities);
+    renderLayerProgress(payload.layers);
+  }
+  renderSensorCards(payload.channels, payload.selection.sensor, {
+    reuse: stablePublicDemo && Boolean(previousPayload),
+  });
 }
 
 function setupCanvas(canvas, height) {
@@ -3477,9 +3694,23 @@ function drawChannelChart(canvas, channel, height, compact) {
   const allValues = lines.flatMap((line) => line.values).filter(Number.isFinite);
   const allX = lines.flatMap((line) => line.x).filter(Number.isFinite);
   if (!allValues.length || !allX.length) return;
-  let ymin = Math.min(...allValues), ymax = Math.max(...allValues);
-  const margin = Math.max((ymax - ymin) * 0.08, Math.abs(ymax) * 0.01, 1e-6);
-  ymin -= margin; ymax += margin;
+  const fixedRange = channel.display_range;
+  let ymin;
+  let ymax;
+  if (
+    Number.isFinite(Number(fixedRange?.min))
+    && Number.isFinite(Number(fixedRange?.max))
+    && Number(fixedRange.min) < Number(fixedRange.max)
+  ) {
+    ymin = Number(fixedRange.min);
+    ymax = Number(fixedRange.max);
+  } else {
+    ymin = Math.min(...allValues);
+    ymax = Math.max(...allValues);
+    const margin = Math.max((ymax - ymin) * 0.08, Math.abs(ymax) * 0.01, 1e-6);
+    ymin -= margin;
+    ymax += margin;
+  }
   const xmin = Math.min(...allX), xmax = Math.max(...allX, 0.1);
   const px = (value) => pad.left + ((value - xmin) / Math.max(xmax - xmin, 1e-9)) * (width - pad.left - pad.right);
   const py = (value) => pad.top + ((ymax - value) / Math.max(ymax - ymin, 1e-9)) * (height - pad.top - pad.bottom);
@@ -3585,40 +3816,63 @@ function renderProbabilities(probabilities) {
   }));
 }
 
-function renderSensorCardsInto(target, channels, selectedId) {
+function renderSensorCardsInto(target, channels, selectedId, {reuse = false} = {}) {
+  const updateCard = (card, channel) => {
+    const predictionEnabled = channel.prediction_enabled !== false;
+    card.className =
+      `sensor-card full-sensor-card${String(channel.id) === String(selectedId) ? " selected" : ""}` +
+      `${predictionEnabled ? "" : " prediction-hidden"}`;
+    card.dataset.channelId = String(channel.id);
+    const actual = card.querySelector(".sensor-actual-value");
+    const predicted = card.querySelector(".sensor-prediction-value");
+    const rmse = card.querySelector(".sensor-rmse-value");
+    if (actual) actual.textContent = fmt(channel.actual_current, 2);
+    if (predicted) predicted.textContent = fmt(channel.prediction_current, 2);
+    if (rmse) rmse.textContent = fmt(channel.rmse, 3);
+    window.requestAnimationFrame(() =>
+      drawChannelChart(card.querySelector("canvas"), channel, 170, true)
+    );
+  };
+  const existing = target ? [...target.querySelectorAll(":scope > .full-sensor-card")] : [];
+  const canReuse = reuse
+    && existing.length === channels.length
+    && existing.every((card, index) => card.dataset.channelId === String(channels[index]?.id));
+  if (canReuse) {
+    existing.forEach((card, index) => updateCard(card, channels[index]));
+    return;
+  }
   const cards = channels.map((channel) => {
     const card = document.createElement("div");
     const predictionEnabled = channel.prediction_enabled !== false;
     card.className =
       `sensor-card full-sensor-card${channel.id === selectedId ? " selected" : ""}` +
       `${predictionEnabled ? "" : " prediction-hidden"}`;
+    card.dataset.channelId = String(channel.id);
     const predictionMetrics = predictionEnabled
-      ? `<span>预测 <strong>${fmt(channel.prediction_current, 2)}</strong></span>
-         <span>RMSE <strong>${fmt(channel.rmse, 3)}</strong></span>`
+      ? `<span>预测 <strong class="sensor-prediction-value">${fmt(channel.prediction_current, 2)}</strong></span>
+         <span>RMSE <strong class="sensor-rmse-value">${fmt(channel.rmse, 3)}</strong></span>`
       : `<span class="prediction-hidden-label">预测 已隐藏</span>`;
     card.innerHTML = `
       <div class="full-sensor-head">
         <div class="sensor-name">${channel.name}<span>${channel.unit}</span></div>
         <div class="sensor-live-values">
-          <span>实测 <strong>${fmt(channel.actual_current, 2)}</strong></span>
+          <span>实测 <strong class="sensor-actual-value">${fmt(channel.actual_current, 2)}</strong></span>
           ${predictionMetrics}
         </div>
       </div>
       <canvas class="full-channel-chart" height="170"></canvas>`;
     card.addEventListener("click", () => {
-      controls.sensor.value = String(channel.id);
+      controls.sensor.value = card.dataset.channelId;
       loadRealtime();
     });
-    window.requestAnimationFrame(() =>
-      drawChannelChart(card.querySelector("canvas"), channel, 170, true)
-    );
+    updateCard(card, channel);
     return card;
   });
   if (target) target.replaceChildren(...cards);
 }
 
-function renderSensorCards(channels, selectedId) {
-  renderSensorCardsInto($("sensorCards"), channels, selectedId);
+function renderSensorCards(channels, selectedId, options = {}) {
+  renderSensorCardsInto($("sensorCards"), channels, selectedId, options);
 }
 
 const MODEL_LABELS = {
@@ -3867,9 +4121,6 @@ async function initialize() {
       "hidden", controls.dataMode.value !== "live"
     );
     updateSimulationSettings();
-    if (isGuestSimulationMode()) {
-      await loadSimulationDatasetOnce();
-    }
     await loadRealtime();
     scheduleAutomaticHardwareCheck(800);
   } catch (error) {
@@ -4840,9 +5091,12 @@ function renderInterfacePanel(configs) {
 
 async function discoverInterfaces() {
   if (controls.acquisitionMode?.value === "simulation") {
-    rememberRealInterfaceSnapshot();
     state.availableInterfaces = [];
     state.physicalInterfaces = [];
+    if (isPublicPrecomputedSimulationMode()) {
+      renderPublicDemoSuccessState();
+      return;
+    }
     if (controls.interfaceDiscoveryStatus) {
       controls.interfaceDiscoveryStatus.textContent =
         "模拟采集不需要识别物理接口；仅使用当前选择的 CSV/文件夹/MySQL 数据源";
@@ -5041,8 +5295,132 @@ function updateRealAcquisitionVisibility() {
   controls.runId?.closest(".compact-input-grid")?.classList.add("hidden");
 }
 
+function publicDemoHardwareResult(bundle = state.publicDemoBundle) {
+  const interfaces = (bundle?.interfaces || buildSimulationInterfaceCatalog()).map((item) => ({
+    ...item,
+    enabled: true,
+    selected: true,
+    ok: true,
+    state: "precomputed_success",
+    message: "预计算模拟接口已就绪（未连接物理设备）",
+  }));
+  const channelNames = bundle?.channels?.map((item) => item.name)
+    || selectedAcquisitionChannelsForInterfaces();
+  const sensors = channelNames.map((name) => ({
+    name,
+    selected: true,
+    blocking: true,
+    ok: true,
+    state: "precomputed_success",
+    message: "预计算模拟通道已就绪",
+  }));
+  return {
+    ok: true,
+    synthetic: true,
+    precomputed: true,
+    elapsed_seconds: 0,
+    interfaces,
+    sensors,
+    errors: [],
+  };
+}
+
+function renderPublicDemoSuccessState(bundle = state.publicDemoBundle) {
+  if (!isPublicPrecomputedSimulationMode()) return false;
+  const result = publicDemoHardwareResult(bundle);
+  state.hardwareCheck = result;
+  state.hardwareCheckFingerprint = "public_precomputed_demo_success";
+  renderHardwareCheckResult(result, {automatic: true});
+  if (controls.interfaceDiscoveryStatus) {
+    controls.interfaceDiscoveryStatus.textContent =
+      `预计算演示已就绪：接口 ${result.interfaces.length}/${result.interfaces.length} 正常；` +
+      `通道 ${result.sensors.length}/${result.sensors.length} 正常（未连接物理设备）`;
+  }
+  const sensorSection = $("sensorSettingsSection");
+  const agentSection = $("agentDiagnosisSection");
+  if (sensorSection) sensorSection.open = true;
+  if (agentSection) agentSection.open = true;
+  $("testSensorsButton")?.setAttribute("disabled", "disabled");
+  controls.resetSensorCheck?.setAttribute("disabled", "disabled");
+  controls.discoverInterfaces?.setAttribute("disabled", "disabled");
+  controls.addInterface?.setAttribute("disabled", "disabled");
+  renderAgentGate();
+  return true;
+}
+
+function syncPublicDemoModeState(publicDemo) {
+  state.publicDemoRestoredRealStatus = false;
+  if (publicDemo) {
+    if (!state.publicDemoUiActive) {
+      state.publicDemoRealStatusSnapshot = {
+        hardwareCheck: state.hardwareCheck,
+        hardwareCheckFingerprint: state.hardwareCheckFingerprint,
+        hardwareClassName: controls.hardwareCheckStatus?.className || "",
+        hardwareHtml: controls.hardwareCheckStatus?.innerHTML || "",
+        sensorOpen: Boolean($("sensorSettingsSection")?.open),
+        agentOpen: Boolean($("agentDiagnosisSection")?.open),
+      };
+    }
+    state.publicDemoUiActive = true;
+    renderPublicDemoSuccessState();
+    return;
+  }
+  if (!state.publicDemoUiActive) return;
+  const snapshot = state.publicDemoRealStatusSnapshot;
+  state.publicDemoUiActive = false;
+  state.publicDemoRealStatusSnapshot = null;
+  state.hardwareCheck = snapshot?.hardwareCheck || null;
+  state.hardwareCheckFingerprint = snapshot?.hardwareCheckFingerprint || "";
+  if (state.hardwareCheck) {
+    renderHardwareCheckResult(state.hardwareCheck, {automatic: false});
+  } else if (controls.hardwareCheckStatus) {
+    controls.hardwareCheckStatus.className = snapshot?.hardwareClassName || "hardware-check-status stale";
+    controls.hardwareCheckStatus.innerHTML = snapshot?.hardwareHtml
+      || "等待真实接口检查；模拟演示结果不会作为真实硬件证据。";
+  }
+  if ($("sensorSettingsSection")) $("sensorSettingsSection").open = Boolean(snapshot?.sensorOpen);
+  if ($("agentDiagnosisSection")) $("agentDiagnosisSection").open = Boolean(snapshot?.agentOpen);
+  $("testSensorsButton")?.removeAttribute("disabled");
+  controls.resetSensorCheck?.removeAttribute("disabled");
+  controls.discoverInterfaces?.removeAttribute("disabled");
+  controls.addInterface?.removeAttribute("disabled");
+  renderAgentGate();
+  state.publicDemoRestoredRealStatus = true;
+}
+
+function setPublicDemoControlVisibility(publicDemo) {
+  document.body?.classList.toggle("public-precomputed-demo", publicDemo);
+  const acquisitionSummary = $("acquisitionSection")?.querySelector("summary");
+  if (acquisitionSummary) {
+    acquisitionSummary.textContent = publicDemo ? "预计算合成数据演示" : "真实采集与保存";
+  }
+  [
+    controls.processingMode,
+    controls.datasetSchema,
+    controls.driver,
+    controls.endpoint,
+    controls.baudrate,
+    controls.sampleRate,
+    controls.runId,
+    controls.liveSpecimen,
+    controls.saveRoot,
+  ].forEach((control) => control?.closest?.("label")?.classList.toggle("hidden", publicDemo));
+  [
+    $("saveRootStatus"),
+    $("browserLocalSavePanel"),
+    document.querySelector(".save-rule-note"),
+    document.querySelector(".mysql-settings"),
+    $("acquisitionParameterPanel"),
+  ].forEach((node) => node?.classList.toggle("hidden", publicDemo));
+  document.querySelectorAll(".prediction-setting").forEach((node) => {
+    node.classList.toggle("hidden", publicDemo);
+  });
+  controls.downloadSimulationPackage?.classList.toggle("hidden", publicDemo);
+}
+
 function updateSimulationSettings() {
   const simulation = controls.acquisitionMode?.value === "simulation";
+  const publicDemo = isPublicPrecomputedSimulationMode();
   const saveRuleNote = document.querySelector(".save-rule-note");
   if (saveRuleNote) {
     saveRuleNote.textContent =
@@ -5051,12 +5429,12 @@ function updateSimulationSettings() {
   controls.simulationSettings?.classList.toggle("hidden", !simulation);
   if (controls.simulationExecutionHostLabel) {
     controls.simulationExecutionHostLabel.classList.toggle(
-      "hidden", !simulation || state.accessRole === "guest" || state.accessRole === "local_admin"
+      "hidden", !simulation || publicDemo || state.accessRole === "local_admin"
     );
   }
   if (controls.simulationExecutionHost) {
     if (state.accessRole === "local_admin") controls.simulationExecutionHost.value = "server";
-    controls.simulationExecutionHost.disabled = state.accessRole === "guest" || state.accessRole === "local_admin";
+    controls.simulationExecutionHost.disabled = publicDemo || state.accessRole === "local_admin";
   }
   if (controls.interfaceDiscoveryStatus && simulation) {
     controls.interfaceDiscoveryStatus.textContent =
@@ -5068,22 +5446,23 @@ function updateSimulationSettings() {
       if (node.value === "simulator") node.value = "serial_json";
     });
   }
-  const mysql = controls.simulationSourceType?.value === "mysql";
-  controls.simulationMysqlSettings?.classList.toggle("hidden", !simulation || !mysql);
-  controls.simulationSourcePathLabel?.classList.toggle("hidden", !simulation || mysql);
+  const mysql = !publicDemo && controls.simulationSourceType?.value === "mysql";
+  controls.simulationSourceType?.closest?.("label")?.classList.toggle("hidden", publicDemo);
+  controls.simulationMysqlSettings?.classList.toggle("hidden", !simulation || !mysql || publicDemo);
+  controls.simulationSourcePathLabel?.classList.toggle("hidden", !simulation || mysql || publicDemo);
   controls.simulationPackagePanel?.classList.toggle(
     "hidden", !simulation || mysql || !simulationPackageControlsVisible()
   );
   if (controls.prepareSimulationPackage) {
-    controls.prepareSimulationPackage.textContent = controls.simulationExecutionHost?.value === "server"
+    controls.prepareSimulationPackage.textContent = publicDemo
+      ? "下载到浏览器并校验"
+      : controls.simulationExecutionHost?.value === "server"
       ? "在服务器准备并校验"
       : "下载到本机辅助程序并校验";
   }
   if (controls.simulationSourceNote) {
-    controls.simulationSourceNote.textContent = state.accessRole === "guest"
-      ? (mysql
-        ? "访客 MySQL 使用本机管理员预先配置的数据源；如需导入本机文件，请切换为单 CSV或CSV文件夹并点击“选择”。"
-        : "访客模式已自动载入管理员提供的模拟 CSV；数据直接用于采集、预测和预警。点击“选择”可导入本机 CSV或文件夹，导入后请点击“开始采集”。")
+    controls.simulationSourceNote.textContent = publicDemo
+      ? "公网模拟采用预计算 synthetic 演示包，覆盖 SMRF 热电偶、PLC、UVC 热像仪、ABB 与 M3232 薄膜压力五类逻辑接口：下载校验一次后，10 Hz 逻辑时间与图表都在浏览器本地运行；不会启动采集、保存、MySQL、运行时预测或 LangChain。"
       : "模拟模式使用所选文件夹、CSV或MySQL数据逐行读取；真实接口模式不会读取本地文件。";
   }
   if (controls.simulationSourcePath) {
@@ -5092,6 +5471,19 @@ function updateSimulationSettings() {
       : "选择单个 CSV 文件";
   }
   updateRealAcquisitionVisibility();
+  setPublicDemoControlVisibility(publicDemo);
+  $("localHelperPanel")?.classList.toggle("hidden", publicDemo);
+  const startButton = $("startAcquisitionButton");
+  const stopButton = $("stopAcquisitionButton");
+  if (startButton) {
+    startButton.textContent = publicDemo ? "开始演示" : "开始采集";
+    if (publicDemo) startButton.disabled = !state.publicDemoReady;
+  }
+  if (stopButton) {
+    stopButton.textContent = publicDemo ? "停止演示" : "停止并保存";
+    if (publicDemo && !state.publicDemoPlayback?.snapshot()?.running) stopButton.disabled = true;
+    else if (!publicDemo) stopButton.disabled = false;
+  }
   if (simulation) {
     if (state.interfaceModeRendered !== "simulation") {
       if (state.interfaceModeRendered === "real") rememberRealInterfaceSnapshot();
@@ -5112,6 +5504,9 @@ function updateSimulationSettings() {
     }
   }
   state.interfaceModeRendered = simulation ? "simulation" : "real";
+  if (typeof syncPublicDemoModeState === "function") {
+    syncPublicDemoModeState(publicDemo);
+  }
 }
 
 function updateIntegrationSource() {
@@ -5161,6 +5556,73 @@ async function runIntegration() {
   }
 }
 
+async function sha256Hex(bytes) {
+  if (!window.crypto?.subtle) {
+    throw new Error("当前浏览器不支持 SHA-256 校验，请使用最新版 Chrome 或 Edge");
+  }
+  const digest = await window.crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)]
+    .map((value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+async function preparePublicDemoBundle(packageId = "") {
+  if (!isPublicPrecomputedSimulationMode()) return null;
+  const selectedId = String(packageId || controls.simulationPackage?.value || "quick_240");
+  const item = state.simulationPackages.find((entry) => entry.package_id === selectedId);
+  if (!item) throw new Error("未找到所选预计算模拟数据包");
+  if (state.publicDemoBundle?.package_id === selectedId && state.publicDemoReady) {
+    return state.publicDemoBundle;
+  }
+  if (state.publicDemoBundlePromise) return state.publicDemoBundlePromise;
+  state.publicDemoReady = false;
+  const startButton = $("startAcquisitionButton");
+  if (startButton) startButton.disabled = true;
+  if (controls.simulationPackageStatus) {
+    controls.simulationPackageStatus.textContent =
+      `正在下载并校验 ${item.label}（${Math.round(Number(item.bytes || 0) / 1024)} KiB）……`;
+  }
+  state.publicDemoBundlePromise = (async () => {
+    const response = await fetch(item.url, {cache: "force-cache", credentials: "same-origin"});
+    if (!response.ok) throw new Error(`预计算数据下载失败（HTTP ${response.status}）`);
+    const bytes = await response.arrayBuffer();
+    if (Number(item.bytes || 0) !== bytes.byteLength) {
+      throw new Error("预计算数据长度校验失败，请刷新后重试");
+    }
+    const digest = await sha256Hex(bytes);
+    if (digest !== item.sha256) {
+      throw new Error("预计算数据 SHA-256 校验失败，请清除浏览器缓存后重试");
+    }
+    const bundle = JSON.parse(new TextDecoder("utf-8").decode(bytes));
+    window.AFP_PUBLIC_DEMO.validateBundle(bundle);
+    if (bundle.package_id !== selectedId) throw new Error("预计算数据包标识不匹配");
+    state.publicDemoBundle = bundle;
+    state.publicDemoReady = true;
+    state.simulationSourceChannels = bundle.channels.map((channel) => channel.name);
+    ensurePublicDemoPlayback().load(bundle);
+    renderPublicDemoSuccessState(bundle);
+    if (controls.simulationPackageStatus) {
+      controls.simulationPackageStatus.textContent =
+        `已就绪：${bundle.points}点 / ${bundle.duration_seconds}秒 / ` +
+        `${bundle.interfaces.length}类接口 / ${bundle.channels.length}通道；` +
+        "开始与停止均在浏览器本地执行，不启动采集、保存、MySQL、运行时模型或 LangChain。";
+    }
+    if (startButton) startButton.disabled = false;
+    return bundle;
+  })();
+  try {
+    return await state.publicDemoBundlePromise;
+  } catch (error) {
+    state.publicDemoReady = false;
+    state.publicDemoBundle = null;
+    if (controls.simulationPackageStatus) {
+      controls.simulationPackageStatus.textContent = `预计算演示准备失败：${error.message}`;
+    }
+    throw error;
+  } finally {
+    state.publicDemoBundlePromise = null;
+  }
+}
+
 async function loadSimulationPackages() {
   state.simulationPackages = [];
   if (!simulationPackageControlsVisible()) {
@@ -5168,22 +5630,33 @@ async function loadSimulationPackages() {
     return;
   }
   try {
-    const response = await fetch("/api/simulation/packages", {
-      cache: "no-store", credentials: "same-origin",
-    });
+    const publicDemo = isPublicPrecomputedSimulationMode();
+    const response = await fetch(
+      publicDemo ? "/demo/manifest-v1.json" : "/api/simulation/packages",
+      {cache: publicDemo ? "no-cache" : "no-store", credentials: "same-origin"},
+    );
     const payload = await response.json();
-    if (!response.ok || !payload?.ok) throw new Error(payload?.error || "无法读取模拟数据包目录");
+    if (!response.ok || (!publicDemo && !payload?.ok)) {
+      throw new Error(payload?.error || "无法读取模拟数据包目录");
+    }
     state.simulationPackages = Array.isArray(payload.packages) ? payload.packages : [];
     if (controls.simulationPackage) {
       controls.simulationPackage.innerHTML = "";
       state.simulationPackages.forEach((item) => {
         const option = document.createElement("option");
         option.value = item.package_id;
-        option.textContent = `${item.label} · ${item.channels?.length || 0}通道 · ${item.bytes || 0}字节`;
+        const channelCount = Array.isArray(item.channels) ? item.channels.length : Number(item.channels || 0);
+        option.textContent = `${item.label} · ${channelCount}通道 · ${item.bytes || 0}字节`;
         controls.simulationPackage.appendChild(option);
       });
+      if (state.simulationPackages.some((item) => item.package_id === "quick_240")) {
+        controls.simulationPackage.value = "quick_240";
+      }
     }
     updateSimulationSettings();
+    if (publicDemo && state.simulationPackages.length) {
+      await preparePublicDemoBundle();
+    }
   } catch (error) {
     if (controls.simulationPackageStatus) {
       controls.simulationPackageStatus.textContent = `模拟数据包目录加载失败：${error.message}`;
@@ -5193,6 +5666,10 @@ async function loadSimulationPackages() {
 
 async function prepareSelectedSimulationSource() {
   if (!simulationPackageControlsVisible()) return;
+  if (isPublicPrecomputedSimulationMode()) {
+    await preparePublicDemoBundle();
+    return;
+  }
   const serverSelected = controls.simulationExecutionHost?.value === "server";
   if (!serverSelected && (!supportsHelperSimulationReplay() || !state.helperStatus?.capabilities?.simulation_prefetch_v1)) {
     throw new Error("本机辅助程序未连接或版本不支持预下载，请重新下载最新版辅助程序");
@@ -5254,6 +5731,12 @@ async function prepareSelectedSimulationSource() {
 function downloadSelectedSimulationPackage() {
   const packageId = String(controls.simulationPackage?.value || "");
   if (!packageId || !simulationPackageControlsVisible()) return;
+  if (isPublicPrecomputedSimulationMode()) {
+    const item = state.simulationPackages.find((entry) => entry.package_id === packageId);
+    if (!item) return;
+    window.open(item.url, "_blank", "noopener");
+    return;
+  }
   const link = document.createElement("a");
   link.href = `/api/simulation/package-download?package_id=${encodeURIComponent(packageId)}`;
   link.download = "";
@@ -5533,7 +6016,11 @@ function validatePhysicalInterfaceBindings(items, realMode) {
 
 controls.acquisitionMode?.addEventListener("change", () => {
   updateSimulationSettings();
-  markHardwareCheckStale("采集模式已变化");
+  void loadSimulationPackages();
+  if (!isPublicPrecomputedSimulationMode() && !state.publicDemoRestoredRealStatus) {
+    markHardwareCheckStale("采集模式已变化");
+  }
+  state.publicDemoRestoredRealStatus = false;
   if (controls.autoProcessParameters?.checked) {
     readProcessParameters({automatic: true});
   }
@@ -5548,12 +6035,26 @@ controls.prepareSimulationPackage?.addEventListener("click", () => {
     toast(error.message);
   });
 });
+controls.simulationPackage?.addEventListener("change", () => {
+  if (!isPublicPrecomputedSimulationMode()) {
+    state.simulationSourceReady = null;
+    return;
+  }
+  state.publicDemoPlayback?.stop();
+  state.publicDemoBundle = null;
+  state.publicDemoReady = false;
+  preparePublicDemoBundle().catch((error) => toast(error.message));
+});
 controls.downloadSimulationPackage?.addEventListener("click", downloadSelectedSimulationPackage);
 controls.integrationSourceType?.addEventListener("change", updateIntegrationSource);
 controls.selectIntegrationFolder?.addEventListener("click", selectIntegrationFolder);
 controls.runIntegration?.addEventListener("click", runIntegration);
 updateIntegrationSource();
 updateSimulationSettings();
+
+document.addEventListener("visibilitychange", () => {
+  state.publicDemoPlayback?.setVisible(!document.hidden);
+});
 
 // Keep the interface-side channel list aligned with the acquisition checklist.
 function selectedAcquisitionChannelsForInterfaces() {
@@ -5761,7 +6262,7 @@ function hardwareConfigFingerprint() {
 
 function hardwareStateLabel(value) {
   return ({
-    ok: "正常", disabled: "已停用", video_only: "仅视频",
+    ok: "正常", precomputed_success: "预计算演示成功", disabled: "已停用", video_only: "仅视频",
     no_channels: "无已选通道", waiting: "等待数据",
     not_connected: "未连接", no_data: "没有采集数据",
     identity_unconfirmed: "目标设备身份未确认",
@@ -5880,6 +6381,7 @@ function markHardwareCheckStale(reason = "配置已变化") {
 }
 
 function scheduleAutomaticHardwareCheck(delay = 700) {
+  if (isPublicPrecomputedSimulationMode()) return;
   if (!controls.autoHardwareCheck?.checked || state.hardwareCheckInProgress) return;
   if (state.acquisitionStatus?.running) return;
   if (state.hardwareCheckTimer) window.clearTimeout(state.hardwareCheckTimer);
