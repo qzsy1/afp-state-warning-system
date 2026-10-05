@@ -1413,8 +1413,22 @@ async function selectPredictionModel() {
   }
 }
 
+function usesBrowserLocalExport() {
+  if (
+    controls.acquisitionMode?.value !== "simulation"
+    || state.accessRole === "local_admin"
+    || isPublicPrecomputedSimulationMode()
+  ) return false;
+  const selection = simulationExecutionSelection(
+    state.accessRole,
+    controls.simulationExecutionHost?.value || "helper_local",
+    state.helperStatus,
+  );
+  return selection.execution_host === "server";
+}
+
 async function selectSaveRoot() {
-  if (state.accessRole === "guest") {
+  if (usesBrowserLocalExport()) {
     await confirmLocalSave();
     return;
   }
@@ -1451,18 +1465,15 @@ function renderSaveRootStatus(status) {
   let payload = status || {};
   // Remote simulation saves to its server session even when the visitor has
   // not authorized an additional folder on the computer viewing this page.
-  if (state.accessRole !== "local_admin" && controls.acquisitionMode?.value === "simulation") {
-    const localPath = controls.saveRoot?.value.trim() || "";
+  if (usesBrowserLocalExport()) {
     payload = state.localSaveAuthorized && state.localSaveDirectoryHandle
       ? {
         ok: true,
-        message: `已授权本地目录“${state.localSaveDirectoryHandle.name || localPath}”，采集完成后可保存到本机`,
+        message: `已授权浏览器导出目录“${state.localSaveDirectoryHandle.name || "已选目录"}”，采集完成后可另存到访问电脑`,
       }
       : {
         ok: false,
-        message: localPath
-          ? "当前会话的服务器目录可保存；已填写本机位置但尚未授权，未保存到访问电脑"
-          : "当前会话的服务器目录可保存；尚未授权本机文件夹，未保存到访问电脑",
+        message: "当前会话的服务器目录可保存；尚未授权浏览器导出目录，未另存到访问电脑",
       };
   }
   node.textContent = payload.message || "保存位置为空，当前采集不保存数据";
@@ -1471,15 +1482,12 @@ function renderSaveRootStatus(status) {
 }
 
 async function refreshSaveRootStatus(path = controls.saveRoot?.value.trim() || "") {
-  if (!path) {
-    renderSaveRootStatus({ok: false, message: "保存位置为空，当前采集不保存数据"});
+  if (usesBrowserLocalExport()) {
+    renderSaveRootStatus({ok: false, message: "等待浏览器目录授权"});
     return;
   }
-  if (state.localSaveAuthorized && state.localSaveDirectoryHandle) {
-    renderSaveRootStatus({
-      ok: true,
-      message: `已授权本地目录“${state.localSaveDirectoryHandle.name || path}”，采集完成后可保存到本机`,
-    });
+  if (!path) {
+    renderSaveRootStatus({ok: false, message: "保存位置为空，当前采集不保存数据"});
     return;
   }
   if (state.accessRole === "guest") {
@@ -1504,7 +1512,6 @@ async function refreshSaveRootStatus(path = controls.saveRoot?.value.trim() || "
 }
 
 async function confirmLocalSave() {
-  const requestedName = controls.saveRoot?.value.trim() || "";
   if (typeof window.showDirectoryPicker !== "function" || !window.isSecureContext) {
     updateLocalSaveStatus("当前浏览器不支持本地目录授权；请使用 HTTPS 或 localhost/127.0.0.1 访问。", true);
     toast("当前地址不支持浏览器本地目录授权");
@@ -1515,11 +1522,10 @@ async function confirmLocalSave() {
     state.localSaveDirectoryHandle = handle;
     state.localSaveAuthorized = true;
     state.localSaveNameDirty = false;
-    controls.saveRoot.value = handle.name || requestedName;
-    updateLocalSaveStatus(`已授权本地目录“${handle.name || requestedName}”；停止并保存后按原软件规则写入。`);
+    updateLocalSaveStatus(`已授权浏览器导出目录“${handle.name || "已选目录"}”；停止并保存后按原软件规则写入。`);
     renderSaveRootStatus({
       ok: true,
-      message: `已授权本地目录“${handle.name || requestedName}”，采集完成后可保存到本机`,
+      message: `已授权浏览器导出目录“${handle.name || "已选目录"}”，采集完成后可另存到访问电脑`,
     });
     toast("本地保存目录已授权");
   } catch (error) {
@@ -5390,6 +5396,7 @@ function syncPublicDemoModeState(publicDemo) {
 
 function setPublicDemoControlVisibility(publicDemo) {
   document.body?.classList.toggle("public-precomputed-demo", publicDemo);
+  const browserExport = !publicDemo && usesBrowserLocalExport();
   const acquisitionSummary = $("acquisitionSection")?.querySelector("summary");
   if (acquisitionSummary) {
     acquisitionSummary.textContent = publicDemo ? "预计算合成数据演示" : "真实采集与保存";
@@ -5403,11 +5410,11 @@ function setPublicDemoControlVisibility(publicDemo) {
     controls.sampleRate,
     controls.runId,
     controls.liveSpecimen,
-    controls.saveRoot,
   ].forEach((control) => control?.closest?.("label")?.classList.toggle("hidden", publicDemo));
+  controls.saveRoot?.closest?.("label")?.classList.toggle("hidden", publicDemo || browserExport);
+  $("browserLocalSavePanel")?.classList.toggle("hidden", !browserExport);
   [
     $("saveRootStatus"),
-    $("browserLocalSavePanel"),
     document.querySelector(".save-rule-note"),
     document.querySelector(".mysql-settings"),
     $("acquisitionParameterPanel"),
@@ -5904,7 +5911,7 @@ function acquisitionConfig() {
     pr: Number(controls.livePressure.value) || 0,
     root: "LIVE",
     source_file: simulation && !remoteSimulation ? (controls.simulationSourcePath?.value.trim() || "") : "",
-    save_root: controls.saveRoot.value.trim(),
+    save_root: usesBrowserLocalExport() ? "" : controls.saveRoot.value.trim(),
     mysql_enabled: Boolean(controls.mysqlEnabled?.checked),
     mysql_host: controls.mysqlHost?.value.trim() || "192.168.101.31",
     mysql_port: Number(controls.mysqlPort?.value) || 3306,

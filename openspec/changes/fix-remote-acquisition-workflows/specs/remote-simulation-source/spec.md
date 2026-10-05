@@ -190,3 +190,18 @@
 #### Scenario: helper 命中已有缓存
 - **WHEN** helper 命中相同 SHA-256 的已验证缓存
 - **THEN** helper MAY 跳过文件字节传输，但 MUST 重新核对当前会话的数据源身份、通道映射和缓存完整状态后才能返回就绪
+
+### Requirement: 浏览器导出目录不得冒充执行端保存路径
+浏览器授权的 `FileSystemDirectoryHandle` SHALL 只用于当前页面停止后的文件导出，其目录显示名 MUST NOT 写入或序列化为服务器/helper 的 `save_root`。服务器本机或 helper 直接保存 SHALL 只接受由实际执行端选择和验证的既有绝对目录，并 MUST 区分相对路径、目录不存在、非目录和真实写权限失败。
+
+#### Scenario: helper 本地采集选择直接保存目录
+- **WHEN** 局域网操作员或已授权用户由 helper 执行真实采集或实际模拟
+- **THEN** 页面 MUST 使用 helper 原生选择器返回的绝对目录作为 `save_root`，MUST NOT 显示会覆盖该路径的浏览器导出授权入口
+
+#### Scenario: 服务器模拟另存到访问电脑
+- **WHEN** 局域网操作员明确选择服务器模拟并授权浏览器导出目录
+- **THEN** 页面 MUST 将目录句柄保留在浏览器内存中，启动载荷的 `save_root` MUST NOT 包含句柄显示名；停止后 SHALL 从同一服务器会话导出文件到该句柄
+
+#### Scenario: 用户提交相对保存路径
+- **WHEN** 服务器或 helper 收到非空但不是绝对路径的 `save_root`
+- **THEN** 系统 MUST 以明确的相对路径错误拒绝该保存位置，不得相对交付目录解析后误报为无写权限

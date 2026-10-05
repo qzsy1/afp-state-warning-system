@@ -69,7 +69,6 @@ if (-not $SkipExecutableBuild -and -not $ExistingExecutable) {
         "--hidden-import", "tkinter", "--hidden-import", "tkinter.filedialog",
         "--hidden-import", "tkinter.messagebox", "--hidden-import", "tkinter.ttk",
         "--hidden-import", "webview", "--hidden-import", "webview.platforms.winforms",
-        "--hidden-import", "interface_agent",
         "--hidden-import", "sklearn.ensemble._forest",
         "--hidden-import", "sklearn.ensemble._iforest",
         "--hidden-import", "sklearn.linear_model._logistic",
@@ -85,7 +84,6 @@ if (-not $SkipExecutableBuild -and -not $ExistingExecutable) {
         "--exclude-module", "tensorboard", "--exclude-module", "keras",
         "--exclude-module", "paddle", "--exclude-module", "cv2",
         "--exclude-module", "kivy", "--exclude-module", "kivy_deps",
-        "--exclude-module", "clr_loader", "--exclude-module", "pythonnet",
         "--exclude-module", "torchaudio", "--exclude-module", "torchvision",
         "--distpath", $DistRoot, "--workpath", $WorkRoot, "--specpath", $WorkRoot,
         (Join-Path $ScriptDir "launcher_entry.py")
@@ -112,10 +110,8 @@ if (-not (Test-Path -LiteralPath (Join-Path $built "AFP_Integrated_System_Modula
 }
 
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $TargetDir), $TargetDir | Out-Null
-if ($AllowExistingTarget) {
-    Copy-Item -Path (Join-Path $built "*") -Destination $TargetDir -Recurse -Force
-} else {
-    Copy-Item -LiteralPath $built -Destination $TargetDir -Recurse
+Get-ChildItem -LiteralPath $built -Force | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination $TargetDir -Recurse -Force
 }
 
 $appTarget = Join-Path $TargetDir "app"
@@ -133,13 +129,29 @@ Copy-Item -LiteralPath (Join-Path $ScriptDir "app\bootstrap.py") -Destination $a
 New-Item -ItemType Directory -Force -Path (Join-Path $appTarget "core"), (Join-Path $appTarget "modules") | Out-Null
 Copy-Item -Path (Join-Path $ScriptDir "app\core\*") -Destination (Join-Path $appTarget "core") -Recurse -Force
 Copy-Item -Path (Join-Path $ScriptDir "app\modules\*") -Destination (Join-Path $appTarget "modules") -Recurse -Force
-Copy-Item -LiteralPath (Join-Path $ScriptDir "config\runtime.delivery.json") -Destination (Join-Path $configTarget "runtime.json") -Force
+$runtimeConfigPath = Join-Path $configTarget "runtime.json"
+Copy-Item -LiteralPath (Join-Path $ScriptDir "config\runtime.delivery.json") -Destination $runtimeConfigPath -Force
+$runtimeConfig = Get-Content -LiteralPath $runtimeConfigPath -Raw | ConvertFrom-Json
+$runtimeConfig.application_version = $ApplicationVersion
+$runtimeConfig | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $runtimeConfigPath -Encoding UTF8
 $documentation = Get-ChildItem -LiteralPath (Join-Path $RepoRoot "docs") -Filter "*.md" -File
 if (-not $documentation) {
     throw "Modular documentation directory does not contain Markdown files."
 }
 $documentation | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination $docsTarget -Force
+}
+$operationalFiles = @(
+    "install_local_helper_autostart.ps1",
+    "public_tunnel_watchdog.ps1",
+    "tailscale_funnel_watchdog.ps1"
+)
+foreach ($name in $operationalFiles) {
+    $source = Join-Path $LegacySource $name
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+        throw "Release operational script is missing: $source"
+    }
+    Copy-Item -LiteralPath $source -Destination (Join-Path $TargetDir $name) -Force
 }
 
 $legacyFiles = @(
@@ -153,7 +165,8 @@ $legacyFiles = @(
     "simulation_replay.py", "simulation_source_transfer.py",
     "public_demo_bundles.py",
     "remote_mysql_setup.py", "server_target_mysql.py", "server_capture_journal.py", "generate_pressure_simulation.py",
-    "web_auth.py", "web_access.py", "public_status.py", "guest_simulation.py", "control_lease.py", "json_safety.py"
+    "web_auth.py", "web_access.py", "public_status.py", "guest_simulation.py", "control_lease.py", "json_safety.py",
+    "diagnosis_jobs.py", "simulation_packages.py"
 )
 foreach ($name in $legacyFiles) {
     $source = Join-Path $LegacySource $name
@@ -174,6 +187,15 @@ foreach ($name in @(
 Get-ChildItem -LiteralPath (Join-Path $LegacySource "static") -Force | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination $legacyStaticTarget -Recurse -Force
     Copy-Item -LiteralPath $_.FullName -Destination $uiTarget -Recurse -Force
+}
+$simulationPackageSource = Join-Path $LegacySource "simulation_packages"
+$simulationPackageTarget = Join-Path $legacyTarget "simulation_packages"
+if (-not (Test-Path -LiteralPath $simulationPackageSource -PathType Container)) {
+    throw "Simulation package directory is missing: $simulationPackageSource"
+}
+New-Item -ItemType Directory -Force -Path $simulationPackageTarget | Out-Null
+Get-ChildItem -LiteralPath $simulationPackageSource -Force | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination $simulationPackageTarget -Recurse -Force
 }
 
 New-Item -ItemType Directory -Force -Path (Join-Path $TargetDir "models"), (Join-Path $legacyTarget "data") | Out-Null

@@ -105,7 +105,7 @@ const fetch = async () => { requests += 1; return {ok: true, json: async () => (
     def test_failed_server_target_mysql_has_a_session_bound_retry_control(self):
         html = (Path(__file__).with_name("static") / "index.html").read_text(encoding="utf-8")
         self.assertIn('id="retryTargetMysqlButton"', html)
-        self.assertIn('/app.js?v=20261001-stable-public-demo-v2', html)
+        self.assertIn('/app.js?v=20261001-save-boundary-v1', html)
         text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
         start = text.index("async function retryServerTargetMysql()")
         end = text.index("async function stopAcquisition()", start)
@@ -901,8 +901,54 @@ const stopPublicDemo = () => {};
         self.assertIn("renderSaveRootStatus({", body)
         self.assertIn("ok: true", body)
         self.assertIn("showDirectoryPicker", body)
+        self.assertNotIn("controls.saveRoot.value = handle.name", body)
 
-    def test_guest_server_session_save_status_cannot_turn_empty_local_path_green(self):
+    def test_browser_export_is_isolated_from_direct_capture_save_root(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        route_start = text.index("function usesBrowserLocalExport()")
+        route_end = text.index("async function selectSaveRoot()", route_start)
+        route_body = text[route_start:route_end]
+        self.assertIn('execution_host === "server"', route_body)
+        self.assertIn('state.accessRole === "local_admin"', route_body)
+        self.assertIn("isPublicPrecomputedSimulationMode()", route_body)
+        script = """
+const controls = {
+  acquisitionMode: {value: "simulation"},
+  simulationExecutionHost: {value: "server"},
+};
+const state = {accessRole: "lan_operator", helperStatus: {}, publicDemo: false};
+const isPublicPrecomputedSimulationMode = () => state.publicDemo;
+const simulationExecutionSelection = (_role, requestedHost) => ({execution_host: requestedHost});
+""" + route_body + """
+if (!usesBrowserLocalExport()) process.exit(1);
+controls.simulationExecutionHost.value = "helper_local";
+if (usesBrowserLocalExport()) process.exit(2);
+controls.simulationExecutionHost.value = "server";
+state.accessRole = "local_admin";
+if (usesBrowserLocalExport()) process.exit(3);
+state.accessRole = "authorized";
+state.publicDemo = true;
+if (usesBrowserLocalExport()) process.exit(4);
+controls.acquisitionMode.value = "real";
+state.publicDemo = false;
+if (usesBrowserLocalExport()) process.exit(5);
+"""
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+        config_start = text.index("function acquisitionConfig()")
+        config_end = text.index("function renderProcessParameterReadStatus", config_start)
+        config_body = text[config_start:config_end]
+        self.assertIn('save_root: usesBrowserLocalExport() ? ""', config_body)
+
+        visibility_start = text.index("function setPublicDemoControlVisibility")
+        visibility_end = text.index("function updateSimulationSettings", visibility_start)
+        visibility_body = text[visibility_start:visibility_end]
+        self.assertIn("usesBrowserLocalExport()", visibility_body)
+        self.assertIn('$("browserLocalSavePanel")', visibility_body)
+
+    def test_server_simulation_export_status_cannot_turn_empty_local_path_green(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
         start = text.index("function renderSaveRootStatus")
@@ -916,16 +962,18 @@ const controls = {saveRootStatus: node, saveRoot: {value: ""},
   acquisitionMode: {value: "simulation"}};
 const state = {accessRole: "guest", localSaveAuthorized: false,
   localSaveDirectoryHandle: null};
+let browserExport = true;
+const usesBrowserLocalExport = () => browserExport;
 """ + function + """
 renderSaveRootStatus({ok: false, message: "保存位置为空，当前采集不保存数据"});
 if (!node.textContent.includes("当前会话的服务器目录") ||
-    !node.textContent.includes("未保存到访问电脑") ||
+    !node.textContent.includes("未另存到访问电脑") ||
     node.textContent.includes("当前采集不保存数据") || !node.classList.error) process.exit(1);
-state.accessRole = "authorized";
+state.accessRole = "lan_operator";
 renderSaveRootStatus({ok: false, message: "保存位置为空，当前采集不保存数据"});
 if (!node.textContent.includes("当前会话的服务器目录") ||
     node.textContent.includes("当前采集不保存数据")) process.exit(3);
-state.accessRole = "local_admin";
+browserExport = false;
 renderSaveRootStatus({ok: false, message: "保存位置为空，当前采集不保存数据"});
 if (node.textContent !== "保存位置为空，当前采集不保存数据") process.exit(2);
 """

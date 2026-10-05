@@ -224,6 +224,13 @@ def check_capture_save_root(path: str | Path | None) -> dict[str, Any]:
     if not raw:
         return {"ok": False, "code": "empty", "path": "", "message": "保存位置为空，当前采集不保存数据"}
     candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        return {
+            "ok": False,
+            "code": "relative",
+            "path": raw,
+            "message": "保存文件夹必须使用实际写入电脑上的绝对路径，当前采集不保存数据",
+        }
     try:
         candidate = candidate.resolve()
     except OSError as exc:
@@ -1110,7 +1117,7 @@ def select_capture_folder(initial_path: str = "") -> str:
             parent=root,
             title="选择AFP采集数据保存位置",
             initialdir=initial_path or str(DEFAULT_CAPTURE_ROOT),
-            mustexist=False,
+            mustexist=True,
         )
         return str(Path(selected).resolve()) if selected else ""
     finally:

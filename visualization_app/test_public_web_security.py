@@ -571,11 +571,14 @@ class PublicWebHttpTests(unittest.TestCase):
                 request_headers["X-AFP-CSRF"] = self.cookies["afp_csrf"]
         request_headers.update(headers or {})
         raw_body = None if body is None else json.dumps(body).encode("utf-8")
-        connection.request(method, path, raw_body, request_headers)
-        response = connection.getresponse()
-        raw = response.read()
-        response_headers = response.getheaders()
-        connection.close()
+        try:
+            connection.request(method, path, raw_body, request_headers)
+            response = connection.getresponse()
+            raw = response.read()
+            response_headers = response.getheaders()
+            response_status = response.status
+        finally:
+            connection.close()
         for name, value in response_headers:
             if name.lower() != "set-cookie":
                 continue
@@ -583,7 +586,7 @@ class PublicWebHttpTests(unittest.TestCase):
             if "=" in first:
                 cookie_name, cookie_value = first.split("=", 1)
                 self.cookies[cookie_name] = cookie_value
-        return response.status, json.loads(raw.decode("utf-8")), response_headers
+        return response_status, json.loads(raw.decode("utf-8")), response_headers
 
     def test_guest_real_start_is_denied_before_acquisition_manager(self):
         self.request_json("GET", "/api/auth/session")
@@ -821,13 +824,24 @@ class PublicWebHttpTests(unittest.TestCase):
     def test_csrf_mismatch_is_rejected(self):
         self.request_json("GET", "/api/auth/session")
 
-        status, payload, _ = self.request_json(
-            "POST",
-            "/api/simulation/stop",
-            {},
-            headers={"X-AFP-CSRF": "wrong"},
-            csrf=False,
-        )
+        # Windows can very occasionally abort a short-lived loopback socket
+        # while this large HTTP suite is cycling servers.  This rejected CSRF
+        # request cannot execute the operation, so one transport-only retry is
+        # safe; a second abort still fails the contract test.
+        for attempt in range(2):
+            try:
+                status, payload, _ = self.request_json(
+                    "POST",
+                    "/api/simulation/stop",
+                    {},
+                    headers={"X-AFP-CSRF": "wrong"},
+                    csrf=False,
+                )
+                break
+            except (ConnectionAbortedError, ConnectionResetError):
+                if attempt == 1:
+                    raise
+                time.sleep(0.05)
 
         self.assertEqual(status, 403)
         self.assertEqual(payload["error"], "csrf_failed")
@@ -1254,7 +1268,14 @@ class RealControlLeaseTests(unittest.TestCase):
         self.assertFalse(lease.heartbeat("session-a", now=31).granted)
 
 
-class ModelCredentialTests(PublicWebHttpTests):
+class ModelCredentialTests(unittest.TestCase):
+    # Reuse the HTTP fixture without inheriting every PublicWebHttpTests test.
+    # Inheriting the test case duplicated the complete loopback-server suite
+    # and could exhaust short-lived Windows connections during the full gate.
+    setUp = PublicWebHttpTests.setUp
+    tearDown = PublicWebHttpTests.tearDown
+    request_json = PublicWebHttpTests.request_json
+
     def _event(self):
         return {
             "interface_id": "thermocouple",

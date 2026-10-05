@@ -49,6 +49,12 @@ class PublicTunnelWatchdogContractTests(unittest.TestCase):
         self.assertIn('-ArgumentList "--server-only"', text)
         self.assertIn('-ArgumentList "--background"', text)
 
+    def test_watchdog_prefers_the_delivery_directory_that_contains_it(self):
+        source = Path(__file__).with_name("public_tunnel_watchdog.ps1")
+        text = source.read_text(encoding="utf-8-sig")
+        self.assertIn("$DeliveryRoot = $PSScriptRoot", text)
+        self.assertIn('Test-Path (Join-Path $DeliveryRoot "AFP_Integrated_System_Modular.exe")', text)
+
 
 if __name__ == "__main__":
     unittest.main()

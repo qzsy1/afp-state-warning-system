@@ -1,8 +1,8 @@
 """Generate a deterministic, full-channel CSV for acquisition-chain testing.
 
-This file intentionally contains the 16 channels of the current new
-collection plan plus pressure-matrix diagnostics.  It is synthetic data for
-software validation only, not evidence of a real AFP defect.
+This file intentionally contains every legacy and new-collection channel plus
+pressure-matrix diagnostics.  It is synthetic data for software validation
+only, not evidence of a real AFP defect.
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import pandas as pd
 SENSOR_COLUMNS = [
     "温度", "压力", "薄膜压力", "ROI平均温度", "张力", "线速度", "ABB_X", "ABB_Y", "ABB_Z",
     *[f"温度{i}" for i in range(1, 9)],
+    "转速", "位移", "振动",
 ]
 PROCESS_COLUMNS = [
     "initial_compaction_force_N", "placement_speed_mm_s", "pid_angle_deg",
@@ -56,6 +57,9 @@ def generate(output: Path, rows: int = 240, seed: int = 20260910) -> Path:
     abb_x = np.cumsum(np.maximum(speed_series, 0)) * 0.1
     abb_y = 2.5 * np.sin(np.linspace(0, np.pi, rows))
     abb_z = (layer - 1) * 0.18
+    rotation = speed_series * 5.7 + rng.normal(0, 1.3, rows)
+    displacement = 0.42 + 0.00075 * pressure + rng.normal(0, 0.006, rows)
+    vibration = 0.08 + 0.0013 * speed_series + 0.00012 * pressure + rng.normal(0, 0.008, rows)
     matrices = [_pressure_matrix(float(value), int(layer[idx]), rng) for idx, value in enumerate(t)]
     film_pressure = []
     for matrix in matrices:
@@ -75,6 +79,9 @@ def generate(output: Path, rows: int = 240, seed: int = 20260910) -> Path:
         "ABB_X": abb_x,
         "ABB_Y": abb_y,
         "ABB_Z": abb_z,
+        "转速": rotation,
+        "位移": displacement,
+        "振动": vibration,
         "initial_compaction_force_N": force,
         "placement_speed_mm_s": speed,
         "pid_angle_deg": angle,
@@ -117,5 +124,5 @@ def generate(output: Path, rows: int = 240, seed: int = 20260910) -> Path:
 
 
 if __name__ == "__main__":
-    target = Path(r"F:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv")
+    target = Path(__file__).resolve().parent / "simulation_m3232_new_collection" / "SIM_PRESSURE_M3232_new_collection.csv"
     print(generate(target))

@@ -12,16 +12,37 @@ $VenvDir = Join-Path $DemoDir ".venv"
 $DemoPython = Join-Path $VenvDir "Scripts\python.exe"
 $Requirements = Join-Path $DemoDir "requirements.txt"
 
-if (-not (Test-Path -LiteralPath $DemoPython -PathType Leaf)) {
+$CreateVenv = -not (Test-Path -LiteralPath $DemoPython -PathType Leaf)
+if (-not $CreateVenv) {
+    $PreviousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "SilentlyContinue"
+        & $DemoPython -c "import sys; raise SystemExit(0)" *> $null
+        $CreateVenv = $LASTEXITCODE -ne 0
+    }
+    finally {
+        $ErrorActionPreference = $PreviousPreference
+    }
+}
+
+if ($CreateVenv) {
     Write-Host "Creating the isolated Python 3.11 environment..."
-    & py -3.11 -m venv $VenvDir
+    & py -3.11 -m venv --clear $VenvDir
     if ($LASTEXITCODE -ne 0) {
         throw "Could not create the Demo environment. Install Python 3.11 first."
     }
 }
 
-& $DemoPython -c "import langchain_core; assert langchain_core.__version__ == '1.6.2'" 2>$null
-if ($LASTEXITCODE -ne 0) {
+$PreviousPreference = $ErrorActionPreference
+try {
+    $ErrorActionPreference = "SilentlyContinue"
+    & $DemoPython -c "import langchain_core; assert langchain_core.__version__ == '1.6.2'" *> $null
+    $DependenciesReady = $LASTEXITCODE -eq 0
+}
+finally {
+    $ErrorActionPreference = $PreviousPreference
+}
+if (-not $DependenciesReady) {
     Write-Host "Installing pinned Demo dependencies..."
     & $DemoPython -m pip install -r $Requirements
     if ($LASTEXITCODE -ne 0) {

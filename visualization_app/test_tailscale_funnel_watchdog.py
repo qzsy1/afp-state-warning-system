@@ -36,6 +36,11 @@ class TailscaleFunnelWatchdogContractTests(unittest.TestCase):
         self.assertIn("New-ScheduledTaskTrigger -AtLogOn", text)
         self.assertIn("CurrentVersion\\Run", text)
 
+    def test_watchdog_prefers_the_delivery_directory_that_contains_it(self):
+        text = self.source.read_text(encoding="utf-8-sig")
+        self.assertIn("$DeliveryRoot = $PSScriptRoot", text)
+        self.assertIn('Test-Path (Join-Path $DeliveryRoot "AFP_Integrated_System_Modular.exe")', text)
+
     def test_watchdog_starts_origin_without_opening_a_second_desktop_window(self):
         text = self.source.read_text(encoding="utf-8-sig")
         self.assertIn('-ArgumentList "--server-only"', text)
@@ -62,6 +67,21 @@ class TailscaleFunnelWatchdogContractTests(unittest.TestCase):
         text = build.read_text(encoding="utf-8-sig")
         self.assertIn("tailscale_funnel_watchdog.ps1", text)
         self.assertIn("Copy-Item", text)
+
+    def test_helper_build_accepts_an_exact_virtualenv_interpreter(self):
+        build = Path(__file__).with_name("build_local_capture_helper.ps1")
+        text = build.read_text(encoding="utf-8-sig")
+        self.assertIn("Test-Path -LiteralPath $PythonExecutable -PathType Leaf", text)
+        self.assertIn("$pythonPrefix = @()", text)
+        self.assertIn("& $pythonCommand @pythonPrefix -m PyInstaller", text)
+        self.assertIn('[string]$DeliveryRoot = ""', text)
+
+    def test_helper_build_refreshes_delivery_integrity_manifest(self):
+        build = Path(__file__).with_name("build_local_capture_helper.ps1")
+        text = build.read_text(encoding="utf-8-sig")
+        self.assertIn("Get-FileHash -Algorithm SHA256", text)
+        self.assertIn('Join-Path $DeliveryRoot "SHA256SUMS.txt"', text)
+        self.assertIn('$_ .Name -ne "SHA256SUMS.txt"'.replace("$_ ", "$_"), text)
 
 
 if __name__ == "__main__":

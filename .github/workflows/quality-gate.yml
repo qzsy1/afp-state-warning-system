@@ -1,0 +1,51 @@
+name: quality-gate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - feature/original-ui-langchain-agent
+
+jobs:
+  quality-gate:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            visualization_app/requirements.txt
+            interface_monitor_demo/requirements.txt
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install portable test dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu -r visualization_app/requirements.txt
+          python -m pip install -r interface_monitor_demo/requirements.txt
+
+      - name: Run full CI quality gate
+        shell: pwsh
+        run: ./tools/verification/run_quality_gate.ps1 -Profile full -Environment ci
+
+      - name: Upload quality-gate reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-gate-reports
+          path: verification/results/
+          if-no-files-found: warn

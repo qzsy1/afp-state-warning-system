@@ -13,6 +13,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import acquisition  # noqa: E402
+from generate_pressure_simulation import generate as generate_pressure_simulation  # noqa: E402
 from acquisition import (  # noqa: E402
     AcquisitionConfig,
     AcquisitionManager,
@@ -52,21 +53,22 @@ class AcquisitionIntegrityTests(unittest.TestCase):
             "abb_motion": ["线速度", "ABB_X", "ABB_Y", "ABB_Z"],
             "m3232_pressure": ["薄膜压力"],
         }
-        config = AcquisitionConfig(
-            driver="simulator",
-            acquisition_mode="simulation",
-            dataset_schema="new_collection_v11_3",
-            simulation_source_path=str(
-                Path(r"F:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv")
-            ),
-            source_file=str(
-                Path(r"F:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv")
-            ),
-            interfaces=interfaces,
-            interface_channel_assignments=assignments,
-            selected_sensors=NEW_COLLECTION_SENSOR_COLUMNS.copy(),
-        )
-        result = AcquisitionManager().test_connection(config, timeout_seconds=0.1)
+        with tempfile.TemporaryDirectory() as temporary:
+            source = generate_pressure_simulation(
+                Path(temporary) / "SIM_PRESSURE_M3232_new_collection.csv",
+                rows=8,
+            )
+            config = AcquisitionConfig(
+                driver="simulator",
+                acquisition_mode="simulation",
+                dataset_schema="new_collection_v11_3",
+                simulation_source_path=str(source),
+                source_file=str(source),
+                interfaces=interfaces,
+                interface_channel_assignments=assignments,
+                selected_sensors=NEW_COLLECTION_SENSOR_COLUMNS.copy(),
+            )
+            result = AcquisitionManager().test_connection(config, timeout_seconds=0.1)
         self.assertEqual(
             {item["id"] for item in result["interfaces"]},
             set(assignments),
@@ -79,6 +81,10 @@ class AcquisitionIntegrityTests(unittest.TestCase):
 
     def test_save_root_status_requires_existing_writable_nonempty_directory(self) -> None:
         self.assertFalse(check_capture_save_root("")["ok"])
+        relative_status = check_capture_save_root("AFP_Capture")
+        self.assertFalse(relative_status["ok"])
+        self.assertEqual(relative_status["code"], "relative")
+        self.assertIn("绝对路径", relative_status["message"])
         with tempfile.TemporaryDirectory() as temporary:
             existing = Path(temporary)
             status = check_capture_save_root(str(existing))

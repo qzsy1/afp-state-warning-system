@@ -9,8 +9,11 @@ $ErrorActionPreference = "SilentlyContinue"
 $TaskName = "AFP Public Tunnel Watchdog"
 $RunKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 $RunValueName = "AFP_Public_Tunnel_Watchdog"
-$ProjectRoot = Split-Path -Parent $PSScriptRoot
-$DeliveryRoot = Join-Path $ProjectRoot "delivery\AFP_Integrated_System_Modular_v2.0.3_Agentic"
+$DeliveryRoot = $PSScriptRoot
+if (-not (Test-Path (Join-Path $DeliveryRoot "AFP_Integrated_System_Modular.exe"))) {
+    $ProjectRoot = Split-Path -Parent $PSScriptRoot
+    $DeliveryRoot = Join-Path $ProjectRoot "delivery\AFP_Integrated_System_Modular_v2.0.3_Agentic"
+}
 if (-not (Test-Path (Join-Path $DeliveryRoot "AFP_Integrated_System_Modular.exe"))) {
     $DeliveryRoot = "F:\AFP_Integrated_Modular_v2\delivery\AFP_Integrated_System_Modular_v2.0.3_Agentic"
 }

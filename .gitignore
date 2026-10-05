@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.venv/
 *.pid
 *.log
 
@@ -31,11 +32,13 @@ visualization_app/new_collection_demo_v11_3/
 visualization_app/portable_build*.log
 visualization_app/server_*.log
 visualization_app/AFP_State_Warning_System.exe
+visualization_app/runtime/verification/
 
 # User-specific editor files
 .idea/
 .vscode/
 visualization_app/trained_models_web/
+visualization_app/models/
 visualization_app/req.json
 visualization_app/test_training_request.json
 
@@ -55,3 +58,6 @@ modular_runtime/models/
 *.zip
 *.7z
 *.bak
+
+# Quality-gate runtime evidence (source matrices and rules remain tracked)
+/verification/results/

@@ -51,6 +51,40 @@ class BuildScriptContractTests(unittest.TestCase):
         self.assertIn('Copy-Item -LiteralPath $_.FullName -Destination $legacyStaticTarget -Recurse -Force', script)
         self.assertIn('Copy-Item -LiteralPath $_.FullName -Destination $uiTarget -Recurse -Force', script)
 
+    def test_build_keeps_pywebview_windows_runtime_dependencies(self) -> None:
+        script = (RUNTIME_ROOT / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn('"--hidden-import", "webview.platforms.winforms"', script)
+        self.assertNotIn('"--exclude-module", "clr_loader"', script)
+        self.assertNotIn('"--exclude-module", "pythonnet"', script)
+
+    def test_build_places_launcher_at_delivery_root(self) -> None:
+        script = (RUNTIME_ROOT / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn("Get-ChildItem -LiteralPath $built -Force", script)
+        self.assertNotIn("Copy-Item -LiteralPath $built -Destination $TargetDir -Recurse", script)
+
+    def test_build_copies_simulation_and_diagnosis_runtime_modules(self) -> None:
+        script = (RUNTIME_ROOT / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn('"diagnosis_jobs.py"', script)
+        self.assertIn('"simulation_packages.py"', script)
+        self.assertIn('Join-Path $LegacySource "simulation_packages"', script)
+
+    def test_build_stamps_requested_version_into_runtime_config(self) -> None:
+        script = (RUNTIME_ROOT / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn("$runtimeConfig.application_version = $ApplicationVersion", script)
+
+    def test_build_copies_release_operational_scripts(self) -> None:
+        script = (RUNTIME_ROOT / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
+        for name in (
+            "install_local_helper_autostart.ps1",
+            "public_tunnel_watchdog.ps1",
+            "tailscale_funnel_watchdog.ps1",
+        ):
+            self.assertIn(f'"{name}"', script)
+
+    def test_build_does_not_embed_external_legacy_entrypoint(self) -> None:
+        script = (RUNTIME_ROOT / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
+        self.assertNotIn('"--hidden-import", "interface_agent"', script)
+
 
 class UpdateTests(unittest.TestCase):
     def test_patch_install_and_rollback(self) -> None:

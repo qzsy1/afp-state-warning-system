@@ -2,6 +2,14 @@
 
 日期：2026-09-22（Asia/Shanghai）
 
+## 2026-10-01 本地保存路径与浏览器导出边界
+
+- 新增回归先复现三项缺陷：浏览器目录显示名覆盖绝对 `save_root`、相对路径按交付工作目录解析、直接保存和浏览器导出入口边界不清；实现后四项针对性测试及完整前端契约 82 项全部通过。
+- 采集完整性 32 项中 31 项通过；唯一失败 `test_simulation_check_reports_each_mapped_interface_as_available` 依赖当前电脑不存在的硬编码 `F:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv`，失败发生在模拟源可用性断言，与本次保存目录代码无关。helper 测试 13 项中 12 项通过，唯一错误为当前源码测试运行时未安装 `websocket` 模块，保存目录委托用例通过。
+- 重启交付程序后，实际回环 API 对 `AFP_Capture` 返回 `code=relative`，对 `D:\AFP_Capture` 完成临时文件探测并返回 `ok=true`；在线首页使用 `20261001-save-boundary-v1`，在线 `app.js` 包含执行端分流且不再包含 `controls.saveRoot.value = handle.name`。
+- 源码、`app/ui` 与 `app/legacy/static` 的 `app.js` SHA-256 均为 `C129B0372C7A7DAFE2B71FAE36CFCACA15028EB5F9EC35F5DD8A19DB0990C7DC`；两个 index 副本和两个 acquisition 副本也分别完全一致。交付自检通过，文件完整性检查 6293 项为 0 missing、0 mismatched、0 malformed。
+- 主程序 EXE 保持 `AA7BC2F636E862E9F603F7B4D4D9D8FC9B71390FFB20F33A011A42EF9D56FD65`，helper EXE 保持 `F59D63966F36B2980D2F80F941B4D3EBA2BFB8D4A46DF9DF3C880FD883336EBA`，本轮未重建二进制。
+
 ## 自动化验证
 
 - 核心回归：261 tests，全部通过，29.020 秒。覆盖 helper 传输/WebSocket/重连、远程镜像、浏览器上传、前端角色分流、公网安全、MySQL 作用域与诊断、Agent 诊断、本地规则以及远程状态路径脱敏。

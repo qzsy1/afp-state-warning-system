@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import tempfile
 import unittest
 
 from acquisition import (
@@ -12,6 +13,7 @@ from acquisition import (
     default_capture_interfaces,
     _resolve_interface_channel_assignments,
 )
+from generate_pressure_simulation import generate as generate_pressure_simulation
 
 
 class M3232PressureDriverTests(unittest.TestCase):
@@ -39,13 +41,19 @@ class M3232PressureDriverTests(unittest.TestCase):
         self.assertEqual(metrics["valid_fraction"], 0.75)
 
     def test_generated_full_channel_csv_is_readable_by_simulator(self) -> None:
-        path = Path(r"F:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv")
-        self.assertTrue(path.exists())
-        driver = SimulatorDriver(path, NEW_COLLECTION_SENSOR_COLUMNS)
-        driver.open()
-        sample = driver.read_sample()
-        self.assertIsNotNone(sample)
-        self.assertEqual(set(NEW_COLLECTION_SENSOR_COLUMNS), set(sample))
+        with tempfile.TemporaryDirectory() as temporary:
+            path = generate_pressure_simulation(
+                Path(temporary) / "SIM_PRESSURE_M3232_new_collection.csv",
+                rows=8,
+            )
+            driver = SimulatorDriver(path, NEW_COLLECTION_SENSOR_COLUMNS)
+            try:
+                driver.open()
+                sample = driver.read_sample()
+                self.assertIsNotNone(sample)
+                self.assertEqual(set(NEW_COLLECTION_SENSOR_COLUMNS), set(sample))
+            finally:
+                driver.close()
 
     def test_m3232_is_default_interface_five(self) -> None:
         interfaces = default_capture_interfaces()

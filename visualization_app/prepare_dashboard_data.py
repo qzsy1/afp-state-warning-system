@@ -12,7 +12,7 @@ import pandas as pd
 APP_DIR = Path(__file__).resolve().parent
 STATE_DIR = APP_DIR.parent
 WORKSPACE_DIR = STATE_DIR.parent
-PROJECT_ROOT = STATE_DIR.parents[2]
+PROJECT_ROOT = STATE_DIR
 
 for path in (WORKSPACE_DIR, STATE_DIR):
     if str(path) not in sys.path:
