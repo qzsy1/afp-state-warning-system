@@ -146,6 +146,46 @@ class SimulationSourceTransferTests(unittest.TestCase):
 
         self.assertEqual(limits, [MAX_TRANSFER_CHUNK_BYTES])
 
+    def test_cache_retries_a_transient_windows_directory_replace_denial(self):
+        manifest, source_root = build_source_manifest(
+            "source-a", "single_csv", self.source / "a.csv"
+        )
+        store = SimulationSourceTicketStore()
+        transfer = store.issue(
+            web_session_id="web-a",
+            helper_session_id="helper-a",
+            manifest=manifest,
+            source_root=source_root,
+        )
+        cache = SimulationSourceCache(self.root / "cache")
+        real_replace = __import__("os").replace
+        attempts = 0
+
+        def transient_replace(source, destination):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise PermissionError("transient scanner lock")
+            return real_replace(source, destination)
+
+        with patch("simulation_source_transfer.os.replace", side_effect=transient_replace), patch(
+            "simulation_source_transfer.time.sleep"
+        ) as sleep:
+            installed = cache.materialize(
+                transfer,
+                lambda ticket, file_index, offset, limit: store.read_chunk(
+                    ticket,
+                    "helper-a",
+                    file_index=file_index,
+                    offset=offset,
+                    limit=limit,
+                ),
+            )
+
+        self.assertTrue((installed / ".manifest.json").is_file())
+        self.assertEqual(attempts, 2)
+        sleep.assert_called_once()
+
     def test_agent_reports_cache_hit_and_does_not_refetch_verified_bytes(self):
         manifest, source_root = build_source_manifest(
             "source-a", "single_csv", self.source / "a.csv"

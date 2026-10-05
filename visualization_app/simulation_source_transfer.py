@@ -28,6 +28,20 @@ class SimulationSourceTransferError(ValueError):
     """Raised when a transfer violates its session or integrity contract."""
 
 
+def _replace_directory_with_retry(source: Path, destination: Path, timeout_seconds: float = 2.0) -> None:
+    """Publish a verified cache directory despite short lived Windows file locks."""
+
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
 def _numeric_value(value: str) -> bool:
     try:
         return math.isfinite(float(str(value).strip()))
@@ -458,7 +472,7 @@ class SimulationSourceCache:
             )
             if destination.exists():
                 shutil.rmtree(destination)
-            os.replace(temporary, destination)
+            _replace_directory_with_retry(temporary, destination)
             return destination
         except Exception:
             shutil.rmtree(temporary, ignore_errors=True)
