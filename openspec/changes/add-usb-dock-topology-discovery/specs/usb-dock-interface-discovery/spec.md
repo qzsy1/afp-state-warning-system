@@ -7,7 +7,7 @@
 ## ADDED Requirements
 
 ### Requirement: Windows USB 拓扑发现
-系统 SHALL 在支持的 Windows 环境中发现 USB Hub、每个下行物理连接器、连接状态、支持的 USB 协议和当前所接设备，并 SHALL 包含没有接入设备的可用端口。系统 MUST 将拓扑查询与传感器数据读取分开，发现端口时不得要求传感器正在输出数据。
+系统 SHALL 在支持的 Windows 环境中发现 USB Hub、每个下行物理连接器、连接状态、支持的 USB 协议和当前所接设备，并 SHALL 包含没有接入设备的可用端口。电脑本机端口记录 MUST 以 `confirmation` 区分 `observed_current` 与 `observed_history`，不得把未经观察的控制器逻辑端口发布为物理接口。系统 MUST 将拓扑查询与传感器数据读取分开，发现端口时不得要求传感器正在输出数据。
 
 #### Scenario: 显示空闲和占用端口
 - **WHEN** 操作员刷新接口，且一个拓展坞包含空闲端口和已接设备的端口
@@ -19,7 +19,15 @@
 
 #### Scenario: 电脑原生 USB 端口与拓展坞端口同时存在
 - **WHEN** Windows 能够确认电脑 Root Hub 上的用户可连接端口，且电脑同时连接一个拓展坞
-- **THEN** 系统 MUST 同时返回电脑原生 USB 端口和拓展坞外部 USB 端口，并 MUST 排除不可供用户连接的内部设备端口和拓展坞上游链路
+- **THEN** 系统 MUST 同时返回经过当前占用或历史观察确认的电脑原生 USB 物理端口和拓展坞外部 USB 端口，并 MUST 排除不可供用户连接的内部设备端口；连接拓展坞的电脑上游插孔 MUST 作为已占用的电脑原生物理端口保留
+
+#### Scenario: Root Hub 报告未实际布线的可连接端口
+- **WHEN** Windows 将某个空 Root Hub 逻辑端口报告为 `user_connectable`，但该端口从未出现设备或下级 Hub，也没有本机历史观察记录
+- **THEN** 系统 MUST NOT 将该逻辑端口显示为电脑机身物理插孔，并 MUST NOT 仅凭 `user_connectable` 推断机身端口数量
+
+#### Scenario: 已观察本机端口恢复为空闲
+- **WHEN** 一个经过设备或下级 Hub 实际占用确认的电脑原生端口被持久记录，随后设备被拔出
+- **THEN** 系统 MUST 继续以相同端口标识显示该端口，将状态更新为空闲，并将 `confirmation` 从 `observed_current` 更新为 `observed_history`
 
 ### Requirement: 伴随 Hub 合并为物理连接器
 系统 SHALL 使用 Windows 报告的伴随端口关系，将共享同一连接器的 USB 2.x 与 SuperSpeed 端口合并为一个逻辑物理端口。系统 MUST 保留各通道支持的协议和状态，且在缺少可靠伴随关系时不得仅凭端口数量猜测合并。

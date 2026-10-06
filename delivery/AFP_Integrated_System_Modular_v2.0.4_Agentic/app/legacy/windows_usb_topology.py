@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import json
+import os
 import re
 import sys
 import uuid
 from collections import defaultdict
 from ctypes import wintypes
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
@@ -342,10 +345,12 @@ def normalize_usb_topology(
     raw_hubs: Sequence[Mapping[str, Any]],
     *,
     errors: Iterable[str] = (),
+    known_host_port_ids: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Normalize raw hub IOCTL records into docks, connectors and devices."""
 
     error_list = [str(item) for item in errors if str(item)]
+    known_host_ports = {str(item) for item in known_host_port_ids if str(item)}
     hubs = [{**hub, "ports": [dict(port) for port in hub.get("ports", [])]} for hub in raw_hubs]
     root_hubs = [hub for hub in hubs if bool(hub.get("is_root"))]
     public_hubs = [hub for hub in hubs if not bool(hub.get("is_root"))]
@@ -529,10 +534,11 @@ def normalize_usb_topology(
             "merge_state": "companion" if len(members) > 1 else "independent",
         })
 
-    # Root hubs represent connectors owned by the computer.  Include only
-    # ports that Windows explicitly marks user-connectable.  A root port that
-    # leads to a discovered downstream hub is the upstream link for that hub,
-    # not an additional sensor connector.
+    # Root hubs represent connectors owned by the computer.  Some firmware
+    # marks unpopulated or un-routed controller ports as user-connectable, so
+    # that flag alone cannot prove a chassis connector exists.  Publish only
+    # connectors that have been physically observed; the discovery wrapper
+    # restores previously observed connectors after they become empty.
     root_by_id = {str(hub["id"]): hub for hub in root_hubs}
     root_path_to_id = {
         _canonical_link(str(hub.get("device_path") or "")): str(hub["id"])
@@ -585,18 +591,31 @@ def normalize_usb_topology(
     for members in root_connectors.values():
         if not any(port.get("user_connectable") is True for _, port in members):
             continue
-        if any(
+        dock_upstream = any(
             _canonical_link(str(port.get("child_hub_path") or "")) in downstream_paths
             for _, port in members
             if port.get("child_hub_path")
-        ):
-            continue
-        if any(
+        ) or any(
             str((port.get("device") or {}).get("instance_id") or "").strip().upper()
             in downstream_instance_ids
             for _, port in members
             if isinstance(port.get("device"), Mapping)
-        ):
+        )
+        member_identity = ",".join(
+            f"{hub_id}:{int(port['number'])}"
+            for hub_id, port in sorted(members, key=lambda value: (value[0], int(value[1]["number"])))
+        )
+        locations = [
+            path
+            for hub_id, _ in members
+            for path in root_by_id[hub_id].get("location_paths", [])
+            if path
+        ]
+        port_id = _stable_id("usbport", "host", _common_location(locations), member_identity)
+        currently_observed = any(
+            str(port.get("state") or "") == "occupied" for _, port in members
+        )
+        if not currently_observed and port_id not in known_host_ports:
             continue
         active = [port for _, port in members if str(port.get("state")) == "occupied"]
         candidate = active[0] if active else members[0][1]
@@ -615,17 +634,6 @@ def normalize_usb_topology(
             else "empty" if "empty" in states
             else "unknown"
         )
-        member_identity = ",".join(
-            f"{hub_id}:{int(port['number'])}"
-            for hub_id, port in sorted(members, key=lambda value: (value[0], int(value[1]["number"])))
-        )
-        locations = [
-            path
-            for hub_id, _ in members
-            for path in root_by_id[hub_id].get("location_paths", [])
-            if path
-        ]
-        port_id = _stable_id("usbport", "host", _common_location(locations), member_identity)
         device = candidate.get("device") if isinstance(candidate.get("device"), Mapping) else None
         device_id: str | None = None
         if device:
@@ -666,8 +674,9 @@ def normalize_usb_topology(
             "supported_protocols": protocols or ["usb2"],
             "state": state,
             "user_connectable": True,
+            "confirmation": "observed_current" if currently_observed else "observed_history",
             "device_id": device_id,
-            "internal_function": "",
+            "internal_function": "dock_upstream" if dock_upstream else "",
             "merge_state": "companion" if len(members) > 1 else "independent",
         })
 
@@ -714,6 +723,46 @@ def normalize_usb_topology(
         "usb_ports": ports,
         "devices": sorted(devices, key=lambda item: item["id"]),
     }
+
+
+def _host_port_registry_path() -> Path | None:
+    override = str(os.environ.get("AFP_USB_HOST_PORT_REGISTRY") or "").strip()
+    if override:
+        return Path(override).expanduser()
+    local_app_data = str(os.environ.get("LOCALAPPDATA") or "").strip()
+    if local_app_data:
+        return Path(local_app_data) / "AFP_Integrated_System" / "usb_host_ports.json"
+    runtime_dir = str(os.environ.get("AFP_RUNTIME_DIR") or "").strip()
+    if runtime_dir:
+        return Path(runtime_dir) / "usb_host_ports.json"
+    return None
+
+
+def _load_known_host_port_ids(path: Path | None) -> set[str]:
+    if path is None or not path.is_file():
+        return set()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return set()
+    values = payload.get("port_ids", []) if isinstance(payload, Mapping) else []
+    return {str(item) for item in values if str(item).startswith("usbport:")}
+
+
+def _save_known_host_port_ids(path: Path | None, port_ids: Iterable[str]) -> None:
+    if path is None:
+        return
+    values = sorted({str(item) for item in port_ids if str(item).startswith("usbport:")})
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps({"schema_version": 1, "port_ids": values}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    except OSError:
+        return
 
 
 class _WindowsApi:
@@ -1274,10 +1323,25 @@ def discover_windows_usb_topology() -> dict[str, Any]:
             errors.append(
                 f"hub {_stable_id('hub', interface.get('instance_id') or interface.get('device_path'))}: {exc}"
             )
+    registry_path = _host_port_registry_path()
+    known_host_port_ids = _load_known_host_port_ids(registry_path)
     try:
-        topology = normalize_usb_topology(raw_hubs, errors=errors)
+        topology = normalize_usb_topology(
+            raw_hubs,
+            errors=errors,
+            known_host_port_ids=known_host_port_ids,
+        )
     except Exception as exc:
         return _empty_topology("unavailable", PROVIDER_NAME, [f"USB topology normalization failed: {exc}"])
+    observed_host_port_ids = {
+        str(port.get("id") or "")
+        for port in topology.get("usb_ports", [])
+        if port.get("owner_kind") == "host"
+    }
+    _save_known_host_port_ids(
+        registry_path,
+        known_host_port_ids | observed_host_port_ids,
+    )
     if not raw_hubs and errors:
         topology["state"] = "unavailable"
     return topology

@@ -84,6 +84,14 @@ def validate_discovery_payload(payload: object) -> tuple[str, ...]:
             issues.append(f"usb_topology.usb_ports[{index}].dock_id must reference a dock")
         if owner_kind == "host" and dock_id:
             issues.append(f"usb_topology.usb_ports[{index}] host port must not reference a dock")
+        if owner_kind == "host" and str(port.get("confirmation") or "") not in {
+            "observed_current",
+            "observed_history",
+        }:
+            issues.append(
+                f"usb_topology.usb_ports[{index}].confirmation must be "
+                "observed_current or observed_history"
+            )
         if port.get("user_connectable") not in {True, False}:
             issues.append(f"usb_topology.usb_ports[{index}].user_connectable must be boolean")
         if not str(port.get("connector_type") or "").strip():

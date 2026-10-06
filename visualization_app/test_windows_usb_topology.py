@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import copy
 import ctypes
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -21,6 +23,7 @@ def _port(
     device: dict | None = None,
     user_connectable: bool | None = True,
     child_hub_path: str = "",
+    device_is_hub: bool = False,
 ) -> dict:
     return {
         "number": number,
@@ -30,6 +33,7 @@ def _port(
         "companion": companion,
         "device": device,
         "child_hub_path": child_hub_path,
+        "device_is_hub": device_is_hub,
     }
 
 
@@ -199,7 +203,7 @@ class WindowsUsbTopologyTests(unittest.TestCase):
         self.assertEqual(unavailable["state"], "unavailable")
         self.assertEqual(unavailable["usb_ports"], [])
 
-    def test_host_user_connectable_ports_join_dock_ports_and_skip_upstream_link(self) -> None:
+    def test_host_ports_require_observation_and_keep_dock_upstream_connector(self) -> None:
         dock_hubs = _genesys_fixture()
         root_path = r"\\?\usb#root_hub30#root#{hub}"
         root = _hub(
@@ -208,9 +212,34 @@ class WindowsUsbTopologyTests(unittest.TestCase):
             pid=0,
             path=root_path,
             ports=[
-                _port(1, child_hub_path=dock_hubs[0]["device_path"]),
-                _port(2, protocol="usb3", user_connectable=True),
-                _port(3, protocol="usb3", user_connectable=False),
+                _port(
+                    1,
+                    state="occupied",
+                    child_hub_path=dock_hubs[0]["device_path"],
+                    device_is_hub=True,
+                    device={
+                        "instance_id": dock_hubs[0]["instance_id"],
+                        "friendly_name": "USB Hub",
+                        "class": "hub",
+                        "vid": 0x05E3,
+                        "pid": 0x0610,
+                    },
+                ),
+                _port(
+                    2,
+                    state="occupied",
+                    protocol="usb3",
+                    user_connectable=True,
+                    device={
+                        "instance_id": r"USB\VID_1234&PID_5678\EXTERNAL",
+                        "friendly_name": "External USB device",
+                        "class": "hid",
+                        "vid": 0x1234,
+                        "pid": 0x5678,
+                    },
+                ),
+                _port(3, protocol="usb3", user_connectable=True),
+                _port(4, protocol="usb3", user_connectable=False),
             ],
             location="PCIROOT(0)#USBROOT(0)",
         )
@@ -221,9 +250,13 @@ class WindowsUsbTopologyTests(unittest.TestCase):
 
         host_ports = [item for item in result["usb_ports"] if item["owner_kind"] == "host"]
         dock_ports = [item for item in result["usb_ports"] if item["owner_kind"] == "dock"]
-        self.assertEqual(len(host_ports), 1)
-        self.assertEqual(host_ports[0]["system_port_number"], 2)
-        self.assertIn("电脑本机", host_ports[0]["label"])
+        self.assertEqual(
+            [port["system_port_number"] for port in host_ports],
+            [1, 2],
+        )
+        self.assertTrue(all("电脑本机" in port["label"] for port in host_ports))
+        self.assertTrue(all(port["confirmation"] == "observed_current" for port in host_ports))
+        self.assertEqual(host_ports[0]["internal_function"], "dock_upstream")
         self.assertEqual(len(dock_ports), 4)
 
     def test_locationless_root_hub_is_not_published_as_empty_host_connectors(self) -> None:
@@ -241,6 +274,61 @@ class WindowsUsbTopologyTests(unittest.TestCase):
         result = topology.normalize_usb_topology([root])
 
         self.assertEqual(result["usb_ports"], [])
+
+    def test_observed_host_port_remains_visible_after_device_is_removed(self) -> None:
+        root = _hub(
+            "root",
+            vid=0,
+            pid=0,
+            path=r"\\?\usb#root_hub30#root#{hub}",
+            ports=[
+                _port(
+                    2,
+                    state="occupied",
+                    protocol="usb3",
+                    device={
+                        "instance_id": r"USB\VID_1234&PID_5678\EXTERNAL",
+                        "friendly_name": "External USB device",
+                        "class": "hid",
+                        "vid": 0x1234,
+                        "pid": 0x5678,
+                    },
+                ),
+                _port(3, protocol="usb3"),
+            ],
+            location="PCIROOT(0)#USBROOT(0)",
+        )
+        root["is_root"] = True
+        root["instance_id"] = r"USB\ROOT_HUB30\ROOT"
+        empty_root = copy.deepcopy(root)
+        empty_root["ports"][0]["state"] = "empty"
+        empty_root["ports"][0]["device"] = None
+
+        fake_api = unittest.mock.Mock()
+        fake_api.enumerate_devices.return_value = {}
+        fake_api.enumerate_hub_interfaces.return_value = [{"device_path": root["device_path"]}]
+        with tempfile.TemporaryDirectory() as temporary:
+            registry_path = str(Path(temporary) / "observed-host-ports.json")
+            with (
+                patch.dict(os.environ, {"AFP_USB_HOST_PORT_REGISTRY": registry_path}),
+                patch.object(topology, "_WindowsApi", return_value=fake_api),
+                patch.object(
+                    topology,
+                    "_read_hub",
+                    side_effect=[(root, []), (empty_root, [])],
+                ),
+            ):
+                first = topology.discover_windows_usb_topology()
+                second = topology.discover_windows_usb_topology()
+
+            first_host = [port for port in first["usb_ports"] if port["owner_kind"] == "host"]
+            second_host = [port for port in second["usb_ports"] if port["owner_kind"] == "host"]
+            self.assertEqual([port["system_port_number"] for port in first_host], [2])
+            self.assertEqual([port["system_port_number"] for port in second_host], [2])
+            self.assertEqual(first_host[0]["id"], second_host[0]["id"])
+            self.assertEqual(first_host[0]["confirmation"], "observed_current")
+            self.assertEqual(second_host[0]["confirmation"], "observed_history")
+            self.assertTrue(Path(registry_path).is_file())
 
 
 if __name__ == "__main__":

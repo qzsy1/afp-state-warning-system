@@ -28,6 +28,7 @@ def compliant_discovery() -> dict:
                     "supported_protocols": ["usb2", "usb3"],
                     "state": "empty",
                     "user_connectable": True,
+                    "confirmation": "observed_history",
                     "device_id": None,
                 },
                 {
@@ -182,6 +183,14 @@ class UsbDockContractValidatorTests(unittest.TestCase):
 
         self.assertIn("owner_kind must be host or dock", issues)
         self.assertIn("serial transport_family must be usb", issues)
+
+    def test_host_ports_require_physical_observation_evidence(self) -> None:
+        payload = compliant_discovery()
+        del payload["usb_topology"]["usb_ports"][0]["confirmation"]
+
+        issues = "\n".join(validate_discovery_payload(payload))
+
+        self.assertIn("confirmation must be observed_current or observed_history", issues)
 
 
 if __name__ == "__main__":
