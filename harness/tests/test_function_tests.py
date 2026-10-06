@@ -2,7 +2,7 @@ import io
 import types
 import unittest
 
-from tools.verification.function_tests import load_function_tests, run_function_tests
+from harness.engine.function_tests import load_function_tests, run_function_tests
 
 
 class FunctionTestAdapterTests(unittest.TestCase):

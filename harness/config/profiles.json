@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "quick": [
+      "harness-contracts",
+      "modular-runtime-contracts"
+    ],
+    "full": [
+      "harness-contracts",
+      "modular-runtime-contracts",
+      "interface-monitor-contracts",
+      "native-function-contracts",
+      "frontend-public-contracts",
+      "acquisition-storage-contracts",
+      "dashboard-runtime-contracts",
+      "diagnosis-interface-contracts",
+      "causal-history-evidence",
+      "edge-helper-websocket-contracts",
+      "model-prediction-contracts"
+    ],
+    "release": [
+      "harness-contracts",
+      "modular-runtime-contracts",
+      "interface-monitor-contracts",
+      "native-function-contracts",
+      "frontend-public-contracts",
+      "acquisition-storage-contracts",
+      "dashboard-runtime-contracts",
+      "diagnosis-interface-contracts",
+      "causal-history-evidence",
+      "edge-helper-websocket-contracts",
+      "model-prediction-contracts",
+      "release-module-status",
+      "release-self-test",
+      "release-verify-files",
+      "release-integration-smoke",
+      "release-functional-smoke",
+      "field-real-hardware",
+      "field-target-mysql"
+    ]
+  }
+}

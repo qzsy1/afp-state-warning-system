@@ -6,16 +6,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.verification.evidence import collect_git_evidence
-from tools.verification.models import RequirementSpec
-from tools.verification.reporting import (
+from harness.engine.evidence import collect_git_evidence
+from harness.engine.models import RequirementSpec
+from harness.engine.reporting import (
     GateReport,
     ReportWriteError,
     aggregate_requirements,
     redact_text,
     write_reports,
 )
-from tools.verification.runner import CheckResult
+from harness.engine.runner import CheckResult
 
 
 def result(check_id: str, status: str, *, blocking: bool = True, requirement: str = "REQ-1") -> CheckResult:
@@ -187,6 +187,13 @@ class ReportingTests(unittest.TestCase):
         self.assertNotEqual(first_path, second_path)
         self.assertTrue(first_path.exists())
         self.assertTrue(second_path.exists())
+
+    def test_check_profile_is_safe_for_windows_report_filename(self) -> None:
+        repo = self.init_repo()
+        report = GateReport(**{**self.make_report(repo).__dict__, "profile": "check:sample"})
+        json_path, _ = write_reports(report, self.root / "results", os.environ)
+        self.assertNotIn(":", json_path.name)
+        self.assertIn("check-sample", json_path.name)
 
 
 if __name__ == "__main__":

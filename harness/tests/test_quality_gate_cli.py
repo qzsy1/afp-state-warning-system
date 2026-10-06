@@ -1,13 +1,15 @@
 import hashlib
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
-from tools.verification.quality_gate import (
+from harness.engine.quality_gate import (
     EXIT_CHECK_FAILED,
     EXIT_CONFIG,
     EXIT_OK,
@@ -65,7 +67,7 @@ class QualityGateCliTests(unittest.TestCase):
             check=True,
         )
         self.matrix = self.root / "matrix.json"
-        self.rules = Path(__file__).parents[3] / "verification" / "exe-rebuild-rules.json"
+        self.rules = Path(__file__).parents[2] / "harness" / "config" / "exe-rebuild-rules.json"
         self.reports = self.root / "reports"
 
     def write_matrix(self, payload: dict) -> None:
@@ -96,6 +98,17 @@ class QualityGateCliTests(unittest.TestCase):
         payload = self.report_payload()
         self.assertEqual(payload["outcome"], "failed")
         self.assertEqual(payload["checks"][0]["exit_code"], 9)
+
+    def test_console_reports_start_and_finish_before_summary(self) -> None:
+        self.write_matrix(matrix_payload(["{python}", "-c", "pass"]))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(main(self.arguments(), repo_root=self.repo), EXIT_OK)
+        text = output.getvalue()
+        self.assertIn("selected 1 check(s)", text)
+        self.assertIn("[1/1] START contract", text)
+        self.assertIn("[1/1] PASSED contract", text)
+        self.assertLess(text.index("START contract"), text.index("PASSED contract"))
 
     def test_failed_nonblocking_unverified_check_is_listed_as_unverified(self) -> None:
         payload = matrix_payload(["{python}", "-c", "import sys; sys.exit(7)"])

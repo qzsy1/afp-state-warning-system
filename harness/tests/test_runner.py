@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.verification.models import CheckSpec
-from tools.verification.runner import OUTPUT_LIMIT, run_check
+from harness.engine.models import CheckSpec
+from harness.engine.runner import OUTPUT_LIMIT, run_check
 
 
 def command_check(command: list[str], **overrides: object) -> CheckSpec:

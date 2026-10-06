@@ -11,26 +11,31 @@ from typing import Mapping, Sequence
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tools.verification.evidence import (  # noqa: E402
+from harness.engine.evidence import (  # noqa: E402
     GitEvidenceError,
     changed_files_from_git,
     collect_git_evidence,
 )
-from tools.verification.exe_policy import (  # noqa: E402
+from harness.engine.exe_policy import (  # noqa: E402
     ExePolicyError,
     classify_changed_files,
     load_exe_rules,
     verify_reuse_hash,
 )
-from tools.verification.matrix import load_matrix, select_checks  # noqa: E402
-from tools.verification.models import GateConfigError  # noqa: E402
-from tools.verification.reporting import (  # noqa: E402
+from harness.engine.matrix import load_matrix, select_checks  # noqa: E402
+from harness.engine.models import GateConfigError  # noqa: E402
+from harness.engine.profiles import (  # noqa: E402
+    load_profiles,
+    select_profile_checks,
+    select_single_check,
+)
+from harness.engine.reporting import (  # noqa: E402
     GateReport,
     ReportWriteError,
     aggregate_requirements,
     write_reports,
 )
-from tools.verification.runner import run_check  # noqa: E402
+from harness.engine.runner import run_check  # noqa: E402
 
 
 EXIT_OK = 0
@@ -47,11 +52,14 @@ class GateArgumentParser(argparse.ArgumentParser):
 
 def _parser() -> GateArgumentParser:
     parser = GateArgumentParser(description="Run the AFP release regression quality gate")
-    parser.add_argument("--profile", required=True, choices=("quick", "full", "release"))
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--profile", choices=("quick", "full", "release"))
+    target.add_argument("--check")
     parser.add_argument("--environment", default="local", choices=("local", "ci"))
-    parser.add_argument("--matrix", default="verification/regression-matrix.json")
-    parser.add_argument("--exe-rules", default="verification/exe-rebuild-rules.json")
-    parser.add_argument("--report-dir", default="verification/results")
+    parser.add_argument("--matrix", default="harness/config/regression-matrix.json")
+    parser.add_argument("--profiles")
+    parser.add_argument("--exe-rules", default="harness/config/exe-rebuild-rules.json")
+    parser.add_argument("--report-dir", default="harness/reports")
     changed = parser.add_mutually_exclusive_group()
     changed.add_argument("--base-ref")
     changed.add_argument("--changed-file", action="append", default=[])
@@ -105,7 +113,13 @@ def main(
         else:
             changed_files = _status_changed_files(git.status)
         exe_decision = classify_changed_files(changed_files, rules)
-        selected = select_checks(matrix, args.profile, args.environment, changed_files)
+        if args.check:
+            selected = (select_single_check(matrix, args.check, args.environment),)
+        elif args.profiles:
+            profiles = load_profiles(_path(root, args.profiles))
+            selected = select_profile_checks(matrix, profiles, args.profile, args.environment)
+        else:
+            selected = select_checks(matrix, args.profile, args.environment, changed_files)
     except (GateConfigError, GitEvidenceError) as exc:
         _print_error(str(exc))
         return EXIT_CONFIG
@@ -113,12 +127,28 @@ def main(
     command_variables: dict[str, str] = {}
     if args.baseline_exe:
         command_variables["{baseline_exe}"] = str(_path(root, args.baseline_exe).resolve())
-    results = tuple(
-        run_check(check, root, environment, command_variables=command_variables)
-        for check in selected
-    )
+    print(f"quality-gate: selected {len(selected)} check(s); execution is starting", flush=True)
+    collected_results = []
+    for index, check in enumerate(selected, start=1):
+        print(
+            f"[{index}/{len(selected)}] START {check.id} - {check.title} "
+            f"(timeout {check.timeout_seconds:g}s)",
+            flush=True,
+        )
+        print("  The command may be quiet while its output is being captured.", flush=True)
+        result = run_check(check, root, environment, command_variables=command_variables)
+        collected_results.append(result)
+        print(
+            f"[{index}/{len(selected)}] {result.status.upper()} {check.id} "
+            f"({result.duration_seconds:.2f}s, exit={result.exit_code})",
+            flush=True,
+        )
+    results = tuple(collected_results)
+    selected_requirement_ids = {item for check in selected for item in check.requirements}
     active_requirements = tuple(
-        requirement for requirement in matrix.requirements if args.profile in requirement.profiles
+        requirement for requirement in matrix.requirements
+        if (args.profile and args.profile in requirement.profiles)
+        or (args.check and requirement.id in selected_requirement_ids)
     )
     requirement_results = aggregate_requirements(active_requirements, results)
     release_issues: list[str] = []
@@ -175,7 +205,7 @@ def main(
     }
     report = GateReport(
         schema_version=1,
-        profile=args.profile,
+        profile=args.profile or f"check:{args.check}",
         environment=args.environment,
         started_at=started_at,
         ended_at=_now(),

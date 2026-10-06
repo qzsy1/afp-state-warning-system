@@ -4,14 +4,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.verification.exe_policy import (
+from harness.engine.exe_policy import (
     ExePolicyError,
     classify_changed_files,
     load_exe_rules,
     sha256_file,
     verify_reuse_hash,
 )
-from tools.verification.models import GateConfigError
+from harness.engine.models import GateConfigError
 
 
 class ExePolicyTests(unittest.TestCase):
@@ -19,7 +19,7 @@ class ExePolicyTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
-        self.real_rules = Path(__file__).parents[3] / "verification" / "exe-rebuild-rules.json"
+        self.real_rules = Path(__file__).parents[2] / "harness" / "config" / "exe-rebuild-rules.json"
 
     def test_ordinary_external_files_reuse_exe(self) -> None:
         rules = load_exe_rules(self.real_rules)
@@ -28,7 +28,7 @@ class ExePolicyTests(unittest.TestCase):
                 "visualization_app/app.py",
                 "visualization_app/static/app.js",
                 "docs/quality-gate.md",
-                "verification/regression-matrix.json",
+                "harness/config/regression-matrix.json",
                 "models/predictor.pth",
                 ".github/workflows/quality-gate.yml",
             ],

@@ -40,12 +40,14 @@ jobs:
 
       - name: Run full CI quality gate
         shell: pwsh
-        run: ./tools/verification/run_quality_gate.ps1 -Profile full -Environment ci
+        run: ./harness/engine/run.ps1 -Profile full -Environment ci
 
       - name: Upload quality-gate reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: quality-gate-reports
-          path: verification/results/
+          path: |
+            harness/logs/
+            harness/reports/
           if-no-files-found: warn

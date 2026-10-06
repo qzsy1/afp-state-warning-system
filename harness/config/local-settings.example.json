@@ -1,0 +1,5 @@
+{
+  "python_path": ".venv/Scripts/python.exe",
+  "baseline_exe": "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/AFP_Integrated_System_Modular.exe",
+  "baseline_exe_sha256": ""
+}

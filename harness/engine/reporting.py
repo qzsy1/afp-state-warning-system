@@ -215,7 +215,8 @@ def write_reports(
         timestamp = datetime.fromisoformat(report.started_at).strftime("%Y%m%d%H%M%S%f")
     except ValueError:
         timestamp = re.sub(r"[^0-9]", "", report.started_at) or "unknown"
-    stem = f"quality-gate-{report.profile}-{report.git.commit[:7]}-{timestamp}"
+    safe_profile = re.sub(r"[^A-Za-z0-9._-]+", "-", report.profile).strip("-") or "unknown"
+    stem = f"quality-gate-{safe_profile}-{report.git.commit[:7]}-{timestamp}"
     output_dir = Path(output_dir)
     json_path = output_dir / f"{stem}.json"
     markdown_path = output_dir / f"{stem}.md"

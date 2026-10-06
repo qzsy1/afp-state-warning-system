@@ -24,7 +24,7 @@
       "id": "harness-contracts",
       "title": "Harness单元与契约测试",
       "kind": "command",
-      "command": ["{python}", "-m", "unittest", "discover", "-s", "tools/verification/tests", "-v"],
+      "command": ["{python}", "-m", "unittest", "discover", "-s", "harness/tests", "-v"],
       "cwd": ".",
       "timeout_seconds": 120,
       "profiles": ["quick", "full", "release"],
@@ -32,7 +32,7 @@
       "blocking": true,
       "evidence_tier": "automated",
       "requirements": ["HARNESS-001", "EXE_REUSE-001"],
-      "change_patterns": ["tools/verification/**", "verification/**", "openspec/changes/release-regression-harness/**"]
+      "change_patterns": ["harness/**", "tools/verification/run_quality_gate.ps1", "openspec/changes/release-regression-harness/**"]
     },
     {
       "id": "modular-runtime-contracts",
@@ -65,7 +65,7 @@
       "id": "native-function-contracts",
       "title": "原生集成界面与MySQL显隐函数契约",
       "kind": "command",
-      "command": ["{python}", "-m", "tools.verification.function_tests", "visualization_app.test_native_integrated_app", "visualization_app.test_mysql_visibility"],
+      "command": ["{python}", "-m", "harness.engine.function_tests", "visualization_app.test_native_integrated_app", "visualization_app.test_mysql_visibility"],
       "cwd": ".",
       "timeout_seconds": 180,
       "profiles": ["full", "release"],

@@ -1,14 +1,14 @@
 import unittest
 from pathlib import Path
 
-from tools.verification.matrix import load_matrix, select_checks
+from harness.engine.matrix import load_matrix, select_checks
 
 
 class RegressionMatrixContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.repo = Path(__file__).parents[3]
-        cls.path = cls.repo / "verification" / "regression-matrix.json"
+        cls.repo = Path(__file__).parents[2]
+        cls.path = cls.repo / "harness" / "config" / "regression-matrix.json"
         cls.matrix = load_matrix(cls.path)
 
     def test_requirement_families_cover_the_approved_balanced_scope(self) -> None:
@@ -65,7 +65,7 @@ class RegressionMatrixContractTests(unittest.TestCase):
     def test_module_level_function_contracts_are_explicitly_collected(self) -> None:
         check = next(item for item in self.matrix.checks if item.id == "native-function-contracts")
         command = " ".join(check.command)
-        self.assertIn("tools.verification.function_tests", command)
+        self.assertIn("harness.engine.function_tests", command)
         self.assertIn("visualization_app.test_native_integrated_app", command)
         self.assertIn("visualization_app.test_mysql_visibility", command)
         self.assertIn("full", check.profiles)

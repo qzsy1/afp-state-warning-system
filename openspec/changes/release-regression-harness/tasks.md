@@ -42,3 +42,40 @@
 - [x] 7.1 运行OpenSpec严格校验，确认proposal、三项能力Spec、design和tasks无结构错误或未解析占位内容
 - [x] 7.2 检查Git差异，确认没有生成新的重复EXE或交付目录，没有提交运行凭据、API Key、数据库密码和运行报告
 - [ ] 7.3 提交规格与Harness源码到当前功能分支，运行最终full门禁后推送GitHub，并记录提交号与远端分支
+
+## 8. 独立Harness目录与兼容迁移
+
+- [x] 8.1 为根目录 `harness/` 布局、唯一配置来源和旧入口转发编写失败契约测试，验证现有分散路径不能满足新契约
+- [x] 8.2 创建 `harness/engine`、`harness/config`、`harness/tests`、`harness/checks`、`harness/logs` 和 `harness/reports`，迁移现有引擎、矩阵、EXE规则和测试并验证原检查ID、超时、证据层级及退出码保持一致
+- [x] 8.3 将 `tools/verification/run_quality_gate.ps1` 改为兼容转发入口并更新GitHub工作流，验证旧命令和新命令执行同一实现
+
+## 9. 单项检查与三级组合入口
+
+- [x] 9.1 为 `list`、`check <id>` 和 `profile <quick|full|release>` 编写失败测试，覆盖未知检查、单项选择、稳定profile组合和必需需求覆盖
+- [x] 9.2 实现单项及profile选择，确保quick固定执行环境、Harness和模块化运行时检查，full执行全部软件回归，release在full上追加五项EXE与两项现场检查，并通过选择测试
+- [x] 9.3 创建纯ASCII的 `quick.cmd`、`full.cmd`、`release.cmd`、`check_all.cmd` 以及每个矩阵检查对应的 `harness/checks/*.cmd`，验证每个入口只转发检查ID/profile、保留退出码并在人工双击模式暂停窗口
+
+## 10. 环境预检与本机发布设置
+
+- [x] 10.1 为Python 3.11、项目 `.venv`、Node.js 22、依赖、工作目录、矩阵和EXE缺失编写失败测试，验证错误包含缺失项、影响检查和修复建议
+- [x] 10.2 实现目标感知的轻量预检和独立 `00_environment.cmd`，验证缺失依赖在受影响命令执行前被准确报告
+- [x] 10.3 实现 `setup.cmd` 与被Git忽略的 `harness/config/local-settings.json`，验证仅保存解释器路径、EXE路径和基线SHA-256且不会保存API Key、密码或Token
+
+## 11. 精确错误诊断与仅错误报告
+
+- [x] 11.1 为unittest、Python traceback、Node.js、命令启动失败、超时、release策略和现场待验证输出编写失败解析测试，验证期望的检查ID、文件、行号、分类和日志路径
+- [x] 11.2 实现统一 `DiagnosticIssue` 解析和每次运行的原始日志/机器状态保存，验证无法解析源码位置时仍保留命令、退出码和日志证据
+- [x] 11.3 为仅错误HTML报告编写失败测试，验证报告不包含通过项、包含建议重跑 `.cmd`，且全部通过时不生成新报告并使旧 `latest-errors.html` 失效
+- [x] 11.4 实现 `latest-errors.html`、历史错误报告和自动打开行为，验证报告写入失败继续返回退出码5
+
+## 12. 文档与人工运行体验
+
+- [x] 12.1 编写 `harness/README.md`，列出每个 `.cmd` 对应功能、三级模式、首次setup、退出码、日志位置和现场验证边界，并逐条验证文档命令可执行
+- [x] 12.2 验证含空格路径、非仓库当前目录启动、中文Windows区域设置和无管理员权限场景，确认CMD内容不发生编码乱码且窗口保持到用户确认
+
+## 13. 集成验证
+
+- [x] 13.1 逐个运行环境、Harness、启动、接口、原生函数、前端、采集保存、Dashboard、诊断、因果证据、Helper/WebSocket及模型预测单项入口，记录每项退出码并确认错误报告仅包含真实问题
+- [x] 13.2 运行quick和full新入口，确认检查组合、需求覆盖、退出码与迁移前语义一致，并确认本机缺少Node.js时给出明确环境错误而非模糊启动失败
+- [x] 13.3 使用可信基线EXE运行release新入口，确认五项EXE诊断、SHA-256策略、脏工作区阻断和两项现场待验证均按规格工作
+- [x] 13.4 运行Harness全部单元与契约测试、OpenSpec严格校验和Git差异检查，确认没有第二套引擎、重复EXE、凭据或未跟踪运行报告后再进入提交步骤

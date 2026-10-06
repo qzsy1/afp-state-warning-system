@@ -3,8 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.verification.matrix import load_matrix, select_checks
-from tools.verification.models import GateConfigError
+from harness.engine.matrix import load_matrix, select_checks
+from harness.engine.models import GateConfigError
 
 
 def valid_matrix() -> dict:

@@ -1,6 +1,6 @@
 # 质量门禁使用说明
 
-统一入口为 `tools/verification/run_quality_gate.ps1`。它定位可用 Python 后调用同一套 Python Harness，并原样返回 Harness 退出码。
+统一实现位于 `harness/`，推荐入口为 `harness/engine/run.ps1` 和可双击的 `harness/*.cmd`。旧 `tools/verification/run_quality_gate.ps1` 仅作兼容转发，并原样返回 Harness 退出码。
 
 本机运行需要 Python 3.11、`visualization_app/requirements.txt` 中的 Python 依赖，以及 Node.js 22 或更高版本。GitHub 工作流会安装 Python 3.11 和 Node.js 22；Windows 本机可安装当前 Node.js LTS。首次配置示例：
 
@@ -16,9 +16,9 @@ py -3.11 -m venv .venv
 - `release`：在 full 基础上运行交付 EXE 的模块状态、自检、文件完整性、集成冒烟和功能冒烟，并检查稳定 EXE 的 SHA-256。
 
 ```powershell
-./tools/verification/run_quality_gate.ps1 -Profile quick
-./tools/verification/run_quality_gate.ps1 -Profile full
-./tools/verification/run_quality_gate.ps1 `
+./harness/engine/run.ps1 -Profile quick
+./harness/engine/run.ps1 -Profile full
+./harness/engine/run.ps1 `
   -Profile release `
   -BaseRef origin/main `
   -BaselineExe delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/AFP_Integrated_System_Modular.exe `
@@ -37,7 +37,7 @@ py -3.11 -m venv .venv
 | 4 | release 工作区、EXE 判定或哈希策略失败 |
 | 5 | JSON/Markdown 报告写入失败 |
 
-每次可执行运行生成 JSON 和 Markdown 报告，默认写入 `verification/results/`。该目录是运行产物并被 Git 忽略。报告包含提交号、分支、工作区状态、命令、退出码、需求覆盖和未验证事项；旧提交的报告不得代替当前提交的新结果。
+每次运行把机器状态和原始日志写入 `harness/logs/<run-id>/`。只有存在问题或待验证事项时才在 `harness/reports/` 生成仅包含问题项的 HTML；全部通过时不生成新错误报告，并使旧 `latest-errors.html` 失效。旧提交的报告不得代替当前提交的新结果。
 
 历史 `v13.9` 因果在线准确率依赖未随仓库或交付包保存的三份 `v13.7` 上游结果。Harness 将缺少 `causal_online_level_metrics.csv` 记录为非阻塞、未验证证据，不得生成或填入虚构指标。
 
