@@ -9,6 +9,7 @@
       "harness-contracts",
       "modular-runtime-contracts",
       "interface-monitor-contracts",
+      "usb-dock-topology-contracts",
       "native-function-contracts",
       "frontend-public-contracts",
       "acquisition-storage-contracts",
@@ -22,6 +23,7 @@
       "harness-contracts",
       "modular-runtime-contracts",
       "interface-monitor-contracts",
+      "usb-dock-topology-contracts",
       "native-function-contracts",
       "frontend-public-contracts",
       "acquisition-storage-contracts",
@@ -35,6 +37,7 @@
       "release-verify-files",
       "release-integration-smoke",
       "release-functional-smoke",
+      "field-usb-dock-topology",
       "field-real-hardware",
       "field-target-mysql"
     ]

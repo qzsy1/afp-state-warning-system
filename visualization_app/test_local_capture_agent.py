@@ -12,6 +12,33 @@ from local_capture_agent import HelperTransport  # noqa: E402
 
 
 class LocalCaptureAgentTests(unittest.TestCase):
+    def test_discover_forwards_usb_topology_and_keeps_empty_ports_out_of_bindings(self):
+        topology = {
+            "schema_version": 1,
+            "state": "complete",
+            "provider": "fixture",
+            "errors": [],
+            "docks": [{"id": "dock:1", "label": "拓展坞 1"}],
+            "usb_ports": [{
+                "id": "usbport:1", "dock_id": "dock:1", "user_connectable": True,
+                "state": "empty", "connector_type": "usb3", "supported_protocols": ["usb3"],
+            }],
+            "devices": [],
+        }
+        manager = Mock()
+        manager.discover_interfaces.return_value = {
+            "physical_interfaces": [],
+            "usb_topology": topology,
+            "defaults": [],
+            "sensor_type_profiles": [],
+            "channel_metadata": {},
+            "error": "",
+        }
+        payload = LocalCaptureAgent(manager=manager).discover()
+        self.assertEqual(payload["usb_topology"], topology)
+        self.assertEqual(payload["interfaces"], [])
+        self.assertTrue(payload["capabilities"]["usb_topology_v1"])
+
     def test_sample_batch_reads_only_incremental_rows_when_manager_supports_cursor(self):
         manager = Mock()
         manager.start.return_value = {"running": True}

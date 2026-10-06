@@ -182,6 +182,25 @@ class AcquisitionIntegrityTests(unittest.TestCase):
                 interface_channel_assignments={"a": ["温度"]},
             )
 
+    def test_usb_port_binding_can_be_saved_but_empty_port_cannot_start_real_capture(self) -> None:
+        config = AcquisitionConfig(
+            acquisition_mode="real", dataset_schema="new_collection_v11_3",
+            selected_sensors=["温度1"],
+            interfaces=[
+                {
+                    "id": "thermocouple_8ch", "enabled": True,
+                    "role": "thermocouple", "driver": "smrf_hid",
+                    "endpoint": "", "physical_port_id": "usbport:test",
+                    "physical_interface_id": "", "physical_interface_kind": "usb_hid",
+                    "physical_verified": False,
+                },
+            ],
+            interface_channel_assignments={"thermocouple_8ch": ["温度1"]},
+        )
+        self.assertEqual(config.interfaces[0]["physical_port_id"], "usbport:test")
+        with self.assertRaisesRegex(RuntimeError, "端口存在，未检测到兼容设备"):
+            AcquisitionManager().start(config)
+
     def test_simulation_allows_shared_logical_source_for_multiple_interfaces(self) -> None:
         """An uploaded file is one logical source, not a real adapter binding."""
         interfaces = [

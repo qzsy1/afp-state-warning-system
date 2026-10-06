@@ -105,7 +105,7 @@ const fetch = async () => { requests += 1; return {ok: true, json: async () => (
     def test_failed_server_target_mysql_has_a_session_bound_retry_control(self):
         html = (Path(__file__).with_name("static") / "index.html").read_text(encoding="utf-8")
         self.assertIn('id="retryTargetMysqlButton"', html)
-        self.assertIn('/app.js?v=20261001-save-boundary-v1', html)
+        self.assertIn('/app.js?v=20261006-usb-topology-v1', html)
         text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
         start = text.index("async function retryServerTargetMysql()")
         end = text.index("async function stopAcquisition()", start)

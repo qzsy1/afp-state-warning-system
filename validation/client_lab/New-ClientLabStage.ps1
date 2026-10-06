@@ -98,7 +98,7 @@ if ($resolvedLabRoot -ieq $resolvedRepoRoot -or $resolvedRepoRoot.StartsWith($re
 }
 
 if ([string]::IsNullOrWhiteSpace($HelperSource)) {
-    $HelperSource = Join-Path $resolvedRepoRoot "delivery\AFP_Integrated_System_Modular_v2.0.3_Agentic\local_helper\AFP_Local_Capture_Helper.exe"
+    $HelperSource = Join-Path $resolvedRepoRoot "delivery\AFP_Integrated_System_Modular_v2.0.4_Agentic\local_helper\AFP_Local_Capture_Helper.exe"
 }
 $resolvedHelperSource = Get-NormalizedPath -Path $HelperSource
 $resolvedFixtureSource = Get-NormalizedPath -Path $FixtureSource

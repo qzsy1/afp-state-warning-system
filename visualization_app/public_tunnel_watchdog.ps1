@@ -12,10 +12,10 @@ $RunValueName = "AFP_Public_Tunnel_Watchdog"
 $DeliveryRoot = $PSScriptRoot
 if (-not (Test-Path (Join-Path $DeliveryRoot "AFP_Integrated_System_Modular.exe"))) {
     $ProjectRoot = Split-Path -Parent $PSScriptRoot
-    $DeliveryRoot = Join-Path $ProjectRoot "delivery\AFP_Integrated_System_Modular_v2.0.3_Agentic"
+    $DeliveryRoot = Join-Path $ProjectRoot "delivery\AFP_Integrated_System_Modular_v2.0.4_Agentic"
 }
 if (-not (Test-Path (Join-Path $DeliveryRoot "AFP_Integrated_System_Modular.exe"))) {
-    $DeliveryRoot = "F:\AFP_Integrated_Modular_v2\delivery\AFP_Integrated_System_Modular_v2.0.3_Agentic"
+    $DeliveryRoot = "F:\AFP_Integrated_Modular_v2\delivery\AFP_Integrated_System_Modular_v2.0.4_Agentic"
 }
 $AppExe = Join-Path $DeliveryRoot "AFP_Integrated_System_Modular.exe"
 $HelperRoot = Join-Path $DeliveryRoot "local_helper"

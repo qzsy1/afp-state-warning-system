@@ -43,6 +43,7 @@ const state = {
   agentRequestId: 0,
   agentDefaultKeyAvailable: false,
   physicalInterfaces: [],
+  usbTopology: null,
   // Keep the last real-mode mapping out of the simulation catalog.  Mode
   // switches must not force a second pairing just to redraw the cards.
   realInterfaceSnapshot: null,
@@ -4053,6 +4054,7 @@ async function initialize() {
         const discovery = payload.acquisition?.interface_discovery || {};
         state.physicalInterfaces = Array.isArray(discovery.physical_interfaces)
           ? discovery.physical_interfaces : [];
+        state.usbTopology = null;
         state.interfaceCatalog = autoAssignPhysicalInterfaces(
           (payload.acquisition?.interface_defaults || defaultInterfaceCatalog()).map((item) => ({...item})),
           {allowSerialFallback: false},
@@ -4773,7 +4775,10 @@ function interfaceConfigs() {
       driver: row.querySelector(".interface-driver")?.value || "serial_json",
       endpoint: row.querySelector(".interface-endpoint")?.value?.trim() || "",
       baudrate: Number(row.querySelector(".interface-baudrate")?.value) || 115200,
-      physical_interface_id: row.querySelector(".interface-physical")?.value || "",
+      physical_interface_id: row.querySelector(".interface-physical")?.selectedOptions?.[0]?.dataset?.liveId
+        || row.querySelector(".interface-physical")?.value || "",
+      physical_port_id: row.querySelector(".interface-physical")?.selectedOptions?.[0]?.dataset?.portId || "",
+      physical_live_interface_id: row.querySelector(".interface-physical")?.selectedOptions?.[0]?.dataset?.liveId || "",
       physical_interface_kind: row.querySelector(".interface-physical")?.selectedOptions?.[0]?.dataset?.kind || "",
       physical_verified: row.querySelector(".interface-physical")?.selectedOptions?.[0]?.dataset?.detected === "true",
       physical_fallback: row.querySelector(".interface-physical")?.selectedOptions?.[0]?.dataset?.fallback === "true",
@@ -4847,8 +4852,45 @@ function refreshInterfaceEndpointOptions() {
 function physicalCandidatesForRole(role) {
   const profile = sensorTypeProfile(role);
   const kind = profile.physical_kind || "";
+  if ((kind === "usb_hid" || kind === "usb_uvc")
+    && state.usbTopology && state.usbTopology.state !== "unavailable") {
+    const topology = state.usbTopology;
+    const ports = Array.isArray(topology?.usb_ports) ? topology.usb_ports : [];
+    const devices = new Map((Array.isArray(topology?.devices) ? topology.devices : [])
+      .map((item) => [String(item.id), item]));
+    const liveByPort = new Map((Array.isArray(state.physicalInterfaces) ? state.physicalInterfaces : [])
+      .filter((item) => item.parent_port_id)
+      .map((item) => [String(item.parent_port_id), item]));
+    return ports.filter((port) => port.user_connectable !== false).map((port) => {
+      const live = liveByPort.get(String(port.id));
+      const device = devices.get(String(port.device_id || ""));
+      const compatible = live?.kind === kind || (kind === "usb_hid" && device?.class === "hid")
+        || (kind === "usb_uvc" && ["video", "uvc"].includes(String(device?.class || "").toLowerCase()));
+      return {
+        id: String(port.id),
+        kind,
+        endpoint: live?.endpoint || "",
+        label: `${port.label || "USB 端口"}${device?.friendly_name ? ` · ${device.friendly_name}` : " · 端口存在，未检测到兼容设备"}`,
+        topology_label: port.label || "USB 端口",
+        dock_id: port.dock_id,
+        parent_port_id: port.id,
+        physical_port_id: port.id,
+        physical_interface_id: compatible ? (live?.id || "") : "",
+        detected: Boolean(compatible && live?.detected !== false),
+        compatible,
+        auto_assignable: true,
+      };
+    });
+  }
   const candidates = (Array.isArray(state.physicalInterfaces) ? state.physicalInterfaces : [])
-    .map((item) => ({...item, kind: item.kind || item.interface_kind || item.type || ""}))
+    .map((item) => {
+      const normalized = {...item, kind: item.kind || item.interface_kind || item.type || ""};
+      if (normalized.kind === "ethernet" && normalized.dock_id
+        && !String(normalized.label || "").includes("拓展坞网口")) {
+        normalized.label = `${normalized.label || normalized.endpoint || normalized.id} · 拓展坞网口`;
+      }
+      return normalized;
+    })
     .filter((item) => !kind || item.kind === kind || (kind === "ethernet" && item.kind === "ethernet_adapter") || (kind === "serial" && item.kind === "com"))
     .filter((item) => item.detected !== false || item.driver_available || item.auto_assignable);
   if (candidates.some((item) => item.detected !== false)) return candidates;
@@ -4872,13 +4914,16 @@ function autoAssignPhysicalInterfaces(configs, {allowSerialFallback = true} = {}
   (configs || []).forEach((item) => {
     const profile = sensorTypeProfile(item.role || "custom");
     const role = item.role || "custom";
-    let selected = candidates.find((candidate) => candidate.id === item.physical_interface_id && compatible(candidate, profile));
+    const liveCandidates = candidates.filter((candidate) =>
+      compatible(candidate, profile) && candidate.detected !== false && candidate.compatible !== false,
+    );
+    let selected = candidates.find((candidate) => (candidate.id === item.physical_interface_id || candidate.id === item.physical_port_id) && compatible(candidate, profile));
     if (!selected && (role === "plc" || role === "robot")) {
-      selected = assigned.ethernet || candidates.find((candidate) => compatible(candidate, profile) && candidate.detected !== false);
+      selected = assigned.ethernet || liveCandidates.find((candidate) => compatible(candidate, profile));
     }
     let fallback = false;
     if (!selected) {
-      selected = candidates.find((candidate) => compatible(candidate, profile) && candidate.detected !== false && !used.has(candidate.id));
+      selected = liveCandidates.find((candidate) => compatible(candidate, profile) && !used.has(candidate.id));
     }
     // A serial fallback is only meaningful for serial protocols.  In real
     // mode a missing USB HID/UVC device must remain unassigned instead of
@@ -4887,15 +4932,18 @@ function autoAssignPhysicalInterfaces(configs, {allowSerialFallback = true} = {}
       selected = candidates.find((candidate) => (normalizedKind(candidate) === "serial" || normalizedKind(candidate) === "com") && candidate.detected !== false && !used.has(candidate.id));
       fallback = Boolean(selected);
     }
-    if (!selected) {
+    if (!selected && !["usb_hid", "usb_uvc"].includes(profile.physical_kind)) {
       selected = candidates.find((candidate) => compatible(candidate, profile)
         && (candidate.auto_assignable || candidate.driver_available)
         && !used.has(candidate.id));
     }
     if (!selected) return;
     item.physical_interface_id = selected.id;
+    item.physical_port_id = selected.physical_port_id || "";
+    if (selected.physical_interface_id) item.physical_interface_id = selected.physical_interface_id;
+    else if (item.physical_port_id) item.physical_interface_id = "";
     item.physical_interface_kind = normalizedKind(selected);
-    item.physical_verified = selected.detected !== false;
+    item.physical_verified = selected.detected !== false && selected.compatible !== false;
     item.physical_fallback = fallback || (item.physical_interface_kind !== profile.physical_kind);
     if ((fallback || item.physical_interface_kind === "serial" || item.physical_interface_kind === "com") && selected.endpoint) {
       item.endpoint = selected.endpoint;
@@ -4912,7 +4960,7 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
   const role = row.querySelector(".interface-role")?.value || "custom";
   if (!select) return;
   const candidates = physicalCandidatesForRole(role);
-  const current = preferredId || select.value;
+  const current = preferredId || select.value || row.dataset.physicalPortId || "";
   const profile = sensorTypeProfile(role);
   if (controls.acquisitionMode?.value === "simulation") {
     select.replaceChildren(option("", `${profile.label || role}：模拟源供数（不占用物理接口）`));
@@ -4939,14 +4987,25 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
     ? "请选择已识别的实际接口"
     : `未发现匹配的实际接口（需要${kindLabels[profile.physical_kind] || profile.physical_kind || "对应协议"}）`;
   select.replaceChildren(option("", emptyText));
+  const groups = new Map();
   candidates.forEach((item) => {
+    const groupLabel = item.dock_id ? `${item.topology_label?.split(" · ")[0] || "拓展坞"} · ${kindLabels[profile.physical_kind] || profile.physical_kind}` : "系统接口";
+    if (!groups.has(groupLabel)) {
+      const group = document.createElement("optgroup");
+      group.label = groupLabel;
+      groups.set(groupLabel, group);
+      select.append(group);
+    }
     const node = option(item.id, item.label || item.endpoint || item.id);
     node.dataset.kind = item.kind || "";
     node.dataset.detected = String(item.detected !== false);
     node.dataset.assignable = String(Boolean(item.auto_assignable || item.driver_available));
     node.dataset.fallback = String(item.kind === "serial" && profile.physical_kind !== "serial");
     node.dataset.endpoint = item.endpoint || "";
-    select.append(node);
+    node.dataset.portId = item.physical_port_id || "";
+    node.dataset.liveId = item.physical_interface_id || "";
+    node.dataset.compatible = String(item.compatible !== false);
+    groups.get(groupLabel).append(node);
   });
   if (current && candidates.some((item) => item.id === current)) select.value = current;
   const selected = select.selectedOptions?.[0];
@@ -4956,8 +5015,7 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
     : "必须选择自动识别到的实际接口后才能启用";
   const enabled = row.querySelector(".interface-enabled");
   if (enabled) {
-    enabled.disabled = !selected?.value
-      || (selected.dataset.detected !== "true" && selected.dataset.assignable !== "true");
+    enabled.disabled = !selected?.value;
     if (enabled.disabled) enabled.checked = false;
   }
   let warning = row.querySelector(".interface-physical-warning");
@@ -4968,8 +5026,10 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
   }
   warning.textContent = selected?.dataset?.fallback === "true"
     ? "警告：当前未识别到匹配协议，临时分配串口，仅用于测试"
+    : selected?.dataset?.portId && selected?.dataset?.detected !== "true"
+    ? "端口存在，未检测到兼容设备；连接设备后重新识别接口"
     : "";
-  warning.classList.toggle("hidden", selected?.dataset?.fallback !== "true");
+  warning.classList.toggle("hidden", !selected?.dataset?.fallback && !(selected?.dataset?.portId && selected?.dataset?.detected !== "true"));
 }
 
 function itemEnabledForSimulation(row) {
@@ -5085,8 +5145,8 @@ function renderInterfacePanel(configs) {
     enabled.addEventListener("change", refreshChannelInterfaceOptions);
     createInterfaceChannelEditor(row, row.dataset.interfaceId);
     applySensorTypeProfile(row, false);
-    refreshPhysicalInterfaceOptions(row, item.physical_interface_id || "");
-    if (item.physical_interface_id && physical.value === item.physical_interface_id) {
+    refreshPhysicalInterfaceOptions(row, item.physical_port_id || item.physical_interface_id || "");
+    if ((item.physical_interface_id || item.physical_port_id) && physical.value === (item.physical_port_id || item.physical_interface_id)) {
       enabled.checked = item.enabled !== false;
     }
     return row;
@@ -5099,6 +5159,7 @@ async function discoverInterfaces() {
   if (controls.acquisitionMode?.value === "simulation") {
     state.availableInterfaces = [];
     state.physicalInterfaces = [];
+    state.usbTopology = null;
     if (isPublicPrecomputedSimulationMode()) {
       renderPublicDemoSuccessState();
       return;
@@ -5140,6 +5201,7 @@ async function discoverInterfaces() {
         (helper.sensor_bindings || []).map((item) => [String(item.role || ""), item]),
       );
       state.physicalInterfaces = physical;
+      state.usbTopology = helper.usb_topology || helper.raw_discovery?.usb_topology || null;
       state.availableInterfaces = recognizedInterfacePortsFrom(helper.raw_discovery?.ports || []);
       // Older helpers may return the physical inventory but omit the binding
       // list.  Run the same protocol-aware allocator used by the LAN path so
@@ -5164,6 +5226,7 @@ async function discoverInterfaces() {
         catalog: state.interfaceCatalog.map((item) => ({...item})),
         physical: physical.map((item) => ({...item})),
         available: state.availableInterfaces.map((item) => ({...item})),
+        usbTopology: state.usbTopology ? JSON.parse(JSON.stringify(state.usbTopology)) : null,
       };
       state.realInterfaceSnapshotAt = Date.now();
       renderInterfacePanel(state.interfaceCatalog);
@@ -5189,6 +5252,7 @@ async function discoverInterfaces() {
     state.availableInterfaces = recognizedInterfacePortsFrom(result.ports || []);
     state.physicalInterfaces = Array.isArray(result.physical_interfaces)
       ? result.physical_interfaces : [];
+    state.usbTopology = result.usb_topology || null;
     const defaults = result.defaults || [];
     state.interfaceCatalog = autoAssignPhysicalInterfaces(
       (defaults.length ? defaults : defaultInterfaceCatalog()).map((item) => ({...item}))
@@ -5224,6 +5288,7 @@ function restoreCachedRealInterfaceSnapshot() {
   state.interfaceCatalog = snapshot.catalog.map((item) => ({...item}));
   state.physicalInterfaces = (snapshot.physical || []).map((item) => ({...item}));
   state.availableInterfaces = (snapshot.available || []).map((item) => ({...item}));
+  state.usbTopology = snapshot.usbTopology || null;
   renderInterfacePanel(state.interfaceCatalog);
   return true;
 }
@@ -5247,7 +5312,7 @@ function addInterface() {
   }
   const used = new Set(current.map((item) => item.physical_interface_id).filter(Boolean));
   const nextPhysical = (state.physicalInterfaces || []).find((item) => !used.has(item.id) && item.detected !== false);
-  current.push({id: `interface_${current.length + 1}`, enabled: Boolean(nextPhysical), role: "custom", driver: "serial_json", endpoint: nextPhysical?.endpoint || "", baudrate: 115200, channel_map: {}, physical_interface_id: nextPhysical?.id || "", physical_interface_kind: nextPhysical?.kind || "", physical_verified: Boolean(nextPhysical)});
+  current.push({id: `interface_${current.length + 1}`, enabled: Boolean(nextPhysical), role: "custom", driver: "serial_json", endpoint: nextPhysical?.endpoint || "", baudrate: 115200, channel_map: {}, physical_interface_id: nextPhysical?.id || "", physical_port_id: nextPhysical?.parent_port_id || "", physical_interface_kind: nextPhysical?.kind || "", physical_verified: Boolean(nextPhysical)});
   state.interfaceCatalog = current;
   renderInterfacePanel(current);
   markHardwareCheckStale("已增加接口配置");
@@ -6005,18 +6070,22 @@ function validatePhysicalInterfaceBindings(items, realMode) {
   const seen = new Map();
   for (const item of items.filter((entry) => entry.enabled)) {
     const profile = sensorTypeProfile(item.role);
-    if (!item.physical_interface_id) {
+    const resourceId = item.physical_port_id || item.physical_interface_id;
+    if (!resourceId) {
       throw new Error(`接口“${item.id}”未选择实际物理接口，不能启用`);
+    }
+    if (item.physical_port_id && !item.physical_interface_id) {
+      throw new Error(`接口“${item.id}”：端口存在，未检测到兼容设备；连接设备后重新识别接口`);
     }
     const expectedKind = profile.physical_kind || "";
     if (item.physical_interface_kind && expectedKind && item.physical_interface_kind !== expectedKind && !item.physical_fallback) {
       throw new Error(`接口“${item.id}”的物理接口类型与协议不匹配`);
     }
-    const previous = seen.get(item.physical_interface_id);
-    if (!previous) { seen.set(item.physical_interface_id, item); continue; }
+    const previous = seen.get(resourceId);
+    if (!previous) { seen.set(resourceId, item); continue; }
     const shared = new Set([previous.role, item.role]);
     if (!(shared.has("plc") && shared.has("robot") && shared.size === 2 && expectedKind === "ethernet" && previous.physical_interface_kind === "ethernet")) {
-      throw new Error(`物理接口“${item.physical_interface_id}”重复绑定；仅允许PLC与ABB共享同一网卡`);
+      throw new Error(`物理接口“${resourceId}”重复绑定；仅允许PLC与ABB共享同一网卡`);
     }
   }
 }

@@ -27,9 +27,9 @@ class ProfileAndCmdContractTests(unittest.TestCase):
 
     def test_stable_profile_composition_and_single_selection(self) -> None:
         self.assertEqual(len(self.profiles["quick"]), 2)
-        self.assertEqual(len(self.profiles["full"]), 11)
-        self.assertEqual(len(self.profiles["release"]), 18)
-        self.assertEqual(self.profiles["release"][:11], self.profiles["full"])
+        self.assertEqual(len(self.profiles["full"]), 12)
+        self.assertEqual(len(self.profiles["release"]), 20)
+        self.assertEqual(self.profiles["release"][:12], self.profiles["full"])
         selected = select_profile_checks(self.matrix, self.profiles, "quick", "local")
         self.assertEqual(tuple(item.id for item in selected), self.profiles["quick"])
         self.assertEqual(select_single_check(self.matrix, "harness-contracts", "local").id, "harness-contracts")

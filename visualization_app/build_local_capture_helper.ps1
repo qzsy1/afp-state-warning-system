@@ -7,7 +7,7 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $entry = Join-Path $PSScriptRoot "local_capture_helper_entry.py"
 if (-not $DeliveryRoot) {
-    $DeliveryRoot = Join-Path $root "delivery\AFP_Integrated_System_Modular_v2.0.3_Agentic"
+    $DeliveryRoot = Join-Path $root "delivery\AFP_Integrated_System_Modular_v2.0.4_Agentic"
 }
 $delivery = Join-Path $deliveryRoot "local_helper"
 $watchdogSource = Join-Path $PSScriptRoot "tailscale_funnel_watchdog.ps1"

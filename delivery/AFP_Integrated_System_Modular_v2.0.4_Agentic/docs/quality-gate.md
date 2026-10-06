@@ -1,6 +1,6 @@
 # 质量门禁使用说明
 
-统一入口为 `tools/verification/run_quality_gate.ps1`。它定位可用 Python 后调用同一套 Python Harness，并原样返回 Harness 退出码。
+统一实现位于 `harness/`，推荐入口为 `harness/engine/run.ps1` 和可双击的 `harness/*.cmd`。旧 `tools/verification/run_quality_gate.ps1` 仅作兼容转发，并原样返回 Harness 退出码。
 
 本机运行需要 Python 3.11、`visualization_app/requirements.txt` 中的 Python 依赖，以及 Node.js 22 或更高版本。GitHub 工作流会安装 Python 3.11 和 Node.js 22；Windows 本机可安装当前 Node.js LTS。首次配置示例：
 
@@ -12,20 +12,22 @@ py -3.11 -m venv .venv
 ## 验证配置
 
 - `quick`：运行 Harness 契约和低成本核心契约，适合日常开发。
-- `full`：运行全部可移植核心回归，覆盖启动、采集、接口、保存、诊断、网络、WebSocket、模型通道和预警链路。
+- `full`：运行全部可移植核心回归，覆盖启动、采集、USB 拓展坞拓扑与接口展示、五类接口、保存、诊断、网络、WebSocket、模型通道和预警链路。
 - `release`：在 full 基础上运行交付 EXE 的模块状态、自检、文件完整性、集成冒烟和功能冒烟，并检查稳定 EXE 的 SHA-256。
 
 ```powershell
-./tools/verification/run_quality_gate.ps1 -Profile quick
-./tools/verification/run_quality_gate.ps1 -Profile full
-./tools/verification/run_quality_gate.ps1 `
+./harness/engine/run.ps1 -Profile quick
+./harness/engine/run.ps1 -Profile full
+./harness/engine/run.ps1 `
   -Profile release `
   -BaseRef origin/main `
-  -BaselineExe delivery/AFP_Integrated_System_Modular_v2.0.3_Agentic/AFP_Integrated_System_Modular.exe `
+  -BaselineExe delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/AFP_Integrated_System_Modular.exe `
   -BaselineExeSha256 <发布前记录的64位SHA-256>
 ```
 
-也可以使用多个 `-ChangedFile` 代替 `-BaseRef`，用于审核一份明确的变更清单。Harness 不会调用 PyInstaller、复制 EXE 或创建交付目录。
+`-BaselineExe` 同时指定哈希复用检查和五项打包诊断实际执行的 EXE，报告会记录解析后的绝对路径，防止新版本发布时误测旧 EXE。也可以使用多个 `-ChangedFile` 代替 `-BaseRef`，用于审核一份明确的变更清单。Harness 不会调用 PyInstaller、复制 EXE 或创建交付目录。
+
+模块化发布脚本按职责分类：`modular_runtime/build_launcher.ps1` 修改启动器二进制构建边界并要求授权重建；`modular_runtime/assemble_modular_delivery.ps1` 只组装外置文件，默认复用稳定EXE并校验哈希；兼容入口 `modular_runtime/build_modular_app.ps1` 本身进入人工确认，若同一变更同时命中启动器构建输入则以重建规则为准。
 
 ## 退出码和报告
 
@@ -37,7 +39,7 @@ py -3.11 -m venv .venv
 | 4 | release 工作区、EXE 判定或哈希策略失败 |
 | 5 | JSON/Markdown 报告写入失败 |
 
-每次可执行运行生成 JSON 和 Markdown 报告，默认写入 `verification/results/`。该目录是运行产物并被 Git 忽略。报告包含提交号、分支、工作区状态、命令、退出码、需求覆盖和未验证事项；旧提交的报告不得代替当前提交的新结果。
+每次运行把机器状态和原始日志写入 `harness/logs/<run-id>/`。只有存在问题或待验证事项时才在 `harness/reports/` 生成仅包含问题项的 HTML；全部通过时不生成新错误报告，并使旧 `latest-errors.html` 失效。旧提交的报告不得代替当前提交的新结果。
 
 历史 `v13.9` 因果在线准确率依赖未随仓库或交付包保存的三份 `v13.7` 上游结果。Harness 将缺少 `causal_online_level_metrics.csv` 记录为非阻塞、未验证证据，不得生成或填入虚构指标。
 
@@ -47,7 +49,7 @@ py -3.11 -m venv .venv
 
 GitHub Actions 的必需检查名称为 `quality-gate`。稳定分支应在 GitHub 分支保护中把该检查设置为必需状态；检查失败时禁止合并。工作流运行 `full/ci`，不使用仓库外私密凭据，也不连接现场硬件或目标 MySQL。
 
-云端检查不得冒充现场验收。真实 SMRF、PLC、ABB、UVC、M3232 和目标 MySQL 在 release 报告中保持“现场待验证”，直到负责人补充真实设备证据。模拟采集通过只说明软件链路通过，不得表述为真实采集通过。
+云端检查不得冒充现场验收。真实 USB 拓展坞、SMRF、PLC、ABB、UVC、M3232 和目标 MySQL 在 release 报告中保持“现场待验证”，直到负责人补充真实设备证据。拓展坞验收必须按 `harness/field/usb-dock-topology.md` 核对三个外部 USB 口、一个内置网口、伴随 Hub 去重和界面分组；模拟采集通过只说明软件链路通过，不得表述为真实采集通过。
 
 ## 凭据边界
 

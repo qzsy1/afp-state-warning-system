@@ -121,6 +121,7 @@ class LocalCaptureAgent:
                 {
                     "role": role,
                     "physical_interface_id": physical_id or None,
+                    "physical_port_id": (candidate or {}).get("parent_port_id") or None,
                     "physical_kind": kind,
                     "protocol": protocols[0],
                     "interface_detected": detected,
@@ -146,8 +147,18 @@ class LocalCaptureAgent:
         return {
             "interfaces": physical,
             "sensor_bindings": bindings,
+            "usb_topology": discovered.get("usb_topology") or {
+                "schema_version": 1,
+                "state": "unavailable",
+                "provider": "legacy_discovery",
+                "errors": ["旧版发现结果未提供 USB 物理端口拓扑"],
+                "docks": [],
+                "usb_ports": [],
+                "devices": [],
+            },
             "capabilities": {
                 "hardware_discovery": True,
+                "usb_topology_v1": bool(discovered.get("usb_topology")),
                 "real_capture": True,
                 "process_parameter_read": True,
                 "local_csv_save": True,

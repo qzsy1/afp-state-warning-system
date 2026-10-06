@@ -7,7 +7,7 @@
 - `setup.cmd`：首次配置可信 Python 和稳定 EXE，设置仅写入被 Git 忽略的 `config/local-settings.json`。
 - `quick.cmd`：环境预检、Harness 契约和模块化运行时检查。
 - `full.cmd`：全部软件回归；不运行 EXE 和现场检查。
-- `release.cmd`：full 加五项稳定 EXE 检查及两项现场待验证。
+- `release.cmd`：full 加五项稳定 EXE 检查及三项现场待验证。
 - `check_all.cmd`：与 release 范围相同，用于人工查看全部检查。
 - `checks/00_environment.cmd`：只检查 Python 3.11、项目 `.venv`、Node.js 22、目录、配置和 EXE。
 
@@ -43,10 +43,10 @@ EXE判定按职责边界处理：`modular_runtime/build_launcher.ps1` 变化要�
 
 ## 现场验证边界
 
-自动化和模拟结果不得冒充真实 SMRF、PLC、ABB、UVC、M3232 或目标 MySQL 的现场硬件证据。`field-real-hardware` 和 `field-target-mysql` 会明确显示为待人工验证。Harness 不保存 API Key、密码或 Token。
+自动化和模拟结果不得冒充真实 USB 拓展坞、SMRF、PLC、ABB、UVC、M3232 或目标 MySQL 的现场硬件证据。`field-usb-dock-topology`、`field-real-hardware` 和 `field-target-mysql` 会明确显示为待人工验证。拓展坞现场步骤见 `field/usb-dock-topology.md`。Harness 不保存 API Key、密码或 Token。
 
 ## 单项入口索引
 
-软件检查：`harness-contracts`、`modular-runtime-contracts`、`interface-monitor-contracts`、`native-function-contracts`、`frontend-public-contracts`、`acquisition-storage-contracts`、`dashboard-runtime-contracts`、`diagnosis-interface-contracts`、`causal-history-evidence`、`edge-helper-websocket-contracts`、`model-prediction-contracts`。
+软件检查：`harness-contracts`、`modular-runtime-contracts`、`interface-monitor-contracts`、`usb-dock-topology-contracts`、`native-function-contracts`、`frontend-public-contracts`、`acquisition-storage-contracts`、`dashboard-runtime-contracts`、`diagnosis-interface-contracts`、`causal-history-evidence`、`edge-helper-websocket-contracts`、`model-prediction-contracts`。
 
-EXE 检查：`release-module-status`、`release-self-test`、`release-verify-files`、`release-integration-smoke`、`release-functional-smoke`。现场项：`field-real-hardware`、`field-target-mysql`。
+EXE 检查：`release-module-status`、`release-self-test`、`release-verify-files`、`release-integration-smoke`、`release-functional-smoke`。现场项：`field-usb-dock-topology`、`field-real-hardware`、`field-target-mysql`。

@@ -17,6 +17,7 @@ class RegressionMatrixContractTests(unittest.TestCase):
             families,
             {
                 "HARNESS", "STARTUP", "SIMULATION", "MODE_ISOLATION", "INTERFACES",
+                "USB_TOPOLOGY",
                 "EDGE_HELPER", "CSV", "MYSQL", "DIAGNOSIS", "LAN_PUBLIC",
                 "WEBSOCKET", "MODEL_CHANNELS", "PREDICTION_WARNING", "EXE_REUSE",
                 "RELEASE_EVIDENCE", "FIELD_BOUNDARY",
@@ -96,6 +97,19 @@ class RegressionMatrixContractTests(unittest.TestCase):
                 self.assertEqual(check.evidence_tier, "field")
                 self.assertFalse(check.blocking)
                 self.assertEqual(check.command, ())
+
+    def test_usb_dock_checks_cover_automated_and_field_evidence(self) -> None:
+        automated = next(item for item in self.matrix.checks if item.id == "usb-dock-topology-contracts")
+        field = next(item for item in self.matrix.checks if item.id == "field-usb-dock-topology")
+        self.assertTrue(automated.blocking)
+        self.assertEqual(automated.evidence_tier, "automated")
+        self.assertEqual(automated.environments, ("local", "ci"))
+        self.assertIn("USB_TOPOLOGY-001", automated.requirements)
+        self.assertIn("harness.engine.usb_dock_contract", automated.command)
+        self.assertFalse(field.blocking)
+        self.assertEqual(field.evidence_tier, "field")
+        self.assertEqual(field.profiles, ("release",))
+        self.assertIn("USB_TOPOLOGY-001", field.requirements)
 
 
 if __name__ == "__main__":

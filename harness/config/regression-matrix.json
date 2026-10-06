@@ -7,6 +7,7 @@
     {"id": "SIMULATION-001", "title": "模拟采集导入、运行和结果链路保持可用", "mandatory": true, "profiles": ["full", "release"]},
     {"id": "MODE_ISOLATION-001", "title": "模拟和真实采集状态相互隔离", "mandatory": true, "profiles": ["full", "release"]},
     {"id": "INTERFACES-001", "title": "SMRF、PLC、UVC、ABB和M3232接口映射保持完整", "mandatory": true, "profiles": ["full", "release"]},
+    {"id": "USB_TOPOLOGY-001", "title": "USB拓展坞物理端口识别、同类型接口展示和设备验证边界正确", "mandatory": true, "profiles": ["full", "release"]},
     {"id": "EDGE_HELPER-001", "title": "边缘辅助程序传输、确认、重连和会话隔离正确", "mandatory": true, "profiles": ["full", "release"]},
     {"id": "CSV-001", "title": "CSV目录、层文件、完整试样和完整性证据正确", "mandatory": true, "profiles": ["full", "release"]},
     {"id": "MYSQL-001", "title": "MySQL保存、重试、目标库隔离和凭据边界正确", "mandatory": true, "profiles": ["full", "release"]},
@@ -60,6 +61,20 @@
       "blocking": true,
       "evidence_tier": "automated",
       "requirements": ["INTERFACES-001", "DIAGNOSIS-001", "MODEL_CHANNELS-001"]
+    },
+    {
+      "id": "usb-dock-topology-contracts",
+      "title": "USB拓展坞拓扑与接口展示契约",
+      "kind": "command",
+      "command": ["{python}", "-m", "harness.engine.usb_dock_contract", "--repo", "."],
+      "cwd": ".",
+      "timeout_seconds": 60,
+      "profiles": ["full", "release"],
+      "environments": ["local", "ci"],
+      "blocking": true,
+      "evidence_tier": "automated",
+      "requirements": ["USB_TOPOLOGY-001", "INTERFACES-001", "EDGE_HELPER-001"],
+      "change_patterns": ["visualization_app/**", "harness/engine/usb_dock_contract.py", "harness/field/usb-dock-topology.md", "openspec/changes/add-usb-dock-topology-discovery/**"]
     },
     {
       "id": "native-function-contracts",
@@ -229,6 +244,19 @@
       "blocking": true,
       "evidence_tier": "local_integration",
       "requirements": ["SIMULATION-001", "PREDICTION_WARNING-001", "RELEASE_EVIDENCE-001"]
+    },
+    {
+      "id": "field-usb-dock-topology",
+      "title": "真实拓展坞三个USB口、一个网口及界面展示现场验收（见harness/field/usb-dock-topology.md）",
+      "kind": "field",
+      "command": [],
+      "cwd": ".",
+      "timeout_seconds": 1,
+      "profiles": ["release"],
+      "environments": ["local"],
+      "blocking": false,
+      "evidence_tier": "field",
+      "requirements": ["USB_TOPOLOGY-001", "FIELD_BOUNDARY-001"]
     },
     {
       "id": "field-real-hardware",

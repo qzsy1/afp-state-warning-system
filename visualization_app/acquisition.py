@@ -31,6 +31,18 @@ import pandas as pd
 from mysql_storage import MySQLCaptureStore, MySQLSettings, validate_database_name
 from smrf_hid import SmrfHidDriver, enumerate_smrf_hid_devices
 from simulation_replay import MonotonicReplayScheduler
+try:
+    from windows_usb_topology import (
+        discover_windows_usb_topology,
+        find_topology_device,
+        topology_dock,
+        topology_port,
+    )
+except ImportError:  # Compatibility with older modular runtimes.
+    discover_windows_usb_topology = None
+    find_topology_device = None
+    topology_dock = None
+    topology_port = None
 
 
 APP_DIR = Path(os.environ.get("AFP_LEGACY_APP_DIR") or Path(__file__).resolve().parent).resolve()
@@ -471,6 +483,48 @@ def _physical_interface_key(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
 
 
+def _associate_usb_topology(
+    topology: dict[str, Any], physical_interfaces: list[dict[str, Any]]
+) -> None:
+    """Add public dock/port references to already discovered live interfaces."""
+
+    if not find_topology_device or not topology_port or not topology_dock:
+        return
+    for interface in physical_interfaces:
+        kind = str(interface.get("kind") or "")
+        match = None
+        if kind == "ethernet":
+            match = find_topology_device(
+                topology, network_name=str(interface.get("name") or interface.get("endpoint") or "")
+            )
+        elif kind in {"serial", "usb_hid", "usb_uvc"}:
+            vid = interface.get("vid")
+            pid = interface.get("pid")
+            if vid is not None and pid is not None:
+                match = find_topology_device(
+                    topology,
+                    vid=int(vid),
+                    pid=int(pid),
+                    serial=str(interface.get("serial") or ""),
+                )
+        if not isinstance(match, dict):
+            continue
+        port = topology_port(topology, str(match.get("parent_port_id") or ""))
+        if not port:
+            continue
+        dock = topology_dock(topology, str(port.get("dock_id") or ""))
+        interface["parent_port_id"] = str(port.get("id") or "")
+        interface["dock_id"] = str(port.get("dock_id") or "")
+        if kind == "ethernet" or port.get("internal_function") == "ethernet":
+            topology_label = f"{(dock or {}).get('label', '拓展坞')} · 拓展坞网口"
+        else:
+            topology_label = str(port.get("label") or "")
+        interface["topology_label"] = topology_label
+        if topology_label:
+            interface["label"] = f"{topology_label} · {interface.get('label', interface.get('id', ''))}"
+        match["live_interface_id"] = str(interface.get("id") or "")
+
+
 def _validate_physical_interface_bindings(
     interfaces: list[dict[str, Any]], acquisition_mode: str
 ) -> None:
@@ -508,15 +562,17 @@ def _validate_physical_interface_bindings(
                 f"{actual_kind}，应为{expected_kind}"
             )
         physical_id = _physical_interface_key(item.get("physical_interface_id"))
-        if acquisition_mode == "real" and not physical_id:
+        physical_port_id = _physical_interface_key(item.get("physical_port_id"))
+        if acquisition_mode == "real" and not physical_id and not physical_port_id:
             raise ValueError(
                 f"真实接口“{item.get('id', role)}”尚未绑定实际物理接口"
             )
-        if not physical_id:
+        resource_id = physical_port_id or physical_id
+        if not resource_id:
             continue
-        previous = seen.get(physical_id)
+        previous = seen.get(resource_id)
         if previous is None:
-            seen[physical_id] = item
+            seen[resource_id] = item
             continue
         shared_roles = {str(previous.get("role") or ""), role}
         shared_kinds = {
@@ -526,7 +582,7 @@ def _validate_physical_interface_bindings(
         if shared_roles == {"plc", "robot"} and shared_kinds == {"ethernet"}:
             continue
         raise ValueError(
-            f"物理接口“{item.get('physical_interface_id')}”重复绑定："
+            f"物理接口“{item.get('physical_port_id') or item.get('physical_interface_id')}”重复绑定："
             f"{previous.get('id', '前一接口')}与{item.get('id', role)}；"
             "仅允许PLC与ABB共享同一网卡"
         )
@@ -803,6 +859,9 @@ class AcquisitionConfig:
             _apply_sensor_interface_profile(interface)
             interface["physical_interface_id"] = str(
                 interface.get("physical_interface_id") or ""
+            ).strip()
+            interface["physical_port_id"] = str(
+                interface.get("physical_port_id") or ""
             ).strip()
             interface["physical_interface_kind"] = str(
                 interface.get("physical_interface_kind")
@@ -2536,6 +2595,23 @@ class AcquisitionManager:
         ports: list[dict[str, Any]] = []
         physical_interfaces: list[dict[str, Any]] = []
         error = ""
+        if discover_windows_usb_topology is None:
+            usb_topology = {
+                "schema_version": 1, "state": "unavailable",
+                "provider": "module_unavailable",
+                "errors": ["USB physical port topology module is unavailable"],
+                "docks": [], "usb_ports": [], "devices": [],
+            }
+        else:
+            try:
+                usb_topology = discover_windows_usb_topology()
+            except Exception as exc:
+                usb_topology = {
+                    "schema_version": 1, "state": "unavailable",
+                    "provider": "windows_usb_hub_ioctl",
+                    "errors": [f"USB topology discovery failed: {exc}"],
+                    "docks": [], "usb_ports": [], "devices": [],
+                }
         try:
             from serial.tools import list_ports
             for item in list_ports.comports():
@@ -2546,6 +2622,7 @@ class AcquisitionManager:
                     "manufacturer": str(item.manufacturer or ""),
                     "vid": item.vid,
                     "pid": item.pid,
+                    "serial": str(item.serial_number or ""),
                 })
                 physical_interfaces.append({
                     "id": f"serial:{str(item.device).upper()}",
@@ -2557,6 +2634,7 @@ class AcquisitionManager:
                     "manufacturer": str(item.manufacturer or ""),
                     "vid": item.vid,
                     "pid": item.pid,
+                    "serial": str(item.serial_number or ""),
                     "detected": True,
                 })
         except Exception as exc:
@@ -2685,12 +2763,13 @@ class AcquisitionManager:
                     if getattr(address, "family", None) == socket.AF_INET
                     and not str(address.address).startswith("127.")
                 ]
-                if not ipv4:
-                    continue
                 physical_interfaces.append({
                     "id": f"ethernet:{name}", "kind": "ethernet",
                     "protocol": "ethernet", "endpoint": name,
-                    "label": f"网卡 {name}（{', '.join(ipv4)}）",
+                    "label": (
+                        f"网卡 {name}（{', '.join(ipv4)}）"
+                        if ipv4 else f"网卡 {name}（当前无 IPv4 地址）"
+                    ),
                     "name": name, "addresses": ipv4, "detected": True,
                     "shared_roles": ["plc", "robot"],
                 })
@@ -2716,9 +2795,11 @@ class AcquisitionManager:
             rtsp_reachable = True
         except OSError:
             pass
+        _associate_usb_topology(usb_topology, physical_interfaces)
         return {
             "ports": ports,
             "physical_interfaces": physical_interfaces,
+            "usb_topology": usb_topology,
             "hid_devices": smrf_devices,
             "defaults": default_capture_interfaces(),
             "sensor_type_profiles": sensor_interface_profiles(),
@@ -2825,6 +2906,7 @@ class AcquisitionManager:
             role = str(item.get("role") or "custom")
             profile = SENSOR_INTERFACE_PROFILES.get(role, SENSOR_INTERFACE_PROFILES["custom"])
             physical_id = str(item.get("physical_interface_id") or "")
+            physical_port_id = str(item.get("physical_port_id") or "")
             physical_kind = str(item.get("physical_interface_kind") or profile.get("physical_kind") or "")
             protocol = str(profile.get("protocol") or item.get("driver") or "")
             physical_fallback = bool(item.get("physical_fallback", False))
@@ -2840,7 +2922,8 @@ class AcquisitionManager:
                 interface_results.append({
                     "id": interface_id, "role": item.get("role", "custom"),
                     "driver": item.get("driver", ""), "endpoint": endpoint,
-                    "physical_interface_id": physical_id, "physical_interface_kind": physical_kind,
+                    "physical_interface_id": physical_id, "physical_port_id": physical_port_id,
+                    "physical_interface_kind": physical_kind,
                     "protocol": protocol, "physical_fallback": physical_fallback,
                     "physical_warning": physical_warning,
                     "enabled": False, "expected_channels": expected,
@@ -2854,7 +2937,8 @@ class AcquisitionManager:
                 interface_results.append({
                     "id": interface_id, "role": item.get("role", "custom"),
                     "driver": item.get("driver", ""), "endpoint": endpoint,
-                    "physical_interface_id": physical_id, "physical_interface_kind": physical_kind,
+                    "physical_interface_id": physical_id, "physical_port_id": physical_port_id,
+                    "physical_interface_kind": physical_kind,
                     "protocol": protocol, "physical_fallback": physical_fallback,
                     "physical_warning": physical_warning,
                     "enabled": True, "expected_channels": [],
@@ -2880,12 +2964,17 @@ class AcquisitionManager:
                         "跳过真实协议探测，请连接设备后重新检查"
                     )
                 else:
-                    message = "实际物理接口尚未验证，跳过真实协议探测；请重新识别接口后检查"
+                    message = (
+                        "端口存在，未检测到兼容设备；请连接设备后重新识别接口并检查"
+                        if physical_port_id and not physical_id
+                        else "实际物理接口尚未验证，跳过真实协议探测；请重新识别接口后检查"
+                    )
                 errors.append(f"{endpoint}：{message}")
                 interface_results.append({
                     "id": interface_id, "role": item.get("role", "custom"),
                     "driver": item.get("driver", ""), "endpoint": endpoint,
-                    "physical_interface_id": physical_id, "physical_interface_kind": physical_kind,
+                    "physical_interface_id": physical_id, "physical_port_id": physical_port_id,
+                    "physical_interface_kind": physical_kind,
                     "protocol": protocol, "physical_fallback": physical_fallback,
                     "physical_warning": physical_warning,
                     "enabled": True, "expected_channels": expected,
@@ -2946,7 +3035,8 @@ class AcquisitionManager:
             interface_results.append({
                 "id": interface_id, "role": item.get("role", "custom"),
                 "driver": item.get("driver", ""), "endpoint": endpoint,
-                "physical_interface_id": physical_id, "physical_interface_kind": physical_kind,
+                "physical_interface_id": physical_id, "physical_port_id": physical_port_id,
+                "physical_interface_kind": physical_kind,
                 "protocol": protocol, "physical_fallback": physical_fallback,
                 "physical_warning": physical_warning,
                 "enabled": True, "expected_channels": expected,
@@ -3296,6 +3386,20 @@ class AcquisitionManager:
         cannot permanently block local, LAN, or public operation.  A real
         hardware capture is never taken over implicitly.
         """
+        if config.acquisition_mode == "real":
+            for item in config.interfaces or []:
+                if not item.get("enabled", True):
+                    continue
+                if item.get("physical_port_id") and not item.get("physical_interface_id"):
+                    raise RuntimeError(
+                        f"接口“{item.get('id', item.get('role', 'unknown'))}”："
+                        "端口存在，未检测到兼容设备；连接设备后重新识别接口"
+                    )
+                if not item.get("physical_verified", False):
+                    raise RuntimeError(
+                        f"接口“{item.get('id', item.get('role', 'unknown'))}”尚未通过物理设备验证，"
+                        "请先执行接口检查"
+                    )
         with self.lifecycle_lock:
             with self.lock:
                 active = self.thread is not None and self.thread.is_alive()
