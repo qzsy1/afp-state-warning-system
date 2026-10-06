@@ -1,0 +1,6397 @@
+from __future__ import annotations
+
+import argparse
+import base64
+import csv
+from copy import deepcopy
+import gzip
+import hashlib
+import hmac
+import inspect
+import io
+import json
+import math
+import mimetypes
+import os
+import re
+import secrets
+import select
+import sys
+import threading
+import time
+import webbrowser
+from http.cookies import SimpleCookie
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse, urlsplit
+
+import numpy as np
+import pandas as pd
+import joblib
+
+from online_inference import (
+    DEFAULT_CHECKPOINT,
+    DEFAULT_MODEL_METADATA,
+    OnlineIModernTCN,
+    inspect_prediction_model,
+    model_catalog,
+    normalize_model_type,
+)
+from acquisition import (
+    ALL_SENSOR_COLUMNS,
+    ACQUISITION_SCHEMAS,
+    AcquisitionConfig,
+    AcquisitionManager,
+    acquisition_config_from_payload,
+    NEW_COLLECTION_SENSOR_COLUMNS,
+    SENSOR_COLUMNS,
+    check_capture_save_root,
+    integrate_capture_sources,
+    default_capture_interfaces,
+    resolve_default_simulation_source,
+    sensor_interface_profiles,
+    select_capture_folder,
+    select_simulation_source,
+)
+from mysql_storage import MySQLCaptureStore, mysql_settings_from_mapping
+from server_target_mysql import ServerTargetProfiles
+from server_capture_journal import ServerCaptureJournal, TargetMySQLSaveCoordinator
+from remote_mysql_setup import classify_mysql_error
+from online_health_features import OnlineWindowFeatureEngine
+from causal_online_runtime import CausalOnlineConsistency
+from runtime_scaler import FeatureScaler
+from new_collection_health import (
+    INDICATOR_REQUIRED_OUTPUTS as NEW_INDICATOR_REQUIRED_OUTPUTS,
+    SENSOR_COLUMNS as NEW_HEALTH_SENSOR_COLUMNS,
+    NEW_ABNORMAL_STATES,
+    NEW_STATE_LABELS,
+    NewCollectionHealthEngine,
+)
+from web_training import WebTrainingManager
+from guest_simulation import GuestSimulationError, GuestSimulationManager
+from helper_relay import HelperRegistry, select_simulation_execution
+from simulation_source_transfer import (
+    MAX_TRANSFER_CHUNK_BYTES,
+    SimulationSourceTicketStore,
+    SimulationSourceTransferError,
+)
+from simulation_packages import (
+    resolve_simulation_package,
+    simulation_package_catalog,
+)
+from edge_capture import RemoteAcquisitionRegistry, select_acquisition_for_identity
+from local_capture_agent import LocalCaptureAgent
+from diagnosis_jobs import DiagnosisJobStore
+from public_status import build_public_device_status
+from web_access import (
+    REAL_ACCESS_ROLES,
+    PermissionPolicy,
+    RequestIdentity,
+    SlidingWindowLimiter,
+    is_lan_client,
+    is_secure_request,
+    is_trusted_quick_tunnel_request,
+    is_trusted_tailscale_funnel_request,
+    lan_session_id,
+    uses_local_capture_helper,
+)
+from web_auth import AuthenticationError, SecurityStore
+from control_lease import RealControlLease
+from json_safety import json_safe_value
+from websocket_live import (
+    VersionedPayloadCache,
+    encode_json_frame,
+    encode_server_frame,
+    synchronized_json_sender,
+    recv_client_frame,
+    websocket_handshake_headers,
+)
+
+
+APP_DIR = Path(os.environ.get("AFP_LEGACY_APP_DIR") or Path(__file__).resolve().parent).resolve()
+
+
+def encode_json_response(payload: dict, accept_encoding: str = "") -> tuple[bytes, bool]:
+    """Serialize a JSON response and compress large browser payloads when supported.
+
+    Live charts return several channels, prediction arrays, and evidence in one
+    response.  Sending that unchanged through a public tunnel adds avoidable
+    transfer time.  Compression is opt-in per request and never changes the
+    JSON contract; helper clients that do not advertise gzip keep the original
+    bytes.
+    """
+
+    raw = json.dumps(
+        json_safe_value(payload), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+    if len(raw) < 1024 or "gzip" not in str(accept_encoding or "").lower():
+        return raw, False
+    compressed = gzip.compress(raw, compresslevel=6, mtime=0)
+    if len(compressed) >= len(raw):
+        return raw, False
+    return compressed, True
+
+
+def encode_static_file_response(
+    path: Path,
+    accept_encoding: str = "",
+    static_root: Path | None = None,
+) -> tuple[bytes, dict[str, str]]:
+    """Return static bytes and delivery headers without changing ordinary assets.
+
+    Only the generated public-demo directory gets explicit cache semantics.
+    Content-addressed bundles are immutable and gzip-compressed when useful;
+    the stable manifest is short-lived so a deployment can point browsers at a
+    new hash without stale data.
+    """
+
+    resolved_path = Path(path).resolve()
+    resolved_root = Path(static_root or STATIC_DIR).resolve()
+    raw = resolved_path.read_bytes()
+    headers: dict[str, str] = {}
+    try:
+        relative = resolved_path.relative_to(resolved_root)
+    except ValueError:
+        return raw, headers
+    if not relative.parts or relative.parts[0] != "demo":
+        return raw, headers
+    headers["ETag"] = f'"{hashlib.sha256(raw).hexdigest()}"'
+    if relative.name == "manifest-v1.json":
+        headers["Cache-Control"] = "public, max-age=60, must-revalidate"
+        return raw, headers
+    if re.fullmatch(r"[A-Za-z0-9_-]+\.[0-9a-f]{16}\.json", relative.name):
+        headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        if len(raw) >= 1024 and "gzip" in str(accept_encoding or "").lower():
+            compressed = gzip.compress(raw, compresslevel=6, mtime=0)
+            if len(compressed) < len(raw):
+                headers["Content-Encoding"] = "gzip"
+                headers["Vary"] = "Accept-Encoding"
+                return compressed, headers
+    return raw, headers
+
+
+def local_mysql_profile() -> dict:
+    """Load machine-local defaults without embedding credentials in source."""
+    candidates: list[Path] = []
+    configured = str(os.environ.get("AFP_MYSQL_PROFILE_FILE") or "").strip()
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    candidates.extend(
+        [
+            APP_DIR.parent / "runtime" / "mysql.local.json",
+            APP_DIR.parent.parent / "runtime" / "mysql.local.json",
+        ]
+    )
+    for path in candidates:
+        try:
+            if path.is_file():
+                payload = json.loads(path.read_text(encoding="utf-8-sig"))
+                if isinstance(payload, dict):
+                    return payload
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+    return {
+        "target": {
+            "host": "192.168.101.31",
+            "port": 3306,
+            "user": "afp_app",
+            "password": "",
+            "database": "afp_state_warning",
+        },
+        "local": {
+            "host": "127.0.0.1",
+            "port": 3306,
+            "user": "root",
+            "password": "",
+            "database": "afp_state_warning",
+        },
+    }
+
+
+def public_mysql_profiles() -> dict:
+    """Return connection defaults without ever returning a password."""
+    payload = local_mysql_profile()
+    if not isinstance(payload, dict):
+        return {"target": {}, "local": {}}
+    safe = deepcopy(payload)
+    for section in ("target", "local"):
+        values = safe.get(section)
+        if isinstance(values, dict):
+            values.pop("password", None)
+            values.pop("mysql_password", None)
+    return safe
+
+
+def decorate_server_mysql_result(result: dict) -> dict:
+    """Annotate server-side MySQL responses without exposing credentials."""
+    payload = dict(result or {})
+    payload.setdefault("scope", "server_target")
+    payload.setdefault("execution_host", "server")
+    return payload
+
+
+def helper_real_capture_payload(payload: dict) -> dict:
+    """Remove server-target credentials before forwarding a real capture to helper."""
+    clean = dict(payload or {})
+    for key in (
+        "mysql_host", "mysql_port", "mysql_user", "mysql_password",
+        "mysql_database", "mysql_target_config_id",
+        "simulation_mysql_host", "simulation_mysql_port", "simulation_mysql_user",
+        "simulation_mysql_password", "simulation_mysql_database",
+    ):
+        clean.pop(key, None)
+    clean["mysql_enabled"] = False
+    return clean
+
+
+def prepare_helper_simulation_payload(
+    guest_manager: GuestSimulationManager,
+    transfer_store: SimulationSourceTicketStore,
+    identity: RequestIdentity,
+    helper_session_id: str,
+    payload: dict,
+) -> dict:
+    """Bind the browser-owned source to one helper without forwarding secrets."""
+
+    source_id = str(payload.get("simulation_source_id") or "").strip()
+    if not source_id:
+        raise GuestSimulationError(
+            "simulation_source_not_found",
+            "请先在当前浏览器选择并上传模拟 CSV 或文件夹",
+        )
+    manifest, source_root = guest_manager.source_transfer_manifest(
+        str(identity.guest_id or ""), source_id
+    )
+    transfer = transfer_store.issue(
+        web_session_id=str(identity.guest_id or ""),
+        helper_session_id=str(helper_session_id or ""),
+        manifest=manifest,
+        source_root=source_root,
+    )
+    clean = helper_real_capture_payload(payload)
+    clean["execution_host"] = "helper_local"
+    clean["simulation_source_transfer"] = transfer
+    clean.pop("simulation_source_path", None)
+    return clean
+
+
+def bind_ready_helper_simulation_payload(
+    guest_manager: GuestSimulationManager,
+    identity: RequestIdentity,
+    payload: dict,
+) -> dict:
+    """Bind a ready receipt to the current session source without retransferring bytes."""
+
+    source_id = str(payload.get("simulation_source_id") or "").strip()
+    ready = payload.get("simulation_source_ready")
+    if not source_id or not isinstance(ready, dict):
+        raise GuestSimulationError(
+            "simulation_source_not_ready",
+            "请先点击“下载到本机辅助程序并校验”，确认数据源已就绪",
+        )
+    manifest, _source_root = guest_manager.source_transfer_manifest(
+        str(identity.guest_id or ""), source_id
+    )
+    if (
+        str(ready.get("source_id") or "") != source_id
+        or str(ready.get("content_sha256") or "")
+        != str(manifest.get("content_sha256") or "")
+    ):
+        raise GuestSimulationError(
+            "simulation_source_not_ready",
+            "模拟数据源已变化，请重新下载到本机辅助程序并校验",
+        )
+    clean = helper_real_capture_payload(payload)
+    clean["execution_host"] = "helper_local"
+    clean["simulation_source_ready"] = {
+        "content_sha256": str(manifest.get("content_sha256") or ""),
+        "source_type": str(manifest.get("source_type") or ""),
+        "relative_paths": [
+            str(item.get("relative_path") or "")
+            for item in (manifest.get("files") or [])
+            if isinstance(item, dict)
+        ],
+    }
+    clean.pop("simulation_source_id", None)
+    return clean
+
+
+def authorized_target_selection(identity: RequestIdentity, profiles: ServerTargetProfiles, payload: dict):
+    """Resolve a remote target profile once, without making the browser own its password."""
+    if identity.role in REAL_ACCESS_ROLES and identity.role != "local_admin":
+        return profiles.for_request(str(identity.session_id or ""), payload)
+    return None
+APP_VERSION = "1.12.0"
+BUILD_ID = "20260823-schema-contract-fix"
+EXECUTABLE_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else APP_DIR
+)
+_ENV_MODEL_DIR = os.environ.get("AFP_MODELS_DIR", "").strip()
+RUNTIME_MODEL_DIR = (
+    Path(_ENV_MODEL_DIR).expanduser().resolve()
+    if _ENV_MODEL_DIR
+    else EXECUTABLE_DIR / "models"
+    if (EXECUTABLE_DIR / "models").exists()
+    else APP_DIR / "models"
+)
+STATIC_DIR = Path(os.environ.get("AFP_UI_DIR") or APP_DIR / "static").resolve()
+DATA_DIR = Path(os.environ.get("AFP_DATA_DIR") or APP_DIR / "data").resolve()
+_PACKAGED_REPLAY_DIR = DATA_DIR / "legacy_replay"
+OUTPUT_DIR = (
+    _PACKAGED_REPLAY_DIR
+    if (_PACKAGED_REPLAY_DIR / "TC_HI_soft_window_results.csv").exists()
+    else APP_DIR.parent / "outputs_tc_hi_soft_consistency_v13_8"
+)
+CAUSAL_OUTPUT_DIR = APP_DIR.parent / "outputs_causal_online_consistency_v13_9"
+
+DEFAULT_MYSQL_FLAT_QUERY = (
+    "SELECT * FROM afp_flat_all "
+    "ORDER BY specimen_key, layer_no, sample_index"
+)
+MYSQL_PREVIEW_LIMIT = 200
+MYSQL_EXPORT_LIMIT = 200_000
+_OPERATION_LOCKS: dict[str, threading.Lock] = {}
+_OPERATION_LOCKS_GUARD = threading.Lock()
+_OPERATION_LOCK_STARTED: dict[str, float] = {}
+# A crashed native probe or a client that disconnects cannot run the normal
+# ``finally`` release path.  Reclaim only locks that have been held well past
+# the normal probe duration; the old worker still owns its original lock and
+# will safely release it when/if it returns.
+OPERATION_LOCK_TTL_SECONDS = 30.0
+_MYSQL_FORBIDDEN_TOKENS = {
+    "ALTER", "ANALYZE", "CALL", "CREATE", "DELETE", "DO", "DROP",
+    "GRANT", "HANDLER", "INSERT", "LOAD", "LOCK", "OPTIMIZE",
+    "RENAME", "REPAIR", "REPLACE", "REVOKE", "SET", "TRUNCATE",
+    "UNLOCK", "UPDATE",
+}
+
+
+def _operation_lock(name: str) -> threading.Lock:
+    with _OPERATION_LOCKS_GUARD:
+        return _OPERATION_LOCKS.setdefault(name, threading.Lock())
+
+def _validate_agent_payload(payload: dict) -> dict:
+    from interface_agent import validate_agent_payload
+
+    return validate_agent_payload(payload)
+
+
+def _mysql_sql_tokens(sql: str) -> list[str]:
+    """Return SQL words outside quoted strings/identifiers.
+
+    This is intentionally conservative.  The browser is a data-view/export
+    surface, not a general SQL console, so comments and stacked statements are
+    rejected by :func:`validate_read_only_mysql_query` before tokenization.
+    """
+    scrubbed = re.sub(r"'(?:''|\\.|[^'])*'", " ", sql, flags=re.S)
+    scrubbed = re.sub(r'"(?:""|\\.|[^"])*"', " ", scrubbed, flags=re.S)
+    scrubbed = re.sub(r"`(?:``|[^`])*`", " ", scrubbed, flags=re.S)
+    return re.findall(r"[A-Za-z_]+", scrubbed.upper())
+
+
+def validate_read_only_mysql_query(
+    query: str,
+    default: str = DEFAULT_MYSQL_FLAT_QUERY,
+) -> str:
+    """Validate one browser-supplied MySQL SELECT/CTE statement.
+
+    Prefix checking alone is unsafe because ``WITH ... DELETE`` and
+    ``SELECT ... INTO OUTFILE`` can change server state.  We therefore reject
+    comments, statement separators and every data/schema/privilege mutation
+    token.  Database permissions remain the final security boundary; this
+    validation is an additional application-level guard.
+    """
+    sql = str(query or "").strip() or default
+    if len(sql) > 20_000:
+        raise ValueError("SQL 查询过长；只允许不超过 20000 个字符的只读查询")
+    if "\x00" in sql or ";" in sql:
+        raise ValueError("只允许一条 SELECT/WITH 查询，不能包含分号或多条语句")
+    if re.search(r"(?:--|#|/\*|\*/)", sql):
+        raise ValueError("只读查询不允许包含 SQL 注释")
+    tokens = _mysql_sql_tokens(sql)
+    if not tokens or tokens[0] not in {"SELECT", "WITH"}:
+        raise ValueError("只允许 SELECT 或 WITH ... SELECT 只读查询")
+    forbidden = sorted(set(tokens) & _MYSQL_FORBIDDEN_TOKENS)
+    if forbidden:
+        raise ValueError(f"只读查询包含禁止关键字：{', '.join(forbidden)}")
+    if "SELECT" not in tokens:
+        raise ValueError("WITH 查询必须以 SELECT 返回数据")
+    for unsafe_phrase in (r"\bINTO\s+(?:OUTFILE|DUMPFILE)\b", r"\bFOR\s+UPDATE\b"):
+        if re.search(unsafe_phrase, sql, flags=re.I):
+            raise ValueError("只读查询不能写文件或锁定数据")
+    return sql
+
+
+def _json_safe_mysql_value(value):
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).decode("utf-8", errors="replace")
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat(sep=" ")
+        except TypeError:
+            return value.isoformat()
+    return str(value)
+
+
+def _normalise_mysql_rows(result) -> tuple[list[str], list[dict]]:
+    if isinstance(result, dict):
+        rows = result.get("rows", [])
+        columns = list(result.get("columns", []) or [])
+    else:
+        rows = result or []
+        columns = []
+    normalised: list[dict] = []
+    for raw in rows:
+        if isinstance(raw, dict):
+            item = {str(key): _json_safe_mysql_value(value) for key, value in raw.items()}
+        else:
+            if not columns:
+                raise ValueError("MySQL 查询结果缺少列名")
+            item = {
+                str(key): _json_safe_mysql_value(value)
+                for key, value in zip(columns, raw)
+            }
+        normalised.append(item)
+    if not columns and normalised:
+        columns = list(normalised[0])
+    return columns, normalised
+
+
+def _call_compatible_mysql_rows(store, query: str, limit: int):
+    """Use a newer store query API when available, otherwise connect directly."""
+    for name in ("read_only_query", "query_readonly", "export_flat_rows"):
+        method = getattr(store, name, None)
+        if not callable(method):
+            continue
+        signature = inspect.signature(method)
+        parameters = signature.parameters
+        # A flat-export helper without a query argument is safe only for the
+        # canonical flat view; custom SELECTs use the compatibility fallback.
+        if "query" not in parameters and query != DEFAULT_MYSQL_FLAT_QUERY:
+            continue
+        kwargs = {}
+        if "query" in parameters:
+            kwargs["query"] = query
+        if "limit" in parameters:
+            kwargs["limit"] = limit
+        return method(**kwargs)
+
+    _, connection = store._connect(store.settings.database)
+    cursor = None
+    try:
+        cursor = connection.cursor()
+        cursor.execute(query)
+        columns = [str(item[0]) for item in (cursor.description or [])]
+        rows = cursor.fetchmany(limit + 1)
+        return {
+            "columns": columns,
+            "rows": [dict(zip(columns, row)) for row in rows[:limit]],
+            "truncated": len(rows) > limit,
+        }
+    finally:
+        if cursor is not None:
+            cursor.close()
+        connection.close()
+
+
+def mysql_read_only_rows(store, query: str, limit: int) -> dict:
+    sql = validate_read_only_mysql_query(query)
+    capped_limit = max(1, min(int(limit), MYSQL_EXPORT_LIMIT))
+    raw = _call_compatible_mysql_rows(store, sql, capped_limit)
+    columns, rows = _normalise_mysql_rows(raw)
+    truncated = bool(raw.get("truncated", False)) if isinstance(raw, dict) else False
+    return {
+        "ok": True,
+        "database": store.settings.database,
+        "host": store.settings.host,
+        "columns": columns,
+        "rows": rows[:capped_limit],
+        "count": min(len(rows), capped_limit),
+        "truncated": truncated or len(rows) > capped_limit,
+        "limit": capped_limit,
+        "query": sql,
+    }
+
+
+def mysql_rows_to_csv(columns: list[str], rows: list[dict]) -> bytes:
+    stream = io.StringIO(newline="")
+    writer = csv.DictWriter(stream, fieldnames=columns, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({name: row.get(name, "") for name in columns})
+    return ("\ufeff" + stream.getvalue()).encode("utf-8")
+
+
+def mysql_test_existing_database(store) -> dict:
+    """Test an already-initialized database without creating or altering it."""
+    verifier = getattr(store, "verify_connection", None)
+    if callable(verifier):
+        return verifier(require_schema=True)
+    for name in ("test_existing_database", "test_read_only_connection"):
+        method = getattr(store, name, None)
+        if callable(method):
+            return method()
+    connection = None
+    cursor = None
+    try:
+        driver, connection = store._connect(store.settings.database)
+        cursor = connection.cursor()
+        cursor.execute("SELECT 1")
+        cursor.fetchone()
+        cursor.execute(
+            "SELECT TABLE_NAME FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA=%s AND TABLE_NAME IN "
+            "('afp_condition','afp_specimen','afp_layer','afp_sensor_sample',"
+            "'afp_sample_all','afp_flat_all','afp_relation_map')",
+            (store.settings.database,),
+        )
+        existing = {str(row[0]) for row in cursor.fetchall()}
+        required = {
+            "afp_condition", "afp_specimen", "afp_layer", "afp_sample_all",
+            "afp_flat_all", "afp_relation_map",
+        }
+        missing = sorted(required - existing)
+        return {
+            "ok": True,
+            "enabled": True,
+            "database": store.settings.database,
+            "host": store.settings.host,
+            "driver": driver,
+            "schema_ready": not missing,
+            "missing_objects": missing,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "enabled": True,
+            "database": store.settings.database,
+            "host": store.settings.host,
+            "error": str(exc),
+        }
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if connection is not None:
+            connection.close()
+
+LEGACY_STATE_LABELS = {
+    "normal": "正常",
+    "power_low": "功率过低",
+    "power_high": "功率过高",
+    "speed_low": "速度过低",
+    "speed_high": "速度过高",
+    "compaction_low": "压实力过低",
+    "compaction_high": "压实力过高",
+}
+STATE_LABELS = {**LEGACY_STATE_LABELS, **NEW_STATE_LABELS}
+ABNORMAL_STATES = [state for state in LEGACY_STATE_LABELS if state != "normal"]
+THERMAL_SENSORS = [f"温度{index}" for index in range(1, 9)]
+INDICATOR_REQUIRED_OUTPUTS = {
+    "T-HI": THERMAL_SENSORS,
+    "C-HI": ["压力"],
+    "TC-HI": [*THERMAL_SENSORS, "压力"],
+    "RFHI": SENSOR_COLUMNS,
+    "PR-HI": SENSOR_COLUMNS,
+    "MPRF-HI": SENSOR_COLUMNS,
+    "PCA-SPE-HI": SENSOR_COLUMNS,
+    "KECA-SPE-HI": SENSOR_COLUMNS,
+    "McFS-AVAE-HI": SENSOR_COLUMNS,
+    "CNN-LSTM-AE-HI": SENSOR_COLUMNS,
+    "W-HI": SENSOR_COLUMNS,
+    "RMD-HI": SENSOR_COLUMNS,
+}
+LIVE_SENSOR_UNITS = {
+    "转速": "device unit",
+    "位移": "mm",
+    "压力": "N / device unit",
+    "薄膜压力": "N",
+    "振动": "device unit",
+    "温度": "°C",
+    "ROI平均温度": "°C",
+    "张力": "N",
+    "线速度": "mm/s",
+    "ABB_X": "mm",
+    "ABB_Y": "mm",
+    "ABB_Z": "mm",
+    **{f"温度{index}": "°C" for index in range(1, 9)},
+}
+NEW_DEMO_ROOT = Path(
+    os.environ.get("AFP_NEW_DEMO_DIR") or APP_DIR / "new_collection_demo_v11_3"
+).resolve()
+SUPPLIED_SIMULATION_SOURCE = Path(
+    r"F:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv"
+).resolve()
+NEW_DEMO_SOURCE = (
+    SUPPLIED_SIMULATION_SOURCE
+    if SUPPLIED_SIMULATION_SOURCE.is_file()
+    else NEW_DEMO_ROOT / "simulator_stream.csv"
+)
+NEW_DEMO_CHECKPOINT = RUNTIME_MODEL_DIR / "new" / "i_T_G" / "checkpoint.pth"
+
+
+def select_prediction_model_file(initial_path: str = "") -> str:
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    initial = Path(initial_path).expanduser() if initial_path else DEFAULT_CHECKPOINT
+    try:
+        selected = filedialog.askopenfilename(
+            parent=root,
+            title="选择已训练的I-ModernTCN预测模型",
+            initialdir=str(initial.parent),
+            initialfile=initial.name,
+            filetypes=[
+                ("PyTorch模型", "*.pth *.pt"),
+                ("所有文件", "*.*"),
+            ],
+        )
+        return str(Path(selected).resolve()) if selected else ""
+    finally:
+        root.destroy()
+
+
+def select_training_file(initial_path: str = "", kind: str = "csv") -> str:
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    initial = Path(initial_path).expanduser() if initial_path else Path.home()
+    filetypes = (
+        [("已整合训练CSV", "*.csv"), ("所有文件", "*.*")]
+        if kind == "csv"
+        else [("PyTorch模型", "*.pth *.pt"), ("所有文件", "*.*")]
+    )
+    try:
+        selected = filedialog.askopenfilename(
+            parent=root,
+            title="选择已整合训练CSV" if kind == "csv" else "选择用于继续训练的模型",
+            initialdir=str(initial.parent if initial.suffix else initial),
+            initialfile=initial.name if initial.suffix else "",
+            filetypes=filetypes,
+        )
+        return str(Path(selected).resolve()) if selected else ""
+    finally:
+        root.destroy()
+
+
+def _finite(value, default=0.0):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+PROCESS_PARAMETER_SCHEMAS = {
+    "legacy_original": [
+        {"key": "p", "current_key": "current_p", "label": "功率", "unit": "W"},
+        {"key": "v", "current_key": "current_v", "label": "铺放速度", "unit": "mm/s"},
+        {"key": "pr", "current_key": "current_pr", "label": "压实力", "unit": "N"},
+    ],
+    "new_collection_v11_3": [
+        {"key": "initial_compaction_force_N", "label": "初始压实力", "unit": "N"},
+        {"key": "placement_speed_mm_s", "label": "铺放速度", "unit": "mm/s"},
+        {"key": "pid_angle_deg", "label": "PID角度", "unit": "°"},
+        {"key": "temperature_setpoint_C", "label": "设定温度", "unit": "°C"},
+    ],
+}
+
+INDICATOR_VARIANTS = {
+    "legacy_original": {
+        "TC-HI": {
+            "variant_id": "TC-HI-Legacy-8T1C",
+            "label": "旧数据热－压实耦合指标（8路温度＋压力）",
+            "construction": "8路温度响应与压力响应的热－压实耦合特征",
+            "required_outputs": INDICATOR_REQUIRED_OUTPUTS["TC-HI"],
+            "required_process_parameters": [],
+        }
+    },
+    "new_collection_v11_3": {
+        "TC-HI": {
+            "variant_id": "TC-HI-New-10T2C4P",
+            "label": "新数据热－压实－工艺耦合指标（10路温度＋压力/张力＋4工艺参数）",
+            "construction": "10路热响应、压力/张力压实响应与4项工艺流形距离联合构建",
+            "required_outputs": NEW_INDICATOR_REQUIRED_OUTPUTS["TC-HI"],
+            "required_process_parameters": [
+                "initial_compaction_force_N",
+                "placement_speed_mm_s",
+                "pid_angle_deg",
+                "temperature_setpoint_C",
+            ],
+        }
+    },
+}
+
+
+INDICATOR_VARIANTS["new_collection_v11_3"]["TC-HI"].update(
+    {
+        "variant_id": "TC-HI-New-16S4P",
+        "label": "新数据热－压实耦合指标（模型16路＋独立薄膜压力通道＋4工艺参数）",
+        "construction": "模型保持原16路实际传感器响应；独立薄膜压力通道单独采集保存，可在后续重训时纳入耦合特征",
+    }
+)
+
+
+def _finite_or_none(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _source_value(sources, *keys):
+    for source in sources:
+        if source is None:
+            continue
+        for key in keys:
+            value = source.get(key)
+            number = _finite_or_none(value)
+            if number is not None:
+                return number
+    return None
+
+
+def build_process_payload(
+    declared_schema: str,
+    observed=None,
+    fallback=None,
+    injection_severity=0.0,
+) -> dict:
+    """Extract process parameters from the received row, then fall back to UI config."""
+    observed = observed if observed is not None else {}
+    fallback = fallback if fallback is not None else {}
+    observed_new = any(
+        _finite_or_none(observed.get(item["key"])) is not None
+        for item in PROCESS_PARAMETER_SCHEMAS["new_collection_v11_3"]
+    )
+    observed_legacy = any(
+        _finite_or_none(observed.get(item["key"])) is not None
+        for item in PROCESS_PARAMETER_SCHEMAS["legacy_original"]
+    )
+    schema_id = (
+        "new_collection_v11_3"
+        if observed_new
+        else "legacy_original"
+        if observed_legacy
+        else declared_schema
+        if declared_schema in PROCESS_PARAMETER_SCHEMAS
+        else "legacy_original"
+    )
+    definitions = PROCESS_PARAMETER_SCHEMAS[schema_id]
+    display_parameters = []
+    observed_count = 0
+    payload = {
+        "schema_id": schema_id,
+        "injection_severity": _finite(injection_severity, 0.0),
+    }
+    for item in definitions:
+        nominal = _source_value([observed, fallback], item["key"])
+        current_key = item.get("current_key", item["key"])
+        current = _source_value([observed], current_key, item["key"])
+        if current is not None:
+            observed_count += 1
+        if current is None:
+            current = _source_value([fallback], current_key, item["key"])
+        if nominal is None:
+            nominal = current
+        payload[item["key"]] = nominal
+        payload[current_key] = current
+        display_parameters.append(
+            {
+                "key": item["key"],
+                "label": item["label"],
+                "unit": item["unit"],
+                "value": current,
+                "nominal": nominal,
+            }
+        )
+    payload["display_parameters"] = display_parameters
+    payload["parameter_source"] = (
+        "input_data"
+        if observed_count == len(definitions)
+        else "input_data_with_config_fallback"
+        if observed_count
+        else "configuration"
+    )
+    return payload
+
+
+def indicator_variant(dataset_schema: str, indicator: str) -> dict:
+    variant = INDICATOR_VARIANTS.get(dataset_schema, {}).get(indicator)
+    if variant is not None:
+        return dict(variant)
+    outputs = (
+        NEW_INDICATOR_REQUIRED_OUTPUTS
+        if dataset_schema == "new_collection_v11_3"
+        else INDICATOR_REQUIRED_OUTPUTS
+    ).get(indicator, [])
+    return {
+        "variant_id": f"{indicator}-{dataset_schema}",
+        "label": indicator,
+        "construction": "按当前输入数据方案提取对应响应与残差特征",
+        "required_outputs": list(outputs),
+        "required_process_parameters": [],
+    }
+
+
+def _json_value(value):
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if pd.isna(value):
+        return None
+    return value
+
+
+def _record(series: pd.Series, fields: list[str]) -> dict:
+    return {field: _json_value(series.get(field)) for field in fields}
+
+
+def cap_pool(scores: np.ndarray, rho: float) -> tuple[float, np.ndarray]:
+    scores = np.asarray(scores, dtype=float)
+    if len(scores) == 0:
+        return 0.0, np.asarray([], dtype=float)
+    alpha = float(np.clip(rho, 0.0, 1.0)) * math.log(max(len(scores) - 1, 1))
+    logits = alpha * scores
+    logits -= np.max(logits)
+    weights = np.exp(logits)
+    weights /= np.sum(weights)
+    return float(np.dot(weights, scores)), weights
+
+
+class DashboardData:
+    def __init__(self) -> None:
+        required = [
+            DATA_DIR / "dashboard_sequences.npz",
+            DATA_DIR / "dashboard_window_index.csv",
+            DATA_DIR / "dashboard_manifest.json",
+            OUTPUT_DIR / "TC_HI_soft_window_results.csv",
+            OUTPUT_DIR / "TC_HI_soft_layer_results_130.csv",
+            OUTPUT_DIR / "TC_HI_soft_specimen_results_26.csv",
+            DATA_DIR / "dashboard_candidate_scores.npz",
+            DATA_DIR / "dashboard_candidate_catalog.csv",
+            DATA_DIR / "dashboard_candidate_features.npz",
+            DATA_DIR / "candidate_models",
+            DATA_DIR / "online_feature_artifacts.joblib",
+            (
+                DATA_DIR / "causal_online_consistency_artifact.joblib"
+                if (DATA_DIR / "causal_online_consistency_artifact.joblib").exists()
+                else CAUSAL_OUTPUT_DIR / "causal_online_consistency_artifact.joblib"
+            ),
+        ]
+        missing = [path for path in required if not path.exists()]
+        if missing:
+            raise FileNotFoundError(
+                "缺少可视化数据，请先运行 prepare_dashboard_data.py：\n"
+                + "\n".join(str(path) for path in missing)
+            )
+
+        arrays = np.load(DATA_DIR / "dashboard_sequences.npz", allow_pickle=False)
+        self.actual = arrays["actual"]
+        self.prediction = arrays["prediction"]
+        self.model_input = arrays["model_input"]
+        self.model_true = arrays["model_true"]
+        self.scaler_mean = arrays["scaler_mean"].astype(float)
+        self.scaler_scale = arrays["scaler_scale"].astype(float)
+        self.sensor_model_indices = arrays["sensor_model_indices"].astype(int)
+        self.index = pd.read_csv(DATA_DIR / "dashboard_window_index.csv")
+        self.windows = pd.read_csv(OUTPUT_DIR / "TC_HI_soft_window_results.csv")
+        self.layers = pd.read_csv(OUTPUT_DIR / "TC_HI_soft_layer_results_130.csv")
+        self.specimens = pd.read_csv(OUTPUT_DIR / "TC_HI_soft_specimen_results_26.csv")
+        self.manifest = json.loads(
+            (DATA_DIR / "dashboard_manifest.json").read_text(encoding="utf-8")
+        )
+        candidate_arrays = np.load(
+            DATA_DIR / "dashboard_candidate_scores.npz", allow_pickle=False
+        )
+        self.candidate_scores = candidate_arrays["anomaly_scores"]
+        self.candidate_type_probabilities = candidate_arrays["type_probabilities"]
+        self.candidate_catalog = pd.read_csv(
+            DATA_DIR / "dashboard_candidate_catalog.csv"
+        )
+        feature_arrays = np.load(
+            DATA_DIR / "dashboard_candidate_features.npz", allow_pickle=False
+        )
+        self.candidate_features = {
+            name: feature_arrays[name] for name in feature_arrays.files
+        }
+        self.candidate_model_dir = DATA_DIR / "candidate_models"
+        self.candidate_model_cache: dict[int, dict] = {}
+        self.candidate_score_cache: dict[
+            tuple[int, int, str], tuple[float, np.ndarray]
+        ] = {}
+        self.candidate_lock = threading.RLock()
+        self.online_predictor = OnlineIModernTCN()
+        # PyTorch and scikit-learn ship separate OpenMP runtimes on Windows.
+        # Load the forecasting runtime before lazily opening any sklearn model.
+        self.online_predictor.warmup()
+        online_artifact = joblib.load(
+            DATA_DIR / "online_feature_artifacts.joblib"
+        )
+        feature_scaler = FeatureScaler(
+            mean=self.scaler_mean.copy(),
+            scale=self.scaler_scale.copy(),
+            source=DATA_DIR / "dashboard_sequences.npz",
+        )
+        self.online_feature_engine = OnlineWindowFeatureEngine(
+            scaler=feature_scaler,
+            ambient=_finite(
+                self.manifest.get("ambient_temperature_reference"), 0.0
+            ),
+            coherence_floor=online_artifact["coherence_floor"],
+            transformers=online_artifact["transformers"],
+        )
+        self.acquisition = AcquisitionManager()
+        self.local_capture_agent = LocalCaptureAgent(manager=self.acquisition)
+        self.helper_registry = HelperRegistry()
+        self.remote_acquisitions = RemoteAcquisitionRegistry()
+        self.causal_online_optimizer = CausalOnlineConsistency(
+                (
+                    DATA_DIR / "causal_online_consistency_artifact.joblib"
+                    if (DATA_DIR / "causal_online_consistency_artifact.joblib").exists()
+                    else CAUSAL_OUTPUT_DIR / "causal_online_consistency_artifact.joblib"
+                )
+        )
+        try:
+            self.new_collection_health_engine = NewCollectionHealthEngine()
+        except FileNotFoundError:
+            self.new_collection_health_engine = None
+        self.live_prediction_cache: dict[tuple[str, int], np.ndarray] = {}
+        self.live_window_result_cache: dict[tuple[str, int, int], dict] = {}
+        self.live_forecast_cache: dict[tuple[str, int, int], tuple[np.ndarray, str]] = {}
+        # Causal, target-aligned predictions are keyed by (target_index, lead).
+        # A target is frozen only for the lead at which it was originally
+        # forecast.  This is separate from the latest rolling forecast shown in
+        # the UI, so changing the display horizon cannot create a fixed lag.
+        self.live_causal_prediction_cache: dict[
+            str, dict[tuple[int, int], np.ndarray]
+        ] = {}
+        # Backward-compatible diagnostic cache containing only the latest
+        # rolling forecast.  It is never used for historical alignment.
+        self.live_rolling_prediction_cache: dict[str, dict[int, np.ndarray]] = {}
+        self.live_cache_lock = threading.RLock()
+        # A replay prediction depends on both the archived window and the
+        # selected checkpoint.  Keying only by window reused stale results
+        # after the user changed the prediction algorithm.
+        self.replay_prediction_cache: dict[tuple[str, int], np.ndarray] = {}
+        self.live_layer_health_path = (
+            self.acquisition.capture_root / "specimen_layer_health.json"
+        )
+        self.web_training = WebTrainingManager(Path(r"F:\AFP_Training_Models"))
+        self.live_layer_health = self._load_live_layer_health()
+
+        if len(self.windows) != len(self.actual) or len(self.index) != len(self.actual):
+            raise RuntimeError("窗口结果、窗口索引与序列数据数量不一致。")
+        if self.candidate_scores.shape != (
+            len(self.candidate_catalog),
+            len(self.actual),
+        ):
+            raise RuntimeError(
+                "候选模型异常分数形状与候选目录/窗口数量不一致。"
+            )
+        if self.candidate_type_probabilities.shape[:2] != self.candidate_scores.shape:
+            raise RuntimeError("候选模型异常类型概率形状不一致。")
+
+        self.windows = self.windows.copy()
+        self.windows["visual_index"] = self.index["visual_index"].to_numpy()
+        self.windows["full_specimen_id"] = self.windows["full_specimen_id"].astype(str)
+        self.windows["layer_sample_id"] = self.windows["layer_sample_id"].astype(str)
+        self.layers["full_specimen_id"] = self.layers["full_specimen_id"].astype(str)
+        self.layers["layer_sample_id"] = self.layers["layer_sample_id"].astype(str)
+        self.specimens["full_specimen_id"] = self.specimens["full_specimen_id"].astype(str)
+
+        self.sensors = self.manifest["sensors"]
+        self.specimen_ids = self.specimens["full_specimen_id"].tolist()
+        self.window_groups = {
+            key: group.sort_values("window_sample_id").reset_index(drop=True)
+            for key, group in self.windows.groupby("layer_sample_id", sort=False)
+        }
+        self.layer_groups = {
+            key: group.sort_values("layer").reset_index(drop=True)
+            for key, group in self.layers.groupby("full_specimen_id", sort=False)
+        }
+
+    def bootstrap(self, *, include_discovery: bool = True) -> dict:
+        interface_discovery = (
+            self.acquisition.discover_interfaces() if include_discovery else {}
+        )
+        specimens = []
+        for _, row in self.specimens.iterrows():
+            specimens.append(
+                {
+                    "id": str(row["full_specimen_id"]),
+                    "split": str(row["dataset_split"]),
+                    "true_state": str(row["true_state"]),
+                    "true_state_label": STATE_LABELS.get(str(row["true_state"]), str(row["true_state"])),
+                    "predicted_state": str(row["soft_predicted_state"]),
+                    "predicted_state_label": STATE_LABELS.get(str(row["soft_predicted_state"]), str(row["soft_predicted_state"])),
+                    "correct": bool(row["soft_prediction_correct"]),
+                }
+            )
+        first = self.specimen_ids[0]
+        first_layer = str(self.layer_groups[first].iloc[0]["layer_sample_id"])
+        indicators = []
+        for indicator, rows in self.candidate_catalog.groupby(
+            "indicator_family", sort=False
+        ):
+            variant_info = indicator_variant("legacy_original", str(indicator))
+            recommended = rows.loc[
+                rows["recommended_for_indicator"].astype(bool)
+            ].iloc[0]
+            models = []
+            for _, candidate in rows.sort_values(
+                "validation_selection_score", ascending=False
+            ).iterrows():
+                models.append(
+                    {
+                        "id": str(candidate["model_kind"]),
+                        "candidate_index": int(candidate["candidate_index"]),
+                        "recommended": bool(candidate["recommended_for_indicator"]),
+                        "validation_selection_score": _finite(
+                            candidate["validation_selection_score"]
+                        ),
+                        "validation_window_balanced_accuracy": _finite(
+                            candidate["validation_window_balanced_accuracy"]
+                        ),
+                        "validation_layer_balanced_accuracy": _finite(
+                            candidate["validation_layer_balanced_accuracy"]
+                        ),
+                        "validation_specimen_balanced_accuracy": _finite(
+                            candidate["validation_specimen_balanced_accuracy"]
+                        ),
+                        "test_window_balanced_accuracy": _finite(
+                            candidate["test_window_balanced_accuracy"]
+                        ),
+                        "test_layer_balanced_accuracy": _finite(
+                            candidate["test_layer_balanced_accuracy"]
+                        ),
+                        "test_specimen_balanced_accuracy": _finite(
+                            candidate["test_specimen_balanced_accuracy"]
+                        ),
+                        "window_threshold": _finite(candidate["window_threshold"]),
+                        "layer_threshold": _finite(candidate["layer_threshold"]),
+                        "specimen_threshold": _finite(candidate["specimen_threshold"]),
+                        "cap_rho": _finite(candidate["cap_rho"]),
+                    }
+                )
+            indicators.append(
+                {
+                    "id": str(indicator),
+                    "label": variant_info["label"],
+                    "variant": variant_info,
+                    "required_outputs": variant_info["required_outputs"],
+                    "recommended_model": str(recommended["model_kind"]),
+                    "models": models,
+                }
+            )
+        new_indicators = []
+        if self.new_collection_health_engine is not None:
+            new_catalog = pd.DataFrame(
+                self.new_collection_health_engine.catalog
+            )
+            for indicator, rows in new_catalog.groupby("indicator", sort=False):
+                variant_info = indicator_variant(
+                    "new_collection_v11_3", str(indicator)
+                )
+                recommended = rows.loc[rows["recommended"].astype(bool)].iloc[0]
+                models = []
+                for _, candidate in rows.sort_values(
+                    "validation_selection_score", ascending=False
+                ).iterrows():
+                    models.append(
+                        {
+                            "id": str(candidate["model"]),
+                            "recommended": bool(candidate["recommended"]),
+                            "validation_selection_score": _finite(
+                                candidate["validation_selection_score"]
+                            ),
+                            "validation_window_balanced_accuracy": _finite(
+                                candidate["validation_window_balanced_accuracy"]
+                            ),
+                            "validation_layer_balanced_accuracy": _finite(
+                                candidate["validation_layer_balanced_accuracy"]
+                            ),
+                            "validation_specimen_balanced_accuracy": _finite(
+                                candidate["validation_specimen_balanced_accuracy"]
+                            ),
+                            "window_threshold": _finite(
+                                candidate["window_threshold"]
+                            ),
+                            "layer_threshold": _finite(
+                                candidate["layer_threshold"]
+                            ),
+                            "specimen_threshold": _finite(
+                                candidate["specimen_threshold"]
+                            ),
+                            "cap_rho": _finite(candidate["cap_rho"]),
+                        }
+                    )
+                new_indicators.append(
+                    {
+                        "id": str(indicator),
+                        "label": (
+                            variant_info["label"]
+                            if str(indicator) == "TC-HI"
+                            else (
+                                "16通道预测残差融合指标"
+                                if str(indicator) == "RFHI"
+                                else str(recommended["indicator_label"])
+                            )
+                        ),
+                        "variant": variant_info,
+                        "required_outputs": variant_info["required_outputs"],
+                        "recommended_model": str(recommended["model"]),
+                        "models": models,
+                    }
+                )
+        return {
+            "application": {"version": APP_VERSION, "build_id": BUILD_ID},
+            "manifest": self.manifest,
+            "state_labels": STATE_LABELS,
+            "sensors": self.sensors,
+            "indicators": indicators,
+            "indicator_schemas": {
+                "legacy_original": indicators,
+                "new_collection_v11_3": new_indicators,
+            },
+            "indicator_variants": INDICATOR_VARIANTS,
+            "specimens": specimens,
+            "defaults": {
+                "specimen": first,
+                "layer": first_layer,
+                "sensor": 2,
+                "cursor": 24,
+                "history": 240,
+                "stream_step": 1,
+                "distance": 0,
+                "length": 480,
+                "step": 1,
+                "threshold": 0.5,
+                "rho": 0.5,
+                "score_mode": "soft",
+                "indicator": "TC-HI",
+                "model": "random_forest",
+                "prediction_horizon": 24,
+                "prediction_model_type": "i_T_G",
+                "forecast_lead": 1,
+                # Real-time acquisition is the only visible run mode.  Local
+                # CSV/folder/MySQL playback is configured as a simulated
+                # acquisition source under the acquisition panel.
+                "realtime_prediction": True,
+                "use_optimized_warning": True,
+                "data_mode": "live",
+            },
+            "acquisition": {
+                "drivers": self.acquisition.available_drivers(),
+                "interface_defaults": interface_discovery.get("defaults", []),
+                "sensor_types": interface_discovery.get("sensor_type_profiles", []),
+                "channel_metadata": interface_discovery.get("channel_metadata", {}),
+                "interface_discovery": interface_discovery,
+                "schemas": self.acquisition.available_schemas(),
+                "sensors": SENSOR_COLUMNS,
+                "prediction_model": self.online_predictor.profile,
+                "prediction_models": model_catalog(),
+                "best_prediction_models": {
+                    schema_id: self.best_prediction_profile(schema_id)
+                    for schema_id in ACQUISITION_SCHEMAS
+                },
+                "new_collection_demo": {
+                    "source_file": (
+                        str(NEW_DEMO_SOURCE.resolve())
+                        if NEW_DEMO_SOURCE.exists()
+                        else ""
+                    ),
+                    "prediction_model": (
+                        inspect_prediction_model(
+                            NEW_DEMO_CHECKPOINT, schema_mode="new_collection_v11_3"
+                        )
+                        if NEW_DEMO_CHECKPOINT.exists()
+                        else None
+                    ),
+                },
+                "indicator_required_outputs": INDICATOR_REQUIRED_OUTPUTS,
+                "indicator_required_outputs_by_schema": {
+                    "legacy_original": INDICATOR_REQUIRED_OUTPUTS,
+                    "new_collection_v11_3": NEW_INDICATOR_REQUIRED_OUTPUTS,
+                },
+                "new_collection_health_ready": bool(
+                    self.new_collection_health_engine is not None
+                ),
+                "default_save_root": str(
+                    self.acquisition.capture_root.resolve()
+                ),
+                "original_columns": [
+                    "振动", "转速", "位移",
+                    *[f"温度{index}" for index in range(1, 9)],
+                    "压力", "cycle", "file", "root",
+                    "p", "v", "pr", "l", "试件",
+                ],
+            },
+        }
+
+    def inspect_prediction_model(
+        self, checkpoint: str = "", model_type: str = "", architecture: str = "",
+        schema_mode: str = "",
+    ) -> dict:
+        return inspect_prediction_model(
+            checkpoint, model_type=model_type, architecture=architecture,
+            schema_mode=schema_mode,
+        )
+
+    def best_prediction_profile(self, dataset_schema: str) -> dict:
+        schema_id = (
+            "new_collection_v11_3"
+            if dataset_schema == "new_collection_v11_3"
+            else "legacy_original"
+        )
+        candidates = []
+        for entry in model_catalog():
+            scope = "new" if schema_id == "new_collection_v11_3" else "legacy"
+            packaged_checkpoint = (
+                RUNTIME_MODEL_DIR / scope / str(entry["id"]) / "checkpoint.pth"
+            )
+            if not packaged_checkpoint.is_file():
+                continue
+            try:
+                profile = inspect_prediction_model(
+                    packaged_checkpoint,
+                    model_type=str(entry["id"]),
+                    schema_mode=schema_id,
+                )
+            except (FileNotFoundError, ValueError, RuntimeError):
+                continue
+            metric = profile.get("validation_loss")
+            if metric is not None and math.isfinite(float(metric)):
+                candidates.append((float(metric), profile))
+        if not candidates:
+            raise FileNotFoundError(
+                f"{schema_id}没有可用且带验证记录的预测模型权重"
+            )
+        metric_value, profile = min(candidates, key=lambda item: item[0])
+        return {
+            **profile,
+            "selection_metric": "minimum_validation_loss",
+            "selection_metric_value": metric_value,
+            "selection_basis": (
+                "仅比较训练时冻结验证集损失；未使用测试集重选"
+            ),
+            "registry_scope": schema_id,
+        }
+
+    def validate_prediction_setup(
+        self,
+        config: AcquisitionConfig,
+        *,
+        load_model: bool,
+    ) -> dict:
+        if config.processing_mode == "capture_only":
+            return {
+                "processing_mode": "capture_only",
+                "compatible": True,
+                "model_required": False,
+                "checkpoint": "",
+                "selected_input_sensors": [],
+                "selected_output_sensors": [],
+                "health_indicator": None,
+                "health_required_outputs": [],
+            }
+        profile = (
+            self.best_prediction_profile(config.dataset_schema)
+            if config.use_best_prediction_override
+            else inspect_prediction_model(
+                config.prediction_model_file,
+                model_type=getattr(config, "prediction_model_type", "i_T_G"),
+                schema_mode=config.dataset_schema,
+            )
+        )
+        auto_corrected = False
+        schema_sensors = list(
+            ACQUISITION_SCHEMAS.get(
+                config.dataset_schema, ACQUISITION_SCHEMAS["legacy_original"]
+            )["sensors"]
+        )
+        if config.use_best_prediction_override:
+            config.prediction_model_file = profile["checkpoint"]
+        acquired_inputs = list(config.model_input_sensors or [])
+        model_inputs = list(profile["input_sensors"])
+        missing_inputs = [
+            name for name in model_inputs if name not in acquired_inputs
+        ]
+        unexpected_inputs = [
+            name for name in acquired_inputs if name not in model_inputs
+        ]
+        model_schema_violations = [
+            name for name in model_inputs if name not in schema_sensors
+        ]
+        if model_schema_violations:
+            raise ValueError(
+                f"所选模型与{config.dataset_schema}数据方案不兼容，"
+                f"模型包含该方案未采集的通道：{model_schema_violations}"
+            )
+        if missing_inputs or unexpected_inputs:
+            raise ValueError(
+                "当前采集传感器与所选预测模型输入不一致。"
+                f"缺少：{missing_inputs or '无'}；"
+                f"模型未声明：{unexpected_inputs or '无'}"
+            )
+        if not set(acquired_inputs).issubset(
+            set(config.selected_sensors or [])
+        ):
+            raise ValueError(
+                "模型输入通道必须全部包含在连接/保存通道中"
+            )
+        selected_outputs = list(config.model_output_sensors or [])
+        if not selected_outputs:
+            raise ValueError("至少选择一个预测模型输出通道")
+        if not set(acquired_inputs).issubset(set(config.selected_sensors or [])):
+            config.selected_sensors = list(
+                dict.fromkeys([*(config.selected_sensors or []), *acquired_inputs])
+            )
+            auto_corrected = True
+        unsupported_outputs = [
+            name
+            for name in selected_outputs
+            if name not in profile["output_sensors"]
+        ]
+        if unsupported_outputs:
+            selected_outputs = [
+                name for name in selected_outputs
+                if name in profile["output_sensors"]
+            ] or list(profile["output_sensors"])
+            config.model_output_sensors = list(selected_outputs)
+            config.prediction_sensors = list(selected_outputs)
+            unsupported_outputs = []
+            auto_corrected = True
+        if unsupported_outputs:
+            raise ValueError(
+                f"所选模型不提供这些输出通道：{unsupported_outputs}"
+            )
+        indicator_outputs = (
+            NEW_INDICATOR_REQUIRED_OUTPUTS
+            if config.dataset_schema == "new_collection_v11_3"
+            else INDICATOR_REQUIRED_OUTPUTS
+        )
+        required_outputs = indicator_outputs.get(
+            config.health_indicator,
+            (
+                NEW_COLLECTION_SENSOR_COLUMNS
+                if config.dataset_schema == "new_collection_v11_3"
+                else SENSOR_COLUMNS
+            ),
+        )
+        missing_health_outputs = [
+            name for name in required_outputs if name not in selected_outputs
+        ]
+        if missing_health_outputs:
+            compatible_indicator = next(
+                (
+                    name
+                    for name in ("TC-HI", "C-HI", "T-HI", "RFHI", "PR-HI", "MPRF-HI")
+                    if name in indicator_outputs
+                    and set(indicator_outputs[name]).issubset(set(selected_outputs))
+                ),
+                None,
+            )
+            if compatible_indicator is not None:
+                config.health_indicator = compatible_indicator
+                required_outputs = indicator_outputs[compatible_indicator]
+                missing_health_outputs = []
+                auto_corrected = True
+        if missing_health_outputs:
+            raise ValueError(
+                f"{config.health_indicator}健康指标需要模型输出："
+                f"{missing_health_outputs}"
+            )
+        if load_model:
+            profile = self.online_predictor.configure(
+                profile["checkpoint"],
+                model_type=getattr(config, "prediction_model_type", profile.get("model_type", "i_T_G")),
+                schema_mode=config.dataset_schema,
+            )
+        return {
+            **profile,
+            "selected_input_sensors": acquired_inputs,
+            "selected_output_sensors": selected_outputs,
+            "health_indicator": config.health_indicator,
+            "health_required_outputs": required_outputs,
+            "auto_corrected_schema_profile": auto_corrected,
+            "compatible": True,
+            "best_prediction_override": bool(
+                config.use_best_prediction_override
+            ),
+        }
+
+    def candidate(self, indicator: str, model_kind: str) -> pd.Series:
+        rows = self.candidate_catalog.loc[
+            self.candidate_catalog["indicator_family"].astype(str).eq(indicator)
+        ]
+        if rows.empty:
+            rows = self.candidate_catalog.loc[
+                self.candidate_catalog["indicator_family"].astype(str).eq("TC-HI")
+            ]
+        selected = rows.loc[rows["model_kind"].astype(str).eq(model_kind)]
+        if selected.empty:
+            selected = rows.loc[rows["recommended_for_indicator"].astype(bool)]
+        return selected.iloc[0]
+
+    def new_collection_candidate(
+        self, indicator: str, model_kind: str
+    ) -> pd.Series:
+        if self.new_collection_health_engine is None:
+            raise RuntimeError(
+                "新数据集健康指标尚未生成，请先运行"
+                " fit_new_collection_health.py"
+            )
+        candidate = self.new_collection_health_engine.candidate(
+            indicator, model_kind
+        )
+        catalog = self.new_collection_health_engine.catalog
+        candidate_index = next(
+            index for index, row in enumerate(catalog)
+            if row["indicator"] == candidate["indicator"]
+            and row["model"] == candidate["model"]
+        )
+        return pd.Series(
+            {
+                **candidate,
+                "candidate_index": -1 - candidate_index,
+                "indicator_family": candidate["indicator"],
+                "model_kind": candidate["model"],
+                "feature_key": "new_collection_multiphysics_v3_16s4p",
+                "recommended_for_indicator": candidate["recommended"],
+            }
+        )
+
+    @staticmethod
+    def _score_columns(score_mode: str) -> tuple[str, dict[str, str]]:
+        if score_mode == "raw":
+            score_col = "window_health_index"
+            state_cols = {
+                state: f"probability_{state}"
+                for state in ABNORMAL_STATES
+            }
+        else:
+            score_col = "soft_window_anomaly_probability"
+            state_cols = {
+                state: f"soft_window_probability_{state}"
+                for state in ABNORMAL_STATES
+            }
+        return score_col, state_cols
+
+    def _aggregate_layer(
+        self,
+        layer_id: str,
+        score_mode: str,
+        threshold: float,
+        rho: float,
+    ) -> dict:
+        group = self.window_groups[layer_id]
+        score_col, state_cols = self._score_columns(score_mode)
+        scores = group[score_col].to_numpy(dtype=float)
+        health, weights = cap_pool(scores, rho)
+        type_probs = {
+            state: float(np.dot(weights, group[col].to_numpy(dtype=float)))
+            for state, col in state_cols.items()
+        }
+        if health < threshold:
+            state = "normal"
+        else:
+            state = max(type_probs, key=type_probs.get)
+        return {
+            "health": health,
+            "state": state,
+            "state_label": STATE_LABELS[state],
+            "type_probabilities": type_probs,
+            "max_weight": float(np.max(weights)) if len(weights) else 0.0,
+            "effective_windows": float(1.0 / np.sum(weights**2)) if len(weights) else 0.0,
+        }
+
+    def _aggregate_window_group(
+        self,
+        group: pd.DataFrame,
+        score_mode: str,
+        threshold: float,
+        rho: float,
+    ) -> dict | None:
+        if group.empty:
+            return None
+        score_col, state_cols = self._score_columns(score_mode)
+        scores = group[score_col].to_numpy(dtype=float)
+        health, weights = cap_pool(scores, rho)
+        type_probs = {
+            state: float(np.dot(weights, group[column].to_numpy(dtype=float)))
+            for state, column in state_cols.items()
+        }
+        predicted_state = (
+            "normal" if health < threshold else max(type_probs, key=type_probs.get)
+        )
+        return {
+            "health": health,
+            "state": predicted_state,
+            "state_label": STATE_LABELS[predicted_state],
+            "type_probabilities": type_probs,
+            "evidence_count": int(len(group)),
+            "maximum_weight": float(np.max(weights)),
+            "effective_count": float(1.0 / np.sum(weights**2)),
+        }
+
+    def _infer_candidate(
+        self,
+        candidate_index: int,
+        visual_indices: np.ndarray,
+        realtime_prediction: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Run classifiers for newly completed windows and cache that evidence."""
+        visual_indices = np.asarray(visual_indices, dtype=int)
+        source = "live_checkpoint" if realtime_prediction else "archived"
+        with self.candidate_lock:
+            missing = [
+                int(index)
+                for index in dict.fromkeys(visual_indices.tolist())
+                if (candidate_index, int(index), source)
+                not in self.candidate_score_cache
+            ]
+            if missing:
+                artifact = self._candidate_artifact(candidate_index)
+                feature_key = str(artifact["feature_key"])
+                predictions = (
+                    self._replay_live_predictions(np.asarray(missing, dtype=int))
+                    if realtime_prediction
+                    else self.prediction[missing]
+                )
+                generated = self.online_feature_engine.transform(
+                    self.actual[missing],
+                    predictions,
+                    requested_key=feature_key,
+                )
+                values = generated[feature_key]
+                new_scores, aligned = self._predict_feature_values(
+                    candidate_index, values
+                )
+                for row_index, visual_index in enumerate(missing):
+                    self.candidate_score_cache[
+                        (candidate_index, visual_index, source)
+                    ] = (
+                        float(new_scores[row_index]),
+                        aligned[row_index].copy(),
+                    )
+            cached = [
+                self.candidate_score_cache[
+                    (candidate_index, int(index), source)
+                ]
+                for index in visual_indices
+            ]
+        scores = np.asarray([item[0] for item in cached], dtype=float)
+        types = np.stack([item[1] for item in cached], axis=0)
+        return scores, types
+
+    def _replay_live_predictions(
+        self, visual_indices: np.ndarray
+    ) -> np.ndarray:
+        profile = self.online_predictor.profile
+        mean, scale = self._prediction_model_scaler(profile)
+        target_columns = list(profile["model_columns"])
+        archived_columns = list(DEFAULT_MODEL_METADATA["model_columns"])
+        sensor_columns = [str(item["name"]) for item in self.sensors]
+        outputs = []
+        for visual_index in np.asarray(visual_indices, dtype=int):
+            cache_key = (str(profile["checkpoint"]), int(visual_index))
+            cached = self.replay_prediction_cache.get(cache_key)
+            if cached is None:
+                archived_physical = (
+                    self.model_input[int(visual_index)]
+                    * self.scaler_scale[None, :]
+                    + self.scaler_mean[None, :]
+                )
+                physical = np.broadcast_to(
+                    mean, (len(archived_physical), len(target_columns))
+                ).astype(float).copy()
+                for name in target_columns:
+                    if name in archived_columns:
+                        physical[:, target_columns.index(name)] = archived_physical[
+                            :, archived_columns.index(name)
+                        ]
+                model_input = ((physical - mean[None, :]) / scale[None, :]).astype(
+                    np.float32
+                )
+                standardized, _ = self.online_predictor.predict(
+                    model_input, 24
+                )
+                cached = self._prediction_to_sensor_matrix(
+                    standardized, profile, sensor_columns
+                )
+                if not np.isfinite(cached).all():
+                    raise ValueError(
+                        "所选预测模型未覆盖历史数据状态预警所需的全部传感器输出"
+                    )
+                self.replay_prediction_cache[cache_key] = cached
+            outputs.append(cached)
+        return np.stack(outputs, axis=0)
+
+    def _load_live_layer_health(self) -> dict[str, dict]:
+        if not self.live_layer_health_path.exists():
+            return {}
+        try:
+            payload = json.loads(
+                self.live_layer_health_path.read_text(encoding="utf-8")
+            )
+            return payload if isinstance(payload, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_live_layer_health(self) -> None:
+        self.live_layer_health_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.live_layer_health_path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(self.live_layer_health, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(self.live_layer_health_path)
+
+    @staticmethod
+    def _live_layer_key(
+        specimen_id: str,
+        layer: int,
+        indicator: str,
+        model_kind: str,
+        prediction_model_signature: str = "",
+    ) -> str:
+        return (
+            f"{specimen_id}|{indicator}|{model_kind}|"
+            f"{prediction_model_signature}|{int(layer)}"
+        )
+
+    @staticmethod
+    def _live_scope_signature(config: dict) -> str:
+        """Return the physical-specimen/condition scope for live evidence.
+
+        Layer evidence must accumulate only within one independent specimen
+        and one fixed process condition.  The previous key used the specimen
+        name and model only, so reusing a specimen name while changing the
+        process parameters could display evidence from the preceding run.
+        Keep the signature deterministic and exclude the layer number so the
+        layers of one specimen still accumulate together.
+        """
+        schema = str(config.get("dataset_schema", "legacy_original"))
+        common = {
+            "schema": schema,
+            "specimen_id": str(config.get("specimen_id", "LIVE_SPECIMEN")),
+            "run_id": str(config.get("run_id", "LIVE_RUN")),
+            "condition_id": str(config.get("condition_id", "LIVE")),
+            "replicate": int(config.get("replicate", 1) or 1),
+        }
+        if schema == "new_collection_v11_3":
+            common.update(
+                {
+                    "initial_force": float(config.get("initial_compaction_force_N", 0) or 0),
+                    "placement_speed": float(config.get("placement_speed_mm_s", 0) or 0),
+                    "pid_angle": float(config.get("pid_angle_deg", 0) or 0),
+                    "temperature_setpoint": float(config.get("temperature_setpoint_C", 0) or 0),
+                }
+            )
+        else:
+            common.update(
+                {
+                    "power": float(config.get("p", 0) or 0),
+                    "speed": float(config.get("v", 0) or 0),
+                    "compaction": float(config.get("pr", 0) or 0),
+                }
+            )
+        return json.dumps(common, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def _stored_live_layers(
+        self,
+        specimen_id: str,
+        indicator: str,
+        model_kind: str,
+        prediction_model_signature: str,
+    ) -> dict[int, dict]:
+        """Return all persisted layers for the active specimen/model.
+
+        The original implementation enumerated ``range(5)`` because the
+        first data-collection plan used five layers.  Live acquisition now
+        accepts any non-negative layer number, so discover the layer index
+        from the persisted key suffix instead of imposing that limit.
+        """
+        prefix = (
+            f"{specimen_id}|{indicator}|{model_kind}|"
+            f"{prediction_model_signature}|"
+        )
+        stored: dict[int, dict] = {}
+        for key, value in self.live_layer_health.items():
+            if not str(key).startswith(prefix):
+                continue
+            try:
+                layer_index = int(str(key)[len(prefix) :])
+            except (TypeError, ValueError):
+                continue
+            if layer_index >= 0 and isinstance(value, dict):
+                stored[layer_index] = value
+        return stored
+
+    def _candidate_artifact(self, candidate_index: int) -> dict:
+        artifact = self.candidate_model_cache.get(candidate_index)
+        if artifact is None:
+            row = self.candidate_catalog.iloc[candidate_index]
+            artifact = joblib.load(
+                self.candidate_model_dir / str(row["model_file"])
+            )
+            self.candidate_model_cache[candidate_index] = artifact
+        return artifact
+
+    def _predict_feature_values(
+        self, candidate_index: int, values: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Calculate anomaly/type probabilities from freshly generated HI features."""
+        artifact = self._candidate_artifact(candidate_index)
+        values = np.asarray(values, dtype=float)
+        binary_model = artifact["binary_model"]
+        raw_binary = np.asarray(binary_model.predict_proba(values), dtype=float)
+        binary_classes = np.asarray(binary_model.classes_)
+        positive = np.flatnonzero(binary_classes == 1)
+        scores = (
+            raw_binary[:, int(positive[0])]
+            if len(positive)
+            else np.zeros(len(values), dtype=float)
+        )
+        type_model = artifact["type_model"]
+        raw_type = np.asarray(type_model.predict_proba(values), dtype=float)
+        aligned = np.zeros((len(values), len(ABNORMAL_STATES)), dtype=float)
+        for source_index, label in enumerate(type_model.classes_):
+            if str(label) in ABNORMAL_STATES:
+                aligned[:, ABNORMAL_STATES.index(str(label))] = raw_type[
+                    :, source_index
+                ]
+        row_sum = aligned.sum(axis=1, keepdims=True)
+        aligned = np.divide(
+            aligned,
+            row_sum,
+            out=np.full_like(aligned, 1.0 / len(ABNORMAL_STATES)),
+            where=row_sum > 0,
+        )
+        return scores, aligned
+
+    def _decision_scores(
+        self,
+        group: pd.DataFrame,
+        candidate: pd.Series,
+        use_optimized_warning: bool,
+        realtime_prediction: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray, str, bool]:
+        visual_indices = group["visual_index"].to_numpy(dtype=int)
+        candidate_index = int(candidate["candidate_index"])
+        realtime_scores, realtime_types = self._infer_candidate(
+            candidate_index, visual_indices, realtime_prediction
+        )
+        optimized_available = (
+            str(candidate["indicator_family"]) == "TC-HI"
+            and str(candidate["model_kind"]) == "random_forest"
+        )
+        if use_optimized_warning and optimized_available:
+            scores = group["soft_window_anomaly_probability"].to_numpy(dtype=float)
+            type_matrix = group[
+                [f"soft_window_probability_{state}" for state in ABNORMAL_STATES]
+            ].to_numpy(dtype=float)
+            return scores, type_matrix, "optimized_v13_8_soft_consistency", True
+        return (
+            realtime_scores,
+            realtime_types,
+            "realtime_features_live_checkpoint"
+            if realtime_prediction
+            else "realtime_features_archived_prediction",
+            False,
+        )
+
+    def _aggregate_candidate_group(
+        self,
+        group: pd.DataFrame,
+        candidate: pd.Series,
+        threshold: float,
+        rho: float,
+        use_optimized_warning: bool,
+        realtime_prediction: bool = False,
+    ) -> dict | None:
+        if group.empty:
+            return None
+        scores, type_matrix, decision_mode, optimized_applied = self._decision_scores(
+            group, candidate, use_optimized_warning, realtime_prediction
+        )
+        health, weights = cap_pool(scores, rho)
+        type_probs = {
+            state: float(np.dot(weights, type_matrix[:, index]))
+            for index, state in enumerate(ABNORMAL_STATES)
+        }
+        predicted_state = (
+            "normal" if health < threshold else max(type_probs, key=type_probs.get)
+        )
+        return {
+            "health": health,
+            "state": predicted_state,
+            "state_label": STATE_LABELS[predicted_state],
+            "type_probabilities": type_probs,
+            "evidence_count": int(len(group)),
+            "maximum_weight": float(np.max(weights)),
+            "effective_count": float(1.0 / np.sum(weights**2)),
+            "decision_mode": decision_mode,
+            "optimized_warning_applied": optimized_applied,
+        }
+
+    def realtime(
+        self,
+        specimen_id: str,
+        sensor_id: int,
+        cursor: int,
+        history: int,
+        step: int,
+        threshold: float,
+        rho: float,
+        score_mode: str,
+        indicator: str = "TC-HI",
+        model_kind: str = "random_forest",
+        prediction_horizon: int = 24,
+        realtime_prediction: bool = False,
+        use_optimized_warning: bool = True,
+        forecast_lead: int = 1,
+        dataset_schema: str = "legacy_original",
+        prediction_model_type: str = "i_T_G",
+    ) -> dict:
+        if dataset_schema != "legacy_original":
+            raise ValueError("历史数据流仅支持旧数据12传感器方案")
+        selected_model_type = normalize_model_type(prediction_model_type)
+        active_profile = self.online_predictor.profile
+        if realtime_prediction and (
+            active_profile.get("schema_mode") != "legacy_original"
+            or active_profile.get("model_type") != selected_model_type
+            or int(active_profile.get("enc_in", 0)) not in {15, 17}
+        ):
+            self.online_predictor.configure(
+                "",
+                model_type=selected_model_type,
+                schema_mode="legacy_original",
+            )
+            active_profile = self.online_predictor.profile
+        if specimen_id not in self.layer_groups:
+            specimen_id = self.specimen_ids[0]
+        sensor_id = int(np.clip(sensor_id, 0, len(self.sensors) - 1))
+        history = int(np.clip(history, 48, 2400))
+        step = int(np.clip(step, 1, 24))
+        threshold = float(np.clip(threshold, 0.0, 1.0))
+        rho = float(np.clip(rho, 0.0, 1.0))
+        score_mode = "raw" if score_mode == "raw" else "soft"
+        prediction_horizon = int(np.clip(prediction_horizon, 1, 600))
+        forecast_lead = int(np.clip(forecast_lead, 1, 24))
+        candidate = self.candidate(indicator, model_kind)
+        indicator = str(candidate["indicator_family"])
+        model_kind = str(candidate["model_kind"])
+        candidate_index = int(candidate["candidate_index"])
+        window_threshold = float(np.clip(threshold, 0.0, 1.0))
+        layer_threshold = _finite(candidate["layer_threshold"], threshold)
+        specimen_threshold = _finite(candidate["specimen_threshold"], threshold)
+
+        specimen_layers = self.layer_groups[specimen_id]
+        layer_blocks: list[dict] = []
+        total_points = 0
+        for _, layer_row in specimen_layers.iterrows():
+            layer_id = str(layer_row["layer_sample_id"])
+            group = self.window_groups[layer_id]
+            visual_indices = group["visual_index"].to_numpy(dtype=int)
+            point_count = int(len(group) * self.actual.shape[1])
+            layer_blocks.append(
+                {
+                    "id": layer_id,
+                    "layer": int(layer_row["layer"]),
+                    "group": group,
+                    "visual_indices": visual_indices,
+                    "start": total_points,
+                    "end": total_points + point_count,
+                    "point_count": point_count,
+                }
+            )
+            total_points += point_count
+
+        cursor = int(np.clip(cursor, 1, total_points))
+        current_layer_index = next(
+            (
+                index
+                for index, block in enumerate(layer_blocks)
+                if cursor <= int(block["end"])
+            ),
+            len(layer_blocks) - 1,
+        )
+        current_block = layer_blocks[current_layer_index]
+        local_cursor = cursor - int(current_block["start"])
+        local_cursor = int(np.clip(local_cursor, 1, int(current_block["point_count"])))
+        completed_current_windows = local_cursor // int(self.actual.shape[1])
+        if local_cursor == int(current_block["point_count"]):
+            completed_current_windows = len(current_block["group"])
+
+        actual_parts = [
+            self.actual[block["visual_indices"]].reshape(-1, self.actual.shape[-1])
+            for block in layer_blocks
+        ]
+        prediction_parts = [
+            self.prediction[block["visual_indices"]].reshape(-1, self.prediction.shape[-1])
+            for block in layer_blocks
+        ]
+        specimen_actual = np.concatenate(actual_parts, axis=0)
+        specimen_prediction = np.concatenate(prediction_parts, axis=0)
+
+        history_start = max(0, cursor - history)
+        observed_indices = np.arange(history_start, cursor, step, dtype=int)
+        future_end = min(total_points, cursor + prediction_horizon)
+        future_indices = np.arange(cursor, future_end, dtype=int)
+        historical_prediction_matrix = specimen_prediction
+        prediction_source = "archived_prediction"
+        if realtime_prediction:
+            first_visual_index = int(layer_blocks[0]["visual_indices"][0])
+            model_history_stream = self._legacy_replay_model_stream(
+                profile=active_profile,
+                first_visual_index=first_visual_index,
+                specimen_actual=specimen_actual[:cursor],
+                layer_blocks=layer_blocks,
+            )
+            online_standardized, forecast_mode = self.online_predictor.predict(
+                model_history_stream[-24:], prediction_horizon
+            )
+            online_physical = self._prediction_to_sensor_matrix(
+                online_standardized,
+                active_profile,
+                [str(item["name"]) for item in self.sensors],
+            )
+            future_prediction_matrix = online_physical
+            future_time = (np.arange(prediction_horizon, dtype=int) + 1) / _finite(
+                self.manifest.get("sampling_hz"), 10.0
+            )
+            # Use the same causal origin for the historical curve.  Previously
+            # the checkbox only changed the future curve while the observed
+            # curve continued to use the archived target sequence, so its
+            # apparent lag never changed when the forecast lead was changed.
+            causal_indices = np.arange(
+                max(0, history_start), cursor, dtype=int
+            )
+            causal_matrix = self._replay_causal_prediction_matrix(
+                model_history_stream=model_history_stream,
+                target_indices=causal_indices,
+                forecast_lead=forecast_lead,
+                profile=active_profile,
+                sensor_columns=[str(item["name"]) for item in self.sensors],
+            )
+            # Start with an empty historical prediction series.  The first
+            # input context is not a prediction target, so it must remain
+            # blank until a causal model origin exists.
+            historical_prediction_matrix = np.full_like(
+                specimen_prediction, np.nan, dtype=float
+            )
+            if len(causal_indices):
+                finite_rows = np.isfinite(causal_matrix).all(axis=1)
+                valid_targets = causal_indices[finite_rows]
+                if len(valid_targets):
+                    historical_prediction_matrix[valid_targets] = causal_matrix[
+                        finite_rows
+                    ]
+            # Keep the legacy source label for clients that already consume it;
+            # the precise causal alignment is exposed separately through
+            # historical_prediction_mode below.
+            prediction_source = "live_checkpoint"
+        else:
+            future_prediction_matrix = specimen_prediction[future_indices]
+            forecast_mode = (
+                "archived_direct_24"
+                if prediction_horizon <= int(self.actual.shape[1])
+                else "archived_rolling_windows"
+            )
+        # The first model input window is context only.  Do not draw archived
+        # predictions over it; the prediction curve begins after this window.
+        input_context_points = min(
+            len(historical_prediction_matrix),
+            int(active_profile.get("seq_len", 24)),
+        )
+        if input_context_points:
+            historical_prediction_matrix[:input_context_points] = np.nan
+        sampling_hz = _finite(self.manifest.get("sampling_hz"), 10.0)
+        observed_time = (observed_indices - cursor) / sampling_hz
+        if not realtime_prediction:
+            future_time = (future_indices - cursor + 1) / sampling_hz
+
+        # Chart-only smoothing keeps causal predictions visually comparable to
+        # the original overlapping-window curve.  Warning calculations above
+        # continue to use the unsmoothed model outputs.
+        historical_prediction_matrix = self._smooth_prediction_for_display(
+            historical_prediction_matrix
+        )
+        future_prediction_matrix = self._smooth_prediction_for_display(
+            future_prediction_matrix
+        )
+
+        channels = []
+        for sensor in self.sensors:
+            index = int(sensor["id"])
+            observed_actual = specimen_actual[observed_indices, index]
+            observed_prediction = historical_prediction_matrix[
+                observed_indices, index
+            ]
+            future_prediction = future_prediction_matrix[:, index]
+            valid_residual = np.isfinite(observed_actual) & np.isfinite(
+                observed_prediction
+            )
+            residual = observed_actual[valid_residual] - observed_prediction[
+                valid_residual
+            ]
+            channels.append(
+                {
+                    **sensor,
+                    "prediction_enabled": True,
+                    "x_observed": observed_time.tolist(),
+                    "actual": observed_actual.tolist(),
+                    "prediction_observed": [
+                        float(value) if math.isfinite(value) else None
+                        for value in observed_prediction
+                    ],
+                    "x_future": future_time.tolist(),
+                    "prediction_future": future_prediction.tolist(),
+                    "actual_current": float(observed_actual[-1]),
+                    "prediction_current": (
+                        float(observed_prediction[-1])
+                        if math.isfinite(observed_prediction[-1])
+                        else None
+                    ),
+                    "rmse": (
+                        float(np.sqrt(np.mean(residual**2)))
+                        if len(residual)
+                        else None
+                    ),
+                }
+            )
+
+        layer_evidence: list[dict] = []
+        for index, block in enumerate(layer_blocks):
+            if index < current_layer_index:
+                evidence_count = len(block["group"])
+            elif index == current_layer_index:
+                evidence_count = int(completed_current_windows)
+            else:
+                evidence_count = 0
+            evidence = block["group"].iloc[:evidence_count]
+            aggregate = self._aggregate_candidate_group(
+                evidence,
+                candidate,
+                layer_threshold,
+                rho,
+                use_optimized_warning,
+                realtime_prediction,
+            )
+            layer_evidence.append(
+                {
+                    "id": block["id"],
+                    "layer": int(block["layer"]),
+                    "display_layer": int(block["layer"]) + 1,
+                    "completed_windows": evidence_count,
+                    "total_windows": int(len(block["group"])),
+                    "status": "complete"
+                    if evidence_count == len(block["group"])
+                    else "active"
+                    if index == current_layer_index
+                    else "waiting",
+                    "aggregate": aggregate,
+                }
+            )
+
+        available_layers = [
+            item for item in layer_evidence if item["aggregate"] is not None
+        ]
+        if available_layers:
+            layer_scores = np.asarray(
+                [item["aggregate"]["health"] for item in available_layers], dtype=float
+            )
+            specimen_health, layer_weights = cap_pool(layer_scores, rho)
+            specimen_type_probs = {
+                anomaly_state: float(
+                    np.dot(
+                        layer_weights,
+                        np.asarray(
+                            [
+                                item["aggregate"]["type_probabilities"][anomaly_state]
+                                for item in available_layers
+                            ],
+                            dtype=float,
+                        ),
+                    )
+                )
+                for anomaly_state in ABNORMAL_STATES
+            }
+            specimen_state = (
+                "normal"
+                if specimen_health < specimen_threshold
+                else max(specimen_type_probs, key=specimen_type_probs.get)
+            )
+            specimen_realtime = {
+                "health": specimen_health,
+                "state": specimen_state,
+                "state_label": STATE_LABELS[specimen_state],
+                "type_probabilities": specimen_type_probs,
+                "evidence_layers": len(available_layers),
+                "effective_layers": float(1.0 / np.sum(layer_weights**2)),
+            }
+        else:
+            specimen_realtime = None
+
+        current_group = current_block["group"]
+        completed_group = current_group.iloc[:completed_current_windows]
+        current_visual_indices = completed_group["visual_index"].to_numpy(dtype=int)
+        realtime_scores, realtime_type_matrix = self._infer_candidate(
+            candidate_index, current_visual_indices, realtime_prediction
+        ) if len(completed_group) else (
+            np.asarray([], dtype=float),
+            np.empty((0, len(ABNORMAL_STATES)), dtype=float),
+        )
+        (
+            current_scores,
+            current_type_matrix,
+            current_decision_mode,
+            optimized_applied,
+        ) = (
+            self._decision_scores(
+                completed_group,
+                candidate,
+                use_optimized_warning,
+                realtime_prediction,
+            )
+            if len(completed_group)
+            else (
+                np.asarray([], dtype=float),
+                np.empty((0, len(ABNORMAL_STATES)), dtype=float),
+                "waiting_for_complete_window",
+                False,
+            )
+        )
+        if completed_current_windows > 0:
+            latest_window = current_group.iloc[completed_current_windows - 1]
+            latest_score = float(current_scores[completed_current_windows - 1])
+            latest_type_probs = {
+                anomaly_state: float(
+                    current_type_matrix[
+                        completed_current_windows - 1, anomaly_index
+                    ]
+                )
+                for anomaly_index, anomaly_state in enumerate(ABNORMAL_STATES)
+            }
+            latest_state = (
+                "normal"
+                if latest_score < window_threshold
+                else max(latest_type_probs, key=latest_type_probs.get)
+            )
+            realtime_window = {
+                "id": str(latest_window["window_sample_id"]),
+                "score": latest_score,
+                "raw_realtime_score": float(
+                    realtime_scores[completed_current_windows - 1]
+                ),
+                "state": latest_state,
+                "state_label": STATE_LABELS[latest_state],
+                "type_probabilities": latest_type_probs,
+                "complete": True,
+                "decision_mode": current_decision_mode,
+                "optimized_warning_applied": optimized_applied,
+            }
+        else:
+            realtime_window = {
+                "id": f"{current_block['id']}_W000",
+                "score": None,
+                "state": "pending",
+                "state_label": "等待首个完整窗口",
+                "type_probabilities": {state: 0.0 for state in ABNORMAL_STATES},
+                "complete": False,
+                "decision_mode": "waiting_for_complete_window",
+                "optimized_warning_applied": False,
+            }
+
+        active_window_index = min(
+            max((local_cursor - 1) // int(self.actual.shape[1]), 0),
+            len(current_group) - 1,
+        )
+        process_row = current_group.iloc[int(active_window_index)]
+        visible_count = int(completed_current_windows)
+        timeline = [
+            float(current_scores[index]) if index < visible_count else None
+            for index in range(len(current_group))
+        ]
+        current_layer_aggregate = layer_evidence[current_layer_index]["aggregate"]
+        official_specimen = self.specimens.loc[
+            self.specimens["full_specimen_id"].astype(str).eq(specimen_id)
+        ].iloc[0]
+
+        return {
+            "mode": "realtime_replay",
+            "selection": {
+                "specimen": specimen_id,
+                "sensor": sensor_id,
+                "cursor": cursor,
+                "history": history,
+                "step": step,
+                "threshold": threshold,
+                "rho": rho,
+                "score_mode": score_mode,
+                "indicator": indicator,
+                "model": model_kind,
+                "prediction_horizon": prediction_horizon,
+                "forecast_lead": forecast_lead,
+                "realtime_prediction": bool(realtime_prediction),
+                "use_optimized_warning": bool(use_optimized_warning),
+            },
+            "candidate": {
+                "indicator": indicator,
+                "model": model_kind,
+                "recommended": bool(candidate["recommended_for_indicator"]),
+                "validation_selection_score": _finite(
+                    candidate["validation_selection_score"]
+                ),
+                "validation_window_balanced_accuracy": _finite(
+                    candidate["validation_window_balanced_accuracy"]
+                ),
+                "validation_layer_balanced_accuracy": _finite(
+                    candidate["validation_layer_balanced_accuracy"]
+                ),
+                "validation_specimen_balanced_accuracy": _finite(
+                    candidate["validation_specimen_balanced_accuracy"]
+                ),
+                "test_window_balanced_accuracy": _finite(
+                    candidate.get("test_window_balanced_accuracy"), None
+                ),
+                "test_layer_balanced_accuracy": _finite(
+                    candidate.get("test_layer_balanced_accuracy"), None
+                ),
+                "test_specimen_balanced_accuracy": _finite(
+                    candidate.get("test_specimen_balanced_accuracy"), None
+                ),
+                "window_threshold": window_threshold,
+                "layer_threshold": layer_threshold,
+                "specimen_threshold": specimen_threshold,
+                "cap_rho": rho,
+            },
+            "forecast": {
+                "requested_horizon": prediction_horizon,
+                "forecast_lead": forecast_lead,
+                "lead_semantics": "历史曲线使用已冻结的因果提前量；历史数据使用窗口起点对齐预测",
+                "returned_horizon": int(len(future_prediction_matrix)),
+                "native_horizon": int(self.actual.shape[1]),
+                "mode": forecast_mode,
+                "realtime": bool(realtime_prediction),
+                "checkpoint": (
+                    self.online_predictor.checkpoint if realtime_prediction else None
+                ),
+                "model_type": active_profile.get("model_type"),
+                "input_sensors": active_profile.get("input_sensors", []),
+                "available_output_sensors": active_profile.get("output_sensors", []),
+                "checkpoint_sha256": active_profile.get("checkpoint_sha256"),
+                "atavn": active_profile.get("atavn"),
+            },
+            "progress": {
+                "cursor": cursor,
+                "total_points": total_points,
+                "percent": float(cursor / total_points),
+                "current_layer_index": current_layer_index,
+                "current_layer": int(current_block["layer"]) + 1,
+                "current_layer_id": str(current_block["id"]),
+                "layer_point": local_cursor,
+                "layer_total_points": int(current_block["point_count"]),
+                "current_window": int(active_window_index) + 1,
+                "total_windows_in_layer": int(len(current_group)),
+                "sample_in_window": int((local_cursor - 1) % int(self.actual.shape[1])) + 1,
+                "window_length": int(self.actual.shape[1]),
+                "finished": cursor >= total_points,
+            },
+            "channels": channels,
+            "selected_channel": channels[sensor_id],
+            "window": realtime_window,
+            "layer": current_layer_aggregate,
+            "specimen": specimen_realtime,
+            "layers": layer_evidence,
+            "timeline": {
+                "scores": timeline,
+                "threshold": window_threshold,
+                "active_index": int(active_window_index),
+                "completed_count": visible_count,
+            },
+            "process": build_process_payload(
+                "legacy_original",
+                observed=process_row,
+                injection_severity=process_row.get("injection_severity", 0.0),
+            ),
+            "official_final": {
+                "true_state": str(official_specimen["true_state"]),
+                "true_state_label": STATE_LABELS.get(
+                    str(official_specimen["true_state"]), str(official_specimen["true_state"])
+                ),
+                "predicted_state": str(official_specimen["soft_predicted_state"]),
+                "predicted_state_label": STATE_LABELS.get(
+                    str(official_specimen["soft_predicted_state"]),
+                    str(official_specimen["soft_predicted_state"]),
+                ),
+            },
+            "feature_generation": {
+                "mode": "realtime_from_current_replay_window",
+                "feature_key": str(candidate["feature_key"]),
+                "indicator_variant": indicator_variant(
+                    "legacy_original", indicator
+                ),
+                "prediction_source": prediction_source,
+                "historical_prediction_mode": (
+                    f"causal_lead_{forecast_lead}"
+                    if realtime_prediction
+                    else "archived_target_sequence"
+                ),
+                "all_12_indicators_supported": True,
+            },
+        }
+
+    def _prediction_model_scaler(
+        self, profile: dict
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if profile.get("uses_dashboard_scaler"):
+            return self.scaler_mean.copy(), self.scaler_scale.copy()
+        mean = np.asarray(profile.get("scaler_mean"), dtype=float)
+        scale = np.asarray(profile.get("scaler_scale"), dtype=float)
+        if mean.shape != (int(profile["enc_in"]),) or scale.shape != mean.shape:
+            raise ValueError("预测模型标准化参数与enc_in不一致")
+        return mean, scale
+
+    def _live_model_tensor(
+        self,
+        rows: list[dict],
+        sensors: np.ndarray,
+        profile: dict,
+        sensor_columns: list[str] | None = None,
+    ) -> np.ndarray:
+        sensor_columns = sensor_columns or SENSOR_COLUMNS
+        mean, scale = self._prediction_model_scaler(profile)
+        model_columns = list(profile["model_columns"])
+        column_index = {
+            name: index for index, name in enumerate(model_columns)
+        }
+        full = np.empty((len(rows), len(model_columns)), dtype=np.float32)
+        full[:] = mean
+        for sensor_name in profile["input_sensors"]:
+            if sensor_name not in sensor_columns:
+                raise ValueError(
+                    f"实时数据缺少模型输入通道：{sensor_name}；"
+                    "禁止用标准化基线伪造未采集的传感器数据"
+                )
+            full[:, column_index[sensor_name]] = sensors[
+                :, sensor_columns.index(sensor_name)
+            ]
+        for context_name in (
+            "cycle",
+            "v",
+            "p",
+            "pr",
+            "l",
+            "initial_compaction_force_N",
+            "placement_speed_mm_s",
+            "pid_angle_deg",
+            "temperature_setpoint_C",
+        ):
+            if context_name not in column_index:
+                continue
+            index = column_index[context_name]
+            full[:, index] = [
+                _finite(row.get(context_name), mean[index])
+                for row in rows
+            ]
+        return ((full - mean) / scale).astype(np.float32)
+
+    def _prediction_to_sensor_matrix(
+        self,
+        standardized: np.ndarray,
+        profile: dict,
+        sensor_columns: list[str] | None = None,
+    ) -> np.ndarray:
+        sensor_columns = sensor_columns or SENSOR_COLUMNS
+        standardized = np.asarray(standardized, dtype=float)
+        mean, scale = self._prediction_model_scaler(profile)
+        model_columns = list(profile["model_columns"])
+        converted = np.full(
+            (len(standardized), len(sensor_columns)),
+            np.nan,
+            dtype=float,
+        )
+        for sensor_name in profile["output_sensors"]:
+            model_index = model_columns.index(sensor_name)
+            display_name = sensor_name
+            if display_name not in sensor_columns:
+                # The archived dashboard calls the force channel 压实力 while
+                # the acquisition/model schema uses 压力.  Treat them as the
+                # same physical channel at the conversion boundary.
+                display_name = {
+                    "压力": "压实力",
+                    "压实力": "压力",
+                }.get(display_name, display_name)
+            if display_name not in sensor_columns:
+                continue
+            sensor_index = sensor_columns.index(display_name)
+            converted[:, sensor_index] = (
+                standardized[:, model_index] * scale[model_index]
+                + mean[model_index]
+            )
+        return converted
+
+    @staticmethod
+    def _smooth_prediction_for_display(values: np.ndarray) -> np.ndarray:
+        """Reduce point-to-point display jitter without changing warning data.
+
+        The archived dashboard curve is produced from overlapping 24-point
+        forecasts and is consequently smoother than a point-by-point causal
+        replay.  Apply a causal three-point median followed by a light low-pass
+        blend only to the values sent to the chart.  Raw model predictions used
+        by health features, thresholds and warning aggregation remain intact.
+        """
+        source = np.asarray(values, dtype=float)
+        if source.ndim != 2 or len(source) < 2:
+            return source.copy()
+        result = np.full_like(source, np.nan, dtype=float)
+        for column in range(source.shape[1]):
+            source_finite_rows = np.flatnonzero(np.isfinite(source[:, column]))
+            leading_blank = (
+                int(source_finite_rows[0])
+                if len(source_finite_rows)
+                else len(source)
+            )
+            previous = np.nan
+            for row in range(len(source)):
+                window = source[max(0, row - 2) : row + 1, column]
+                finite = window[np.isfinite(window)]
+                if not len(finite):
+                    continue
+                median = float(np.median(finite))
+                if math.isfinite(previous):
+                    value = 0.65 * median + 0.35 * previous
+                else:
+                    value = median
+                result[row, column] = value
+                previous = value
+            finite_rows = np.flatnonzero(np.isfinite(result[:, column]))
+            if len(finite_rows):
+                first = int(finite_rows[0])
+                # Preserve the intentional blank model-input context.  The
+                # smoothing routine may fill leading gaps for ordinary
+                # display data, but it must not invent predictions before the
+                # first forecast target exists.
+                result[:max(first, leading_blank), column] = np.nan
+                for row in range(first + 1, len(result)):
+                    if not np.isfinite(result[row, column]):
+                        result[row, column] = result[row - 1, column]
+        return result
+
+    def _replay_causal_prediction_matrix(
+        self,
+        *,
+        model_history_stream: np.ndarray,
+        target_indices: np.ndarray,
+        forecast_lead: int,
+        profile: dict,
+        sensor_columns: list[str],
+    ) -> np.ndarray:
+        """Recompute replay predictions at their causal forecast origins.
+
+        The archived dashboard prediction is a window-level target sequence and
+        is useful for reproducing the original benchmark.  It is not, however,
+        a prediction made at a selectable lead for every displayed point.  The
+        online model can predict a batch of causal origins, so replay mode uses
+        this helper when the realtime-prediction option is enabled.  A target at
+        index ``t`` is taken from the ``forecast_lead``-th output of the model
+        origin immediately before it, which makes changing the lead change the
+        historical alignment rather than only the future panel.
+        """
+        targets = np.asarray(target_indices, dtype=int)
+        output = np.full(
+            (len(targets), len(sensor_columns)), np.nan, dtype=float
+        )
+        if not len(targets):
+            return output
+        lead = int(np.clip(forecast_lead, 1, 24))
+        stream = np.asarray(model_history_stream, dtype=np.float32)
+        seq_len = int(profile.get("seq_len", 24))
+        if stream.ndim != 2 or stream.shape[1] != int(profile["enc_in"]):
+            return output
+        valid_targets: list[int] = []
+        histories: list[np.ndarray] = []
+        for position, target in enumerate(targets):
+            # The stream begins with one 24-point context block.  The target
+            # t is generated from the origin t-lead+1.
+            origin = int(target) - lead + 1
+            stream_end = seq_len + origin
+            if origin < 0 or stream_end < seq_len or stream_end > len(stream):
+                continue
+            history = stream[stream_end - seq_len : stream_end]
+            if history.shape == (seq_len, int(profile["enc_in"])) and np.isfinite(history).all():
+                valid_targets.append(position)
+                histories.append(history)
+        if not histories:
+            return output
+        batch = np.stack(histories, axis=0)
+        standardized, _ = self.online_predictor.predict_batch(batch, lead)
+        rows = standardized[:, lead - 1, :]
+        physical = self._prediction_to_sensor_matrix(
+            rows, profile, sensor_columns
+        )
+        output[np.asarray(valid_targets, dtype=int)] = physical
+        return output
+
+    def _legacy_replay_model_stream(
+        self,
+        *,
+        profile: dict,
+        first_visual_index: int,
+        specimen_actual: np.ndarray,
+        layer_blocks: list[dict],
+    ) -> np.ndarray:
+        """Map archived physical replay data into the selected model contract."""
+        mean, scale = self._prediction_model_scaler(profile)
+        model_columns = list(profile["model_columns"])
+        physical = np.broadcast_to(
+            mean, (len(specimen_actual), len(model_columns))
+        ).astype(float).copy()
+        sensor_names = [str(item["name"]) for item in self.sensors]
+        for model_sensor in profile["input_sensors"]:
+            display_sensor = "压实力" if model_sensor == "压力" else model_sensor
+            if display_sensor not in sensor_names:
+                raise ValueError(f"历史数据缺少模型输入传感器：{model_sensor}")
+            physical[:, model_columns.index(model_sensor)] = specimen_actual[
+                :, sensor_names.index(display_sensor)
+            ]
+
+        point_offset = 0
+        for block in layer_blocks:
+            for _, row in block["group"].iterrows():
+                stop = min(point_offset + 24, len(physical))
+                for context_name in ("p", "v", "pr", "cycle", "l"):
+                    if context_name in model_columns:
+                        index = model_columns.index(context_name)
+                        physical[point_offset:stop, index] = _finite(
+                            row.get(context_name), mean[index]
+                        )
+                point_offset = stop
+
+        archived_columns = list(DEFAULT_MODEL_METADATA["model_columns"])
+        archived_physical = (
+            self.model_input[int(first_visual_index)] * self.scaler_scale[None, :]
+            + self.scaler_mean[None, :]
+        )
+        context = np.broadcast_to(
+            mean, (len(archived_physical), len(model_columns))
+        ).astype(float).copy()
+        for name in model_columns:
+            target_index = model_columns.index(name)
+            if name in archived_columns:
+                context[:, target_index] = archived_physical[
+                    :, archived_columns.index(name)
+                ]
+            elif len(physical):
+                context[:, target_index] = physical[0, target_index]
+        return np.concatenate(
+            [
+                ((context - mean[None, :]) / scale[None, :]).astype(np.float32),
+                ((physical - mean[None, :]) / scale[None, :]).astype(np.float32),
+            ],
+            axis=0,
+        )
+
+    def _health_feature_arrays(
+        self,
+        actual: np.ndarray,
+        prediction: np.ndarray,
+        selected_outputs: set[str],
+        sensor_columns: list[str] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        sensor_columns = sensor_columns or SENSOR_COLUMNS
+        actual = np.asarray(actual, dtype=float)
+        prediction = np.asarray(prediction, dtype=float)
+        baseline = self.scaler_mean[self.sensor_model_indices]
+        health_actual = np.broadcast_to(
+            baseline, (len(actual), len(SENSOR_COLUMNS))
+        ).astype(float).copy()
+        health_prediction = health_actual.copy()
+        for sensor_name in selected_outputs:
+            source_index = sensor_columns.index(sensor_name)
+            health_index = SENSOR_COLUMNS.index(sensor_name)
+            if (
+                not np.isfinite(actual[:, source_index]).all()
+                or not np.isfinite(prediction[:, source_index]).all()
+            ):
+                raise ValueError(
+                    f"健康指标所需输出通道没有完整实测/预测：{sensor_name}"
+                )
+            health_actual[:, health_index] = actual[:, source_index]
+            health_prediction[:, health_index] = prediction[:, source_index]
+        return health_actual, health_prediction
+
+    def _new_collection_health_arrays(
+        self,
+        actual: np.ndarray,
+        prediction: np.ndarray,
+        selected_outputs: set[str],
+        sensor_columns: list[str],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if self.new_collection_health_engine is None:
+            raise RuntimeError("新数据集健康指标模型尚未生成")
+        artifact = self.new_collection_health_engine.artifact
+        health_sensor_count = len(NEW_HEALTH_SENSOR_COLUMNS)
+        baseline = np.asarray(
+            artifact["summary_center"], dtype=float
+        )[:health_sensor_count]
+        health_actual = np.broadcast_to(
+            baseline, (len(actual), health_sensor_count)
+        ).copy()
+        health_prediction = health_actual.copy()
+        for sensor_name in selected_outputs:
+            source_index = sensor_columns.index(sensor_name)
+            target_index = NEW_HEALTH_SENSOR_COLUMNS.index(sensor_name)
+            if (
+                not np.isfinite(actual[:, source_index]).all()
+                or not np.isfinite(prediction[:, source_index]).all()
+            ):
+                raise ValueError(
+                    f"健康指标所需输出通道没有完整实测/预测：{sensor_name}"
+                )
+            health_actual[:, target_index] = actual[:, source_index]
+            health_prediction[:, target_index] = prediction[:, source_index]
+        return health_actual, health_prediction
+
+    def _capture_only_live(
+        self,
+        *,
+        status: dict,
+        rows: list[dict],
+        sensor_columns: list[str],
+        sensor_id: int,
+        history: int,
+        step: int,
+        prediction_horizon: int,
+    ) -> dict:
+        config = status.get("config") or {}
+        sample_rate = _finite(config.get("sample_rate_hz"), 10.0)
+        observed_start = max(0, len(rows) - history)
+        indices = np.arange(observed_start, len(rows), step, dtype=int)
+        observed_time = (
+            (indices - max(len(rows), 1)) / sample_rate
+            if len(indices)
+            else np.asarray([], dtype=float)
+        )
+        channels: list[dict] = []
+        for index, name in enumerate(sensor_columns):
+            if name in SENSOR_COLUMNS:
+                legacy_index = SENSOR_COLUMNS.index(name)
+                sensor = {**self.sensors[legacy_index], "id": index}
+            else:
+                sensor = {
+                    "id": index,
+                    "name": name,
+                    "unit": LIVE_SENSOR_UNITS.get(name, "device unit"),
+                }
+            values: list[float | None] = []
+            for row_index in indices:
+                value = _finite(rows[int(row_index)].get(name), float("nan"))
+                values.append(float(value) if math.isfinite(value) else None)
+            channels.append(
+                {
+                    **sensor,
+                    "prediction_source_name": name,
+                    "prediction_enabled": False,
+                    "x_observed": observed_time.tolist(),
+                    "actual": values,
+                    "prediction_observed": [],
+                    "x_future": [],
+                    "prediction_future": [],
+                    "actual_current": values[-1] if values else None,
+                    "prediction_current": None,
+                    "rmse": None,
+                }
+            )
+        if not channels:
+            raise ValueError("仅采集模式至少需要一个传感器通道")
+        current_layer = max(0, int(config.get("layer", 0) or 0))
+        completed_file_layers = {
+            max(0, int(layer) - 1)
+            for layer in (status.get("completed_layers") or [])
+        }
+        live_layer_indices = sorted(completed_file_layers | {current_layer})
+        layers = [
+            {
+                "id": f"{config.get('specimen_id', 'LIVE')}_L{layer}",
+                "layer": layer,
+                "display_layer": layer + 1,
+                "completed_windows": 0,
+                "total_windows": 1,
+                "status": "active" if layer == current_layer else "waiting",
+                "aggregate": None,
+            }
+            for layer in live_layer_indices
+        ]
+        process = build_process_payload(
+            str(config.get("dataset_schema", "legacy_original")),
+            observed=rows[-1] if rows else {},
+            fallback=config,
+        )
+        return {
+            "mode": "capture_only",
+            "selection": {
+                "specimen": str(config.get("specimen_id", "LIVE_SPECIMEN")),
+                "sensor": sensor_id,
+                "cursor": len(rows),
+                "history": history,
+                "step": step,
+                "threshold": 0.5,
+                "rho": 0.5,
+                "score_mode": "disabled",
+                "indicator": "disabled",
+                "model": "disabled",
+                "prediction_horizon": prediction_horizon,
+                "realtime_prediction": False,
+                "prediction_sensors": [],
+                "prediction_model": "",
+                "use_optimized_warning": False,
+            },
+            "candidate": {
+                "indicator": "仅采集",
+                "model": "未启用预测/预警",
+                "recommended": False,
+                "validation_selection_score": None,
+                "validation_window_balanced_accuracy": None,
+                "validation_layer_balanced_accuracy": None,
+                "validation_specimen_balanced_accuracy": None,
+            },
+            "forecast": {
+                "requested_horizon": prediction_horizon,
+                "returned_horizon": 0,
+                "native_horizon": 24,
+                "mode": "capture_only",
+                "realtime": False,
+                "checkpoint": "",
+                "model_name": "未加载",
+                "input_sensors": [],
+                "available_output_sensors": [],
+                "selected_output_sensors": [],
+                "display_consistency": "not_applicable",
+            },
+            "progress": {
+                "cursor": len(rows),
+                "total_points": max(len(rows) + 1, 1),
+                "percent": 0.0,
+                "current_layer_index": current_layer,
+                "current_layer": current_layer + 1,
+                "current_layer_id": f"LIVE_L{current_layer}",
+                "layer_point": len(rows),
+                "layer_total_points": max(len(rows) + 1, 1),
+                "current_window": 1,
+                "total_windows_in_layer": 1,
+                "sample_in_window": ((max(len(rows), 1) - 1) % 24) + 1,
+                "window_length": 24,
+                "finished": False,
+            },
+            "channels": channels,
+            "selected_channel": channels[sensor_id],
+            "window": {
+                "id": "DISABLED",
+                "complete": False,
+                "score": None,
+                "raw_realtime_score": None,
+                "state": "pending",
+                "state_label": "仅采集，不判定",
+                "type_probabilities": {},
+                "optimized_warning_applied": False,
+            },
+            "layer": None,
+            "specimen": None,
+            "layers": layers,
+            "timeline": {
+                "scores": [],
+                "threshold": 0.5,
+                "active_index": 0,
+                "completed_count": 0,
+            },
+            "process": process,
+            "official_final": {
+                "true_state": "unknown",
+                "true_state_label": "仅采集：未设置真值",
+                "predicted_state": "disabled",
+                "predicted_state_label": "未启用预测预警",
+            },
+            "acquisition": status,
+            "feature_generation": {
+                "mode": "capture_only",
+                "feature_key": None,
+                "all_12_indicators_supported": False,
+                "completed_windows_reused": 0,
+                "incremental_cache": False,
+                "historical_prediction_mode": "disabled",
+                "health_indicator_output_sensors": [],
+                "selected_model_output_sensors": [],
+                "warning_optimization": "disabled",
+            },
+        }
+
+    def live(
+        self,
+        sensor_id: int,
+        history: int,
+        step: int,
+        threshold: float,
+        rho: float,
+        indicator: str,
+        model_kind: str,
+        prediction_horizon: int,
+        use_optimized_warning: bool = True,
+        prediction_sensors: list[str] | None = None,
+        processing_mode: str | None = None,
+        forecast_lead: int = 1,
+        dataset_schema: str | None = None,
+        prediction_model_type: str | None = None,
+        acquisition: AcquisitionManager | None = None,
+    ) -> dict:
+        """Real acquisition -> live model -> live HI features -> warning."""
+        active_acquisition = acquisition or self.acquisition
+        status = active_acquisition.status()
+        rows, timestamps = active_acquisition.numeric_matrix()
+        config = status.get("config") or {}
+        requested_schema = (
+            dataset_schema
+            if dataset_schema in ACQUISITION_SCHEMAS
+            else str(config.get("dataset_schema") or "legacy_original")
+        )
+        if config.get("dataset_schema") and config.get("dataset_schema") != requested_schema:
+            raise ValueError(
+                "界面数据方案与当前采集会话不一致，请先停止采集后重新开始"
+            )
+        config = {**config, "dataset_schema": requested_schema}
+        requested_model_type = normalize_model_type(
+            prediction_model_type
+            or config.get("prediction_model_type")
+            or "i_T_G"
+        )
+        if processing_mode in {"capture_only", "prediction_warning"}:
+            config = {**config, "processing_mode": processing_mode}
+        active_sensor_columns = list(
+            config.get("selected_sensors")
+            or ACQUISITION_SCHEMAS[requested_schema]["sensors"]
+        )
+        sensor_id = int(
+            np.clip(sensor_id, 0, max(len(active_sensor_columns) - 1, 0))
+        )
+        history = int(np.clip(history, 48, 2400))
+        step = int(np.clip(step, 1, 24))
+        threshold = float(np.clip(threshold, 0.0, 1.0))
+        rho = float(np.clip(rho, 0.0, 1.0))
+        prediction_horizon = int(np.clip(prediction_horizon, 1, 600))
+        forecast_lead = int(np.clip(forecast_lead, 1, 24))
+        if config.get("processing_mode") == "capture_only":
+            return self._capture_only_live(
+                status=status,
+                rows=rows,
+                sensor_columns=active_sensor_columns,
+                sensor_id=sensor_id,
+                history=history,
+                step=step,
+                prediction_horizon=prediction_horizon,
+            )
+        new_schema = config.get("dataset_schema") == "new_collection_v11_3"
+        abnormal_states = (
+            NEW_ABNORMAL_STATES if new_schema else ABNORMAL_STATES
+        )
+        candidate = (
+            self.new_collection_candidate(indicator, model_kind)
+            if new_schema
+            else self.candidate(indicator, model_kind)
+        )
+        candidate_index = int(candidate["candidate_index"])
+        feature_key = str(candidate["feature_key"])
+        indicator = str(candidate["indicator_family"])
+        model_kind = str(candidate["model_kind"])
+        causal_optimized = bool(
+            use_optimized_warning
+            and not new_schema
+            and indicator == "TC-HI"
+            and model_kind == "random_forest"
+        )
+        calibrated_optimized = bool(use_optimized_warning and new_schema)
+        optimized_warning_applied = causal_optimized or calibrated_optimized
+        effective_rho = (
+            float(np.clip(_finite(candidate.get("cap_rho"), rho), 0.0, 1.0))
+            if calibrated_optimized
+            else rho
+        )
+        effective_window_threshold = (
+            float(
+                np.clip(
+                    _finite(candidate.get("window_threshold"), threshold),
+                    0.0,
+                    1.0,
+                )
+            )
+            if calibrated_optimized
+            else threshold
+        )
+        active_profile = self.online_predictor.profile
+        # A schema switch can arrive while an acquisition session is being
+        # reused.  Reload the registered checkpoint compatible with the active
+        # sensor set before constructing health features; otherwise an old
+        # in-memory profile is reported as a health-indicator mismatch.
+        active_sensor_names = set(active_sensor_columns)
+        if (
+            active_profile.get("schema_mode") != requested_schema
+            or active_profile.get("model_type") != requested_model_type
+            or any(
+            str(name) not in active_sensor_names
+            for name in active_profile.get("input_sensors", [])
+            )
+        ):
+            compatible_profile = inspect_prediction_model(
+                "",
+                model_type=requested_model_type,
+                schema_mode=requested_schema,
+            )
+            self.online_predictor.configure(
+                compatible_profile["checkpoint"],
+                model_type=compatible_profile.get("model_type", requested_model_type),
+                schema_mode=requested_schema,
+            )
+            active_profile = self.online_predictor.profile
+        configured_prediction_sensors = (
+            prediction_sensors
+            if prediction_sensors is not None
+            else config.get("model_output_sensors")
+            or config.get("prediction_sensors")
+        )
+        prediction_sensor_names = set(
+            active_profile["output_sensors"]
+            if configured_prediction_sensors is None
+            else configured_prediction_sensors
+        )
+        prediction_sensor_names.intersection_update(
+            config.get("model_input_sensors")
+            or config.get("selected_sensors")
+            or active_sensor_columns
+        )
+        indicator_output_catalog = (
+            NEW_INDICATOR_REQUIRED_OUTPUTS
+            if new_schema
+            else INDICATOR_REQUIRED_OUTPUTS
+        )
+        required_health_outputs = indicator_output_catalog.get(
+            indicator,
+            NEW_COLLECTION_SENSOR_COLUMNS if new_schema else SENSOR_COLUMNS,
+        )
+        missing_health_outputs = [
+            name
+            for name in required_health_outputs
+            if name not in prediction_sensor_names
+        ]
+        if missing_health_outputs:
+            # A schema switch may leave the previous indicator/output checklist
+            # in the browser.  Select a compatible family instead of making
+            # every live refresh fail until the page is manually reloaded.
+            compatible_indicator = next(
+                (
+                    name
+                    for name in ("TC-HI", "C-HI", "T-HI", "RFHI", "PR-HI", "MPRF-HI")
+                    if name in indicator_output_catalog
+                    and set(indicator_output_catalog[name]).issubset(
+                        prediction_sensor_names
+                    )
+                ),
+                None,
+            )
+            if compatible_indicator is None:
+                raise ValueError(
+                    f"{indicator}健康指标缺少模型输出通道："
+                    f"{missing_health_outputs}；当前可用输出："
+                    f"{sorted(prediction_sensor_names)}"
+                )
+            indicator = compatible_indicator
+            required_health_outputs = indicator_output_catalog[indicator]
+        prediction_model_signature = (
+            f"{active_profile['checkpoint']}|"
+            f"{','.join(sorted(prediction_sensor_names))}"
+        )
+        latest_process_row = rows[-1] if rows else {}
+        process_payload = build_process_payload(
+            "new_collection_v11_3" if new_schema else "legacy_original",
+            observed=latest_process_row,
+            fallback=config,
+        )
+        process_parameters = {
+            name: _finite(process_payload.get(name), 0.0)
+            for name in (
+                "initial_compaction_force_N",
+                "placement_speed_mm_s",
+                "pid_angle_deg",
+                "temperature_setpoint_C",
+            )
+        }
+
+        sensors = np.full(
+            (len(rows), len(active_sensor_columns)), np.nan, dtype=float
+        )
+        for row_index, row in enumerate(rows):
+            for column_index, name in enumerate(active_sensor_columns):
+                value = row.get(name)
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(number):
+                    sensors[row_index, column_index] = number
+        acquired_model_inputs = [
+            name
+            for name in active_profile["input_sensors"]
+            if name in active_sensor_columns
+        ]
+        input_indices = [
+            active_sensor_columns.index(name)
+            for name in acquired_model_inputs
+        ]
+        all_channels_ready = (
+            len(rows) >= 24
+            and bool(input_indices)
+            and np.isfinite(sensors[:, input_indices]).all()
+        )
+        model_tensor = (
+            self._live_model_tensor(
+                rows, sensors, active_profile, active_sensor_columns
+            )
+            if all_channels_ready
+            else None
+        )
+
+        # A stable folder can be reused when a layer is collected again. Include
+        # started_at so cached predictions/results can never leak into a new run.
+        session_key = (
+            f"{status.get('session_dir') or 'no-session'}|"
+            f"{status.get('started_at') or 0.0}"
+        )
+        completed: list[dict] = []
+        # Keep the native 24-point window prediction for warning scores.  The
+        # chart uses a separate target-aligned causal prediction series below.
+        warning_prediction = np.full_like(sensors, np.nan)
+        historical_prediction = np.full_like(sensors, np.nan)
+        if all_channels_ready and len(rows) >= 48:
+            for target_start in range(24, len(rows) - 23, 24):
+                cache_key = (session_key, target_start)
+                with self.live_cache_lock:
+                    prediction = self.live_prediction_cache.get(cache_key)
+                if prediction is None:
+                    predicted_standardized, _ = self.online_predictor.predict(
+                        model_tensor[target_start - 24 : target_start], 24
+                    )
+                    prediction = self._prediction_to_sensor_matrix(
+                        predicted_standardized,
+                        active_profile,
+                        active_sensor_columns,
+                    )
+                    with self.live_cache_lock:
+                        self.live_prediction_cache[cache_key] = prediction
+                actual_window = sensors[target_start : target_start + 24]
+                warning_prediction[
+                    target_start : target_start + 24
+                ] = prediction
+                result_key = (session_key, candidate_index, target_start)
+                with self.live_cache_lock:
+                    cached_result = self.live_window_result_cache.get(result_key)
+                if cached_result is None:
+                    if new_schema:
+                        health_actual, health_prediction = (
+                            self._new_collection_health_arrays(
+                                actual_window,
+                                prediction,
+                                set(required_health_outputs),
+                                active_sensor_columns,
+                            )
+                        )
+                        score, type_probabilities, feature_values = (
+                            self.new_collection_health_engine.predict(
+                                indicator,
+                                health_actual,
+                                health_prediction,
+                                process_parameters,
+                                model_kind,
+                            )
+                        )
+                        cached_result = {
+                            "score": float(score),
+                            "type_probabilities": type_probabilities,
+                            "feature_values": feature_values.tolist(),
+                            "contact_observed": bool(
+                                np.max(
+                                    actual_window[
+                                        :, active_sensor_columns.index("压力")
+                                    ]
+                                ) >= 10.0
+                            ),
+                        }
+                    else:
+                        health_actual, health_prediction = (
+                            self._health_feature_arrays(
+                                actual_window,
+                                prediction,
+                                set(required_health_outputs),
+                                active_sensor_columns,
+                            )
+                        )
+                        feature_sets = self.online_feature_engine.transform(
+                            health_actual,
+                            health_prediction,
+                            requested_key=feature_key,
+                        )
+                        feature_values = feature_sets[feature_key]
+                        with self.candidate_lock:
+                            scores, type_matrix = self._predict_feature_values(
+                                candidate_index, feature_values
+                            )
+                        cached_result = {
+                            "score": float(scores[0]),
+                            "type_probabilities": {
+                                state: float(type_matrix[0, index])
+                                for index, state in enumerate(abnormal_states)
+                            },
+                            "contact_observed": bool(
+                                np.max(
+                                    actual_window[
+                                        :, active_sensor_columns.index("压力")
+                                    ]
+                                ) >= 10.0
+                            ),
+                        }
+                    with self.live_cache_lock:
+                        self.live_window_result_cache[result_key] = cached_result
+                score = float(cached_result["score"])
+                type_probs = dict(cached_result["type_probabilities"])
+                predicted_state = (
+                    "normal"
+                    if score < effective_window_threshold
+                    else max(type_probs, key=type_probs.get)
+                )
+                completed.append(
+                    {
+                        "id": f"LIVE_W{len(completed):03d}",
+                        "score": score,
+                        "state": predicted_state,
+                        "state_label": STATE_LABELS[predicted_state],
+                        "type_probabilities": type_probs,
+                        "target_start": target_start,
+                        "feature_mode": "realtime_from_raw_window",
+                        "contact_observed": bool(
+                            cached_result["contact_observed"]
+                        ),
+                    }
+                )
+
+        future_prediction = np.empty(
+            (0, len(active_sensor_columns)), dtype=float
+        )
+        rolling_forecast_prediction = np.empty(
+            (0, len(active_sensor_columns)), dtype=float
+        )
+        forecast_mode = "waiting_for_24_points"
+        if all_channels_ready:
+            # Always retain at least the native 24-step forecast. Even when the
+            # UI requests only 1 future point, this lets the next refresh align
+            # every newly arrived observation with a prediction made before it
+            # arrived instead of waiting for a complete 24-point target block.
+            inference_horizon = max(24, prediction_horizon, forecast_lead)
+            forecast_key = (session_key, len(rows), inference_horizon)
+            with self.live_cache_lock:
+                cached_forecast = self.live_forecast_cache.get(forecast_key)
+            if cached_forecast is None:
+                forecast_standardized, forecast_mode = self.online_predictor.predict(
+                    model_tensor[-24:], inference_horizon
+                )
+                rolling_forecast_prediction = self._prediction_to_sensor_matrix(
+                    forecast_standardized,
+                    active_profile,
+                    active_sensor_columns,
+                )
+                cached_forecast = (rolling_forecast_prediction, forecast_mode)
+                with self.live_cache_lock:
+                    self.live_forecast_cache[forecast_key] = cached_forecast
+                    # Only one forecast is useful for a given session/horizon.
+                    stale_keys = [
+                        key
+                        for key in self.live_forecast_cache
+                        if key[0] == session_key
+                        and key[2] == inference_horizon
+                        and key != forecast_key
+                    ]
+                    for key in stale_keys:
+                        self.live_forecast_cache.pop(key, None)
+            else:
+                rolling_forecast_prediction, forecast_mode = cached_forecast
+
+            # The future curve is always the latest rolling forecast.  For the
+            # historical curve, freeze only the prediction made with the
+            # selected causal lead.  This prevents an old 24-step forecast
+            # from being mistaken for a current prediction after the UI
+            # horizon is changed.
+            with self.live_cache_lock:
+                latest_predictions = self.live_rolling_prediction_cache.setdefault(
+                    session_key, {}
+                )
+                latest_predictions.clear()
+                latest_predictions.update(
+                    {
+                        len(rows) + offset: np.asarray(predicted_row, dtype=float).copy()
+                        for offset, predicted_row in enumerate(
+                            rolling_forecast_prediction
+                        )
+                    }
+                )
+                causal_predictions = self.live_causal_prediction_cache.setdefault(
+                    session_key, {}
+                )
+                max_causal_lead = min(24, len(rolling_forecast_prediction))
+                for lead in range(1, max_causal_lead + 1):
+                    target_index = len(rows) + lead - 1
+                    causal_predictions.setdefault(
+                        (target_index, lead),
+                        np.asarray(
+                            rolling_forecast_prediction[lead - 1],
+                            dtype=float,
+                        ).copy(),
+                    )
+                oldest_required = max(0, len(rows) - 2400)
+                stale_keys = [
+                    key for key in causal_predictions if key[0] < oldest_required
+                ]
+                for key in stale_keys:
+                    causal_predictions.pop(key, None)
+
+                historical_prediction = np.full_like(sensors, np.nan)
+                for target_index in range(len(rows)):
+                    predicted_row = causal_predictions.get(
+                        (target_index, forecast_lead)
+                    )
+                    if predicted_row is not None:
+                        historical_prediction[target_index] = predicted_row
+
+                # Do not show stale values from a previous origin in the
+                # future region.  Every refresh uses the newest model output.
+                future_prediction = np.asarray(
+                    rolling_forecast_prediction[:prediction_horizon],
+                    dtype=float,
+                )
+
+        evidence_scores = np.asarray(
+            [item["score"] for item in completed], dtype=float
+        )
+        specimen_id = str(config.get("specimen_id", "LIVE_SPECIMEN"))
+        # Include specimen/process condition in the persistence namespace so
+        # a new independent specimen or changed parameters starts at layer 0
+        # and cannot inherit evidence from a previous condition.
+        live_scope_signature = self._live_scope_signature(config)
+        evidence_namespace = f"{prediction_model_signature}|{live_scope_signature}"
+        current_layer = max(0, int(config.get("layer", 0) or 0))
+        layer_aggregate = None
+        specimen_aggregate = None
+        persist_layer_health = False
+        if len(evidence_scores):
+            layer_health, weights = cap_pool(evidence_scores, effective_rho)
+            layer_type_probs = {
+                state: float(
+                    np.dot(
+                        weights,
+                        np.asarray(
+                            [
+                                item["type_probabilities"][state]
+                                for item in completed
+                            ],
+                            dtype=float,
+                        ),
+                    )
+                )
+                for state in abnormal_states
+            }
+            layer_threshold = (
+                _finite(candidate["layer_threshold"], threshold)
+                if optimized_warning_applied
+                else threshold
+            )
+            layer_state = (
+                "normal"
+                if layer_health < layer_threshold
+                else max(layer_type_probs, key=layer_type_probs.get)
+            )
+            layer_aggregate = {
+                "health": layer_health,
+                "state": layer_state,
+                "state_label": STATE_LABELS[layer_state],
+                "type_probabilities": layer_type_probs,
+                "evidence_count": len(completed),
+                "maximum_weight": float(np.max(weights)),
+                "effective_count": float(1.0 / np.sum(weights**2)),
+                "decision_mode": (
+                    "validation_calibrated_cap_16s4p"
+                    if calibrated_optimized
+                    else "live_features_and_classifier"
+                ),
+                "optimized_warning_applied": calibrated_optimized,
+            }
+            causal_summary = None
+            if not new_schema:
+                causal_summary = self.causal_online_optimizer.build_layer_summary(
+                    evidence_scores,
+                    np.asarray(
+                        [
+                            [
+                                item["type_probabilities"][state]
+                                for state in abnormal_states
+                            ]
+                            for item in completed
+                        ],
+                        dtype=float,
+                    ),
+                    np.asarray(
+                        [item["contact_observed"] for item in completed],
+                        dtype=bool,
+                    ),
+                )
+            layer_key = self._live_layer_key(
+                specimen_id,
+                current_layer,
+                indicator,
+                model_kind,
+                evidence_namespace,
+            )
+            previous_layer = self.live_layer_health.get(layer_key)
+            layer_complete = not bool(status.get("running"))
+            persist_layer_health = (
+                previous_layer is None
+                or int(previous_layer.get("completed_window_count", -1))
+                != len(completed)
+                or bool(previous_layer.get("layer_complete", False))
+                != layer_complete
+            )
+            self.live_layer_health[layer_key] = {
+                **layer_aggregate,
+                **(
+                    {"causal_summary": causal_summary}
+                    if causal_summary is not None
+                    else {}
+                ),
+                "specimen_id": specimen_id,
+                "layer": current_layer,
+                "indicator": indicator,
+                "model_kind": model_kind,
+                "prediction_model": active_profile["checkpoint"],
+                "model_output_sensors": sorted(prediction_sensor_names),
+                "run_id": str(config.get("run_id", "")),
+                "updated_sample_count": len(rows),
+                "completed_window_count": len(completed),
+                "layer_complete": layer_complete,
+            }
+            if persist_layer_health and not causal_optimized:
+                self._save_live_layer_health()
+
+        stored_layers = self._stored_live_layers(
+            specimen_id,
+            indicator,
+            model_kind,
+            evidence_namespace,
+        )
+        completed_file_layers = {
+            max(0, int(layer) - 1)
+            for layer in (status.get("completed_layers") or [])
+        }
+        live_layer_indices = sorted(
+            set(stored_layers) | completed_file_layers | {max(0, current_layer)}
+        )
+        if stored_layers:
+            layer_items = [stored_layers[index] for index in sorted(stored_layers)]
+            layer_scores = np.asarray(
+                [item["health"] for item in layer_items], dtype=float
+            )
+            specimen_health, specimen_weights = cap_pool(
+                layer_scores, effective_rho
+            )
+            specimen_type_probs = {
+                state: float(
+                    np.dot(
+                        specimen_weights,
+                        np.asarray(
+                            [item["type_probabilities"][state] for item in layer_items],
+                            dtype=float,
+                        ),
+                    )
+                )
+                for state in abnormal_states
+            }
+            specimen_threshold = (
+                _finite(candidate["specimen_threshold"], threshold)
+                if optimized_warning_applied
+                else threshold
+            )
+            specimen_state = (
+                "normal"
+                if specimen_health < specimen_threshold
+                else max(specimen_type_probs, key=specimen_type_probs.get)
+            )
+            actual_layer_count = len(layer_items)
+            specimen_complete = bool(layer_items) and all(
+                bool(item.get("layer_complete", True)) for item in layer_items
+            )
+            specimen_aggregate = {
+                "health": specimen_health,
+                "state": specimen_state,
+                "state_label": STATE_LABELS[specimen_state],
+                "type_probabilities": specimen_type_probs,
+                "evidence_layers": actual_layer_count,
+                "actual_layer_count": actual_layer_count,
+                "effective_layers": float(
+                    1.0 / np.sum(specimen_weights**2)
+                ),
+                "complete": specimen_complete,
+                "aggregation": "CAP pooling across all available physical layers",
+                "decision_mode": (
+                    "validation_calibrated_cap_16s4p"
+                    if calibrated_optimized
+                    else "live_features_and_classifier"
+                ),
+                "optimized_warning_applied": calibrated_optimized,
+            }
+
+        latest = completed[-1] if completed else None
+        if latest is None:
+            message = (
+                f"需要全部{len(active_profile['input_sensors'])}个模型输入"
+                "通道连续收到24点才能预测"
+                if not all_channels_ready
+                else "首次窗口预警需要24点历史＋24点实测"
+            )
+            realtime_window = {
+                "id": "LIVE_W000",
+                "score": None,
+                "raw_realtime_score": None,
+                "state": "pending",
+                "state_label": message,
+                "type_probabilities": {
+                    state: 0.0 for state in abnormal_states
+                },
+                "complete": False,
+                "decision_mode": "waiting_for_live_evidence",
+                "optimized_warning_applied": False,
+            }
+        else:
+            realtime_window = {
+                **latest,
+                "raw_realtime_score": latest["score"],
+                "complete": True,
+                "decision_mode": (
+                    "validation_calibrated_cap_16s4p"
+                    if calibrated_optimized
+                    else "live_features_and_classifier"
+                ),
+                "optimized_warning_applied": calibrated_optimized,
+            }
+
+        if causal_optimized and latest is not None and layer_aggregate is not None:
+            causal_items = [
+                stored_layers[index]
+                for index in sorted(stored_layers)
+                if index <= current_layer
+                and "causal_summary" in stored_layers[index]
+            ]
+            if causal_items:
+                causal_result = self.causal_online_optimizer.predict(
+                    [item["causal_summary"] for item in causal_items],
+                    window_health=float(latest["score"]),
+                    window_types=np.asarray(
+                        [
+                            latest["type_probabilities"][state]
+                            for state in abnormal_states
+                        ],
+                        dtype=float,
+                    ),
+                    current_layer_complete=not bool(status.get("running")),
+                    current_window_fraction=min(
+                        1.0, len(completed) / 24.0
+                    ),
+                )
+
+                def posterior_values(posterior: np.ndarray) -> tuple:
+                    posterior = np.asarray(posterior, dtype=float)
+                    state = self.causal_online_optimizer.states[
+                        int(np.argmax(posterior))
+                    ]
+                    abnormal = float(1.0 - posterior[0])
+                    anomaly = posterior[1:]
+                    total = float(anomaly.sum())
+                    type_probs = {
+                        name: float(anomaly[index] / total)
+                        if total > 0
+                        else 1.0 / len(abnormal_states)
+                        for index, name in enumerate(abnormal_states)
+                    }
+                    return state, abnormal, type_probs
+
+                window_state, window_health, window_types = posterior_values(
+                    causal_result["window_posterior"]
+                )
+                layer_state, optimized_layer_health, optimized_layer_types = (
+                    posterior_values(causal_result["layer_posterior"])
+                )
+                (
+                    specimen_state,
+                    optimized_specimen_health,
+                    optimized_specimen_types,
+                ) = posterior_values(causal_result["specimen_posterior"])
+                realtime_window.update(
+                    {
+                        "score": window_health,
+                        "state": window_state,
+                        "state_label": STATE_LABELS[window_state],
+                        "type_probabilities": window_types,
+                        "decision_mode": causal_result["method"],
+                        "optimized_warning_applied": True,
+                    }
+                )
+                layer_aggregate.update(
+                    {
+                        "raw_health": layer_aggregate["health"],
+                        "health": optimized_layer_health,
+                        "state": layer_state,
+                        "state_label": STATE_LABELS[layer_state],
+                        "type_probabilities": optimized_layer_types,
+                        "decision_mode": causal_result["method"],
+                        "optimized_warning_applied": True,
+                    }
+                )
+                specimen_aggregate = {
+                    "health": optimized_specimen_health,
+                    "state": specimen_state,
+                    "state_label": STATE_LABELS[specimen_state],
+                    "type_probabilities": optimized_specimen_types,
+                    "evidence_layers": len(causal_items),
+                    "effective_layers": (
+                        specimen_aggregate["effective_layers"]
+                        if specimen_aggregate
+                        else float(len(causal_items))
+                    ),
+                    "complete": bool(causal_result["all_five_complete"]),
+                    "aggregation": causal_result["method"],
+                    "optimized_warning_applied": True,
+                }
+                current_key = self._live_layer_key(
+                    specimen_id,
+                    current_layer,
+                    indicator,
+                    model_kind,
+                    evidence_namespace,
+                )
+                self.live_layer_health[current_key][
+                    "optimized_aggregate"
+                ] = layer_aggregate
+                if persist_layer_health:
+                    self._save_live_layer_health()
+
+        observed_start = max(0, len(rows) - history)
+        observed_indices = np.arange(observed_start, len(rows), step, dtype=int)
+        sampling_hz = (
+            _finite(status.get("config", {}).get("sample_rate_hz"), 10.0)
+            if status.get("config")
+            else 10.0
+        )
+        observed_time = (
+            (observed_indices - max(len(rows), 1)) / sampling_hz
+            if len(observed_indices)
+            else np.asarray([], dtype=float)
+        )
+        future_time = (
+            np.arange(len(future_prediction), dtype=float) + 1
+        ) / sampling_hz
+        # Smooth only the visual series.  The raw matrices were already used
+        # for the current window, layer and specimen health decisions.
+        historical_prediction = self._smooth_prediction_for_display(
+            historical_prediction
+        )
+        future_prediction = self._smooth_prediction_for_display(
+            future_prediction
+        )
+        channels = []
+        for index, source_sensor_name in enumerate(active_sensor_columns):
+            if source_sensor_name in SENSOR_COLUMNS:
+                legacy_index = SENSOR_COLUMNS.index(source_sensor_name)
+                sensor = {**self.sensors[legacy_index], "id": index}
+            else:
+                sensor = {
+                    "id": index,
+                    "name": source_sensor_name,
+                    "unit": LIVE_SENSOR_UNITS.get(
+                        source_sensor_name, "device unit"
+                    ),
+                }
+            prediction_enabled = source_sensor_name in prediction_sensor_names
+            actual_values = (
+                sensors[observed_indices, index]
+                if len(observed_indices)
+                else np.asarray([], dtype=float)
+            )
+            prediction_values = (
+                historical_prediction[observed_indices, index]
+                if len(observed_indices)
+                else np.asarray([], dtype=float)
+            )
+            valid_residual = np.isfinite(actual_values) & np.isfinite(
+                prediction_values
+            )
+            rmse = (
+                float(
+                    np.sqrt(
+                        np.mean(
+                            np.square(
+                                actual_values[valid_residual]
+                                - prediction_values[valid_residual]
+                            )
+                        )
+                    )
+                )
+                if np.any(valid_residual)
+                else None
+            )
+            channels.append(
+                {
+                    **sensor,
+                    "prediction_source_name": source_sensor_name,
+                    "prediction_enabled": prediction_enabled,
+                    "x_observed": observed_time.tolist(),
+                    "actual": [
+                        float(value) if math.isfinite(value) else None
+                        for value in actual_values
+                    ],
+                    "prediction_observed": [
+                        float(value) if math.isfinite(value) else None
+                        for value in prediction_values
+                    ] if prediction_enabled else [],
+                    "x_future": (
+                        future_time.tolist() if prediction_enabled else []
+                    ),
+                    "prediction_future": (
+                        future_prediction[:, index].tolist()
+                        if prediction_enabled and len(future_prediction)
+                        else []
+                    ),
+                    "actual_current": (
+                        float(actual_values[-1])
+                        if len(actual_values) and math.isfinite(actual_values[-1])
+                        else None
+                    ),
+                    "prediction_current": (
+                        float(prediction_values[-1])
+                        if prediction_enabled
+                        and len(prediction_values)
+                        and math.isfinite(prediction_values[-1])
+                        else (
+                            float(future_prediction[0, index])
+                            if prediction_enabled and len(future_prediction)
+                            else None
+                        )
+                    ),
+                    "rmse": rmse if prediction_enabled else None,
+                }
+            )
+
+        layers = []
+        for layer_index in live_layer_indices:
+            is_current = layer_index == current_layer
+            stored = stored_layers.get(layer_index)
+            current_layer_complete = bool(
+                is_current
+                and layer_aggregate is not None
+                and not status.get("running")
+            )
+            completed_windows = (
+                len(completed)
+                if is_current
+                else int(stored.get("evidence_count", 0))
+                if stored
+                else 0
+            )
+            total_windows = (
+                max(
+                    len(completed)
+                    if current_layer_complete
+                    else len(completed) + 1,
+                    1,
+                )
+                if is_current
+                else max(completed_windows, 1)
+            )
+            layers.append(
+                {
+                    "id": f"{specimen_id}_L{layer_index}",
+                    "layer": layer_index,
+                    "display_layer": layer_index + 1,
+                    "completed_windows": completed_windows,
+                    "total_windows": total_windows,
+                    "status": (
+                        "complete"
+                        if current_layer_complete
+                        else "active"
+                        if is_current
+                        else "complete"
+                        if stored
+                        else "waiting"
+                    ),
+                    "aggregate": (
+                        layer_aggregate
+                        if is_current
+                        else stored.get("optimized_aggregate", stored)
+                        if stored and causal_optimized
+                        else stored
+                    ),
+                }
+            )
+
+        process = process_payload
+        return {
+            "mode": "live_acquisition",
+            "selection": {
+                "specimen": str(config.get("specimen_id", "LIVE_SPECIMEN")),
+                "sensor": sensor_id,
+                "cursor": len(rows),
+                "history": history,
+                "step": step,
+                "threshold": effective_window_threshold,
+                "rho": effective_rho,
+                "score_mode": "live",
+                "indicator": indicator,
+                "model": model_kind,
+                "prediction_horizon": prediction_horizon,
+                "forecast_lead": forecast_lead,
+                "realtime_prediction": True,
+                "prediction_sensors": sorted(prediction_sensor_names),
+                "prediction_model": active_profile["checkpoint"],
+                "best_prediction_override": bool(
+                    config.get("use_best_prediction_override", False)
+                ),
+                "use_optimized_warning": optimized_warning_applied,
+            },
+            "candidate": {
+                "indicator": indicator,
+                "model": model_kind,
+                "recommended": bool(candidate["recommended_for_indicator"]),
+                "validation_selection_score": _finite(
+                    candidate["validation_selection_score"]
+                ),
+                "validation_window_balanced_accuracy": _finite(
+                    candidate["validation_window_balanced_accuracy"]
+                ),
+                "validation_layer_balanced_accuracy": _finite(
+                    candidate["validation_layer_balanced_accuracy"]
+                ),
+                "validation_specimen_balanced_accuracy": _finite(
+                    candidate["validation_specimen_balanced_accuracy"]
+                ),
+                "test_window_balanced_accuracy": _finite(
+                    candidate.get("test_window_balanced_accuracy"), None
+                ),
+                "test_layer_balanced_accuracy": _finite(
+                    candidate.get("test_layer_balanced_accuracy"), None
+                ),
+                "test_specimen_balanced_accuracy": _finite(
+                    candidate.get("test_specimen_balanced_accuracy"), None
+                ),
+                "window_threshold": effective_window_threshold,
+                "layer_threshold": (
+                    _finite(candidate["layer_threshold"], threshold)
+                    if optimized_warning_applied
+                    else threshold
+                ),
+                "specimen_threshold": (
+                    _finite(candidate["specimen_threshold"], threshold)
+                    if optimized_warning_applied
+                    else threshold
+                ),
+                "cap_rho": effective_rho,
+            },
+                "forecast": {
+                    "requested_horizon": prediction_horizon,
+                    "forecast_lead": forecast_lead,
+                    "lead_semantics": "历史曲线使用冻结的因果提前量；未来曲线每次刷新使用最新滚动预测",
+                "returned_horizon": len(future_prediction),
+                "native_horizon": 24,
+                "mode": forecast_mode,
+                "realtime": True,
+                "checkpoint": self.online_predictor.checkpoint,
+                "model_name": active_profile.get("name", "I-ModernTCN"),
+                "input_sensors": active_profile["input_sensors"],
+                "available_output_sensors": active_profile["output_sensors"],
+                "selected_output_sensors": sorted(prediction_sensor_names),
+                "best_prediction_override": bool(
+                    config.get("use_best_prediction_override", False)
+                ),
+                "display_consistency": "latest_rolling_future_target_aligned_history",
+                "warning_prediction_alignment": "native_24_window_origin",
+            },
+            "progress": {
+                "cursor": len(rows),
+                "total_points": max(len(rows) + 1, 1),
+                "percent": 0.0,
+                "current_layer_index": current_layer,
+                "current_layer": current_layer + 1,
+                "current_layer_id": f"LIVE_L{current_layer}",
+                "layer_point": len(rows),
+                "layer_total_points": max(len(rows) + 1, 48),
+                "current_window": len(completed) + 1,
+                "total_windows_in_layer": max(len(completed) + 1, 1),
+                "sample_in_window": ((max(len(rows), 1) - 1) % 24) + 1,
+                "window_length": 24,
+                "finished": False,
+            },
+            "channels": channels,
+            "selected_channel": channels[sensor_id],
+            "window": realtime_window,
+            "layer": layer_aggregate,
+            "specimen": specimen_aggregate,
+            "layers": layers,
+            "timeline": {
+                "scores": [item["score"] for item in completed] + [None],
+                "threshold": effective_window_threshold,
+                "active_index": len(completed),
+                "completed_count": len(completed),
+            },
+            "process": process,
+            "official_final": {
+                "true_state": "unknown",
+                "true_state_label": "真实采集：未知",
+                "predicted_state": (
+                    specimen_aggregate["state"]
+                    if specimen_aggregate
+                    else "pending"
+                ),
+                "predicted_state_label": (
+                    specimen_aggregate["state_label"]
+                    if specimen_aggregate
+                    else "等待数据"
+                ),
+            },
+            "acquisition": status,
+            "feature_generation": {
+                "mode": "realtime_from_actual_and_live_prediction",
+                "feature_key": feature_key,
+                "indicator_variant": indicator_variant(
+                    "new_collection_v11_3" if new_schema else "legacy_original",
+                    indicator,
+                ),
+                "all_12_indicators_supported": True,
+                "completed_windows_reused": len(completed),
+                "incremental_cache": True,
+                "historical_prediction_mode": (
+                    f"target_aligned_causal_lead_{forecast_lead}"
+                ),
+                "health_indicator_output_sensors": required_health_outputs,
+                "selected_model_output_sensors": sorted(
+                    prediction_sensor_names
+                ),
+                "warning_optimization": (
+                    "causal_online_v13_9"
+                    if causal_optimized
+                    else "validation_calibrated_cap_16s4p"
+                    if calibrated_optimized
+                    else "none"
+                ),
+            },
+        }
+
+    def view(
+        self,
+        specimen_id: str,
+        layer_id: str | None,
+        sensor_id: int,
+        distance: int,
+        length: int,
+        step: int,
+        threshold: float,
+        rho: float,
+        score_mode: str,
+    ) -> dict:
+        if specimen_id not in self.layer_groups:
+            specimen_id = self.specimen_ids[0]
+        specimen_layers = self.layer_groups[specimen_id]
+        valid_layers = specimen_layers["layer_sample_id"].astype(str).tolist()
+        if layer_id not in valid_layers:
+            layer_id = valid_layers[0]
+
+        sensor_id = int(np.clip(sensor_id, 0, len(self.sensors) - 1))
+        threshold = float(np.clip(threshold, 0.0, 1.0))
+        rho = float(np.clip(rho, 0.0, 1.0))
+        score_mode = "raw" if score_mode == "raw" else "soft"
+
+        window_group = self.window_groups[layer_id]
+        visual_indices = window_group["visual_index"].to_numpy(dtype=int)
+        layer_actual = self.actual[visual_indices]
+        layer_prediction = self.prediction[visual_indices]
+        point_count = int(layer_actual.shape[0] * layer_actual.shape[1])
+
+        distance = int(np.clip(distance, 0, max(point_count - 1, 0)))
+        length = int(np.clip(length, 24, point_count))
+        step = int(np.clip(step, 1, 24))
+        end = max(1, point_count - distance)
+        start = max(0, end - length)
+        selection = np.arange(start, end, step, dtype=int)
+
+        actual_flat = layer_actual.reshape(point_count, layer_actual.shape[-1])
+        prediction_flat = layer_prediction.reshape(point_count, layer_prediction.shape[-1])
+        sampling_hz = _finite(self.manifest.get("sampling_hz"), 10.0)
+        x_seconds = (selection - (end - 1)) / sampling_hz
+
+        selected_actual = actual_flat[selection, sensor_id]
+        selected_prediction = prediction_flat[selection, sensor_id]
+        selected_residual = selected_actual - selected_prediction
+        current_window_local = min((end - 1) // 24, len(window_group) - 1)
+        current_window = window_group.iloc[int(current_window_local)]
+
+        layer_official = specimen_layers.loc[
+            specimen_layers["layer_sample_id"].astype(str).eq(layer_id)
+        ].iloc[0]
+        specimen_official = self.specimens.loc[
+            self.specimens["full_specimen_id"].astype(str).eq(specimen_id)
+        ].iloc[0]
+
+        layer_preview = self._aggregate_layer(layer_id, score_mode, threshold, rho)
+        all_layer_previews = [
+            self._aggregate_layer(other_layer, score_mode, threshold, rho)
+            for other_layer in valid_layers
+        ]
+        layer_scores = np.asarray([item["health"] for item in all_layer_previews], dtype=float)
+        specimen_health, layer_weights = cap_pool(layer_scores, rho)
+        specimen_type_probs = {
+            state: float(
+                np.dot(
+                    layer_weights,
+                    np.asarray(
+                        [item["type_probabilities"][state] for item in all_layer_previews],
+                        dtype=float,
+                    ),
+                )
+            )
+            for state in ABNORMAL_STATES
+        }
+        if specimen_health < threshold:
+            specimen_preview_state = "normal"
+        else:
+            specimen_preview_state = max(specimen_type_probs, key=specimen_type_probs.get)
+
+        score_col, state_cols = self._score_columns(score_mode)
+        timeline_scores = window_group[score_col].to_numpy(dtype=float)
+        current_type_probs = {
+            state: _finite(current_window[col])
+            for state, col in state_cols.items()
+        }
+        current_score = _finite(current_window[score_col])
+        current_preview_state = (
+            "normal"
+            if current_score < threshold
+            else max(current_type_probs, key=current_type_probs.get)
+        )
+
+        sensor_stats = []
+        selected_actual_all = actual_flat[selection]
+        selected_prediction_all = prediction_flat[selection]
+        for sensor in self.sensors:
+            idx = int(sensor["id"])
+            residual = selected_actual_all[:, idx] - selected_prediction_all[:, idx]
+            sensor_stats.append(
+                {
+                    "id": idx,
+                    "name": sensor["name"],
+                    "unit": sensor["unit"],
+                    "actual_mean": float(np.mean(selected_actual_all[:, idx])),
+                    "prediction_mean": float(np.mean(selected_prediction_all[:, idx])),
+                    "rmse": float(np.sqrt(np.mean(residual**2))),
+                    "actual_last": float(selected_actual_all[-1, idx]),
+                    "prediction_last": float(selected_prediction_all[-1, idx]),
+                }
+            )
+
+        official_fields = [
+            "true_state",
+            "soft_predicted_state",
+            "soft_prediction_correct",
+            "dataset_split",
+        ]
+        layer_fields = [
+            "layer_sample_id",
+            "layer",
+            "true_state",
+            "soft_predicted_state",
+            "soft_prediction_correct",
+            "soft_layer_anomaly_probability",
+            "layer_health_index",
+        ]
+        process_fields = [
+            "p",
+            "v",
+            "pr",
+            "current_p",
+            "current_v",
+            "current_pr",
+            "injection_severity",
+        ]
+        return {
+            "selection": {
+                "specimen": specimen_id,
+                "layer": layer_id,
+                "sensor": sensor_id,
+                "distance": distance,
+                "length": length,
+                "step": step,
+                "threshold": threshold,
+                "rho": rho,
+                "score_mode": score_mode,
+                "point_count": point_count,
+                "displayed_points": int(len(selection)),
+            },
+            "available_layers": [
+                {
+                    "id": str(row["layer_sample_id"]),
+                    "layer": int(row["layer"]),
+                    "label": f"第 {int(row['layer']) + 1} 层（内部索引 {int(row['layer'])}）",
+                }
+                for _, row in specimen_layers.iterrows()
+            ],
+            "series": {
+                "x_seconds": x_seconds.tolist(),
+                "actual": selected_actual.tolist(),
+                "prediction": selected_prediction.tolist(),
+                "residual": selected_residual.tolist(),
+                "sensor": self.sensors[sensor_id],
+            },
+            "sensor_stats": sensor_stats,
+            "window_timeline": {
+                "labels": window_group["window_sample_id"].astype(str).tolist(),
+                "scores": timeline_scores.tolist(),
+                "threshold": threshold,
+                "current_index": int(current_window_local),
+            },
+            "current_window": {
+                "id": str(current_window["window_sample_id"]),
+                "official_state": str(
+                    current_window[
+                        "soft_predicted_state" if score_mode == "soft" else "predicted_window_state"
+                    ]
+                ),
+                "official_state_label": STATE_LABELS.get(
+                    str(
+                        current_window[
+                            "soft_predicted_state" if score_mode == "soft" else "predicted_window_state"
+                        ]
+                    ),
+                    str(current_window.get("predicted_window_state", "")),
+                ),
+                "preview_state": current_preview_state,
+                "preview_state_label": STATE_LABELS[current_preview_state],
+                "score": current_score,
+                "type_probabilities": current_type_probs,
+            },
+            "layer_official": {
+                **_record(layer_official, layer_fields),
+                "true_state_label": STATE_LABELS.get(str(layer_official["true_state"]), ""),
+                "predicted_state_label": STATE_LABELS.get(str(layer_official["soft_predicted_state"]), ""),
+            },
+            "specimen_official": {
+                **_record(specimen_official, official_fields),
+                "true_state_label": STATE_LABELS.get(str(specimen_official["true_state"]), ""),
+                "predicted_state_label": STATE_LABELS.get(str(specimen_official["soft_predicted_state"]), ""),
+            },
+            "preview": {
+                "layer": layer_preview,
+                "specimen": {
+                    "health": specimen_health,
+                    "state": specimen_preview_state,
+                    "state_label": STATE_LABELS[specimen_preview_state],
+                    "type_probabilities": specimen_type_probs,
+                    "layer_weights": layer_weights.tolist(),
+                },
+            },
+            "process": build_process_payload(
+                "legacy_original",
+                observed=current_window,
+                injection_severity=current_window.get("injection_severity", 0.0),
+            ),
+        }
+
+
+class AppHandler(BaseHTTPRequestHandler):
+    dashboard: DashboardData
+    security_store: SecurityStore
+    guest_manager: GuestSimulationManager
+    control_lease: RealControlLease
+    replay_cache: dict[str, tuple[int, dict]]
+    replay_lock: threading.Lock
+    model_limiter: SlidingWindowLimiter
+    model_call_lock: threading.Lock
+    diagnosis_jobs: DiagnosisJobStore
+    access_context: str = "public"
+    permission_policy = PermissionPolicy()
+    login_limiter = SlidingWindowLimiter()
+    network_status: dict[str, Any] = {}
+    network_status_provider: Any = None
+    service_started_at: float = 0.0
+
+    def log_message(self, fmt: str, *args) -> None:
+        # 实时数据流可达到10 Hz；逐请求打印会淹没终端并影响长时间运行。
+        return
+
+    def _allowed_hosts(self) -> set[str]:
+        hosts = {"localhost", "127.0.0.1"}
+        for url in self._current_network_status().get("urls", []):
+            try:
+                host = urlsplit(str(url)).hostname
+            except ValueError:
+                host = None
+            if host:
+                hosts.add(host.lower())
+        return hosts
+
+    def _current_network_status(self) -> dict[str, Any]:
+        provider = self.network_status_provider
+        if callable(provider):
+            try:
+                latest = provider()
+            except Exception:
+                latest = None
+            if isinstance(latest, dict):
+                self.network_status.clear()
+                self.network_status.update(latest)
+        return dict(self.network_status or {})
+
+    def _is_allowed_host(self) -> bool:
+        host_header = str(self.headers.get("Host", "")).strip()
+        if not host_header:
+            return False
+        try:
+            host = urlsplit(f"http://{host_header}").hostname
+        except ValueError:
+            return False
+        if not host:
+            return False
+        normalized_host = host.lower()
+        if normalized_host in self._allowed_hosts():
+            return True
+        # Public reverse proxies can use either the legacy random Cloudflare
+        # hostname or the stable Tailscale Funnel hostname.  Trust either only
+        # when its provider-specific checks prove a loopback HTTPS proxy.
+        peer_host = str(self.client_address[0] if self.client_address else "")
+        return (
+            is_trusted_quick_tunnel_request(
+                peer_host, normalized_host, self.headers
+            )
+            or is_trusted_tailscale_funnel_request(
+                peer_host, normalized_host, self.headers
+            )
+        )
+
+    def _is_allowed_origin(self) -> bool:
+        if not self._is_allowed_host():
+            return False
+        origin = str(self.headers.get("Origin", "")).strip()
+        if not origin:
+            return True
+        try:
+            parsed = urlsplit(origin)
+            request_host = urlsplit(
+                f"http://{self.headers.get('Host', '')}"
+            ).netloc.lower()
+        except ValueError:
+            return False
+        return parsed.scheme in {"http", "https"} and parsed.netloc.lower() == request_host
+
+    def _reject_unsafe_request(self) -> bool:
+        if self._is_allowed_origin():
+            return False
+        self._send_json({"error": "请求来源或 Host 不被允许"}, HTTPStatus.FORBIDDEN)
+        return True
+
+    def _request_cookies(self) -> dict[str, str]:
+        if hasattr(self, "_parsed_cookies"):
+            return self._parsed_cookies
+        parsed: dict[str, str] = {}
+        try:
+            jar = SimpleCookie()
+            jar.load(str(self.headers.get("Cookie", "")))
+            parsed = {name: morsel.value for name, morsel in jar.items()}
+        except Exception:
+            parsed = {}
+        self._parsed_cookies = parsed
+        return parsed
+
+    def _queue_cookie(
+        self,
+        name: str,
+        value: str,
+        *,
+        http_only: bool,
+        same_site: str,
+        max_age: int | None = None,
+        secure: bool | None = None,
+    ) -> None:
+        parts = [f"{name}={value}", "Path=/", f"SameSite={same_site}"]
+        if http_only:
+            parts.append("HttpOnly")
+        if max_age is not None:
+            parts.append(f"Max-Age={int(max_age)}")
+        # Loopback HTTP is accepted for local setup, but a Secure cookie would
+        # then never be returned by the browser.  Mark cookies Secure only when
+        # the request is actually HTTPS (or Cloudflare forwarded HTTPS).
+        forwarded_proto = str(self.headers.get("X-Forwarded-Proto", "")).split(",", 1)[0].strip().lower()
+        use_secure = (forwarded_proto == "https") if secure is None else bool(secure)
+        if use_secure:
+            parts.append("Secure")
+        pending = getattr(self, "_pending_cookies", None)
+        if pending is None:
+            pending = []
+            self._pending_cookies = pending
+        pending.append("; ".join(parts))
+
+    def _ensure_browser_cookies(self) -> None:
+        cookies = self._request_cookies()
+        guest_id = str(cookies.get("afp_guest") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{32,64}", guest_id):
+            guest_id = secrets.token_urlsafe(24)
+            cookies["afp_guest"] = guest_id
+            self._queue_cookie(
+                "afp_guest", guest_id, http_only=True, same_site="Lax"
+            )
+        csrf = str(cookies.get("afp_csrf") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{32,64}", csrf):
+            csrf = secrets.token_urlsafe(32)
+            cookies["afp_csrf"] = csrf
+            self._queue_cookie(
+                "afp_csrf", csrf, http_only=False, same_site="Strict"
+            )
+
+    def _is_secure_transport(self) -> bool:
+        peer_host = str(self.client_address[0] if self.client_address else "")
+        return is_secure_request(peer_host, self.headers, self.access_context)
+
+    def _remote_label(self) -> str:
+        peer_host = str(self.client_address[0] if self.client_address else "")
+        if peer_host in {"127.0.0.1", "::1"}:
+            forwarded = str(self.headers.get("CF-Connecting-IP", "")).strip()
+            if re.fullmatch(r"[0-9A-Fa-f:.]{2,64}", forwarded):
+                return forwarded
+        return peer_host[:200]
+
+    def _identity(self) -> RequestIdentity:
+        cached = getattr(self, "_request_identity", None)
+        if cached is not None:
+            return cached
+        self._ensure_browser_cookies()
+        cookies = self._request_cookies()
+        guest_id = str(cookies["afp_guest"])
+        peer_host = str(self.client_address[0] if self.client_address else "")
+        if self.access_context == "local_admin" and peer_host in {
+            "127.0.0.1",
+            "::1",
+        }:
+            identity = RequestIdentity("local_admin", "local-admin", guest_id)
+        elif self.access_context == "public" and is_lan_client(peer_host, self.headers):
+            # A direct private-network client is the operator's LAN session.
+            # Cloudflare requests arrive through loopback with a CF identity
+            # header and remain guest/authorized according to web login.
+            identity = RequestIdentity(
+                "lan_operator", lan_session_id(guest_id), guest_id
+            )
+        else:
+            token = str(cookies.get("afp_session") or "")
+            session = self.security_store.resolve_session(token) if token else None
+            if session is None:
+                identity = RequestIdentity("guest", None, guest_id)
+            else:
+                identity = RequestIdentity(
+                    "authorized", session.session_id, guest_id
+                )
+                self._queue_cookie(
+                    "afp_session",
+                    token,
+                    http_only=True,
+                    same_site="Strict",
+                    max_age=2147483647,
+                )
+        self._request_identity = identity
+        return identity
+
+    def _require_permission(self, method: str, path: str) -> bool:
+        decision = self.permission_policy.authorize(method, path, self._identity())
+        if decision.allowed:
+            return True
+        self._send_json({"error": decision.error}, HTTPStatus(decision.status))
+        return False
+
+    def _require_csrf(self) -> bool:
+        if self._identity().role == "local_admin":
+            return True
+        expected = str(self._request_cookies().get("afp_csrf") or "")
+        supplied = str(self.headers.get("X-AFP-CSRF", ""))
+        if expected and supplied and hmac.compare_digest(expected, supplied):
+            return True
+        self._send_json({"error": "csrf_failed"}, HTTPStatus.FORBIDDEN)
+        return False
+
+    def _control_owner_id(self) -> str:
+        identity = self._identity()
+        return str(identity.session_id or "")
+
+    def _request_acquisition(self, requested_mode: str = ""):
+        identity = self._identity()
+        if (
+            str(requested_mode or "").lower() == "simulation"
+            and identity.role != "local_admin"
+        ):
+            with self.remote_simulation_hosts_lock:
+                execution_host = self.remote_simulation_hosts.get(
+                    str(identity.session_id or ""), "server"
+                )
+            if execution_host == "helper_local":
+                return self.dashboard.remote_acquisitions.for_session(
+                    str(identity.session_id or "")
+                )
+            return self.guest_manager.acquisition(identity.guest_id)
+        return select_acquisition_for_identity(
+            identity.role,
+            identity.session_id,
+            self.dashboard.acquisition,
+            self.dashboard.remote_acquisitions,
+            requested_mode=requested_mode,
+        )
+
+    def _target_status(self, session_id: str, status: dict[str, Any]) -> dict[str, Any]:
+        """Attach only public server-target progress to helper-backed status."""
+        value = dict(status or {})
+        capture_uuid = str(value.get("capture_uuid") or "")
+        if capture_uuid:
+            target = self.target_capture_journal.capture_status(session_id, capture_uuid)
+            if target is not None:
+                value["server_target"] = target
+        return value
+
+    def _schedule_target_save(self, session_id: str, capture_uuid: str) -> None:
+        state = self.target_capture_journal.capture_status(session_id, capture_uuid)
+        if not state or state.get("state") not in {"ready", "failed"}:
+            return
+        threading.Thread(
+            target=self.target_saver.save_now,
+            args=(session_id, capture_uuid),
+            name="AFP-server-target-save",
+            daemon=True,
+        ).start()
+
+    def _ingest_helper_sample(self, session_id: str, batch: dict[str, Any]) -> dict[str, Any]:
+        capture_uuid = str(batch.get("capture_uuid") or "") if isinstance(batch, dict) else ""
+        if self.target_capture_journal.manages(session_id, capture_uuid):
+            accepted = self.target_capture_journal.ingest(
+                session_id, batch if isinstance(batch, dict) else {},
+                self.dashboard.remote_acquisitions,
+            )
+            if accepted.get("ok"):
+                self._schedule_target_save(session_id, capture_uuid)
+            return accepted
+        return self.dashboard.remote_acquisitions.ingest(
+            session_id, batch if isinstance(batch, dict) else {}
+        )
+
+    def _accept_helper_result(
+        self, device_id: str, token: str, request_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        session_id = self.dashboard.helper_registry.authenticate(device_id, token)
+        if session_id is not None:
+            self.target_capture_journal.bind_start_result(session_id, request_id, payload)
+            self.dashboard.remote_acquisitions.for_session(
+                session_id
+            ).observe_helper_status(payload)
+        return self.dashboard.helper_registry.accept_result(
+            device_id, token, request_id, payload
+        )
+
+    def _diagnostic_context(
+        self, hardware_result: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        identity = self._identity()
+        acquisition_status = deepcopy(self._request_acquisition().status())
+        if identity.role == "local_admin":
+            return (
+                deepcopy(self.dashboard.acquisition.discover_interfaces()),
+                acquisition_status,
+            )
+        physical_interfaces = []
+        for item in hardware_result.get("interfaces") or []:
+            if not isinstance(item, dict):
+                continue
+            physical_interfaces.append(
+                {
+                    "id": item.get("physical_interface_id") or item.get("id"),
+                    "endpoint": item.get("endpoint"),
+                    "kind": item.get("physical_interface_kind"),
+                    "protocol": item.get("driver"),
+                    "detected": bool(item.get("ok")),
+                    "state": item.get("state"),
+                    "message": item.get("message"),
+                }
+            )
+        return (
+            {
+                "source": (
+                    "local_helper"
+                    if uses_local_capture_helper(identity.role)
+                    else "remote_browser_snapshot"
+                ),
+                "physical_interfaces": physical_interfaces,
+            },
+            acquisition_status,
+        )
+
+    def _require_real_control(self) -> bool:
+        identity = self._identity()
+        if identity.role not in REAL_ACCESS_ROLES:
+            self._send_json({"error": "real_access_required"}, HTTPStatus.FORBIDDEN)
+            return False
+        owner_id = self._control_owner_id()
+        current = self.control_lease.status()
+        if identity.role == "local_admin" and current.get("owner_id") in {
+            None,
+            "local-admin",
+        }:
+            if current.get("owner_id") is None:
+                self.control_lease.acquire("local-admin", "本机软件")
+            return True
+        if current.get("owner_id") != owner_id:
+            self._send_json(
+                {
+                    "error": "real_control_required",
+                    "control": current,
+                },
+                HTTPStatus.CONFLICT,
+            )
+            return False
+        return True
+
+    def _replay_key(self, path: str) -> str:
+        request_id = str(self.headers.get("X-AFP-Request-ID", "")).strip()
+        if not request_id or len(request_id) > 128:
+            return ""
+        return f"{path}:{request_id}"
+
+    def _replay_get(self, key: str) -> tuple[int, dict] | None:
+        if not key:
+            return None
+        with self.replay_lock:
+            return self.replay_cache.get(key)
+
+    def _replay_put(self, key: str, status: HTTPStatus, payload: dict) -> None:
+        if not key:
+            return
+        with self.replay_lock:
+            self.replay_cache[key] = (int(status), dict(payload))
+            while len(self.replay_cache) > 256:
+                self.replay_cache.pop(next(iter(self.replay_cache)))
+
+    def _send_security_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "same-origin")
+        for value in getattr(self, "_pending_cookies", []):
+            self.send_header("Set-Cookie", value)
+        self._pending_cookies = []
+
+    def _begin_operation(self, name: str) -> threading.Lock | None:
+        now = time.monotonic()
+        with _OPERATION_LOCKS_GUARD:
+            lock = _OPERATION_LOCKS.setdefault(name, threading.Lock())
+            if lock.acquire(blocking=False):
+                _OPERATION_LOCK_STARTED[name] = now
+                return lock
+            started = _OPERATION_LOCK_STARTED.get(name)
+            if started is not None and now - started > OPERATION_LOCK_TTL_SECONDS:
+                replacement = threading.Lock()
+                replacement.acquire()
+                _OPERATION_LOCKS[name] = replacement
+                _OPERATION_LOCK_STARTED[name] = now
+                return replacement
+        self._send_json(
+            {"error": "operation_in_progress", "operation": name},
+            HTTPStatus.CONFLICT,
+        )
+        return None
+
+    def _send_network_status(self) -> None:
+        payload = self._current_network_status()
+        payload.pop("api_key", None)
+        payload.pop("model_name", None)
+        started = float(self.service_started_at or time.time())
+        payload["service_uptime_seconds"] = round(
+            max(0.0, time.time() - started), 1
+        )
+        self._send_json(payload)
+
+    def _cloudflared_status(self) -> dict[str, object]:
+        try:
+            from public_web import inspect_cloudflared_service
+            config = dict(getattr(self, "public_web_config", {}) or {})
+            return inspect_cloudflared_service(str(config.get("cloudflared_service", "cloudflared")))
+        except Exception:
+            return {"installed": False, "running": False, "service_name": "cloudflared", "error_code": "inspection_unavailable"}
+
+    def _send_json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
+        raw, compressed = encode_json_response(
+            payload, self.headers.get("Accept-Encoding", "")
+        )
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        if compressed:
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("Cache-Control", "no-store")
+        self._send_security_headers()
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _send_file(self, path: Path) -> None:
+        if not path.exists() or not path.is_file():
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        raw, delivery_headers = encode_static_file_response(
+            path, self.headers.get("Accept-Encoding", ""), STATIC_DIR
+        )
+        mime, _ = mimetypes.guess_type(path.name)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", f"{mime or 'application/octet-stream'}; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        for name, value in delivery_headers.items():
+            self.send_header(name, value)
+        self._send_security_headers()
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _send_download(
+        self,
+        raw: bytes,
+        filename: str,
+        content_type: str = "application/octet-stream",
+    ) -> None:
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", filename).strip("._")
+        safe_name = safe_name or "download.bin"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{safe_name}"')
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
+        self._send_security_headers()
+        self.end_headers()
+        self.wfile.write(raw)
+
+    @staticmethod
+    def _one(query: dict[str, list[str]], key: str, default: str) -> str:
+        return query.get(key, [default])[0]
+
+    def _live_payload(
+        self,
+        query: dict[str, list[str]],
+        acquisition: AcquisitionManager | None = None,
+    ) -> dict:
+        requested_mode = self._one(query, "acquisition_mode", "")
+        identity = self._identity()
+        with self.remote_simulation_hosts_lock:
+            simulation_execution_host = self.remote_simulation_hosts.get(
+                str(identity.session_id or ""), "server"
+            )
+        public_simulation = (
+            self.path.split("?", 1)[0] in {"/api/simulation/live", "/api/simulation/ws"}
+            or (
+                requested_mode == "simulation"
+                and identity.role != "local_admin"
+                and simulation_execution_host != "helper_local"
+            )
+        )
+        acquisition = acquisition or self._request_acquisition(
+            requested_mode
+        )
+        payload = self.dashboard.live(
+            sensor_id=int(self._one(query, "sensor", "2")),
+            history=int(self._one(query, "history", "240")),
+            step=int(self._one(query, "step", "1")),
+            threshold=float(self._one(query, "threshold", "0.5")),
+            rho=float(self._one(query, "rho", "0.5")),
+            indicator=self._one(query, "indicator", "TC-HI"),
+            model_kind=self._one(query, "model", "random_forest"),
+            prediction_horizon=int(
+                self._one(query, "prediction_horizon", "24")
+            ),
+            forecast_lead=int(self._one(query, "forecast_lead", "1")),
+            use_optimized_warning=self._one(
+                query, "use_optimized_warning", "true"
+            ).lower()
+            in {"1", "true", "yes", "on"},
+            prediction_sensors=(
+                (
+                    []
+                    if self._one(query, "prediction_sensors", "__none__")
+                    == "__none__"
+                    else [
+                        name
+                        for name in self._one(
+                            query, "prediction_sensors", ""
+                        ).split(",")
+                        if name in ALL_SENSOR_COLUMNS
+                    ]
+                )
+                if "prediction_sensors" in query
+                else None
+            ),
+            processing_mode=self._one(
+                query, "processing_mode", "prediction_warning"
+            ),
+            dataset_schema=self._one(
+                query, "dataset_schema", "legacy_original"
+            ),
+            prediction_model_type=self._one(
+                query, "prediction_model_type", "i_T_G"
+            ),
+            acquisition=acquisition,
+        )
+        acquisition_payload = payload.get("acquisition")
+        if isinstance(acquisition_payload, dict):
+            published_at = time.time()
+            acquisition_payload["remote_browser_published_at"] = published_at
+            try:
+                latest_sample_at = float(
+                    acquisition_payload.get("remote_latest_sample_at")
+                )
+            except (TypeError, ValueError):
+                latest_sample_at = 0.0
+            acquisition_payload["remote_sample_end_to_end_age_ms"] = (
+                max(0.0, (published_at - latest_sample_at) * 1000.0)
+                if latest_sample_at > 0
+                else None
+            )
+        if public_simulation and isinstance(payload.get("acquisition"), dict):
+            payload["acquisition"] = self.guest_manager.public_status(
+                self._identity().guest_id, payload["acquisition"]
+            )
+        return payload
+
+    def _serve_live_websocket(self, query: dict[str, list[str]]) -> None:
+        """Push live dashboard payloads over one RFC 6455 connection.
+
+        The existing acquisition and prediction code remains the source of
+        truth.  This endpoint only replaces repeated HTTP requests with a
+        persistent server-to-browser stream; local/LAN clients keep the
+        existing polling path.
+        """
+        from websocket_live import websocket_handshake_headers
+
+        key = str(self.headers.get("Sec-WebSocket-Key") or "").strip()
+        if not key:
+            self._send_json({"error": "websocket_key_missing"}, HTTPStatus.BAD_REQUEST)
+            return
+        headers = websocket_handshake_headers(key)
+        previous_protocol = self.protocol_version
+        self.protocol_version = "HTTP/1.1"
+        try:
+            self.send_response(HTTPStatus.SWITCHING_PROTOCOLS)
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+        finally:
+            self.protocol_version = previous_protocol
+        self.close_connection = True
+        # A server-initiated stream does not need browser application frames,
+        # but checking readability lets us acknowledge close/ping frames.
+        self.request.settimeout(5.0)
+        acquisition = None
+        if self.path.split("?", 1)[0] == "/api/simulation/ws":
+            acquisition = self.guest_manager.acquisition(self._identity().guest_id)
+        if acquisition is None:
+            acquisition = self._request_acquisition(
+                self._one(query, "acquisition_mode", "")
+            )
+        try:
+            next_push = 0.0
+            next_heartbeat = time.monotonic() + 5.0
+            payload_cache = VersionedPayloadCache()
+            while True:
+                now = time.monotonic()
+                wait_for = max(0.0, min(0.05, next_push - now))
+                readable, _, _ = select.select([self.request], [], [], wait_for)
+                if readable:
+                    try:
+                        control = self.request.recv(4096)
+                    except (OSError, TimeoutError):
+                        return
+                    if not control:
+                        return
+                    opcode = control[0] & 0x0F
+                    if opcode == 0x8:  # close
+                        self.request.sendall(encode_server_frame(b"", opcode=0x8))
+                        return
+                    if opcode == 0x9:  # ping
+                        self.request.sendall(encode_server_frame(b"", opcode=0xA))
+                    continue
+                if time.monotonic() < next_push:
+                    continue
+                try:
+                    payload = payload_cache.payload_for(
+                        acquisition,
+                        lambda: self._live_payload(query, acquisition=acquisition),
+                    )
+                    if payload is None:
+                        if time.monotonic() < next_heartbeat:
+                            next_push = time.monotonic() + 0.05
+                            continue
+                        payload = {
+                            "type": "heartbeat",
+                            "stream_version": payload_cache.version,
+                        }
+                        next_heartbeat = time.monotonic() + 5.0
+                    frame = encode_json_frame(payload)
+                except Exception as exc:
+                    frame = encode_json_frame({"type": "error", "error": str(exc)})
+                self.request.sendall(frame)
+                next_push = time.monotonic() + 0.05
+        except (BrokenPipeError, ConnectionResetError, OSError, TimeoutError):
+            return
+
+    def _serve_helper_websocket(self, query: dict[str, list[str]]) -> None:
+        """Keep one authenticated local-helper connection open over WSS.
+
+        The helper uses the same pairing token and command contract as the
+        legacy HTTPS poller.  This endpoint only changes message transport;
+        discovery and capture still execute in the existing helper process.
+        """
+        authorization = str(self.headers.get("Authorization", ""))
+        token = (
+            authorization[7:].strip()
+            if authorization.lower().startswith("bearer ")
+            else ""
+        )
+        device_id = str(
+            (query.get("device_id") or [""])[0]
+            or self.headers.get("X-AFP-Device-ID", "")
+        ).strip()
+        session_id = self.dashboard.helper_registry.authenticate(device_id, token)
+        if not session_id:
+            self._send_json({"ok": False, "error": "helper_authentication_failed"}, HTTPStatus.UNAUTHORIZED)
+            return
+        key = str(self.headers.get("Sec-WebSocket-Key") or "").strip()
+        if not key:
+            self._send_json({"ok": False, "error": "websocket_key_missing"}, HTTPStatus.BAD_REQUEST)
+            return
+        headers = websocket_handshake_headers(key)
+        previous_protocol = self.protocol_version
+        self.protocol_version = "HTTP/1.1"
+        try:
+            self.send_response(HTTPStatus.SWITCHING_PROTOCOLS)
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+        finally:
+            self.protocol_version = previous_protocol
+        self.close_connection = True
+
+        sender = synchronized_json_sender(self.request)
+
+        if not self.dashboard.helper_registry.attach(
+            session_id, device_id, token, sender
+        ):
+            return
+        self.request.settimeout(30.0)
+        try:
+            while True:
+                opcode, raw = recv_client_frame(self.request)
+                if opcode == 0x8:  # close
+                    try:
+                        self.request.sendall(encode_server_frame(b"", opcode=0x8))
+                    except OSError:
+                        pass
+                    return
+                if opcode == 0x9:  # ping
+                    self.request.sendall(encode_server_frame(raw, opcode=0xA))
+                    continue
+                if opcode != 0x1:  # only text application messages are needed
+                    continue
+                try:
+                    message = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, ValueError):
+                    sender({"type": "error", "error": "helper消息不是有效JSON"})
+                    continue
+                if not isinstance(message, dict):
+                    sender({"type": "error", "error": "helper消息必须是JSON对象"})
+                    continue
+                message_type = str(message.get("type") or "").strip().lower()
+                if message_type == "hello":
+                    capabilities = message.get("capabilities")
+                    self.dashboard.helper_registry.attach(
+                        session_id,
+                        device_id,
+                        token,
+                        sender,
+                        capabilities=capabilities
+                        if isinstance(capabilities, dict)
+                        else None,
+                    )
+                    sender({"type": "hello_ack", "ok": True})
+                elif message_type == "heartbeat":
+                    if self.dashboard.helper_registry.authenticate(device_id, token):
+                        sender({"type": "heartbeat_ack", "ok": True})
+                    else:
+                        sender({"type": "error", "error": "helper_authentication_failed"})
+                        return
+                elif message_type == "result":
+                    accepted = self._accept_helper_result(
+                        device_id, token,
+                        str(message.get("request_id") or ""),
+                        message.get("payload")
+                        if isinstance(message.get("payload"), dict)
+                        else {},
+                    )
+                    sender({"type": "result_ack", **accepted})
+                elif message_type == "sample_batch":
+                    batch = message.get("batch")
+                    accepted = self._ingest_helper_sample(session_id, batch if isinstance(batch, dict) else {})
+                    sender({"type": "sample_ack", **accepted})
+                else:
+                    sender({"type": "error", "error": "helper消息类型不受支持"})
+        except (BrokenPipeError, ConnectionResetError, ConnectionError, OSError, TimeoutError, ValueError):
+            return
+        finally:
+            self.dashboard.helper_registry.detach(session_id, sender=sender)
+
+    def do_GET(self) -> None:  # noqa: N802
+        if not self._is_allowed_host():
+            self._send_json({"error": "请求 Host 不被允许"}, HTTPStatus.FORBIDDEN)
+            return
+        parsed = urlparse(self.path)
+        self._ensure_browser_cookies()
+        if parsed.path.startswith("/api/") and not self._require_permission(
+            "GET", parsed.path
+        ):
+            return
+        if (
+            parsed.path in {"/api/simulation/ws", "/api/live/ws"}
+            and str(self.headers.get("Upgrade") or "").lower() == "websocket"
+        ):
+            self._serve_live_websocket(parse_qs(parsed.query))
+            return
+        if (
+            parsed.path == "/api/helper/ws"
+            and str(self.headers.get("Upgrade") or "").lower() == "websocket"
+        ):
+            self._serve_helper_websocket(parse_qs(parsed.query))
+            return
+        if parsed.path == "/api/health":
+            self._send_json(
+                {"status": "ok", "version": APP_VERSION, "build_id": BUILD_ID}
+            )
+            return
+        if parsed.path == "/api/network/status":
+            self._send_network_status()
+            return
+        if parsed.path == "/api/real/control/status":
+            self._send_json(self.control_lease.status())
+            return
+        if parsed.path == "/api/admin/status":
+            self._send_json(
+                {
+                    "security": self.security_store.safe_status(),
+                    "real_control": self.control_lease.status(),
+                    "network": dict(self.network_status or {}),
+                }
+            )
+            return
+        if parsed.path == "/api/admin/security/settings":
+            config = dict(getattr(self, "public_web_config", {}) or {})
+            self._send_json(
+                {
+                    "security": self.security_store.safe_status(),
+                    "hostname": str(config.get("hostname", config.get("domain", ""))),
+                    "guest_session_quota_mb": int(config.get("guest_session_quota_mb", 256)),
+                    "guest_total_quota_mb": int(config.get("guest_total_quota_mb", 2048)),
+                    "cloudflared": self._cloudflared_status(),
+                }
+            )
+            return
+        if parsed.path == "/api/auth/session":
+            identity = self._identity()
+            safe_status = self.security_store.safe_status()
+            self._send_json(
+                {
+                    "authenticated": identity.role in REAL_ACCESS_ROLES,
+                    "role": identity.role,
+                    "model_access": bool(
+                        identity.role in REAL_ACCESS_ROLES
+                        and safe_status.get("model_configured")
+                    ),
+                    "secure_transport": self._is_secure_transport(),
+                    "csrf_ready": bool(self._request_cookies().get("afp_csrf")),
+                }
+            )
+            return
+        if parsed.path == "/api/public/device-status":
+            self._send_json(
+                build_public_device_status(
+                    None,
+                    self.dashboard.acquisition.latest_check_result(),
+                    self.dashboard.acquisition.status(),
+                )
+            )
+            return
+        if parsed.path == "/api/simulation/status":
+            self._send_json(self.guest_manager.status(self._identity().guest_id))
+            return
+        if parsed.path == "/api/simulation/packages":
+            identity = self._identity()
+            if identity.role not in {"authorized", "lan_operator"}:
+                self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
+                return
+            self._send_json({"ok": True, "packages": simulation_package_catalog()})
+            return
+        if parsed.path == "/api/simulation/package-download":
+            identity = self._identity()
+            if identity.role not in {"authorized", "lan_operator"}:
+                self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
+                return
+            try:
+                package_id = self._one(parse_qs(parsed.query), "package_id", "")
+                package_path = resolve_simulation_package(package_id)
+                self._send_download(
+                    package_path.read_bytes(),
+                    package_path.name,
+                    "text/csv; charset=utf-8",
+                )
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+            return
+        if parsed.path == "/api/simulation/dataset":
+            try:
+                self._send_json(
+                    self.guest_manager.dataset(self._identity().guest_id)
+                )
+            except GuestSimulationError as exc:
+                self._send_json(
+                    {"ok": False, "error": str(exc), "code": exc.code},
+                    HTTPStatus.BAD_REQUEST,
+                )
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/simulation/live":
+            try:
+                query = parse_qs(parsed.query)
+                self._send_json(
+                    self._live_payload(
+                        query,
+                        self.guest_manager.acquisition(self._identity().guest_id),
+                    )
+                )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/simulation/download":
+            raw, filename = self.guest_manager.download_archive(
+                self._identity().guest_id
+            )
+            self._send_download(raw, filename, "application/zip")
+            return
+        if parsed.path == "/api/simulation/export-manifest":
+            self._send_json(self.guest_manager.export_manifest(self._identity().guest_id))
+            return
+        if parsed.path == "/api/simulation/export-file":
+            try:
+                relative_path = self._one(parse_qs(parsed.query), "path", "")
+                raw, _name = self.guest_manager.export_file(self._identity().guest_id, relative_path)
+                self._send_download(raw, Path(relative_path).name)
+            except (FileNotFoundError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+            return
+        if parsed.path == "/api/agent/defaults":
+            from interface_agent import DEFAULT_SILICONFLOW_MODEL
+
+            identity = self._identity()
+            if identity.role in REAL_ACCESS_ROLES:
+                _api_key, model_name = self.security_store.model_credentials()
+                self._send_json(
+                    {
+                        "model_name": model_name or DEFAULT_SILICONFLOW_MODEL,
+                        "model_access": bool(_api_key and model_name),
+                        "default_key_available": bool(_api_key),
+                    }
+                )
+            else:
+                self._send_json(
+                    {
+                        "model_name": DEFAULT_SILICONFLOW_MODEL,
+                        "model_access": False,
+                        "default_key_available": False,
+                    }
+                )
+            return
+        if parsed.path == "/api/agent/diagnose/result":
+            session_id = str(self._identity().session_id or "")
+            if not session_id:
+                self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
+                return
+            job_id = self._one(parse_qs(parsed.query), "job_id", "")
+            snapshot = self.diagnosis_jobs.get(session_id, job_id)
+            if snapshot is None:
+                self._send_json({"error": "job_not_found"}, HTTPStatus.NOT_FOUND)
+                return
+            self._send_json(snapshot)
+            return
+        if parsed.path == "/api/training/status":
+            query = parse_qs(parsed.query)
+            self._send_json(self.dashboard.web_training.status(int(self._one(query, "after_seq", "0"))))
+            return
+        if parsed.path == "/api/training/defaults":
+            query = parse_qs(parsed.query)
+            self._send_json(self.dashboard.web_training.defaults(self._one(query, "mode", "new")))
+            return
+        if parsed.path == "/api/bootstrap":
+            identity = self._identity()
+            # Server hardware belongs only to the loopback administrator.
+            # Remote roles either use their paired helper or browser uploads;
+            # probing PLC/ABB/RTSP here adds several seconds and the result is
+            # discarded below for helper-backed sessions anyway.
+            bootstrap = self.dashboard.bootstrap(
+                include_discovery=identity.role == "local_admin"
+            )
+            acquisition = bootstrap.get("acquisition") or {}
+            demo = acquisition.get("new_collection_demo") or {}
+            # Use the same administrator-approved CSV as the initial source in
+            # both guest playback and the unlocked desktop-style simulation.
+            # Guests receive only the display name below; authorized users need
+            # the full local path so the original chooser/start flow can read it.
+            default_source = str(demo.get("source_file") or "")
+            if default_source:
+                acquisition["simulation_source_type"] = "single_csv"
+                acquisition["simulation_source_name"] = default_source
+            if uses_local_capture_helper(identity.role):
+                # Real acquisition for remote operators belongs to the paired
+                # visitor helper.  Never seed its panel with server hardware
+                # or a server-local save folder while the helper reconnects.
+                # Static sensor roles/defaults do not probe server hardware;
+                # keep them so the browser does not fall back to custom JSON.
+                bootstrap = deepcopy(bootstrap)
+                acquisition = bootstrap.get("acquisition") or {}
+                acquisition["interface_defaults"] = default_capture_interfaces()
+                acquisition["sensor_types"] = sensor_interface_profiles()
+                acquisition["interface_discovery"] = {"physical_interfaces": []}
+                acquisition["default_save_root"] = ""
+                bootstrap["acquisition"] = acquisition
+            if identity.role == "guest":
+                bootstrap = deepcopy(bootstrap)
+                bootstrap["manifest"] = {
+                    key: value
+                    for key, value in (bootstrap.get("manifest") or {}).items()
+                    if key not in {"result_dir", "split_root", "output_root"}
+                }
+                acquisition = bootstrap.get("acquisition") or {}
+                discovery = acquisition.get("interface_discovery") or {}
+                physical_interfaces = []
+                for item in discovery.get("physical_interfaces") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    physical_interfaces.append({
+                        key: item.get(key)
+                        for key in (
+                            "id", "kind", "protocol", "endpoint", "label",
+                            "description", "detected", "driver_available",
+                            "auto_assignable", "shared_roles",
+                        )
+                        if key in item
+                    })
+                acquisition["interface_discovery"] = {
+                    "physical_interfaces": physical_interfaces,
+                }
+                acquisition["interface_defaults"] = default_capture_interfaces()
+                acquisition["sensor_types"] = sensor_interface_profiles()
+                acquisition["default_save_root"] = ""
+                source_status = self.guest_manager.source_status(identity.guest_id)
+                acquisition["simulation_source_type"] = source_status.get("source_type", "single_csv")
+                acquisition["simulation_source_name"] = source_status.get("name", "")
+                acquisition["simulation_source_channels"] = source_status.get("channels", [])
+                demo = acquisition.get("new_collection_demo") or {}
+                demo["source_file"] = ""
+                demo["prediction_model"] = None
+                bootstrap["acquisition"] = acquisition
+            self._send_json(bootstrap)
+            return
+        if parsed.path == "/api/mysql/defaults":
+            self._send_json(public_mysql_profiles())
+            return
+        if parsed.path == "/api/helper/status":
+            self._send_json(
+                self.dashboard.helper_registry.status(
+                    str(self._identity().session_id or self._identity().guest_id)
+                )
+            )
+            return
+        if parsed.path == "/api/helper/result":
+            request_id = self._one(parse_qs(parsed.query), "request_id", "")
+            session_id = str(self._identity().session_id or "")
+            result = self.dashboard.helper_registry.pop_result(session_id, request_id)
+            self._send_json({"ok": result is not None, "request_id": request_id, "payload": result})
+            return
+        if parsed.path == "/api/acquisition/status":
+            query = parse_qs(parsed.query)
+            requested_mode = self._one(query, "acquisition_mode", "")
+            identity = self._identity()
+            with self.remote_simulation_hosts_lock:
+                simulation_execution_host = self.remote_simulation_hosts.get(
+                    str(identity.session_id or ""), "server"
+                )
+            if (
+                requested_mode == "simulation"
+                and identity.role != "local_admin"
+                and simulation_execution_host != "helper_local"
+            ):
+                self._send_json(self.guest_manager.status(identity.guest_id))
+            else:
+                status = self._request_acquisition(requested_mode).status()
+                if identity.role in REAL_ACCESS_ROLES and identity.role != "local_admin":
+                    status = self._target_status(str(identity.session_id or ""), status)
+                self._send_json(status)
+            return
+        if parsed.path == "/api/acquisition/save-status":
+            query = parse_qs(parsed.query)
+            requested = self._one(query, "path", "")
+            self._send_json(check_capture_save_root(requested))
+            return
+        if parsed.path == "/api/acquisition/export-manifest":
+            self._send_json(self.dashboard.acquisition.export_manifest())
+            return
+        if parsed.path == "/api/acquisition/export-file":
+            try:
+                relative_path = self._one(parse_qs(parsed.query), "path", "")
+                raw, _name = self.dashboard.acquisition.export_file(relative_path)
+                self._send_download(raw, Path(relative_path).name)
+            except (FileNotFoundError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+            return
+        if parsed.path == "/api/acquisition/discover":
+            self._send_json(self.dashboard.acquisition.discover_interfaces())
+            return
+        if parsed.path == "/api/live":
+            try:
+                query = parse_qs(parsed.query)
+                payload = self._live_payload(query)
+                self._send_json(payload)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/view":
+            try:
+                query = parse_qs(parsed.query)
+                payload = self.dashboard.view(
+                    specimen_id=self._one(query, "specimen", ""),
+                    layer_id=self._one(query, "layer", "") or None,
+                    sensor_id=int(self._one(query, "sensor", "2")),
+                    distance=int(self._one(query, "distance", "0")),
+                    length=int(self._one(query, "length", "480")),
+                    step=int(self._one(query, "step", "1")),
+                    threshold=float(self._one(query, "threshold", "0.5")),
+                    rho=float(self._one(query, "rho", "0.5")),
+                    score_mode=self._one(query, "score_mode", "soft"),
+                )
+                self._send_json(payload)
+            except Exception as exc:  # pragma: no cover - returned to browser
+                self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/realtime":
+            try:
+                query = parse_qs(parsed.query)
+                payload = self.dashboard.realtime(
+                    specimen_id=self._one(query, "specimen", ""),
+                    sensor_id=int(self._one(query, "sensor", "2")),
+                    cursor=int(self._one(query, "cursor", "24")),
+                    history=int(self._one(query, "history", "240")),
+                    step=int(self._one(query, "step", "1")),
+                    threshold=float(self._one(query, "threshold", "0.5")),
+                    rho=float(self._one(query, "rho", "0.5")),
+                    score_mode=self._one(query, "score_mode", "soft"),
+                    indicator=self._one(query, "indicator", "TC-HI"),
+                    model_kind=self._one(query, "model", "random_forest"),
+                    prediction_horizon=int(
+                        self._one(query, "prediction_horizon", "24")
+                    ),
+                    realtime_prediction=self._one(
+                        query, "realtime_prediction", "false"
+                    ).lower() in {"1", "true", "yes", "on"},
+                    forecast_lead=int(
+                        self._one(query, "forecast_lead", "1")
+                    ),
+                    use_optimized_warning=self._one(
+                        query, "use_optimized_warning", "true"
+                    ).lower() in {"1", "true", "yes", "on"},
+                    dataset_schema=self._one(
+                        query, "dataset_schema", "legacy_original"
+                    ),
+                    prediction_model_type=self._one(
+                        query, "prediction_model_type", "i_T_G"
+                    ),
+                )
+                self._send_json(payload)
+            except Exception as exc:  # pragma: no cover - returned to browser
+                self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+
+        relative = "index.html" if parsed.path in ("", "/") else parsed.path.lstrip("/")
+        target = (STATIC_DIR / relative).resolve()
+        if STATIC_DIR.resolve() not in target.parents and target != STATIC_DIR.resolve():
+            self.send_error(HTTPStatus.FORBIDDEN)
+            return
+        self._send_file(target)
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if self._reject_unsafe_request():
+            return
+        self._ensure_browser_cookies()
+        if not self._require_permission("POST", parsed.path):
+            return
+        helper_transport_path = parsed.path in {
+            "/api/helper/pair/complete",
+            "/api/helper/poll",
+            "/api/helper/result",
+            "/api/helper/samples",
+            "/api/helper/simulation-source/chunk",
+        }
+        if not helper_transport_path and not self._require_csrf():
+            return
+        if parsed.path == "/api/auth/login" and not self._is_secure_transport():
+            self._send_json({"error": "https_required"}, HTTPStatus.UPGRADE_REQUIRED)
+            return
+        content_type = str(self.headers.get("Content-Type", "")).lower()
+        if not content_type.startswith("application/json"):
+            self._send_json(
+                {"error": "POST 请求必须使用 application/json"},
+                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+            )
+            return
+        operation_name = None
+        if parsed.path in {
+            "/api/acquisition/test",
+            "/api/acquisition/reset-check",
+        }:
+            operation_name = "acquisition-check"
+        elif parsed.path == "/api/agent/diagnose":
+            # Model diagnosis may legitimately take longer than a hardware
+            # probe.  Keep its mutex independent so a timed-out/slow model
+            # request cannot block reset/recheck of the physical interfaces.
+            operation_name = "agent-diagnose"
+        elif parsed.path in {"/api/acquisition/start", "/api/acquisition/stop"}:
+            operation_name = "acquisition-control"
+        elif parsed.path in {"/api/training/start", "/api/training/stop"}:
+            operation_name = "training-control"
+        operation_lock = (
+            self._begin_operation(operation_name) if operation_name else None
+        )
+        if operation_name and operation_lock is None:
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length) if length else b"{}"
+            payload = json.loads(body.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("请求体必须是JSON对象")
+            if parsed.path == "/api/helper/pair/complete":
+                result = self.dashboard.helper_registry.complete_pairing(
+                    str(payload.get("challenge") or ""),
+                    str(payload.get("device_id") or ""),
+                    payload.get("capabilities")
+                    if isinstance(payload.get("capabilities"), dict)
+                    else {},
+                )
+                self._send_json(result)
+                return
+            if parsed.path in {
+                "/api/helper/poll",
+                "/api/helper/result",
+                "/api/helper/samples",
+                "/api/helper/simulation-source/chunk",
+            }:
+                authorization = str(self.headers.get("Authorization", ""))
+                token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+                device_id = str(payload.get("device_id") or "")
+                if parsed.path == "/api/helper/poll":
+                    result = self.dashboard.helper_registry.poll(device_id, token)
+                elif parsed.path == "/api/helper/samples":
+                    session_id = self.dashboard.helper_registry.authenticate(device_id, token)
+                    if session_id is None:
+                        result = {"ok": False, "error": "helper_authentication_failed"}
+                    else:
+                        batch = payload.get("batch")
+                        result = self._ingest_helper_sample(
+                            session_id, batch if isinstance(batch, dict) else {}
+                        )
+                elif parsed.path == "/api/helper/simulation-source/chunk":
+                    session_id = self.dashboard.helper_registry.authenticate(device_id, token)
+                    if session_id is None:
+                        result = {"ok": False, "error": "helper_authentication_failed"}
+                    else:
+                        try:
+                            result = self.simulation_source_transfers.read_chunk(
+                                str(payload.get("ticket") or ""),
+                                session_id,
+                                file_index=int(payload.get("file_index", -1)),
+                                offset=int(payload.get("offset", 0)),
+                                limit=int(payload.get("limit", MAX_TRANSFER_CHUNK_BYTES)),
+                            )
+                        except SimulationSourceTransferError as exc:
+                            self._send_json(
+                                {"ok": False, "error": str(exc)},
+                                HTTPStatus.BAD_REQUEST,
+                            )
+                            return
+                else:
+                    result = self._accept_helper_result(
+                        device_id, token,
+                        str(payload.get("request_id") or ""),
+                        payload.get("payload") if isinstance(payload.get("payload"), dict) else {},
+                    )
+                self._send_json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.UNAUTHORIZED)
+                return
+            if parsed.path in {
+                "/api/real/control/acquire",
+                "/api/real/control/heartbeat",
+                "/api/real/control/release",
+            }:
+                owner_id = self._control_owner_id()
+                if parsed.path.endswith("/acquire"):
+                    decision = self.control_lease.acquire(
+                        owner_id,
+                        str(self.headers.get("User-Agent", "访客浏览器")),
+                    )
+                    self._send_json(
+                        {
+                            "granted": decision.granted,
+                            "error": decision.error,
+                            "control": self.control_lease.status(),
+                        },
+                        HTTPStatus.OK if decision.granted else HTTPStatus.CONFLICT,
+                    )
+                elif parsed.path.endswith("/heartbeat"):
+                    decision = self.control_lease.heartbeat(owner_id)
+                    self._send_json(
+                        {
+                            "granted": decision.granted,
+                            "error": decision.error,
+                            "control": self.control_lease.status(),
+                        },
+                        HTTPStatus.OK if decision.granted else HTTPStatus.CONFLICT,
+                    )
+                else:
+                    self._send_json(
+                        {
+                            "released": self.control_lease.release(owner_id),
+                            "control": self.control_lease.status(),
+                        }
+                    )
+                return
+            if parsed.path == "/api/admin/real-control/takeover":
+                decision = self.control_lease.force_takeover()
+                self._send_json(
+                    {
+                        "granted": decision.granted,
+                        "control": self.control_lease.status(),
+                    }
+                )
+                return
+            if parsed.path == "/api/admin/security/configure":
+                password = str(payload.get("password") or "")
+                api_key = str(payload.get("api_key") or "")
+                model_name = str(payload.get("model_name") or "")
+                self.security_store.configure_owner(password, api_key, model_name)
+                self._send_json(
+                    {
+                        "configured": True,
+                        "security": self.security_store.safe_status(),
+                    }
+                )
+                return
+            if parsed.path == "/api/admin/security/settings":
+                password = str(payload.get("password") or "")
+                model_name = str(payload.get("model_name") or "")
+                clear_key = bool(payload.get("clear_api_key", False))
+                if "api_key" in payload and not clear_key:
+                    api_key = str(payload.get("api_key") or "")
+                elif clear_key:
+                    api_key = ""
+                else:
+                    api_key, _previous_model = self.security_store.model_credentials()
+                if not model_name:
+                    _previous_key, model_name = self.security_store.model_credentials()
+                self.security_store.configure_owner(password, api_key, model_name)
+                self._send_json({"security": self.security_store.safe_status()})
+                return
+            if parsed.path == "/api/admin/security/revoke":
+                self.security_store.revoke(str(payload.get("session_id") or ""))
+                self._send_json({"revoked": True, "security": self.security_store.safe_status()})
+                return
+            if parsed.path == "/api/admin/simulation/cleanup":
+                self._send_json({"cleanup": self.guest_manager.cleanup_stopped()})
+                return
+            if parsed.path == "/api/admin/security/revoke-all":
+                self.security_store.revoke_all()
+                self._send_json({"revoked": True, "security": self.security_store.safe_status()})
+                return
+            if parsed.path == "/api/auth/login":
+                remote_key = self._remote_label() or "unknown"
+                if self.login_limiter.blocked("login", remote_key) or (
+                    self.login_limiter.count("login", remote_key, 600.0) >= 5
+                ):
+                    self._send_json(
+                        {"error": "login_rate_limited"},
+                        HTTPStatus.TOO_MANY_REQUESTS,
+                    )
+                    return
+                try:
+                    token, session = self.security_store.authenticate(
+                        str(payload.get("password") or ""),
+                        str(self.headers.get("User-Agent", "")),
+                        remote_key,
+                    )
+                except AuthenticationError:
+                    self.login_limiter.allow("login", remote_key, 5, 600.0)
+                    if self.login_limiter.count("login", remote_key, 600.0) >= 5:
+                        self.login_limiter.block("login", remote_key, 900.0)
+                    self._send_json(
+                        {"error": "authentication_failed"},
+                        HTTPStatus.UNAUTHORIZED,
+                    )
+                    return
+                self.login_limiter.clear("login", remote_key)
+                self._queue_cookie(
+                    "afp_session",
+                    token,
+                    http_only=True,
+                    same_site="Strict",
+                    max_age=2147483647,
+                )
+                self._request_identity = RequestIdentity(
+                    "authorized", session.session_id, self._identity().guest_id
+                )
+                safe_status = self.security_store.safe_status()
+                self._send_json(
+                    {
+                        "authenticated": True,
+                        "role": "authorized",
+                        "model_access": bool(safe_status.get("model_configured")),
+                    }
+                )
+                return
+            controlled_paths = {
+                "/api/acquisition/test",
+                "/api/acquisition/reset-check",
+                "/api/acquisition/start",
+                "/api/acquisition/stop",
+                "/api/acquisition/integrate",
+                "/api/training/import",
+                "/api/training/start",
+                "/api/training/stop",
+            }
+            simulation_session_control = (
+                parsed.path in {"/api/acquisition/start", "/api/acquisition/stop"}
+                and str(payload.get("acquisition_mode") or "").lower() == "simulation"
+            )
+            if (
+                parsed.path in controlled_paths
+                and not simulation_session_control
+                and not self._require_real_control()
+            ):
+                return
+            replay_key = self._replay_key(parsed.path)
+            replayed = self._replay_get(replay_key)
+            if replayed is not None:
+                self._send_json(replayed[1], HTTPStatus(replayed[0]))
+                return
+            if parsed.path == "/api/auth/logout":
+                token = str(self._request_cookies().get("afp_session") or "")
+                self.security_store.logout(token)
+                self._queue_cookie(
+                    "afp_session",
+                    "",
+                    http_only=True,
+                    same_site="Strict",
+                    max_age=0,
+                )
+                self._send_json({"authenticated": False, "role": "guest"})
+                return
+            if parsed.path == "/api/simulation/start":
+                self._send_json(
+                    self.guest_manager.start(self._identity().guest_id, payload)
+                )
+                return
+            if parsed.path == "/api/simulation/process-parameters":
+                self._send_json(
+                    self.guest_manager.read_process_parameters(
+                        self._identity().guest_id, payload
+                    )
+                )
+                return
+            if parsed.path == "/api/simulation/select-source":
+                self._send_json(
+                    {
+                        "error": "remote_path_not_accessible",
+                        "message": "远程路径不可由服务器直接访问，请使用浏览器选择并上传",
+                    },
+                    HTTPStatus.BAD_REQUEST,
+                )
+                return
+            if parsed.path == "/api/simulation/upload-source":
+                files = payload.get("files")
+                self._send_json(
+                    self.guest_manager.upload_source(
+                        self._identity().guest_id,
+                        str(payload.get("source_type") or "single_csv"),
+                        files if isinstance(files, list) else [],
+                    )
+                )
+                return
+            if parsed.path == "/api/acquisition/select-package":
+                identity = self._identity()
+                if identity.role not in {"authorized", "lan_operator"}:
+                    self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
+                    return
+                try:
+                    package_id = str(payload.get("package_id") or "")
+                    package_path = resolve_simulation_package(package_id)
+                    result = self.guest_manager.upload_source(
+                        identity.guest_id,
+                        "single_csv",
+                        [
+                            {
+                                "name": package_path.name,
+                                "data": base64.b64encode(package_path.read_bytes()).decode("ascii"),
+                            }
+                        ],
+                    )
+                    result["package_id"] = package_id
+                    result["synthetic"] = True
+                    self._send_json(result)
+                except (ValueError, GuestSimulationError) as exc:
+                    self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path == "/api/simulation/stop":
+                self._send_json(
+                    self.guest_manager.stop(self._identity().guest_id)
+                )
+                return
+            if parsed.path == "/api/agent/diagnose/start":
+                from interface_agent import (
+                    DEFAULT_SILICONFLOW_MODEL,
+                    run_interface_diagnoses,
+                )
+
+                identity = self._identity()
+                if identity.role not in REAL_ACCESS_ROLES:
+                    self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
+                    return
+                request_data = _validate_agent_payload(payload)
+                try:
+                    stored_key, stored_model = self.security_store.model_credentials()
+                except Exception:
+                    stored_key, stored_model = "", DEFAULT_SILICONFLOW_MODEL
+                api_key = request_data["api_key"] or stored_key
+                model_name = request_data["model_name"] or stored_model
+                session_id = str(identity.session_id or "local-admin")
+                events = deepcopy(request_data["events"])
+                hardware_result = deepcopy(request_data["hardware_result"])
+                discovery, acquisition_status = self._diagnostic_context(
+                    hardware_result
+                )
+                fingerprint_payload = {
+                    "events": events,
+                    "hardware_result": hardware_result,
+                }
+                fingerprint = hashlib.sha256(
+                    json.dumps(
+                        fingerprint_payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+
+                # Freeze a deterministic local result before any provider call
+                # so the page can render facts even when the model is slow or
+                # unavailable.  It is intentionally never labeled as a
+                # confirmed hardware diagnosis.
+                local_result = run_interface_diagnoses(
+                    events,
+                    api_key="",
+                    model_name=DEFAULT_SILICONFLOW_MODEL,
+                    hardware_result=hardware_result,
+                    discovery=discovery,
+                    acquisition_status=acquisition_status,
+                    diagnosis_mode="fast",
+                    use_environment_credentials=False,
+                )
+                local_result["model_used"] = False
+                if not api_key or not model_name:
+                    self._send_json(
+                        {
+                            "job_id": "",
+                            "fingerprint": fingerprint,
+                            "state": "success",
+                            "phase": "local_complete",
+                            "result": local_result,
+                            "local_result": local_result,
+                            "cache_hit": bool(local_result.get("cache_hit")),
+                        }
+                    )
+                    return
+                if self.model_limiter.count("model", session_id, 60.0) >= 3:
+                    self._send_json({"error": "model_rate_limited", "local_result": local_result}, HTTPStatus.TOO_MANY_REQUESTS)
+                    return
+                self.model_limiter.allow("model", session_id, 3, 60.0)
+
+                def run_model() -> dict:
+                    if not self.model_call_lock.acquire(blocking=False):
+                        raise RuntimeError("模型调用正在进行，请稍后重试")
+                    started = time.monotonic()
+                    try:
+                        result = run_interface_diagnoses(
+                            events,
+                            api_key=api_key,
+                            model_name=model_name,
+                            hardware_result=hardware_result,
+                            discovery=discovery,
+                            acquisition_status=acquisition_status,
+                            diagnosis_mode=str(request_data.get("diagnosis_mode") or "fast"),
+                            use_environment_credentials=False,
+                        )
+                        result["model_used"] = str(
+                            result.get("model_status") or ""
+                        ).startswith("success")
+                        self.security_store.append_audit(
+                            "model_success" if result["model_used"] else "model_failure",
+                            session_id=identity.session_id,
+                            remote_label=self._remote_label(),
+                            details={
+                                "model_name": model_name,
+                                "elapsed_seconds": round(max(0.0, time.monotonic() - started), 3),
+                                "job_fingerprint": fingerprint,
+                            },
+                        )
+                        return result
+                    finally:
+                        self.model_call_lock.release()
+
+                snapshot = self.diagnosis_jobs.submit(
+                    session_id,
+                    fingerprint,
+                    run_model,
+                    local_result=local_result,
+                )
+                self._send_json(snapshot, HTTPStatus.ACCEPTED)
+                return
+            if parsed.path == "/api/agent/diagnose":
+                from interface_agent import (
+                    DEFAULT_SILICONFLOW_MODEL,
+                    run_interface_diagnoses,
+                )
+
+                request_data = _validate_agent_payload(payload)
+                identity = self._identity()
+                if identity.role in REAL_ACCESS_ROLES:
+                    try:
+                        stored_key, stored_model = self.security_store.model_credentials()
+                    except Exception:
+                        stored_key, stored_model = "", DEFAULT_SILICONFLOW_MODEL
+                    # The web form mirrors the desktop model settings.  An
+                    # explicitly supplied pair is used for this diagnosis;
+                    # leaving both fields blank falls back to the protected
+                    # credentials configured by the local administrator.
+                    api_key = request_data["api_key"] or stored_key
+                    model_name = request_data["model_name"] or stored_model
+                    use_environment = False
+                else:
+                    # Public visitors can view and run local diagnostics, but
+                    # their browser cannot turn this endpoint into a proxy for
+                    # arbitrary provider keys.
+                    api_key, model_name = "", DEFAULT_SILICONFLOW_MODEL
+                    use_environment = False
+
+                def run_local() -> dict:
+                    discovery, acquisition_status = self._diagnostic_context(
+                        request_data["hardware_result"]
+                    )
+                    local_result = run_interface_diagnoses(
+                        request_data["events"],
+                        api_key="",
+                        model_name=DEFAULT_SILICONFLOW_MODEL,
+                        hardware_result=request_data["hardware_result"],
+                        discovery=discovery,
+                        acquisition_status=acquisition_status,
+                        diagnosis_mode="fast",
+                        use_environment_credentials=False,
+                    )
+                    local_result["model_used"] = False
+                    return local_result
+
+                if not api_key or not model_name:
+                    result = run_local()
+                else:
+                    session_key = str(identity.session_id or identity.guest_id or "public")
+                    if self.model_limiter.count("model", session_key, 60.0) >= 3:
+                        self.security_store.append_audit(
+                            "model_rate_limited",
+                            session_id=identity.session_id,
+                            remote_label=self._remote_label(),
+                            details={"model_name": model_name},
+                        )
+                        result = run_local()
+                        result["error"] = "model_rate_limited"
+                        self._send_json(result, HTTPStatus.TOO_MANY_REQUESTS)
+                        return
+                    if not self.model_call_lock.acquire(blocking=False):
+                        self.security_store.append_audit(
+                            "model_rate_limited",
+                            session_id=identity.session_id,
+                            remote_label=self._remote_label(),
+                            details={"model_name": model_name},
+                        )
+                        result = run_local()
+                        result["error"] = "model_rate_limited"
+                        self._send_json(result, HTTPStatus.TOO_MANY_REQUESTS)
+                        return
+                    started = time.monotonic()
+                    self.model_limiter.allow("model", session_key, 3, 60.0)
+                    try:
+                        discovery, acquisition_status = self._diagnostic_context(
+                            request_data["hardware_result"]
+                        )
+                        result = run_interface_diagnoses(
+                            request_data["events"],
+                            api_key=api_key,
+                            model_name=model_name,
+                            hardware_result=request_data["hardware_result"],
+                            discovery=discovery,
+                            acquisition_status=acquisition_status,
+                            diagnosis_mode=str(request_data.get("diagnosis_mode") or "fast"),
+                            use_environment_credentials=use_environment,
+                        )
+                        result["model_used"] = str(
+                            result.get("model_status") or ""
+                        ).startswith("success")
+                        self.security_store.append_audit(
+                            "model_success"
+                            if result["model_used"]
+                            else "model_failure",
+                            session_id=identity.session_id,
+                            remote_label=self._remote_label(),
+                            details={
+                                "model_name": model_name,
+                                "elapsed_seconds": round(
+                                    max(0.0, time.monotonic() - started), 3
+                                ),
+                            },
+                        )
+                    finally:
+                        self.model_call_lock.release()
+                self._send_json(result)
+                return
+            if parsed.path == "/api/acquisition/test":
+                identity = self._identity()
+                remote_simulation = (
+                    str(payload.get("acquisition_mode") or "").lower() == "simulation"
+                    and identity.role != "local_admin"
+                )
+                if remote_simulation:
+                    config = self.guest_manager.safe_config(identity.guest_id, payload, authorized=True)
+                    model_validation = self.dashboard.validate_prediction_setup(
+                        config, load_model=False
+                    )
+                    result = self.guest_manager.acquisition(
+                        identity.guest_id
+                    ).test_connection(config)
+                    result["prediction_model"] = model_validation
+                    self._send_json(result)
+                    return
+                if str(payload.get("simulation_source_type", "")).lower() == "mysql":
+                    payload["simulation_mysql_query"] = validate_read_only_mysql_query(
+                        str(payload.get("simulation_mysql_query", ""))
+                    )
+                config = acquisition_config_from_payload(payload)
+                model_validation = self.dashboard.validate_prediction_setup(
+                    config, load_model=False
+                )
+                result = self.dashboard.acquisition.test_connection(config)
+                result["prediction_model"] = model_validation
+                self._send_json(result)
+                return
+            if parsed.path == "/api/acquisition/process-parameters":
+                identity = self._identity()
+                if (
+                    str(payload.get("acquisition_mode") or "").lower() == "simulation"
+                    and identity.role != "local_admin"
+                ):
+                    self._send_json(
+                        self.guest_manager.read_process_parameters(
+                            identity.guest_id, payload
+                        )
+                    )
+                    return
+                demo = (
+                    (self.dashboard.bootstrap(include_discovery=False).get("acquisition") or {})
+                    .get("new_collection_demo") or {}
+                )
+                payload = resolve_default_simulation_source(
+                    payload, str(demo.get("source_file") or "")
+                )
+                config = acquisition_config_from_payload(payload)
+                self._send_json(
+                    self.dashboard.acquisition.read_process_parameters(config)
+                )
+                return
+            if parsed.path == "/api/acquisition/reset-check":
+                self._send_json(self.dashboard.acquisition.reset_check_state())
+                return
+            if parsed.path == "/api/training/import":
+                if str(payload.get("source", "")).lower() == "mysql":
+                    payload["query"] = validate_read_only_mysql_query(
+                        str(payload.get("query", ""))
+                    )
+                self._send_json(self.dashboard.web_training.import_source(payload))
+                return
+            if parsed.path == "/api/training/start":
+                self._send_json(self.dashboard.web_training.start(payload))
+                return
+            if parsed.path == "/api/training/stop":
+                self._send_json(self.dashboard.web_training.stop())
+                return
+            if parsed.path == "/api/training/select-file":
+                selected = select_training_file(
+                    str(payload.get("initial_path", "")),
+                    str(payload.get("kind", "csv")),
+                )
+                self._send_json({"selected": bool(selected), "path": selected})
+                return
+            if parsed.path == "/api/mysql/test":
+                identity = self._identity()
+                selection = authorized_target_selection(identity, self.target_profiles, payload)
+                settings = selection.settings if selection else mysql_settings_from_mapping(payload)
+                store = MySQLCaptureStore(settings)
+                result = (
+                    mysql_test_existing_database(store)
+                    if bool(payload.get("read_only", False))
+                    else store.test_connection()
+                )
+                result = decorate_server_mysql_result(result)
+                if selection is not None:
+                    result.update(selection.public())
+                if not result.get("ok"):
+                    result["error_detail"] = classify_mysql_error(result.get("error"))
+                self._send_json(result)
+                return
+            if parsed.path == "/api/helper/pair/start":
+                session_id = str(self._identity().session_id or "")
+                if not session_id:
+                    self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
+                    return
+                self._send_json(self.dashboard.helper_registry.start_pairing(session_id))
+                return
+            if parsed.path == "/api/helper/command":
+                identity = self._identity()
+                session_id = str(identity.session_id or "")
+                if not session_id:
+                    self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
+                    return
+                command_name = str(payload.get("command") or "").strip().lower()
+                command_payload = (
+                    payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+                )
+                if command_name == "prepare_simulation_source":
+                    try:
+                        helper_payload = prepare_helper_simulation_payload(
+                            self.guest_manager,
+                            self.simulation_source_transfers,
+                            identity,
+                            session_id,
+                            command_payload,
+                        )
+                    except (ValueError, GuestSimulationError, SimulationSourceTransferError) as exc:
+                        self._send_json({"ok": False, "error": str(exc)})
+                        return
+                    result = self.dashboard.helper_registry.command(
+                        session_id, command_name, helper_payload
+                    )
+                    self._send_json(result)
+                    return
+                if command_name == "start_capture":
+                    capture_mode = str(
+                        command_payload.get("acquisition_mode") or "real"
+                    ).lower()
+                    if capture_mode == "simulation":
+                        execution = select_simulation_execution(
+                            self.dashboard.helper_registry.status(session_id)
+                        )
+                        if execution["execution_host"] != "helper_local":
+                            self._send_json(
+                                {
+                                    "ok": False,
+                                    "error": execution["fallback_reason"],
+                                    **execution,
+                                }
+                            )
+                            return
+                    elif capture_mode != "real":
+                        self._send_json({"ok": False, "error": "helper_capture_mode_invalid"})
+                        return
+                    target_enabled = mysql_settings_from_mapping(command_payload).enabled
+                    if capture_mode == "simulation":
+                        try:
+                            helper_payload = bind_ready_helper_simulation_payload(
+                                self.guest_manager,
+                                identity,
+                                command_payload,
+                            )
+                        except GuestSimulationError as exc:
+                            self._send_json(
+                                {"ok": False, "error": str(exc), "code": exc.code}
+                            )
+                            return
+                    else:
+                        helper_payload = helper_real_capture_payload(command_payload)
+                    if target_enabled:
+                        selection = self.target_profiles.for_request(session_id, command_payload)
+                        helper_payload["execution_host"] = "helper_local"
+                        result = self.dashboard.helper_registry.command(
+                            session_id, command_name, helper_payload
+                        )
+                        if capture_mode == "simulation" and result.get("ok"):
+                            with self.remote_simulation_hosts_lock:
+                                self.remote_simulation_hosts[session_id] = "helper_local"
+                        if result.get("ok") and result.get("request_id"):
+                            self.target_capture_journal.arm_start(
+                                session_id, str(result["request_id"]), selection.config_id,
+                                config=helper_payload, target=selection.public(),
+                            )
+                        self._send_json(result)
+                        return
+                    self.target_capture_journal.disarm(session_id)
+                    command_payload = helper_payload
+                    command_payload["execution_host"] = "helper_local"
+                result = self.dashboard.helper_registry.command(
+                    session_id, command_name, command_payload
+                )
+                if (
+                    command_name == "start_capture"
+                    and str(command_payload.get("acquisition_mode") or "").lower()
+                    == "simulation"
+                    and result.get("ok")
+                ):
+                    with self.remote_simulation_hosts_lock:
+                        self.remote_simulation_hosts[session_id] = "helper_local"
+                self._send_json(result)
+                return
+            if parsed.path == "/api/mysql/preflight":
+                identity = self._identity()
+                selection = authorized_target_selection(identity, self.target_profiles, payload)
+                settings = selection.settings if selection else mysql_settings_from_mapping(payload)
+                result = MySQLCaptureStore(settings).preflight(
+                    require_schema=bool(payload.get("require_schema", True)),
+                    write_test=bool(payload.get("write_test", False)),
+                )
+                result = decorate_server_mysql_result(result)
+                if selection is not None:
+                    result.update(selection.public())
+                self._send_json(result)
+                return
+            if parsed.path == "/api/mysql/target/retry":
+                identity = self._identity()
+                session_id = str(identity.session_id or "")
+                capture_uuid = str(payload.get("capture_uuid") or "").strip()
+                if identity.role not in {"authorized", "lan_operator"} or not session_id:
+                    self._send_json(
+                        {"ok": False, "error": "目标 MySQL 重试仅适用于已配对的本机辅助采集会话"},
+                        HTTPStatus.FORBIDDEN,
+                    )
+                    return
+                state = self.target_capture_journal.capture_status(session_id, capture_uuid)
+                if state is None:
+                    self._send_json(
+                        {"ok": False, "error": "未找到本会话可重试的目标 MySQL 采集记录"},
+                        HTTPStatus.NOT_FOUND,
+                    )
+                    return
+                if state.get("state") not in {"ready", "failed"}:
+                    self._send_json(
+                        {"ok": False, "error": "目标 MySQL 当前不可重试", "server_target": state},
+                        HTTPStatus.CONFLICT,
+                    )
+                    return
+                self._schedule_target_save(session_id, capture_uuid)
+                self._send_json(
+                    {
+                        "ok": True,
+                        "server_target": self.target_capture_journal.capture_status(
+                            session_id, capture_uuid
+                        ),
+                    }
+                )
+                return
+            if parsed.path == "/api/mysql/relation-map":
+                selection = authorized_target_selection(self._identity(), self.target_profiles, payload)
+                settings = selection.settings if selection else mysql_settings_from_mapping(payload)
+                result = MySQLCaptureStore(settings).relation_map(
+                    int(payload.get("limit", 1000)),
+                    auto_initialize=True,
+                )
+                result = decorate_server_mysql_result(result)
+                if selection is not None:
+                    result.update(selection.public())
+                if not result.get("ok"):
+                    result["error_detail"] = classify_mysql_error(result.get("error"))
+                self._send_json(result)
+                return
+            if parsed.path == "/api/mysql/query":
+                selection = authorized_target_selection(self._identity(), self.target_profiles, payload)
+                settings = selection.settings if selection else mysql_settings_from_mapping(payload)
+                result = mysql_read_only_rows(
+                    MySQLCaptureStore(settings),
+                    str(payload.get("query", "")),
+                    max(1, min(int(payload.get("limit", MYSQL_PREVIEW_LIMIT)), 1000)),
+                )
+                result = decorate_server_mysql_result(result)
+                if selection is not None:
+                    result.update(selection.public())
+                self._send_json(result)
+                return
+            if parsed.path == "/api/mysql/export-csv":
+                selection = authorized_target_selection(self._identity(), self.target_profiles, payload)
+                settings = selection.settings if selection else mysql_settings_from_mapping(payload)
+                result = mysql_read_only_rows(
+                    MySQLCaptureStore(settings),
+                    str(payload.get("query", "")),
+                    max(
+                        1,
+                        min(
+                            int(payload.get("limit", MYSQL_EXPORT_LIMIT)),
+                            MYSQL_EXPORT_LIMIT,
+                        ),
+                    ),
+                )
+                self._send_download(
+                    mysql_rows_to_csv(result["columns"], result["rows"]),
+                    f"afp_{settings.database}_export.csv",
+                    "text/csv; charset=utf-8",
+                )
+                return
+            if parsed.path == "/api/prediction-model/select-file":
+                selected = select_prediction_model_file(
+                    str(payload.get("initial_path", ""))
+                )
+                self._send_json(
+                    {
+                        "selected": bool(selected),
+                        "path": selected,
+                        "model": (
+                            self.dashboard.inspect_prediction_model(
+                                selected, str(payload.get("model_type", "")),
+                                schema_mode=str(payload.get("schema_mode", "")),
+                            )
+                            if selected
+                            else None
+                        ),
+                    }
+                )
+                return
+            if parsed.path == "/api/prediction-model/inspect":
+                self._send_json(
+                    self.dashboard.inspect_prediction_model(
+                        str(payload.get("path", "")),
+                        str(payload.get("model_type", "")),
+                        schema_mode=str(payload.get("schema_mode", "")),
+                    )
+                )
+                return
+            if parsed.path == "/api/acquisition/select-folder":
+                selected = select_capture_folder(
+                    str(payload.get("initial_path", ""))
+                )
+                self._send_json(
+                    {"selected": bool(selected), "path": selected}
+                )
+                return
+            if parsed.path == "/api/acquisition/select-source":
+                if self._identity().role != "local_admin":
+                    self._send_json(
+                        {
+                            "error": "remote_path_not_accessible",
+                            "message": "远程路径不可由服务器直接访问，请使用浏览器选择并上传",
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                source_type = str(payload.get("source_type", "single_csv"))
+                if source_type == "mysql":
+                    self._send_json({"selected": False, "path": ""})
+                    return
+                selected = select_simulation_source(
+                    source_type, str(payload.get("initial_path", ""))
+                )
+                self._send_json({"selected": bool(selected), "path": selected})
+                return
+            if parsed.path == "/api/acquisition/upload-source":
+                identity = self._identity()
+                if identity.role == "local_admin":
+                    self._send_json(
+                        {"error": "browser_upload_not_required"},
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                files = payload.get("files")
+                self._send_json(
+                    self.guest_manager.upload_source(
+                        identity.guest_id,
+                        str(payload.get("source_type") or "single_csv"),
+                        files if isinstance(files, list) else [],
+                    )
+                )
+                return
+            if parsed.path == "/api/acquisition/integrate":
+                if str(payload.get("source_type", "")).lower() == "mysql":
+                    payload["query"] = validate_read_only_mysql_query(
+                        str(payload.get("query", ""))
+                    )
+                result = integrate_capture_sources(
+                    str(payload.get("source_type", "folder_csv")),
+                    str(payload.get("source_path", "")),
+                    str(payload.get("output_file", "")),
+                    payload.get("mysql_settings")
+                    if isinstance(payload.get("mysql_settings"), dict)
+                    else payload,
+                    str(payload.get("query", "")),
+                )
+                self._send_json(result)
+                return
+            if parsed.path == "/api/acquisition/start":
+                identity = self._identity()
+                remote_simulation = (
+                    str(payload.get("acquisition_mode") or "").lower() == "simulation"
+                    and identity.role != "local_admin"
+                )
+                if remote_simulation:
+                    if (
+                        str(payload.get("execution_host") or "") != "server"
+                        or str(payload.get("simulation_execution_choice") or "")
+                        != "server_explicit"
+                    ):
+                        self._send_json(
+                            {
+                                "error": "explicit_server_simulation_required",
+                                "message": (
+                                    "远程模拟默认由本机辅助程序执行；如需服务器备用模式，"
+                                    "请在页面明确选择“服务器模拟”"
+                                ),
+                            },
+                            HTTPStatus.CONFLICT,
+                        )
+                        return
+                    with self.remote_simulation_hosts_lock:
+                        self.remote_simulation_hosts[
+                            str(identity.session_id or "")
+                        ] = "server"
+                    if bool(payload.get("mysql_enabled")) and identity.role in REAL_ACCESS_ROLES:
+                        selection = self.target_profiles.for_request(
+                            str(identity.session_id or ""), payload
+                        )
+                        payload = {**payload, "mysql_password": selection.settings.password}
+                    config = self.guest_manager.safe_config(identity.guest_id, payload)
+                    model_validation = self.dashboard.validate_prediction_setup(
+                        config, load_model=True
+                    )
+                    result = self.guest_manager.start(identity.guest_id, payload, authorized=True)
+                    result["prediction_model"] = model_validation
+                    self._replay_put(replay_key, HTTPStatus.OK, result)
+                    self._send_json(result)
+                    return
+                demo = (
+                    (self.dashboard.bootstrap(include_discovery=False).get("acquisition") or {})
+                    .get("new_collection_demo") or {}
+                )
+                payload = resolve_default_simulation_source(
+                    payload, str(demo.get("source_file") or "")
+                )
+                if str(payload.get("simulation_source_type", "")).lower() == "mysql":
+                    payload["simulation_mysql_query"] = validate_read_only_mysql_query(
+                        str(payload.get("simulation_mysql_query", ""))
+                    )
+                config = acquisition_config_from_payload(payload)
+                model_validation = self.dashboard.validate_prediction_setup(
+                    config, load_model=True
+                )
+                result = self.dashboard.acquisition.start(config)
+                result["prediction_model"] = model_validation
+                self._replay_put(replay_key, HTTPStatus.OK, result)
+                self._send_json(result)
+                return
+            if parsed.path == "/api/acquisition/stop":
+                identity = self._identity()
+                if (
+                    str(payload.get("acquisition_mode") or "").lower() == "simulation"
+                    and identity.role != "local_admin"
+                ):
+                    result = self.guest_manager.stop(identity.guest_id)
+                else:
+                    result = self.dashboard.acquisition.stop()
+                self._replay_put(replay_key, HTTPStatus.OK, result)
+                self._send_json(result)
+                return
+            self.send_error(HTTPStatus.NOT_FOUND)
+        except GuestSimulationError as exc:
+            self._send_json(
+                {"error": exc.code, "message": str(exc)},
+                HTTPStatus.BAD_REQUEST,
+            )
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        finally:
+            if operation_lock is not None:
+                with _OPERATION_LOCKS_GUARD:
+                    if _OPERATION_LOCKS.get(operation_name) is operation_lock:
+                        _OPERATION_LOCK_STARTED.pop(operation_name, None)
+                operation_lock.release()
+
+
+def create_server(
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    network_status: dict[str, Any] | None = None,
+    *,
+    dashboard: DashboardData | None = None,
+    security_store: SecurityStore | None = None,
+    guest_manager: GuestSimulationManager | None = None,
+    control_lease: RealControlLease | None = None,
+    access_context: str = "public",
+    public_web_config: dict[str, Any] | None = None,
+    network_status_provider: Any = None,
+) -> ThreadingHTTPServer:
+    active_dashboard = dashboard or DashboardData()
+    runtime_root = (APP_DIR.parent / "runtime").resolve()
+    active_security_store = security_store or SecurityStore(
+        runtime_root / "public_web_security.sqlite3"
+    )
+    simulation_candidates = [
+        Path(r"F:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv"),
+        APP_DIR / "new_collection_demo_v11_3" / "simulator_stream.csv",
+        DATA_DIR / "dashboard_candidate_catalog.csv",
+    ]
+    simulation_source = next((item for item in simulation_candidates if item.is_file()), simulation_candidates[-1])
+    capture_root = Path(
+        getattr(active_dashboard.acquisition, "capture_root", runtime_root / "capture")
+    ).resolve()
+    active_guest_manager = guest_manager or GuestSimulationManager(
+        capture_root / "public_simulation",
+        {
+            "builtin": {
+                "source_type": "single_csv",
+                "path": str(simulation_source),
+            }
+        },
+    )
+    active_control_lease = control_lease or RealControlLease()
+    helper_registry = HelperRegistry(
+        persistence_path=runtime_root / "helper_registry.json"
+    )
+    active_dashboard.helper_registry = helper_registry
+    active_dashboard.remote_acquisitions = RemoteAcquisitionRegistry()
+    target_profiles = ServerTargetProfiles(local_mysql_profile)
+    target_capture_journal = ServerCaptureJournal(
+        runtime_root / "server_target_capture_journal.sqlite3"
+    )
+    target_saver = TargetMySQLSaveCoordinator(target_capture_journal, target_profiles)
+    simulation_source_transfers = SimulationSourceTicketStore()
+    active_dashboard.target_capture_journal = target_capture_journal
+    replay_cache: dict[str, tuple[int, dict]] = {}
+    replay_lock = threading.Lock()
+    model_limiter = SlidingWindowLimiter()
+    model_call_lock = threading.Lock()
+    diagnosis_jobs = DiagnosisJobStore()
+    remote_simulation_hosts: dict[str, str] = {}
+    remote_simulation_hosts_lock = threading.RLock()
+    handler = type(
+        "ConfiguredAppHandler",
+        (AppHandler,),
+        {
+            "dashboard": active_dashboard,
+            "security_store": active_security_store,
+            "guest_manager": active_guest_manager,
+            "control_lease": active_control_lease,
+            "replay_cache": replay_cache,
+            "replay_lock": replay_lock,
+            "model_limiter": model_limiter,
+            "model_call_lock": model_call_lock,
+            "diagnosis_jobs": diagnosis_jobs,
+            "target_profiles": target_profiles,
+            "target_capture_journal": target_capture_journal,
+            "target_saver": target_saver,
+            "simulation_source_transfers": simulation_source_transfers,
+            "remote_simulation_hosts": remote_simulation_hosts,
+            "remote_simulation_hosts_lock": remote_simulation_hosts_lock,
+            "access_context": str(access_context),
+            "public_web_config": dict(public_web_config or {}),
+            "login_limiter": SlidingWindowLimiter(),
+            "network_status": dict(network_status or {}),
+            "network_status_provider": network_status_provider,
+            "service_started_at": time.time(),
+        },
+    )
+    server = ThreadingHTTPServer((host, port), handler)
+    server.network_status = handler.network_status
+    server.service_started_at = handler.service_started_at
+    server.dashboard = active_dashboard
+    server.security_store = active_security_store
+    server.guest_manager = active_guest_manager
+    server.control_lease = active_control_lease
+    server.access_context = handler.access_context
+    server.public_web_config = dict(public_web_config or {})
+    server.diagnosis_jobs = diagnosis_jobs
+    server.target_capture_journal = target_capture_journal
+    server.simulation_source_transfers = simulation_source_transfers
+    return server
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="AFP 状态预警可视化界面")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--no-browser", action="store_true")
+    args = parser.parse_args()
+    server = create_server(args.host, args.port)
+    url = f"http://{args.host}:{args.port}"
+    print(f"AFP 状态预警可视化界面已启动：{url}")
+    print("按 Ctrl+C 停止服务。")
+    if not args.no_browser:
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

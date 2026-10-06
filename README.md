@@ -51,8 +51,29 @@ AFP_Integrated_System_Modular.exe --functional-smoke
 
 ## 使用与发布边界
 
-完整 Windows 软件文件夹可直接复制到其它 Windows 电脑，目标电脑不需要另装 Python、PyTorch 或 Git，但必须保持 EXE、`_internal`、`app`、`config`、`models` 和 `native_dll` 的相对位置。使用 MySQL 时需要可访问的 MySQL Server；使用真实传感器时需要相应设备、驱动、通信参数与权限。
+完整 Windows 软件文件夹可直接复制到其它 Windows 电脑，目标电脑不需要另装 Python 或 PyTorch，但必须保持 EXE、`_internal`、`app`、`config`、`models` 和 `native_dll` 的相对位置。使用 MySQL 时需要可访问的 MySQL Server；使用真实传感器时需要相应设备、驱动、通信参数与权限。
 
-原始采集数据、正式实验数据库、个人路径、训练权重和生成软件包不直接放入源码提交历史。大型软件包与权重应通过 GitHub Releases 发布。
+当前唯一受支持的完整交付版本为 `delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/`。该目录中的程序、依赖、模型和演示数据通过 Git LFS 同步；日志、运行状态、回滚目录、验证输出、采集数据和本机配置不进入 Git。
+
+另一台电脑首次同步需要安装 Git LFS：
+
+```powershell
+git lfs install
+git clone https://github.com/qzsy1/afp-state-warning-system.git
+cd afp-state-warning-system
+git lfs pull
+```
+
+已有仓库日常更新：
+
+```powershell
+git switch main
+git pull --ff-only origin main
+git lfs pull
+.\delivery\AFP_Integrated_System_Modular_v2.0.4_Agentic\AFP_Integrated_System_Modular.exe --verify-files
+.\delivery\AFP_Integrated_System_Modular_v2.0.4_Agentic\AFP_Integrated_System_Modular.exe --self-test
+```
+
+两台电脑的 `git rev-parse HEAD` 相同且 `--verify-files` 通过时，发布程序内容一致。原始采集数据、正式实验数据库、个人路径和运行时状态继续保留在各自电脑中。
 
 模拟/OOD/弱标签预警只表示模型证据，不等同于独立确认的真实缺陷。生产部署和论文结论应使用真实传感器、独立缺陷检测或力学性能证据重新确认阈值、精度和适用范围。

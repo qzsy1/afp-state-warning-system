@@ -1,0 +1,46 @@
+﻿{
+    "application_version":  "2.0.4",
+    "api_version":  "2.0",
+    "paths":  {
+                  "app_dir":  "app",
+                  "legacy_dir":  "app/legacy",
+                  "modules_dir":  "app/modules",
+                  "ui_dir":  "app/ui",
+                  "data_dir":  "app/legacy/data",
+                  "models_dir":  "models",
+                  "native_dll_dir":  "native_dll",
+                  "config_dir":  "config",
+                  "logs_dir":  "logs",
+                  "updates_dir":  "updates",
+                  "rollback_dir":  "rollback",
+                  "runtime_dir":  "runtime"
+              },
+    "module_policy":  {
+                          "strict_api":  true,
+                          "fail_on_unhealthy_required_module":  true
+                      },
+    "ui":  {
+               "title":  "AFP 实时预测、状态预警与模型训练系统（模块化版）",
+               "width":  1660,
+               "height":  1040
+           },
+    "lan_web":  {
+                    "enabled":  true,
+                    "bind_host":  "0.0.0.0",
+                    "port":  8770,
+                    "open_desktop_window":  true
+                },
+    "public_web":  {
+                       "enabled":  true,
+                       "public_bind_host":  "0.0.0.0",
+                       "public_port":  8770,
+                       "local_admin_bind_host":  "127.0.0.1",
+                       "local_admin_port":  8771,
+                       "open_desktop_window":  true,
+                       "hostname":  "",
+                       "domain":  "",
+                       "cloudflare_tunnel_enabled":  false,
+                       "cloudflared_path":  "cloudflared",
+                       "cloudflare_tunnel_name":  ""
+                   }
+}

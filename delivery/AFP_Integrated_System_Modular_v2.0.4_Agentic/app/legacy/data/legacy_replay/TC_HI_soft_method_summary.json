@@ -1,0 +1,57 @@
+{
+  "version": "13.8.0",
+  "method": "TC-HI + soft Potts/CRF log-opinion pool",
+  "source_result": "F:\\program\\channel_independent_MTSF-main\\channel_independent_MTSF-main\\auto_fiber_placement\\new-state-monitor\\state_monitor_v13\\outputs_tc_hi_fixed_split_v13_7",
+  "cross_validation_used": false,
+  "selection_split": "validation_only",
+  "locked_test": true,
+  "hard_specimen_label_back_projection": false,
+  "specimen_type_calibration": "48 specimen-level statistics; StandardScaler + multinomial LogisticRegression(C=0.1); fitted on 15 train specimens only",
+  "selected_gamma": 0.4,
+  "type_temperature": 0.01,
+  "binary_context_weight": 0.4,
+  "type_context_weight": 0.75,
+  "all_locked_test_metrics_above_90_percent": true,
+  "test_metrics": [
+    {
+      "dataset": "test_all",
+      "level": "window",
+      "n_samples": 851,
+      "errors": 9,
+      "binary_accuracy": 0.9894242068,
+      "balanced_accuracy": 0.9884507649,
+      "seven_state_accuracy": 0.9894242068,
+      "hard_specimen_label_back_projection": false,
+      "method": "TC-HI + soft Potts/CRF log-opinion pool"
+    },
+    {
+      "dataset": "test_all",
+      "level": "layer",
+      "n_samples": 35,
+      "errors": 2,
+      "binary_accuracy": 0.9428571429,
+      "balanced_accuracy": 0.9666666667,
+      "seven_state_accuracy": 0.9428571429,
+      "hard_specimen_label_back_projection": false,
+      "method": "TC-HI + soft Potts/CRF log-opinion pool"
+    },
+    {
+      "dataset": "test_all",
+      "level": "specimen",
+      "n_samples": 7,
+      "errors": 0,
+      "binary_accuracy": 1.0,
+      "balanced_accuracy": 1.0,
+      "seven_state_accuracy": 1.0,
+      "hard_specimen_label_back_projection": false,
+      "method": "TC-HI + soft Potts/CRF log-opinion pool"
+    }
+  ],
+  "test_specimens": 7,
+  "seven_of_seven_wilson_95_lower": 0.6456695649333126,
+  "statistical_warning": "Seven-state specimen test accuracy has increments of 1/7. Above 90% therefore requires 7/7; this is not evidence of a stable 100% real-world accuracy.",
+  "figures": [
+    "F:\\program\\channel_independent_MTSF-main\\channel_independent_MTSF-main\\auto_fiber_placement\\new-state-monitor\\state_monitor_v13\\outputs_tc_hi_soft_consistency_v13_8\\figures\\Fig21_TC_HI_Soft_Consistency_Accuracy.png",
+    "F:\\program\\channel_independent_MTSF-main\\channel_independent_MTSF-main\\auto_fiber_placement\\new-state-monitor\\state_monitor_v13\\outputs_tc_hi_soft_consistency_v13_8\\figures\\Fig21_TC_HI_Soft_Consistency_Accuracy.pdf"
+  ]
+}

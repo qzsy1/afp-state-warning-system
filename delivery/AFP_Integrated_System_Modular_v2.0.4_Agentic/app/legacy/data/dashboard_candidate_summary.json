@@ -1,0 +1,9 @@
+{
+  "candidate_count": 48,
+  "indicator_count": 12,
+  "model_count": 4,
+  "window_count": 5582,
+  "recommendation_rule": "maximum validation_selection_score within indicator",
+  "seed": 2026,
+  "stride": 24
+}

@@ -12,3 +12,34 @@
 *.pth binary
 *.joblib binary
 *.npz binary
+
+# The supported Windows delivery is versioned through Git LFS. Text source and
+# configuration remain ordinary Git objects. Every delivery file keeps its
+# exact assembled bytes so SHA256SUMS.txt remains valid after checkout.
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/** -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.exe filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.dll filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.pyd filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.so filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.lib filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.pth filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.joblib filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.npz filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.csv filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.zip filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.7z filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.gz filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.enc filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.sqlite filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.sqlite3 filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.db filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.xls filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.xlsx filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.pdf filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.png filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.jpg filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.jpeg filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.gif filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.ico filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.bin filter=lfs diff=lfs merge=lfs -text
+delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.dat filter=lfs diff=lfs merge=lfs -text

@@ -43,7 +43,8 @@ visualization_app/req.json
 visualization_app/test_training_request.json
 
 # Modular runtime: generated delivery, user data, models and local state
-/delivery/
+# Keep every generated delivery ignored except the single supported v2.0.4 package.
+/delivery/*
 /runtime/
 modular_runtime/dist/
 modular_runtime/build/
@@ -64,3 +65,21 @@ modular_runtime/models/
 /harness/logs/
 /harness/reports/
 /harness/config/local-settings.json
+
+# Publish only the immutable v2.0.4 delivery through Git and Git LFS. These
+# rules must remain after the general generated-file rules above.
+!/delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/
+!/delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**
+/delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/logs/**
+/delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/runtime/**
+/delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/rollback/**
+/delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/updates/inbox/**
+/delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/updates/staging/**
+/delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/verification/**
+/delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/config/local/**
+/delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/runtime/**
+/delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/__pycache__/**
+/delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.pyc
+/delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.pyo
+/delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.pid
+/delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/*.bak

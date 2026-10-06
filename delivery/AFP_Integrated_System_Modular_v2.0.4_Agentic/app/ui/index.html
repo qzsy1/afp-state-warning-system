@@ -1,0 +1,519 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AFP 实时预测与状态预警系统</title>
+  <link rel="stylesheet" href="/styles.css?v=20261001-stable-public-demo-v2">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="system-bar">
+      <div class="system-brand">
+        <div class="brand-mark">AFP</div>
+        <div>
+          <strong>多传感器实时预测与三级状态预警系统</strong>
+          <span>I-ModernTCN · 健康指标 · 层次证据聚合</span>
+        </div>
+      </div>
+      <div class="system-statuses">
+        <a class="system-training-link" href="/training.html" title="打开模型训练中心">模型训练中心</a>
+        <div class="system-status-item"><span class="status-dot"></span><div><small>数据连接</small><b id="connectionStatus">正在连接本地数据服务</b></div></div>
+        <div class="system-status-item"><span class="live-dot"></span><div><small>运行状态</small><b id="streamStatus">实时数据已暂停</b></div></div>
+        <div class="system-status-item wide"><div><small>数据位置</small><b id="streamPosition">等待开始</b></div></div>
+        <div class="system-status-item meta"><div><small>数据集 / 模型信息</small><b id="datasetMeta">正在加载数据流信息……</b></div></div>
+      </div>
+      <div id="lan-web-status" class="lan-web-status" role="status" aria-live="polite">
+        <div><small>局域网访问</small><b id="lan-web-mode">正在检测</b></div>
+        <button id="lan-web-copy" class="lan-web-copy" type="button" title="复制局域网访问网址">复制网址</button>
+        <span id="lan-web-url" class="lan-web-url">等待服务地址</span>
+      </div>
+      <div class="access-status" role="status" aria-live="polite">
+        <span id="access-mode-badge" class="access-mode-badge">访客模拟模式</span>
+        <span id="real-control-owner" class="real-control-owner"></span>
+        <button id="unlock-real-mode" class="secondary-button compact-button" type="button">解锁真实模式</button>
+        <button id="lock-real-mode" class="secondary-button compact-button hidden" type="button">退出真实模式</button>
+        <button id="admin-security-settings" class="secondary-button compact-button hidden" type="button">安全设置</button>
+      </div>
+    </header>
+
+    <div class="workspace-grid">
+      <aside class="sidebar">
+        <div class="section-heading"><span>01</span><div><b>采集与试样设置</b><small>数据源、试样和通道</small></div></div>
+
+        <details class="control-section">
+          <summary>数据定位与运行模式</summary>
+          <div class="control-content">
+            <label>运行模式
+              <select id="dataModeSelect">
+                <option value="live" selected>实时采集（真实或模拟）</option>
+              </select>
+            </label>
+            <label>试样<select id="specimenSelect"></select></label>
+            <label>重点查看通道<select id="sensorSelect"></select></label>
+          </div>
+        </details>
+
+        <details id="acquisitionSection" class="control-section hidden">
+          <summary>真实采集与保存</summary>
+          <div class="control-content">
+            <div id="localHelperPanel" class="local-helper-panel">
+              <div class="local-helper-head"><strong>本机采集辅助程序</strong><span id="helperStatus" class="helper-status">未配对</span></div>
+              <p id="helperStatusNote" class="control-note">真实采集需要在访问此网页的电脑上运行本地采集辅助程序。</p>
+              <div class="path-picker-row">
+                <button id="pairHelperButton" class="secondary-button compact-button" type="button">生成配对码</button>
+                <code id="helperPairingCode" class="helper-pairing-code hidden"></code>
+              </div>
+            </div>
+            <label>处理模式
+              <select id="processingModeSelect">
+                <option value="capture_only">仅采集并保存（不加载模型）</option>
+                <option value="prediction_warning" selected>采集＋实时预测与预警</option>
+              </select>
+            </label>
+            <label>数据采集方案<select id="datasetSchemaSelect"></select></label>
+            <label>采集来源
+              <select id="acquisitionModeSelect">
+                <option value="real" selected>真实接口采集</option>
+                <option value="simulation">模拟采集</option>
+              </select>
+            </label>
+            <div id="simulationSettings" class="simulation-settings hidden">
+              <label id="simulationExecutionHostLabel">模拟执行位置
+                <select id="simulationExecutionHostSelect">
+                  <option value="helper_local" selected>访问电脑辅助程序（默认，低延迟）</option>
+                  <option value="server">服务器模拟（明确备用，不支持本机 MySQL）</option>
+                </select>
+              </label>
+              <label>模拟数据形式
+                <select id="simulationSourceTypeSelect">
+                  <option value="single_csv">单 CSV 文件</option>
+                  <option value="folder_csv">采集数据文件夹</option>
+                  <option value="mysql">MySQL 数据库</option>
+                </select>
+              </label>
+              <label id="simulationSourcePathLabel">模拟数据文件/文件夹
+                <span class="path-picker-row">
+                  <input id="simulationSourcePathInput" type="text" placeholder="选择 CSV 文件或采集数据文件夹">
+                  <button id="selectSimulationSourceButton" class="secondary-button compact-button" type="button">选择</button>
+                </span>
+              </label>
+              <input id="simulationSourceFileInput" class="hidden" type="file" accept=".csv,text/csv" multiple>
+              <div id="simulationPackagePanel" class="simulation-package-panel hidden">
+                <label>批准的合成模拟数据
+                  <select id="simulationPackageSelect"></select>
+                </label>
+                <div class="path-picker-row">
+                  <button id="prepareSimulationPackageButton" class="primary-button compact-button" type="button">下载到本机辅助程序并校验</button>
+                  <button id="downloadSimulationPackageButton" class="secondary-button compact-button" type="button">另存示例 CSV 到电脑</button>
+                </div>
+                <p id="simulationPackageStatus" class="control-note">下载和校验不会自动开始采集。</p>
+              </div>
+              <div id="simulationMysqlSettings" class="simulation-mysql-settings hidden">
+                <p class="control-note shared-mysql-note">使用“真实采集与保存”中的统一 MySQL 连接信息。</p>
+                <div class="compact-input-grid shared-mysql-legacy-fields hidden" aria-hidden="true">
+                  <label>MySQL 主机<input id="simulationMysqlHostInput" type="text" value="127.0.0.1"></label>
+                  <label>端口<input id="simulationMysqlPortInput" type="number" value="3306" min="1" max="65535"></label>
+                  <label>用户<input id="simulationMysqlUserInput" type="text" value="root"></label>
+                  <label>密码<input id="simulationMysqlPasswordInput" type="password" value="" autocomplete="new-password"></label>
+                  <label>数据库<input id="simulationMysqlDatabaseInput" type="text" value="afp_state_warning"></label>
+                </div>
+                <label>SQL 查询
+                  <textarea id="simulationMysqlQueryInput" rows="2">SELECT * FROM afp_flat_all ORDER BY specimen_key, layer_no, sample_index</textarea>
+                </label>
+              </div>
+              <p id="simulationSourceNote" class="control-note">模拟模式使用所选文件夹、CSV或MySQL数据逐行读取；访客网页可直接上传本机 CSV，真实接口模式不会读取本地文件。</p>
+            </div>
+            <label>采集驱动<select id="driverSelect"></select></label>
+            <label>模拟采集数据文件<input id="sourceFileInput" type="text" placeholder="模拟驱动的数据 CSV；真实驱动可留空"></label>
+            <label>连接地址<input id="endpointInput" type="text" placeholder="串口 COM3 或 TCP 127.0.0.1:9000"></label>
+            <div class="compact-input-grid">
+              <label>波特率<input id="baudrateInput" type="number" value="115200" min="1200"></label>
+              <label>采样 Hz<input id="sampleRateInput" type="number" value="10" min="0.1" max="1000" step="0.1"></label>
+            </div>
+            <div class="compact-input-grid">
+              <label>运行编号<input id="runIdInput" type="text" value="LIVE_RUN_001"></label>
+              <label>试样编号<input id="liveSpecimenInput" type="text" value="LIVE_SPECIMEN_001"></label>
+            </div>
+            <label>采集数据保存位置
+              <span class="path-picker-row">
+                <input id="saveRootInput" type="text" placeholder="默认：F:\AFP_Capture；为空时不保存">
+                <button id="selectSaveRootButton" class="secondary-button compact-button" type="button">选择</button>
+              </span>
+            </label>
+            <p id="saveRootStatus" class="control-note error">保存位置为空，当前采集不保存数据</p>
+            <div id="browserLocalSavePanel" class="browser-local-save-panel">
+              <div class="path-picker-row">
+                <button id="confirmLocalSaveButton" class="secondary-button" type="button">确认并授权本地保存</button>
+              </div>
+              <p id="localSaveStatus" class="control-note">未确认本地目录；当前不会保存到访问网页的电脑。</p>
+            </div>
+            <p class="control-note save-rule-note">自动建立“试样名_p功率_v速度_pr压实力”文件夹，同时保存每层文件、完整试样快照和采集记录。</p>
+            <div class="mysql-settings">
+              <label class="toggle"><input id="mysqlLocalEnabledInput" type="checkbox"> 保存到打开软件这台电脑的 MySQL</label>
+              <div id="mysqlLocalDetails" hidden aria-hidden="true">
+              <div class="compact-input-grid">
+                <label>本机地址<input id="mysqlLocalHostInput" type="text" value="127.0.0.1"></label>
+                <label>本机端口<input id="mysqlLocalPortInput" type="number" min="1" max="65535" step="1" value="3306"></label>
+                <label>本机用户名<input id="mysqlLocalUserInput" type="text" value="root"></label>
+                <label>本机密码<input id="mysqlLocalPasswordInput" type="password" value="" autocomplete="new-password"></label>
+                <label>本机数据库<input id="mysqlLocalDatabaseInput" type="text" value="afp_state_warning" pattern="[A-Za-z][A-Za-z0-9_]{0,63}"></label>
+              </div>
+              <div class="transport">
+                <button id="testLocalMysqlButton" class="secondary-button" type="button">检查本机数据库</button>
+                <button id="refreshLocalRelationMapButton" class="secondary-button" type="button">刷新本机关系表</button>
+              </div>
+              <p id="mysqlLocalStatus" class="control-note">本机数据库：尚未检查。</p>
+              <div class="relation-map-panel">
+                <div class="sensor-selector-title">本机数据库｜工况—试样—独立重复—铺层关系</div>
+                <div class="relation-map-scroll">
+                  <table id="localRelationMapTable" class="relation-map-table">
+                    <thead><tr><th>工况</th><th>试样</th><th>独立重复</th><th>铺层</th><th>采样点数</th><th>最后保存</th></tr></thead>
+                    <tbody><tr><td colspan="6">点击“刷新本机关系表”查看本机 MySQL 数据</td></tr></tbody>
+                  </table>
+                </div>
+              </div>
+              </div>
+              <label class="toggle"><input id="mysqlEnabledInput" type="checkbox"> 保存到目标电脑 MySQL</label>
+              <div id="mysqlTargetDetails" hidden aria-hidden="true">
+              <div class="compact-input-grid">
+                <label>目标电脑 IP / 域名<input id="mysqlHostInput" type="text" value="192.168.101.31"></label>
+                <label>端口<input id="mysqlPortInput" type="number" min="1" max="65535" step="1" value="3306"></label>
+                <label>用户名<input id="mysqlUserInput" type="text" value="afp_app"></label>
+                <label>密码<input id="mysqlPasswordInput" type="password" value="" autocomplete="new-password"></label>
+                <label>数据库名称<input id="mysqlDatabaseInput" type="text" value="afp_state_warning" pattern="[A-Za-z][A-Za-z0-9_]{0,63}"></label>
+              </div>
+              <div class="transport">
+                <button id="testMysqlButton" class="secondary-button" type="button">检查目标数据库</button>
+                <button id="refreshTargetRelationMapButton" class="secondary-button" type="button">刷新目标关系表</button>
+                <button id="retryTargetMysqlButton" class="secondary-button hidden" type="button">重试本次目标库写入</button>
+              </div>
+              <p id="mysqlTargetStatus" class="control-note">目标数据库：尚未检查。</p>
+              <div class="relation-map-panel">
+                <div class="sensor-selector-title">目标电脑数据库｜工况—试样—独立重复—铺层关系</div>
+                <div class="relation-map-scroll">
+                  <table id="targetRelationMapTable" class="relation-map-table">
+                    <thead><tr><th>工况</th><th>试样</th><th>独立重复</th><th>铺层</th><th>采样点数</th><th>最后保存</th></tr></thead>
+                    <tbody><tr><td colspan="6">点击“刷新目标关系表”查看目标电脑 MySQL 数据</td></tr></tbody>
+                  </table>
+                </div>
+              </div>
+              <details class="remote-mysql-panel">
+                <summary>目标电脑数据查看与下载</summary>
+                <div class="remote-mysql-content">
+                  <label>只读 SQL（仅允许 SELECT / WITH ... SELECT）
+                    <textarea id="remoteMysqlQueryInput" rows="3">SELECT * FROM afp_flat_all ORDER BY specimen_key, layer_no, sample_index</textarea>
+                  </label>
+                  <label>预览行数<input id="remoteMysqlLimitInput" type="number" min="1" max="1000" step="1" value="200"></label>
+                  <div class="remote-mysql-actions">
+                    <button id="previewMysqlDataButton" class="secondary-button" type="button">预览数据</button>
+                    <button id="copyMysqlPreviewButton" class="secondary-button" type="button">复制预览</button>
+                    <button id="downloadMysqlCsvButton" class="primary-button" type="button">下载 CSV</button>
+                  </div>
+                  <p id="remoteMysqlStatus" class="control-note">使用上方同一套连接信息；查看和下载不会修改数据库。</p>
+                  <div class="remote-mysql-preview-scroll">
+                    <table id="remoteMysqlPreviewTable" class="relation-map-table">
+                      <tbody><tr><td>点击“预览数据”读取远程数据</td></tr></tbody>
+                    </table>
+                  </div>
+                </div>
+              </details>
+              </div>
+              <p id="mysqlStatus" class="control-note">保存状态：本地 CSV 始终优先保存；可单独或同时启用两套 MySQL。</p>
+            </div>
+            <label class="prediction-setting">已训练预测模型文件
+              <span class="path-picker-row">
+                <input id="predictionModelInput" type="text" placeholder="选择 I-ModernTCN 的 .pth/.pt 模型">
+                <button id="selectPredictionModelButton" class="secondary-button compact-button" type="button">选择</button>
+              </span>
+            </label>
+            <label class="prediction-setting">预测算法
+              <select id="predictionModelTypeSelect"></select>
+            </label>
+            <div id="predictionModelStatus" class="model-file-status prediction-setting">尚未检查预测模型</div>
+            <label class="toggle prediction-setting"><input id="bestPredictionOverrideInput" type="checkbox">使用冻结验证集最佳预测模型覆盖当前选择</label>
+            <p id="bestPredictionOverrideNote" class="control-note prediction-setting">未勾选时严格使用手动模型；勾选后只按验证集误差在同一采集方案内选择兼容模型。</p>
+            <details id="sensorSettingsSection" class="sensor-settings-section collapsible-subsection">
+              <summary class="sensor-settings-summary">传感器设置与接口映射</summary>
+              <div class="collapsible-subsection-content">
+              <div class="sensor-selector-title">采集保存、模型输入与模型输出</div>
+              <div class="interface-toolbar">
+              <button id="discoverInterfacesButton" class="secondary-button compact-button" type="button">自动识别接口</button>
+              <button id="addInterfaceButton" class="secondary-button compact-button" type="button">＋ 增加接口</button>
+              <span id="interfaceDiscoveryStatus" class="muted">默认启用热电偶接口和其它传感器接口</span>
+              </div>
+              <div id="interfacePanel" class="interface-panel"></div>
+              <p class="control-note">温度1～温度8均可独立选择。停止采集时可自由勾选、取消或使用全选/清空；采集中为保证同一文件通道定义不变会暂时锁定。接口勾选、角色和通道映射同时作用于显示、CSV和MySQL。</p>
+              <div id="liveSensorChecklist" class="sensor-checklist"></div>
+              <div id="sensorChecklistResizer" class="sensor-checklist-resizer" role="separator"
+                 aria-label="调整传感器通道区域高度" aria-orientation="horizontal" tabindex="0"
+                 title="上下拖动调整传感器通道区域高度；双击恢复默认高度">
+                <span aria-hidden="true">•••</span>
+              </div>
+              <p class="control-note sensor-prediction-note">仅采集模式只使用“采集保存”；预测模式要求输入通道与模型元数据一致，输出通道决定预测曲线及健康指标数据。</p>
+              <label class="hardware-auto-toggle">
+              <input id="autoHardwareCheckInput" type="checkbox" checked>
+              启动时自动检查接口与传感器通道（仅一次）
+              </label>
+              <div class="transport hardware-check-actions">
+              <button id="testSensorsButton" class="secondary-button" type="button">立即检查</button>
+              <button id="resetSensorCheckButton" class="secondary-button" type="button">重置并重新检查</button>
+              </div>
+              <div id="hardwareCheckStatus" class="hardware-check-status checking">
+              等待自动检查；检查会逐项确认接口、通道和有效数据。
+              </div>
+              </div>
+            </details>
+            <details id="agentDiagnosisSection" class="agent-diagnosis-section collapsible-subsection" aria-labelledby="agentDiagnosisTitle">
+              <summary class="agent-diagnosis-heading">
+                <div>
+                  <div id="agentDiagnosisTitle" class="sensor-selector-title">LangChain 接口诊断提示</div>
+                  <p class="control-note">诊断提示合并显示在上方自动检查结果中，并覆盖全部异常。</p>
+                </div>
+                <span id="agentGateStatus" class="agent-gate-status">离线测试诊断</span>
+              </summary>
+              <div class="collapsible-subsection-content">
+               <div id="agent-model-access" class="agent-model-access">服务器模型：未授权</div>
+               <div class="compact-input-grid agent-input-grid">
+                <label>硅基流动 API Key<input id="agentApiKeyInput" type="password" autocomplete="off" placeholder="sk-…（仅授权模式调用）"></label>
+                <label>模型名称<input id="agentModelNameInput" type="text" value="deepseek-ai/DeepSeek-V3" placeholder="deepseek-ai/DeepSeek-V3" autocomplete="off"></label>
+               </div>
+              <div class="agent-actions">
+                <span id="agentAutoStatus" class="control-note">未配置时使用内置离线测试诊断；配置正确时由模型按现象选择只读取证工具。</span>
+                <button id="agentDiagnoseButton" class="secondary-button" type="button" disabled>重新诊断全部异常</button>
+              </div>
+              <p class="agent-scope-note">覆盖 SMRF 热电偶、PLC、UVC、ABB 与 M3232 薄膜压力传感器接口。只展示诊断结论和证据来源，不展示调用轨迹；异常失败时保留本地规则兜底。Key 不保存、不写日志。</p>
+              </div>
+            </details>
+            <details id="acquisitionParameterPanel" class="acquisition-parameter-panel collapsible-subsection" aria-labelledby="acquisitionParameterTitle">
+              <summary id="acquisitionParameterTitle" class="sensor-selector-title acquisition-parameter-title">采集参数设置</summary>
+              <div class="collapsible-subsection-content">
+              <div id="legacyParameterGrid" class="compact-input-grid">
+                <label>功率 p<input id="livePowerInput" type="number" value="600"></label>
+                <label>速度 v<input id="liveSpeedInput" type="number" value="100"></label>
+                <label>压实力 pr<input id="livePressureInput" type="number" value="600"></label>
+                <label>层号（从0开始，每次递增1）<input id="liveLayerInput" class="step-one-input" type="number" value="0" min="0" step="1" inputmode="numeric"></label>
+              </div>
+              <div id="newParameterGrid" class="compact-input-grid hidden">
+                <div class="process-parameter-auto-row">
+                  <label class="checkbox-row"><input id="autoProcessParametersInput" type="checkbox">自动读取工艺参数</label>
+                  <button id="readProcessParametersButton" class="secondary-button" type="button">立即读取</button>
+                </div>
+                <p id="processParameterReadStatus" class="control-note process-parameter-read-status">未启用自动读取；当前使用下方手动输入值。</p>
+                <label>初始压实力/N<input id="initialForceInput" type="number" value="400"></label>
+                <label>铺放速度/mm·s⁻¹<input id="placementSpeedInput" type="number" value="80"></label>
+                <label>PID 角度/°<input id="pidAngleInput" type="number" value="5"></label>
+                <label>设定温度/°C<input id="temperatureSetpointInput" type="number" value="360"></label>
+                <label>工况编号<input id="conditionIdInput" type="text" value="H06"></label>
+                <label>独立重复（每次递增1）<input id="replicateInput" class="step-one-input" type="number" value="1" min="1" step="1" inputmode="numeric"></label>
+                <label>层号（从0开始，每次递增1）<input id="newLayerInput" class="step-one-input" type="number" value="0" min="0" step="1" inputmode="numeric"></label>
+              </div>
+              <p class="control-note collection-index-note">采集运行期间层号和独立重复编号锁定；只有停止并成功保存本次采集后，才可递增到下一层或下一独立重复。</p>
+              </div>
+            </details>
+            <div class="transport">
+              <button id="startAcquisitionButton" class="primary-button">开始采集</button>
+            </div>
+            <button id="stopAcquisitionButton" class="secondary-button full-button">停止并保存</button>
+            <div id="acquisitionStatus" class="acquisition-status">尚未启动真实采集</div>
+          </div>
+        </details>
+
+        <div class="section-heading compact-heading"><span>02</span><div><b>预测与预警设置</b><small>时间步、指标与模型</small></div></div>
+
+        <details class="control-section">
+          <summary>数据流与预测控制</summary>
+          <div class="control-content">
+            <div class="transport">
+              <button id="playButton" class="primary-button">▶ 开始</button>
+              <button id="resetButton" class="secondary-button">↻ 重置</button>
+            </div>
+            <label><span>采集进度 <output id="progressValue">0 / 0</output></span><input id="cursorInput" type="range" min="1" max="100" value="24"></label>
+            <div class="compact-input-grid">
+              <label>数据推进速度<select id="speedSelect"><option value="0.5">0.5×</option><option value="1" selected>1×（10 Hz）</option><option value="2">2×</option><option value="5">5×</option><option value="10">10×</option></select></label>
+              <label>每次推进<select id="streamStepSelect"><option value="1" selected>1 点</option><option value="2">2 点</option><option value="4">4 点</option><option value="8">8 点</option><option value="24">24 点 / 1窗口</option></select></label>
+              <label>历史长度<select id="lengthSelect"><option value="120">120 点 / 12 s</option><option value="240" selected>240 点 / 24 s</option><option value="480">480 点 / 48 s</option><option value="768">768 点 / 76.8 s</option><option value="1200">1200 点 / 120 s</option></select></label>
+              <label>绘图抽样<select id="stepSelect"><option value="1">1（全部点）</option><option value="2">2</option><option value="4">4</option><option value="6">6</option><option value="12">12</option></select></label>
+            </div>
+            <label><span>距当前时刻的预测步长 <output id="horizonValue">24</output> 点</span><input id="horizonInput" type="range" min="1" max="600" value="24"></label>
+            <div class="range-number-row"><span>1</span><input id="horizonNumber" type="number" min="1" max="600" step="1" value="24" aria-label="直接输入预测步长" title="输入 1 至 600，按 Enter 应用"><span>600</span></div>
+            <label class="checkbox-row"><input id="realtimePredictionInput" type="checkbox">使用 I-ModernTCN 实时计算预测</label>
+            <label class="checkbox-row"><input id="loopInput" type="checkbox" checked>试样结束后循环播放</label>
+          </div>
+        </details>
+
+        <details id="healthIndicatorSection" class="control-section">
+          <summary>健康指标与异常分数</summary>
+          <div class="control-content">
+            <label class="checkbox-row auto-indicator-row"><input id="autoIndicatorInput" type="checkbox" checked>根据输入数据方案自动选择健康指标构建形式</label>
+            <div id="indicatorAutoStatus" class="indicator-auto-status">正在识别输入数据与 TC-HI 构建形式……</div>
+            <div class="compact-input-grid">
+              <label>健康指标<select id="indicatorSelect"></select></label>
+              <label>异常分数模型<select id="modelSelect"></select></label>
+            </div>
+            <div id="recommendationCard" class="recommendation-card">正在读取模型推荐……</div>
+            <label><span>异常阈值 <output id="thresholdValue">0.50</output></span><input id="thresholdInput" type="range" min="0.05" max="0.95" step="0.01" value="0.50"></label>
+            <label><span>CAP 聚合强度 ρ <output id="rhoValue">0.50</output></span><input id="rhoInput" type="range" min="0" max="1" step="0.05" value="0.50"></label>
+            <label class="checkbox-row"><input id="optimizedWarningInput" type="checkbox" checked><span id="optimizedWarningLabel">使用优化预警</span></label>
+            <label class="checkbox-row evidence-visibility-setting"><input id="showLayerEvidenceInput" type="checkbox" checked>显示健康指标与铺层证据</label>
+            <p id="calculationModeNote" class="control-note">异常分数由所选分类器实时计算；窗口仅在 24 个真实点全部到达后进入聚合。</p>
+          </div>
+        </details>
+      <details id="dataIntegrationSection" class="control-section">
+        <summary>采集数据整合为 CSV</summary>
+        <div class="control-content">
+          <label>数据来源
+            <select id="integrationSourceTypeSelect">
+              <option value="folder_csv" selected>采集数据文件夹（每个试样一份完整文件）</option>
+              <option value="mysql">MySQL 数据库（afp_flat_all）</option>
+            </select>
+          </label>
+          <label id="integrationFolderLabel">采集数据文件夹
+            <span class="path-picker-row">
+              <input id="integrationFolderInput" type="text" placeholder="选择保存采集数据的根文件夹">
+              <button id="selectIntegrationFolderButton" class="secondary-button compact-button" type="button">选择</button>
+            </span>
+          </label>
+          <div id="integrationMysqlSettings" class="simulation-mysql-settings hidden">
+            <p class="control-note shared-mysql-note">使用“真实采集与保存”中的统一 MySQL 连接信息。</p>
+            <div class="compact-input-grid shared-mysql-legacy-fields hidden" aria-hidden="true">
+              <label>MySQL 主机<input id="integrationMysqlHostInput" type="text" value="127.0.0.1"></label>
+              <label>端口<input id="integrationMysqlPortInput" type="number" value="3306" min="1" max="65535"></label>
+              <label>用户<input id="integrationMysqlUserInput" type="text" value="root"></label>
+              <label>密码<input id="integrationMysqlPasswordInput" type="password" value="" autocomplete="new-password"></label>
+              <label>数据库<input id="integrationMysqlDatabaseInput" type="text" value="afp_state_warning"></label>
+            </div>
+            <label>SQL 查询
+              <textarea id="integrationMysqlQueryInput" rows="2">SELECT * FROM afp_flat_all ORDER BY specimen_key, layer_no, sample_index</textarea>
+            </label>
+          </div>
+          <label>整合文件保存位置（留空则保存到来源文件夹）
+            <input id="integrationOutputInput" type="text" placeholder="默认：来源文件夹/整合数据.csv">
+          </label>
+          <button id="runIntegrationButton" class="primary-button full-button" type="button">整合并导出 CSV</button>
+          <p id="integrationStatus" class="control-note">只读取每个试样当前的完整数据文件，不重复导入历史快照和分层文件。</p>
+        </div>
+      </details>
+      </aside>
+
+      <div id="leftColumnResizer" class="column-resizer left-resizer" role="separator"
+           aria-label="调整左侧设置栏宽度" aria-orientation="vertical" tabindex="0"
+           title="左右拖动调整设置栏宽度；双击恢复默认">
+        <span class="resizer-grip" aria-hidden="true">⋮</span>
+      </div>
+
+      <main class="main-content">
+        <details class="panel chart-panel primary-workbench collapsible-panel">
+          <summary class="panel-header collapsible-panel-summary">
+            <div><p class="panel-kicker">LIVE I-MODERNTCN FORECAST</p><h1 id="seriesTitle">实测值与未来预测值</h1></div>
+            <div class="legend">
+              <span><i class="legend-line actual"></i>已采集实测</span>
+              <span id="observedPredictionLegend"><i class="legend-line prediction"></i>历史对应预测</span>
+              <span id="futurePredictionLegend"><i class="legend-line future"></i>未来步长预测</span>
+              <label id="residualToggleLabel" class="toggle"><input id="residualToggle" type="checkbox"><span></span>残差</label>
+            </div>
+          </summary>
+          <div class="collapsible-panel-content">
+            <canvas id="seriesChart" height="300"></canvas>
+            <div class="chart-footer"><span>竖线左侧为已采集时刻，右侧为尚未到达的未来预测</span><span id="displayRange">—</span></div>
+          </div>
+        </details>
+
+        <section class="panel channel-panel">
+          <div class="panel-header compact">
+            <div><p class="panel-kicker">ALL ACQUIRED & PREDICTED CHANNELS</p><h2>全部传感器实时采集与预测</h2></div>
+            <span id="allChannelHint" class="muted">所有通道按统一方式显示</span>
+          </div>
+          <div class="channel-panel-content">
+            <div id="sensorCardsViewport" class="sensor-cards-viewport">
+              <div id="sensorCards" class="sensor-grid"></div>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <div id="rightColumnResizer" class="column-resizer right-resizer" role="separator"
+           aria-label="调整右侧预警栏宽度" aria-orientation="vertical" tabindex="0"
+           title="左右拖动调整预警栏宽度；双击恢复默认">
+        <span class="resizer-grip" aria-hidden="true">⋮</span>
+      </div>
+
+      <aside class="warning-rail">
+        <div class="rail-title"><span>03</span><div><b>三级状态预警</b><small>窗口 → 铺层 → 实际层数试样</small></div></div>
+        <article class="status-card accent-amber">
+          <div class="card-kicker">窗口级 · 最近完成窗口</div>
+          <div class="state-row"><span id="windowState" class="state-pill">等待窗口</span><strong id="windowScore" class="score-value">—</strong></div>
+          <div id="windowDetail" class="status-detail">窗口需要 24 个实测点</div>
+        </article>
+        <article class="status-card accent-cyan">
+          <div class="card-kicker">层级 · 当前铺层</div>
+          <div class="state-row"><span id="layerState" class="state-pill">等待数据</span><span id="layerScore" class="correctness">—</span></div>
+          <div id="layerDetail" class="status-detail">尚无完整窗口</div>
+        </article>
+        <article class="status-card accent-blue">
+          <div class="card-kicker">试样级 · 实际层数聚合</div>
+          <div class="state-row"><span id="specimenState" class="state-pill">等待数据</span><span id="specimenScore" class="correctness">—</span></div>
+          <div id="specimenDetail" class="status-detail">尚无层级证据</div>
+        </article>
+        <article class="status-card parameter-card accent-violet">
+          <div class="card-kicker">当前工艺参数</div>
+          <div id="processParameterGrid" class="parameter-grid"><div><span>等待识别</span><strong>—</strong></div></div>
+          <div id="parameterDetail" class="status-detail">—</div>
+        </article>
+        <details class="rail-block collapsible-rail-block" open>
+          <summary class="mini-panel-header"><div><p class="panel-kicker">ANOMALY TYPE</p><h2>异常类型概率</h2></div></summary>
+          <div class="collapsible-rail-content"><div id="probabilityBars" class="probability-bars"></div></div>
+        </details>
+      </aside>
+
+      <div id="verticalPanelResizer" class="vertical-panel-resizer" role="separator"
+           aria-label="调整上方监测区与下方证据区高度" aria-orientation="horizontal" tabindex="0"
+           title="上下拖动调整监测区与证据区高度；双击恢复默认">
+        <span class="vertical-resizer-grip" aria-hidden="true">•••</span>
+      </div>
+
+      <section id="evidenceDock" class="evidence-dock">
+        <details id="layerEvidencePanel" class="panel layer-panel collapsible-panel" open>
+          <summary class="panel-header compact collapsible-panel-summary">
+            <div><p class="panel-kicker">LAYER EVIDENCE</p><h2>铺层证据形成进度</h2></div>
+            <span id="layerPreviewBadge" class="preview-badge">等待完整窗口</span>
+          </summary>
+          <div class="collapsible-panel-content"><div id="layerProgress" class="layer-progress"></div></div>
+        </details>
+        <details id="timelineEvidencePanel" class="panel timeline-panel collapsible-panel" open>
+          <summary class="panel-header compact collapsible-panel-summary"><div><p class="panel-kicker">CAUSAL WINDOW EVIDENCE</p><h2>当前层窗口健康指标</h2></div></summary>
+          <div class="collapsible-panel-content">
+            <canvas id="timelineChart" height="160"></canvas>
+            <div id="poolingSummary" class="inline-summary">只显示已经完成计算的窗口</div>
+          </div>
+        </details>
+      </section>
+    </div>
+  </div>
+  <div id="toast" class="toast"></div>
+  <div id="real-access-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="real-access-title">
+    <div class="modal-card">
+      <h2 id="real-access-title">解锁真实采集模式</h2>
+      <p id="real-access-transport-note" class="control-note">请输入管理员授权密码。密码仅通过 HTTPS 提交。</p>
+      <label>授权密码<input id="real-access-password" type="password" autocomplete="current-password"></label>
+      <div class="modal-actions"><button id="real-access-submit" class="primary-button" type="button">确认解锁</button><button id="real-access-cancel" class="secondary-button" type="button">取消</button></div>
+    </div>
+  </div>
+  <div id="admin-security-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="admin-security-title">
+    <div class="modal-card admin-security-card">
+      <h2 id="admin-security-title">本地管理员安全设置</h2>
+      <p class="control-note">仅在本机管理员页面保存。密码至少 12 个字符；API Key 只保存在服务器，不会返回给浏览器。</p>
+      <label>授权密码<input id="admin-password" type="password" autocomplete="new-password" placeholder="至少 12 个字符"></label>
+      <label>硅基流动 API Key<input id="admin-api-key" type="password" autocomplete="off" placeholder="sk-…（可留空保持原 Key）"></label>
+      <label>模型名称<input id="admin-model-name" type="text" value="deepseek-ai/DeepSeek-V3" autocomplete="off"></label>
+      <label class="checkbox-row"><input id="admin-clear-api-key" type="checkbox">清除服务器中已保存的 API Key</label>
+      <div class="modal-actions"><button id="admin-security-save" class="primary-button" type="button">保存设置</button><button id="admin-security-cancel" class="secondary-button" type="button">取消</button></div>
+      <p id="admin-security-status" class="control-note"></p>
+    </div>
+  </div>
+  <script src="/mysql_visibility.js?v=20260909-mysql-toggle-2"></script>
+  <script src="/process_parameters.js?v=20260916-auto-process-1"></script>
+  <script src="/public_demo.js?v=20261001-stable-public-demo-v2"></script>
+  <script src="/app.js?v=20261001-save-boundary-v1"></script>
+</body>
+</html>

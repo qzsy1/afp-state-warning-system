@@ -1,0 +1,5 @@
+Method: TC-HI + soft Potts/CRF log-opinion pool
+Cross-validation used: False
+Hard specimen label back-projection: False
+All locked-test metrics > 90%: True
+Output: F:\program\channel_independent_MTSF-main\channel_independent_MTSF-main\auto_fiber_placement\new-state-monitor\state_monitor_v13\outputs_tc_hi_soft_consistency_v13_8

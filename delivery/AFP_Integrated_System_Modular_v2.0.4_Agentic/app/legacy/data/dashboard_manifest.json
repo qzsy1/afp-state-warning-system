@@ -1,0 +1,83 @@
+{
+  "version": "1.1.0",
+  "source_method": "TC-HI + Random Forest + soft Potts/CRF consistency (v13.8)",
+  "result_dir": "F:\\program\\channel_independent_MTSF-main\\channel_independent_MTSF-main\\results\\3",
+  "split_root": "F:\\program\\channel_independent_MTSF-main\\channel_independent_MTSF-main\\auto_fiber_placement\\new-state-monitor\\health_split_v3_accuracy",
+  "output_root": "F:\\program\\channel_independent_MTSF-main\\channel_independent_MTSF-main\\auto_fiber_placement\\new-state-monitor\\state_monitor_v13\\outputs_tc_hi_soft_consistency_v13_8",
+  "sampling_hz": 10.0,
+  "window_length": 24,
+  "stride": 24,
+  "seed": 2026,
+  "ambient_temperature_reference": 13.64000048682421,
+  "window_count": 5582,
+  "specimen_count": 26,
+  "layer_count": 130,
+  "sensors": [
+    {
+      "id": 0,
+      "name": "转速",
+      "unit": "物理单位"
+    },
+    {
+      "id": 1,
+      "name": "位移",
+      "unit": "物理单位"
+    },
+    {
+      "id": 2,
+      "name": "温度1",
+      "unit": "℃"
+    },
+    {
+      "id": 3,
+      "name": "温度2",
+      "unit": "℃"
+    },
+    {
+      "id": 4,
+      "name": "温度3",
+      "unit": "℃"
+    },
+    {
+      "id": 5,
+      "name": "温度4",
+      "unit": "℃"
+    },
+    {
+      "id": 6,
+      "name": "温度5",
+      "unit": "℃"
+    },
+    {
+      "id": 7,
+      "name": "温度6",
+      "unit": "℃"
+    },
+    {
+      "id": 8,
+      "name": "温度7",
+      "unit": "℃"
+    },
+    {
+      "id": 9,
+      "name": "温度8",
+      "unit": "℃"
+    },
+    {
+      "id": 10,
+      "name": "压实力",
+      "unit": "物理单位"
+    },
+    {
+      "id": 11,
+      "name": "振动",
+      "unit": "物理单位"
+    }
+  ],
+  "notes": [
+    "actual 为旧数据及试样一致的机理引导异常响应；prediction 为原 I-ModernTCN 预测。",
+    "model_input/model_true 为当前检查点实时前向推理所需的17通道标准化输入。",
+    "合成异常只用于算法开发，不等同于真实缺陷真值。",
+    "界面可调阈值与 CAP 参数仅用于交互预览，不覆盖正式实验结果。"
+  ]
+}
