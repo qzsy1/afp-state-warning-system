@@ -131,7 +131,7 @@ Copy-Item -Path (Join-Path $ScriptDir "app\core\*") -Destination (Join-Path $app
 Copy-Item -Path (Join-Path $ScriptDir "app\modules\*") -Destination (Join-Path $appTarget "modules") -Recurse -Force
 $runtimeConfigPath = Join-Path $configTarget "runtime.json"
 Copy-Item -LiteralPath (Join-Path $ScriptDir "config\runtime.delivery.json") -Destination $runtimeConfigPath -Force
-$runtimeConfig = Get-Content -LiteralPath $runtimeConfigPath -Raw | ConvertFrom-Json
+$runtimeConfig = Get-Content -LiteralPath $runtimeConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $runtimeConfig.application_version = $ApplicationVersion
 $runtimeConfig | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $runtimeConfigPath -Encoding UTF8
 $documentation = Get-ChildItem -LiteralPath (Join-Path $RepoRoot "docs") -Filter "*.md" -File
