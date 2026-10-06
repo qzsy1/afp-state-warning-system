@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -9,22 +10,17 @@ import numpy as np
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_ARTIFACT = (
-    APP_DIR
-    / "new_collection_demo_v11_3"
-    / "models"
-    / "new_collection_hi_artifacts.joblib"
+    Path(os.environ.get("AFP_NEW_HEALTH_ARTIFACT")).expanduser().resolve()
+    if os.environ.get("AFP_NEW_HEALTH_ARTIFACT")
+    else APP_DIR / "new_collection_demo_v11_3" / "models" / "new_collection_hi_artifacts.joblib"
 )
 
 SENSOR_COLUMNS = [
     "温度", "压力", "ROI平均温度", "张力", "线速度",
     "ABB_X", "ABB_Y", "ABB_Z",
     *[f"温度{index}" for index in range(1, 9)],
-    "转速", "位移", "振动",
 ]
-EXCLUDED_COLLECTION_CHANNELS = {"转速", "位移", "振动"}
-ACTIVE_COLLECTION_CHANNELS = [
-    name for name in SENSOR_COLUMNS if name not in EXCLUDED_COLLECTION_CHANNELS
-]
+ACTIVE_COLLECTION_CHANNELS = list(SENSOR_COLUMNS)
 PROCESS_COLUMNS = [
     "initial_compaction_force_N",
     "placement_speed_mm_s",
@@ -36,11 +32,6 @@ THERMAL = [
 ]
 COMPACTION = ["压力", "张力"]
 MOTION = ["线速度", "ABB_X", "ABB_Y", "ABB_Z"]
-# Retain the feature slot for compatibility with the existing trained
-# classifiers, but it is explicitly zero because vibration is not acquired in
-# the new collection plan.
-VIBRATION = []
-
 NEW_STATE_LABELS = {
     "normal": "正常",
     "underheat": "温度设定过低",
@@ -77,7 +68,6 @@ MASTER_FEATURE_NAMES = [
     "motion_residual_rms",
     "speed_tracking_error",
     "trajectory_residual_rms",
-    "vibration_residual_rms",
     "global_residual_p95",
     "cross_channel_residual_coherence",
     "thermo_compaction_coupling_error",
@@ -114,7 +104,7 @@ INDICATOR_FEATURES = {
     "RFHI": [
         "thermal_residual_rms", "pressure_residual_rms",
         "tension_residual_rms", "motion_residual_rms",
-        "trajectory_residual_rms", "vibration_residual_rms",
+        "trajectory_residual_rms",
         "global_residual_p95", "cross_channel_residual_coherence",
     ],
     "PR-HI": [
@@ -122,7 +112,7 @@ INDICATOR_FEATURES = {
         "response_compaction_distance", "response_motion_distance",
         "speed_tracking_error", "thermo_compaction_coupling_error",
     ],
-    "MPRF-HI": MASTER_FEATURE_NAMES[:21],
+    "MPRF-HI": MASTER_FEATURE_NAMES[:20],
     "PCA-SPE-HI": ["pca_spe", "global_residual_p95"],
     "KECA-SPE-HI": [
         "keca_distance", "process_manifold_distance",
@@ -135,7 +125,7 @@ INDICATOR_FEATURES = {
     ],
     "CNN-LSTM-AE-HI": [
         "temporal_autoencoding_error", "thermal_ramp_error",
-        "motion_residual_rms", "vibration_residual_rms",
+        "motion_residual_rms",
         "global_residual_p95",
     ],
     "W-HI": [
@@ -163,6 +153,8 @@ INDICATOR_LABELS = {
     "RMD-HI": "稳健马氏距离指标",
 }
 
+INDICATOR_LABELS["RFHI"] = "16通道预测残差融合指标"
+
 INDICATOR_REQUIRED_OUTPUTS = {
     "T-HI": THERMAL,
     "C-HI": COMPACTION,
@@ -188,8 +180,17 @@ def _finite(value: Any, default: float = 0.0) -> float:
 
 
 def _integral(values: np.ndarray) -> float:
-    trapezoid = getattr(np, "trapezoid", np.trapz)
-    return float(trapezoid(values))
+    # NumPy 2.x removed ``np.trapz`` while older supported versions do not
+    # expose ``np.trapezoid``.  Avoid evaluating a missing fallback eagerly
+    # and keep the same unit-spacing trapezoidal integral on both versions.
+    trapezoid = getattr(np, "trapezoid", None)
+    if trapezoid is not None:
+        return float(trapezoid(values))
+    legacy_trapz = getattr(np, "trapz", None)
+    if legacy_trapz is not None:
+        return float(legacy_trapz(values))
+    values = np.asarray(values, dtype=float)
+    return float(np.sum((values[:-1] + values[1:]) * 0.5))
 
 
 def _indices(names: list[str]) -> list[int]:
@@ -424,7 +425,6 @@ def build_master_feature_vector(
         "motion_residual_rms": _group_rms(residual_z, MOTION),
         "speed_tracking_error": speed_tracking_error,
         "trajectory_residual_rms": float(np.sqrt(np.mean(np.square(residual_z[:, trajectory_indices])))),
-        "vibration_residual_rms": 0.0,
         "global_residual_p95": float(np.quantile(absolute_z, 0.95)),
         "cross_channel_residual_coherence": coherence,
         "thermo_compaction_coupling_error": thermo_compaction_coupling_error,
@@ -512,6 +512,16 @@ class NewCollectionHealthEngine:
                 "请先运行 fit_new_collection_health.py"
             )
         self.artifact = joblib.load(self.artifact_path)
+        artifact_sensors = list(self.artifact.get("sensor_columns", []))
+        artifact_schema = str(self.artifact.get("schema_version", ""))
+        if artifact_sensors != SENSOR_COLUMNS or artifact_schema != "new_collection_hi_v3_16s4p":
+            raise ValueError(
+                "新数据集健康指标文件与当前16传感器方案不一致。"
+                "请运行 fit_new_collection_health.py 重新生成指标文件。"
+            )
+        artifact_features = list(self.artifact.get("indicator_features", {}))
+        if artifact_features != list(INDICATOR_FEATURES):
+            raise ValueError("健康指标目录与当前程序版本不一致，请重新生成指标文件")
 
     @property
     def catalog(self) -> list[dict[str, Any]]:
@@ -546,4 +556,30 @@ class NewCollectionHealthEngine:
         classes = np.asarray(model["binary_model"].classes_)
         positive = np.flatnonzero(classes == 1)
         score = float(raw[0, int(positive[0])]) if len(positive) else 0.0
-        return score, cause_probabilities(process), features
+        raw_types = np.asarray(
+            model["type_model"].predict_proba(features[None, :]), dtype=float
+        )[0]
+        aligned = np.zeros(len(NEW_ABNORMAL_STATES), dtype=float)
+        for source_index, state in enumerate(model["type_model"].classes_):
+            if str(state) in NEW_ABNORMAL_STATES:
+                aligned[NEW_ABNORMAL_STATES.index(str(state))] = raw_types[
+                    source_index
+                ]
+        if float(aligned.sum()) <= 1e-12:
+            aligned[:] = 1.0 / len(aligned)
+        else:
+            aligned /= aligned.sum()
+        mechanism = cause_probabilities(process)
+        mechanism_values = np.asarray(
+            [mechanism[state] for state in NEW_ABNORMAL_STATES], dtype=float
+        )
+        # The learned response signature remains the primary type evidence;
+        # process conditions act as an interpretable mechanistic prior.  This
+        # avoids the former uniform output under nominal process settings.
+        fused = 0.75 * aligned + 0.25 * mechanism_values
+        fused /= max(float(fused.sum()), 1e-12)
+        probabilities = {
+            state: float(fused[index])
+            for index, state in enumerate(NEW_ABNORMAL_STATES)
+        }
+        return score, probabilities, features

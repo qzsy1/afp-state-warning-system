@@ -26,7 +26,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_ROOT = APP_DIR / "new_collection_demo_v11_3"
 MODEL_DIR = DATA_ROOT / "models"
 MANIFEST = DATA_ROOT / "manifest.csv"
-CHECKPOINT = MODEL_DIR / "i_modern_tcn_new_collection_v11_3.pth"
+CHECKPOINT = APP_DIR / "models" / "new" / "i_T_G" / "checkpoint.pth"
 METADATA = CHECKPOINT.with_suffix(".pth.json")
 ARTIFACT = MODEL_DIR / "new_collection_hi_artifacts.joblib"
 METRICS_FILE = MODEL_DIR / "new_collection_hi_metrics.csv"
@@ -37,7 +37,9 @@ XJU_ROOT = (
     if getattr(sys, "frozen", False)
     else Path(r"F:\program\XJUsorceopen")
 )
-MODEL_COLUMNS = [*SENSOR_COLUMNS, *PROCESS_COLUMNS]
+MODEL_METADATA = json.loads(METADATA.read_text(encoding="utf-8"))
+MODEL_COLUMNS = [str(name) for name in MODEL_METADATA["model_columns"]]
+OUTPUT_INDICES = [MODEL_COLUMNS.index(name) for name in SENSOR_COLUMNS]
 RANDOM_SEED = 20260730
 
 
@@ -91,7 +93,7 @@ def _predict(x_raw: np.ndarray) -> np.ndarray:
     import torch
     import shijie.model_mine.I_modernTCN_GAT_abalation as model_module
 
-    metadata = json.loads(METADATA.read_text(encoding="utf-8"))
+    metadata = MODEL_METADATA
     mean = np.asarray(metadata["scaler_mean"], dtype=np.float32)
     scale = np.asarray(metadata["scaler_scale"], dtype=np.float32)
     standardized_input = ((x_raw - mean) / scale).astype(np.float32)
@@ -114,7 +116,7 @@ def _predict(x_raw: np.ndarray) -> np.ndarray:
             decoder = torch.zeros((len(batch), 48, len(MODEL_COLUMNS)), device=device)
             standardized = model(batch, mark, decoder, mark).cpu().numpy()
             physical = standardized * scale[None, None, :] + mean[None, None, :]
-            outputs.append(physical[:, :, : len(SENSOR_COLUMNS)])
+            outputs.append(physical[:, :, OUTPUT_INDICES])
     return np.concatenate(outputs, axis=0)
 
 
@@ -208,12 +210,12 @@ def _estimators() -> dict[str, object]:
             ),
         ),
         "random_forest": RandomForestClassifier(
-            n_estimators=400, min_samples_leaf=2,
+            n_estimators=200, min_samples_leaf=2,
             class_weight="balanced_subsample", random_state=RANDOM_SEED,
             n_jobs=-1,
         ),
         "extra_trees": ExtraTreesClassifier(
-            n_estimators=400, min_samples_leaf=2,
+            n_estimators=200, min_samples_leaf=2,
             class_weight="balanced", random_state=RANDOM_SEED, n_jobs=-1,
         ),
     }
@@ -373,7 +375,7 @@ def main() -> None:
 
     artifact = {
         **calibration,
-        "schema_version": "new_collection_hi_v2",
+        "schema_version": "new_collection_hi_v3_16s4p",
         "sensor_columns": SENSOR_COLUMNS,
         "process_columns": PROCESS_COLUMNS,
         "indicator_features": INDICATOR_FEATURES,
@@ -385,8 +387,20 @@ def main() -> None:
             "阈值与推荐模型仅用验证集；内推和外推测试集锁定"
         ),
         "warning": "当前为模拟新数据集联调结果，不能代表真实AFP缺陷识别性能",
+        "prediction_model": {
+            "checkpoint": str(CHECKPOINT),
+            "checkpoint_sha256": __import__("hashlib").sha256(
+                CHECKPOINT.read_bytes()
+            ).hexdigest(),
+            "model_type": MODEL_METADATA.get("model_type", "i_T_G"),
+            "atavn": MODEL_METADATA.get("atavn"),
+            "input_sensors": MODEL_METADATA.get("input_sensors", []),
+            "output_sensors": MODEL_METADATA.get("output_sensors", []),
+        },
     }
-    joblib.dump(artifact, ARTIFACT)
+    # Compression and a bounded ensemble size keep the desktop package and
+    # startup memory practical without changing the feature/decision contract.
+    joblib.dump(artifact, ARTIFACT, compress=3)
     pd.DataFrame(catalog).to_csv(CATALOG_FILE, index=False, encoding="utf-8-sig")
     pd.DataFrame(metrics).to_csv(METRICS_FILE, index=False, encoding="utf-8-sig")
     summary = {

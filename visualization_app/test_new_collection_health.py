@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import re
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +11,7 @@ from new_collection_health import (
     NEW_ABNORMAL_STATES,
     PROCESS_COLUMNS,
     SENSOR_COLUMNS,
+    NewCollectionHealthEngine,
     build_calibration,
     build_feature_vector,
     cause_probabilities,
@@ -33,6 +35,10 @@ class NewCollectionHealthTests(unittest.TestCase):
         cls.process = dict(zip(PROCESS_COLUMNS, cls.process_points[0]))
 
     def test_all_twelve_indicators_generate_finite_features(self) -> None:
+        self.assertEqual(len(SENSOR_COLUMNS), 16)
+        self.assertNotIn("转速", SENSOR_COLUMNS)
+        self.assertNotIn("位移", SENSOR_COLUMNS)
+        self.assertNotIn("振动", SENSOR_COLUMNS)
         self.assertEqual(len(INDICATOR_FEATURES), 12)
         for indicator, names in INDICATOR_FEATURES.items():
             with self.subTest(indicator=indicator):
@@ -67,6 +73,19 @@ class NewCollectionHealthTests(unittest.TestCase):
         self.assertIn(
             "document.activeElement !== controls.horizonNumber", javascript
         )
+        declarations = re.findall(
+            r"(?m)^function\s+([A-Za-z0-9_]+)\s*\(", javascript
+        )
+        self.assertEqual(len(declarations), len(set(declarations)))
+
+    def test_packaged_health_artifact_matches_current_schema(self) -> None:
+        engine = NewCollectionHealthEngine()
+        self.assertEqual(
+            engine.artifact["schema_version"],
+            "new_collection_hi_v3_16s4p",
+        )
+        self.assertEqual(engine.artifact["sensor_columns"], SENSOR_COLUMNS)
+        self.assertEqual(len(engine.catalog), 48)
 
 
 if __name__ == "__main__":

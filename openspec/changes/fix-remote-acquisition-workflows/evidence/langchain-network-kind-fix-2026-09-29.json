@@ -1,0 +1,58 @@
+{
+  "date": "2026-09-29",
+  "change": "fix-remote-acquisition-workflows",
+  "scope": "PLC/ABB missing physical_interface_kind must not abort LangChain diagnosis",
+  "root_cause": "The deterministic planner selected check_network_path for simultaneous PLC/ABB failures even when helper events omitted physical_interface_kind, while the read-only tool safety validator correctly rejected non-confirmed ethernet events. The request therefore failed before the provider call.",
+  "implementation": {
+    "network_tool_validator_relaxed": false,
+    "missing_kind_plan": [
+      "get_cross_interface_timeline",
+      "inspect_interface_mapping"
+    ],
+    "fast_model_calls_max": 1,
+    "structured_contract_fields": [
+      "required_interface_ids",
+      "known_evidence_ids_by_interface",
+      "output_example"
+    ]
+  },
+  "verification": {
+    "red_test_before_fix": "DiagnosticToolError: 该工具只允许检查已配置的PLC或ABB网络接口",
+    "agentic_diagnosis_tests": {
+      "passed": 32,
+      "failed": 0
+    },
+    "related_regression_tests": {
+      "passed": 280,
+      "failed": 0,
+      "coverage": [
+        "agentic diagnosis",
+        "five-interface agent contracts",
+        "public web security",
+        "frontend remote workflows",
+        "helper relay and transport",
+        "acquisition integrity"
+      ]
+    },
+    "openspec_strict_validation": "passed",
+    "runtime": {
+      "pid": 28448,
+      "loopback_health": "ok",
+      "public_health": "ok",
+      "diagnosis_start_http": 202,
+      "local_model_status": "offline_success",
+      "local_diagnoses": 2,
+      "final_state": "success",
+      "final_model_status": "success",
+      "final_model_used": true,
+      "final_diagnoses": 2,
+      "final_error": ""
+    }
+  },
+  "delivery": {
+    "agentic_diagnosis_sha256": "431A4C3CA0DF9B5ED59C6A8619C1E4BB329A13E2E1988C6BF493BFA777848F24",
+    "main_exe_sha256_unchanged": "AA7BC2F636E862E9F603F7B4D4D9D8FC9B71390FFB20F33A011A42EF9D56FD65",
+    "helper_exe_sha256_unchanged": "272FB53A4A622882E83CB86C5BDC3EDE13C7B4BBF745627BAEF65E17D5026001"
+  },
+  "boundary": "The actual provider call was verified through the loopback local-admin endpoint on the same restarted delivery process. The public domain health endpoint was verified separately; a second-PC authorized browser remains the user's acceptance environment."
+}

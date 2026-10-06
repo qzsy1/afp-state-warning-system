@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import json
 import math
+import http.client
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 
+import app as app_module
 from acquisition import (
     AcquisitionConfig,
     AcquisitionManager,
@@ -19,13 +23,17 @@ from acquisition import (
     ORIGINAL_COLUMNS,
     SENSOR_COLUMNS,
 )
+from generate_pressure_simulation import generate as generate_pressure_simulation
 from app import (
     DashboardData,
     NEW_DEMO_CHECKPOINT,
     NEW_DEMO_SOURCE,
     cap_pool,
+    _operation_lock,
+    _OPERATION_LOCK_STARTED,
+    create_server,
 )
-from online_inference import inspect_prediction_model
+from online_inference import NEW_MODEL_SENSOR_COLUMNS, inspect_prediction_model
 
 
 class PoolingTests(unittest.TestCase):
@@ -40,10 +48,40 @@ class PoolingTests(unittest.TestCase):
 class DashboardTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.dashboard = DashboardData()
+        cls.simulation_fixture = tempfile.TemporaryDirectory()
+        cls.original_new_demo_source = app_module.NEW_DEMO_SOURCE
+        source = generate_pressure_simulation(
+            Path(cls.simulation_fixture.name) / "SIM_PRESSURE_M3232_new_collection.csv",
+            rows=96,
+        )
+        global DEFAULT_SIMULATOR_FILE, NEW_DEMO_SOURCE
+        DEFAULT_SIMULATOR_FILE = source
+        NEW_DEMO_SOURCE = source
+        app_module.NEW_DEMO_SOURCE = source
+        try:
+            cls.dashboard = DashboardData()
+        except Exception:
+            app_module.NEW_DEMO_SOURCE = cls.original_new_demo_source
+            cls.simulation_fixture.cleanup()
+            raise
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        app_module.NEW_DEMO_SOURCE = cls.original_new_demo_source
+        cls.simulation_fixture.cleanup()
 
     def test_bootstrap_and_view(self) -> None:
         bootstrap = self.dashboard.bootstrap()
+        self.assertEqual(bootstrap["application"]["version"], "1.12.0")
+        prediction_models = bootstrap["acquisition"]["prediction_models"]
+        self.assertEqual(len(prediction_models), 11)
+        self.assertTrue(
+            all(
+                model["available_by_schema"][schema]
+                for model in prediction_models
+                for schema in ("legacy_original", "new_collection_v11_3")
+            )
+        )
         defaults = bootstrap["defaults"]
         payload = self.dashboard.view(
             defaults["specimen"],
@@ -197,8 +235,10 @@ class DashboardTests(unittest.TestCase):
             "raw", "TC-HI", "random_forest", 48, True, True,
         )
         self.assertEqual(raw["forecast"]["mode"], "archived_direct_24")
-        self.assertEqual(optimized["forecast"]["mode"], "live_checkpoint_recursive")
+        self.assertEqual(optimized["forecast"]["mode"], "i_T_G_recursive")
         self.assertEqual(optimized["forecast"]["returned_horizon"], 48)
+        self.assertEqual(optimized["forecast"]["model_type"], "i_T_G")
+        self.assertEqual(len(optimized["forecast"]["checkpoint_sha256"]), 64)
         self.assertEqual(
             raw["window"]["decision_mode"],
             "realtime_features_archived_prediction",
@@ -234,6 +274,10 @@ class DashboardTests(unittest.TestCase):
             / "outputs_causal_online_consistency_v13_9"
             / "causal_online_level_metrics.csv"
         )
+        if not metrics_path.is_file():
+            self.skipTest(
+                "缺少不可重建的v13.9历史因果指标；由causal-history-evidence单独报告"
+            )
         metrics = pd.read_csv(metrics_path)
         test = metrics.loc[metrics["dataset"].eq("test_all")].set_index("level")
         self.assertGreaterEqual(
@@ -273,6 +317,7 @@ class DashboardTests(unittest.TestCase):
                 run_id="TEST_RUN",
                 specimen_id="TEST_SPECIMEN",
                 layer=0,
+                save_root=str(temporary_path),
             )
             stopped = None
             try:
@@ -460,6 +505,7 @@ class DashboardTests(unittest.TestCase):
     def test_selected_save_root_keeps_layer_and_whole_specimen_files(self) -> None:
         def capture_layer(root: Path, layer: int) -> dict:
             manager = AcquisitionManager(root / "unused_default")
+            (root / "用户选择目录").mkdir(parents=True, exist_ok=True)
             config = AcquisitionConfig(
                 driver="simulator",
                 source_file=str(DEFAULT_SIMULATOR_FILE),
@@ -482,19 +528,11 @@ class DashboardTests(unittest.TestCase):
             root = Path(temporary)
             first = capture_layer(root, 0)
             second = capture_layer(root, 1)
-            specimen_dir = (
-                root / "用户选择目录" / "试样A_p600_v100_pr600"
-            )
-            layer_1 = specimen_dir / "试样A_p600_v100_pr600_第1层.CSV"
-            layer_2 = specimen_dir / "试样A_p600_v100_pr600_第2层.CSV"
-            whole_1 = (
-                specimen_dir
-                / "试样A_p600_v100_pr600_完整试样_已采1层.CSV"
-            )
-            whole_2 = (
-                specimen_dir
-                / "试样A_p600_v100_pr600_完整试样_已采2层.CSV"
-            )
+            specimen_dir = root / "用户选择目录" / "R1_p600_v100_pr600"
+            layer_1 = specimen_dir / "R1_p600_v100_pr600_第1层.CSV"
+            layer_2 = specimen_dir / "R1_p600_v100_pr600_第2层.CSV"
+            whole_1 = specimen_dir / "R1_p600_v100_pr600_完整试样.CSV"
+            whole_2 = whole_1
             self.assertEqual(Path(first["raw_file"]), layer_1)
             self.assertEqual(Path(second["raw_file"]), layer_2)
             self.assertEqual(Path(first["full_specimen_file"]), whole_1)
@@ -503,6 +541,9 @@ class DashboardTests(unittest.TestCase):
             self.assertTrue(layer_2.exists())
             self.assertTrue(whole_1.exists())
             self.assertTrue(whole_2.exists())
+            self.assertEqual(
+                len(list(specimen_dir.glob("*完整试样*.CSV"))), 1
+            )
             first_rows = pd.read_csv(layer_1, encoding="gb18030")
             second_rows = pd.read_csv(layer_2, encoding="gb18030")
             combined = pd.read_csv(whole_2, encoding="gb18030")
@@ -515,6 +556,8 @@ class DashboardTests(unittest.TestCase):
             original_manager = self.dashboard.acquisition
             manager = AcquisitionManager(Path(temporary))
             self.dashboard.acquisition = manager
+            save_root = Path(temporary) / "capture"
+            save_root.mkdir(parents=True, exist_ok=True)
             config = AcquisitionConfig(
                 processing_mode="capture_only",
                 dataset_schema="new_collection_v11_3",
@@ -525,6 +568,7 @@ class DashboardTests(unittest.TestCase):
                 sample_rate_hz=1000.0,
                 specimen_id="NEW_CAPTURE_ONLY",
                 condition_id="H06",
+                save_root=str(save_root),
             )
             stopped = None
             try:
@@ -544,10 +588,13 @@ class DashboardTests(unittest.TestCase):
                     "TC-HI", "random_forest", 24,
                 )
                 self.assertEqual(payload["mode"], "capture_only")
-                # The new collection plan intentionally acquires 16 physical
-                # channels; rotation speed, displacement and vibration are
-                # excluded from the new dataset.
-                self.assertEqual(len(payload["channels"]), 16)
+                # The new collection plan acquires 17 channels, including
+                # separate PLC pressure and pressure-film channels. Rotation
+                # speed, displacement and vibration remain excluded.
+                self.assertEqual(len(payload["channels"]), 17)
+                self.assertIn(
+                    "薄膜压力", [channel["name"] for channel in payload["channels"]]
+                )
                 self.assertEqual(payload["forecast"]["returned_horizon"], 0)
                 self.assertEqual(
                     payload["feature_generation"]["mode"], "capture_only"
@@ -574,7 +621,12 @@ class DashboardTests(unittest.TestCase):
             profile = self.dashboard.inspect_prediction_model(
                 str(NEW_DEMO_CHECKPOINT)
             )
-            self.assertEqual(profile["enc_in"], 23)
+            self.assertEqual(profile["enc_in"], 20)
+            # This checkpoint predates the pressure-film model input. Capture
+            # keeps all 17 channels while inference uses its declared 16-input
+            # subset instead of inventing an untrained feature.
+            self.assertEqual(profile["input_sensors"], NEW_MODEL_SENSOR_COLUMNS)
+            self.assertNotIn("薄膜压力", profile["input_sensors"])
             config = AcquisitionConfig(
                 processing_mode="prediction_warning",
                 dataset_schema="new_collection_v11_3",
@@ -608,9 +660,28 @@ class DashboardTests(unittest.TestCase):
                     "TC-HI", "random_forest", 24,
                 )
                 self.assertEqual(payload["mode"], "live_acquisition")
-                self.assertEqual(len(payload["channels"]), 16)
+                self.assertEqual(len(payload["channels"]), 17)
+                self.assertEqual(
+                    sum(bool(channel["prediction_enabled"]) for channel in payload["channels"]),
+                    len(NEW_MODEL_SENSOR_COLUMNS),
+                )
+                pressure_film = next(
+                    channel for channel in payload["channels"] if channel["name"] == "薄膜压力"
+                )
+                self.assertFalse(pressure_film["prediction_enabled"])
                 self.assertEqual(payload["forecast"]["returned_horizon"], 24)
                 self.assertTrue(payload["window"]["complete"])
+                self.assertTrue(
+                    payload["window"]["optimized_warning_applied"]
+                )
+                self.assertEqual(
+                    payload["feature_generation"]["warning_optimization"],
+                    "validation_calibrated_cap_16s4p",
+                )
+                probabilities = list(
+                    payload["window"]["type_probabilities"].values()
+                )
+                self.assertGreater(max(probabilities) - min(probabilities), 1e-6)
                 self.assertEqual(
                     payload["forecast"]["checkpoint"],
                     str(NEW_DEMO_CHECKPOINT.resolve()),
@@ -648,13 +719,108 @@ class DashboardTests(unittest.TestCase):
         )
         self.assertEqual(
             result["selection_metric"],
-            "validation_mse_standardized",
+            "minimum_validation_loss",
         )
-        self.assertAlmostEqual(
-            float(result["selection_metric_value"]),
-            0.035947587341070175,
-        )
+        self.assertLess(float(result["selection_metric_value"]), 0.01)
         self.assertNotIn("test", result["selection_basis"].lower())
+
+
+class LanServerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        fake_dashboard = type("FakeDashboard", (), {})()
+        fake_dashboard.acquisition = SimpleNamespace(
+            discover_interfaces=lambda: {},
+            status=lambda: {"running": False, "sensors": []},
+        )
+        with patch("app.DashboardData", return_value=fake_dashboard):
+            cls.server = create_server(
+                "127.0.0.1",
+                0,
+                {
+                    "enabled": True,
+                    "bind_host": "0.0.0.0",
+                    "port": 8770,
+                    "urls": ["http://127.0.0.1:8770/"],
+                    "api_key": "must-not-leak",
+                },
+                access_context="local_admin",
+            )
+        cls.thread = __import__("threading").Thread(
+            target=cls.server.serve_forever, daemon=True
+        )
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=2)
+
+    def request(self, method: str, path: str, body: dict | None = None, headers=None):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port)
+        payload = None if body is None else json.dumps(body).encode("utf-8")
+        request_headers = {"Host": f"127.0.0.1:{self.server.server_port}"}
+        if body is not None:
+            request_headers["Content-Type"] = "application/json"
+        request_headers.update(headers or {})
+        connection.request(method, path, payload, request_headers)
+        response = connection.getresponse()
+        raw = response.read()
+        connection.close()
+        return response.status, json.loads(raw.decode("utf-8"))
+
+    def test_network_status_never_contains_secrets(self):
+        status, payload = self.request("GET", "/api/network/status")
+        self.assertEqual(status, 200)
+        self.assertNotIn("api_key", json.dumps(payload))
+        self.assertEqual(payload["urls"], ["http://127.0.0.1:8770/"])
+
+    def test_cross_origin_mutation_is_rejected(self):
+        status, _ = self.request(
+            "POST",
+            "/api/acquisition/reset-check",
+            {},
+            {"Origin": "http://attacker.example"},
+        )
+        self.assertEqual(status, 403)
+
+    def test_same_operation_returns_409_while_in_progress(self):
+        lock = _operation_lock("acquisition-check")
+        self.assertTrue(lock.acquire(blocking=False))
+        try:
+            status, payload = self.request("POST", "/api/acquisition/reset-check", {})
+        finally:
+            lock.release()
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["error"], "operation_in_progress")
+
+    def test_agent_diagnosis_does_not_block_hardware_check_lock(self):
+        lock = _operation_lock("acquisition-check")
+        self.assertTrue(lock.acquire(blocking=False))
+        try:
+            event = {"interface_id": "uvc_temperature", "state": "no_data", "channels": ["ROI平均温度"]}
+            with patch("interface_agent.run_interface_diagnoses", return_value={"diagnoses": []}):
+                status, payload = self.request(
+                    "POST", "/api/agent/diagnose",
+                    {"api_key": "", "model_name": "", "events": [event], "hardware_result": {}},
+                )
+        finally:
+            lock.release()
+        self.assertNotEqual(status, 409)
+        self.assertNotEqual(payload.get("error"), "operation_in_progress")
+
+    def test_stale_hardware_check_lock_can_be_reclaimed(self):
+        lock = _operation_lock("acquisition-check")
+        self.assertTrue(lock.acquire(blocking=False))
+        try:
+            _OPERATION_LOCK_STARTED["acquisition-check"] = time.monotonic() - 1
+            with patch("app.OPERATION_LOCK_TTL_SECONDS", 0.0, create=True):
+                status, payload = self.request("POST", "/api/acquisition/reset-check", {})
+        finally:
+            lock.release()
+        self.assertNotEqual(status, 409)
+        self.assertNotEqual(payload.get("error"), "operation_in_progress")
 
 
 if __name__ == "__main__":

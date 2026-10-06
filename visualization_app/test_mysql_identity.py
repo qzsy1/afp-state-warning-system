@@ -1,12 +1,191 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 from acquisition import AcquisitionConfig
-from mysql_storage import MySQLCaptureStore, process_condition_key
+from app import validate_read_only_mysql_query
+from mysql_storage import MySQLCaptureStore, MySQLSettings, process_condition_key
+
+
+class _FakeCursor:
+    def __init__(self) -> None:
+        self.executed: list[tuple[str, tuple | None]] = []
+        self._rows: list[tuple] = []
+
+    def execute(self, sql, parameters=None) -> None:
+        self.executed.append((str(sql), parameters))
+        upper = str(sql).upper()
+        if "INFORMATION_SCHEMA.TABLES" in upper:
+            from mysql_storage import REQUIRED_SCHEMA_OBJECTS
+            self._rows = [(name,) for name in sorted(REQUIRED_SCHEMA_OBJECTS)]
+        elif "COUNT(*)" in upper:
+            self._rows = [(0,)]
+        elif upper.strip().startswith("SELECT 1"):
+            self._rows = [(1,)]
+        else:
+            self._rows = []
+
+    def executemany(self, sql, values) -> None:
+        self.executed.append((str(sql), tuple(values)))
+
+    def fetchone(self):
+        return self._rows.pop(0) if self._rows else None
+
+    def fetchall(self):
+        rows, self._rows = self._rows, []
+        return rows
+
+    def close(self) -> None:
+        pass
+
+
+class _FakeConnection:
+    def __init__(self) -> None:
+        self.cursor_instance = _FakeCursor()
+        self.closed = False
+
+    def cursor(self):
+        return self.cursor_instance
+
+    def close(self) -> None:
+        self.closed = True
+
+    def commit(self) -> None:
+        pass
+
+    def rollback(self) -> None:
+        pass
 
 
 class MySQLIdentityTests(unittest.TestCase):
+    def test_save_layer_streams_reiterable_rows_in_bounded_batches(self) -> None:
+        settings = MySQLSettings(enabled=True, database="afp_remote")
+        store = MySQLCaptureStore(settings)
+        connection = _FakeConnection()
+        config = AcquisitionConfig(
+            specimen_id="specimen-a", capture_uuid="capture-a", layer=0,
+            selected_sensors=["温度1"],
+        )
+
+        def rows():
+            for index in range(2_501):
+                yield {"温度1": float(index), "timestamp_unix": float(index)}
+
+        with mock.patch.object(store, "_connect", return_value=("fake", connection)):
+            result = store.save_layer(
+                config, rows=rows(), layer_file=None, full_specimen_file=None,
+                timestamp_file=None, folder_path=None, summary={},
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["saved_rows"], 2_501)
+        batches = [values for sql, values in connection.cursor_instance.executed
+                   if "INSERT INTO AFP_SENSOR_SAMPLE" in sql.upper()]
+        self.assertEqual([len(values) for values in batches], [1000, 1000, 501])
+        self.assertEqual(batches[0][0][2], 0)
+        self.assertEqual(batches[-1][-1][2], 2500)
+        statements = [sql.upper() for sql, _ in connection.cursor_instance.executed]
+        layer_insert = next(
+            index for index, sql in enumerate(statements)
+            if "INSERT INTO AFP_LAYER" in sql
+        )
+        first_sample_insert = next(
+            index for index, sql in enumerate(statements)
+            if "INSERT INTO AFP_SENSOR_SAMPLE" in sql
+        )
+        self.assertLess(
+            layer_insert,
+            first_sample_insert,
+            "the parent layer row must exist before foreign-keyed sample rows",
+        )
+    def test_non_tls_profile_keeps_connector_security_negotiation_available(self) -> None:
+        """caching_sha2_password must be able to negotiate TLS/RSA itself."""
+        settings = MySQLSettings(
+            enabled=True,
+            host="192.168.101.31",
+            user="afp_app",
+            password="secret",
+        )
+        kwargs = MySQLCaptureStore(settings)._connection_kwargs(
+            "mysql.connector", settings.database
+        )
+        self.assertNotIn("ssl_disabled", kwargs)
+
+    def test_remote_settings_accept_host_and_mask_secret(self) -> None:
+        settings = MySQLSettings.from_mapping({
+            "mysql_enabled": "true",
+            "mysql_host": "192.168.10.25",
+            "mysql_port": "3307",
+            "mysql_user": "afp_app",
+            "mysql_password": "secret",
+            "mysql_database": "afp_remote",
+        })
+        self.assertEqual(settings.host, "192.168.10.25")
+        self.assertEqual(settings.port, 3307)
+        public = settings.public_dict()
+        self.assertNotIn("password", public)
+        self.assertTrue(public["password_configured"])
+
+    def test_verify_existing_schema_does_not_run_ddl(self) -> None:
+        settings = MySQLSettings(enabled=True, host="10.0.0.8", database="afp_remote")
+        store = MySQLCaptureStore(settings)
+        connection = _FakeConnection()
+        with mock.patch.object(store, "_connect", return_value=("fake", connection)):
+            result = store.verify_connection(require_schema=True)
+        self.assertTrue(result["ok"])
+        self.assertTrue(connection.closed)
+        statements = "\n".join(sql for sql, _ in connection.cursor_instance.executed).upper()
+        self.assertNotIn("CREATE ", statements)
+        self.assertNotIn("ALTER ", statements)
+
+    def test_relation_refresh_can_initialize_missing_database(self) -> None:
+        settings = MySQLSettings(enabled=True, database="afp_empty")
+        store = MySQLCaptureStore(settings)
+        initialized = {
+            "ok": True,
+            "initialized": True,
+            "database": "afp_empty",
+        }
+        ready = {
+            "ok": True,
+            "enabled": True,
+            "database": "afp_empty",
+            "rows": [],
+            "count": 0,
+            "total_count": 0,
+        }
+        calls: list[bool] = []
+
+        def relation_once(*args, **kwargs):
+            calls.append(True)
+            return (
+                {"ok": False, "enabled": True, "database": "afp_empty",
+                 "rows": [], "error": "1049 Unknown database 'afp_empty'"}
+                if len(calls) == 1 else ready
+            )
+
+        with mock.patch.object(store, "_relation_map_once", side_effect=relation_once), \
+             mock.patch.object(store, "initialize_schema", return_value=initialized) as init:
+            result = store.relation_map(1000, auto_initialize=True)
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(calls), 2)
+        init.assert_called_once_with(create_database=True)
+
+    def test_browser_mysql_query_rejects_mutation(self) -> None:
+        self.assertEqual(
+            validate_read_only_mysql_query("SELECT * FROM afp_flat_all"),
+            "SELECT * FROM afp_flat_all",
+        )
+        for unsafe in (
+            "DELETE FROM afp_layer",
+            "WITH x AS (SELECT 1) DELETE FROM afp_layer",
+            "SELECT * FROM afp_flat_all INTO OUTFILE 'x.csv'",
+            "SELECT 1; DROP TABLE afp_layer",
+        ):
+            with self.subTest(unsafe=unsafe), self.assertRaises(ValueError):
+                validate_read_only_mysql_query(unsafe)
+
     def test_legacy_process_parameters_change_condition_and_specimen_keys(self) -> None:
         first = AcquisitionConfig(
             dataset_schema="legacy_original", specimen_id="S1", replicate=1,

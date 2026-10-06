@@ -39,3 +39,25 @@ def test_integrated_smoke_covers_both_workflows() -> None:
     assert '"--integration-smoke"' in source
     assert 'processing_mode="prediction_warning"' in source
     assert '"training_type": "prediction_warning"' in source
+
+
+def test_native_mysql_browsing_distinguishes_local_and_target_profiles() -> None:
+    source = (ROOT / "native_integrated_app.py").read_text(encoding="utf-8")
+    assert 'text="查看本机关系"' in source
+    assert 'text="查看目标关系"' in source
+    assert "command=lambda: self._show_mysql_relations(local=True)" in source
+    assert "def _show_mysql_relations(self, local: bool = False)" in source
+    assert "self.mysql_local_status_text" in source
+    assert "self.mysql_target_status_text" in source
+
+
+def test_web_mysql_refresh_distinguishes_local_and_target_profiles() -> None:
+    html = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+    script = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'id="refreshLocalRelationMapButton"' in html
+    assert 'id="refreshTargetRelationMapButton"' in html
+    assert 'id="localRelationMapTable"' in html
+    assert 'id="targetRelationMapTable"' in html
+    assert "async function refreshRelationMap(scope)" in script
+    assert 'refreshRelationMap("local")' in script
+    assert 'refreshRelationMap("target")' in script

@@ -100,6 +100,7 @@ def read_excel_or_folder(path: str | Path) -> ImportResult:
         if p.suffix.lower() in {".csv", ".xlsx", ".xls", ".xlsm"}
         and p.name.lower() not in {"manifest.csv", "import_summary.csv"}
         and "采集记录" not in p.parts
+        and "历史版本" not in p.parts
         and "时间戳" not in p.name
         and "完整试样" not in p.name
     )

@@ -1,0 +1,82 @@
+{
+  "schema": "afp-mysql-save-fix-evidence-v1",
+  "generated_at_utc": "2026-09-24T01:26:10Z",
+  "change": "fix-remote-acquisition-workflows",
+  "root_causes": [
+    "server-target MySQL was not listening after the host reboot",
+    "helper-local first-use preflight did not initialize an existing empty AFP database",
+    "the client-lab minimum grant omitted REFERENCES and view retry privileges",
+    "save_layer inserted foreign-keyed sample rows before the afp_layer parent row"
+  ],
+  "sandbox_helper_local": {
+    "synthetic_client_lab": true,
+    "helper_sha256": "5216A6D110164BB23D8D1B2D29DBB335D998DA1DB176CB227339054586BCA5D6",
+    "profile_configured": true,
+    "scope": "helper_local",
+    "execution_host": "visitor_local_computer",
+    "preflight_ok": true,
+    "schema_initialized": true,
+    "rollback_write_test": true,
+    "capture_sample_count": 150,
+    "csv_saved": true,
+    "mysql_save_ok": true,
+    "mysql_saved_rows": 150,
+    "afp_sensor_sample_rows": 150,
+    "afp_sample_all_rows": 150,
+    "afp_layer_rows": 1,
+    "credentials_exported": false,
+    "dpapi_ciphertext_exported": false,
+    "physical_devices_covered": false,
+    "evidence_file": "F:\\AFP_Client_Validation_Lab\\results\\helper-local-mysql-acceptance.json"
+  },
+  "server_target": {
+    "delivery_code": true,
+    "scope": "server_target",
+    "preflight_ok": true,
+    "rollback_write_test": true,
+    "save_ok": true,
+    "saved_rows": 1,
+    "afp_sensor_sample_rows": 1,
+    "afp_sample_all_rows": 1,
+    "afp_layer_rows": 1,
+    "exact_test_identity_cleaned": true,
+    "credentials_exported": false
+  },
+  "regression": {
+    "product_related_tests": {
+      "ran": 259,
+      "passed": 259,
+      "failed": 0
+    },
+    "client_lab_tests": {
+      "ran": 12,
+      "passed": 12,
+      "failed": 0
+    },
+    "openspec_strict_validation": "passed",
+    "source_delivery_pairs_checked": 6,
+    "source_delivery_pairs_matched": 6
+  },
+  "delivery": {
+    "manifest_lines": 6544,
+    "manifest_mismatches": 0,
+    "mutable_manifest_entries": 0,
+    "main_exe_sha256": "AA7BC2F636E862E9F603F7B4D4D9D8FC9B71390FFB20F33A011A42EF9D56FD65",
+    "helper_exe_sha256": "5216A6D110164BB23D8D1B2D29DBB335D998DA1DB176CB227339054586BCA5D6"
+  },
+  "public_endpoint": {
+    "url": "https://desktop-410sfvi.tail97fe2c.ts.net/",
+    "root_http_status": 200,
+    "asset_http_status": 200,
+    "root_elapsed_ms": 158.3,
+    "cache_marker_present": true,
+    "initialize_if_missing_flag_present": true,
+    "write_test_flag_present": true
+  },
+  "manual_acceptance": {
+    "authorized_public_helper_local_success_visible": "pending",
+    "authorized_public_server_target_success_visible": "pending",
+    "second_physical_pc": "pending",
+    "five_physical_sensor_interfaces": "not_covered"
+  }
+}

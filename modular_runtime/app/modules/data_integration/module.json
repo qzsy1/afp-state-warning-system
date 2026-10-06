@@ -1,0 +1,10 @@
+{
+  "id": "data_integration",
+  "name": "采集数据整合",
+  "version": "2.0.0",
+  "api_version": "2.0",
+  "entrypoint": "plugin.py",
+  "enabled": true,
+  "dependencies": ["acquisition", "storage"],
+  "capabilities": ["capture_folder_to_csv", "mysql_to_csv", "schema_normalization"]
+}

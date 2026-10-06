@@ -1,15 +1,30 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import csv
+from copy import deepcopy
+import gzip
+import hashlib
+import hmac
+import inspect
+import io
 import json
 import math
 import mimetypes
+import os
+import re
+import secrets
+import select
+import sys
 import threading
+import time
 import webbrowser
+from http.cookies import SimpleCookie
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 import numpy as np
 import pandas as pd
@@ -17,20 +32,32 @@ import joblib
 
 from online_inference import (
     DEFAULT_CHECKPOINT,
+    DEFAULT_MODEL_METADATA,
     OnlineIModernTCN,
     inspect_prediction_model,
+    model_catalog,
+    normalize_model_type,
 )
 from acquisition import (
     ALL_SENSOR_COLUMNS,
     ACQUISITION_SCHEMAS,
     AcquisitionConfig,
     AcquisitionManager,
+    acquisition_config_from_payload,
     NEW_COLLECTION_SENSOR_COLUMNS,
-    NEW_EXCLUDED_SENSOR_COLUMNS,
     SENSOR_COLUMNS,
+    check_capture_save_root,
+    integrate_capture_sources,
+    default_capture_interfaces,
+    resolve_default_simulation_source,
+    sensor_interface_profiles,
     select_capture_folder,
+    select_simulation_source,
 )
 from mysql_storage import MySQLCaptureStore, mysql_settings_from_mapping
+from server_target_mysql import ServerTargetProfiles
+from server_capture_journal import ServerCaptureJournal, TargetMySQLSaveCoordinator
+from remote_mysql_setup import classify_mysql_error
 from online_health_features import OnlineWindowFeatureEngine
 from causal_online_runtime import CausalOnlineConsistency
 from runtime_scaler import FeatureScaler
@@ -42,11 +69,276 @@ from new_collection_health import (
     NewCollectionHealthEngine,
 )
 from web_training import WebTrainingManager
+from guest_simulation import GuestSimulationError, GuestSimulationManager
+from helper_relay import HelperRegistry, select_simulation_execution
+from simulation_source_transfer import (
+    MAX_TRANSFER_CHUNK_BYTES,
+    SimulationSourceTicketStore,
+    SimulationSourceTransferError,
+)
+from simulation_packages import (
+    resolve_simulation_package,
+    simulation_package_catalog,
+)
+from edge_capture import RemoteAcquisitionRegistry, select_acquisition_for_identity
+from local_capture_agent import LocalCaptureAgent
+from diagnosis_jobs import DiagnosisJobStore
+from public_status import build_public_device_status
+from web_access import (
+    REAL_ACCESS_ROLES,
+    PermissionPolicy,
+    RequestIdentity,
+    SlidingWindowLimiter,
+    is_lan_client,
+    is_secure_request,
+    is_trusted_quick_tunnel_request,
+    is_trusted_tailscale_funnel_request,
+    lan_session_id,
+    uses_local_capture_helper,
+)
+from web_auth import AuthenticationError, SecurityStore
+from control_lease import RealControlLease
+from json_safety import json_safe_value
+from websocket_live import (
+    VersionedPayloadCache,
+    encode_json_frame,
+    encode_server_frame,
+    synchronized_json_sender,
+    recv_client_frame,
+    websocket_handshake_headers,
+)
 
 
-APP_DIR = Path(__file__).resolve().parent
-STATIC_DIR = APP_DIR / "static"
-DATA_DIR = APP_DIR / "data"
+APP_DIR = Path(os.environ.get("AFP_LEGACY_APP_DIR") or Path(__file__).resolve().parent).resolve()
+
+
+def encode_json_response(payload: dict, accept_encoding: str = "") -> tuple[bytes, bool]:
+    """Serialize a JSON response and compress large browser payloads when supported.
+
+    Live charts return several channels, prediction arrays, and evidence in one
+    response.  Sending that unchanged through a public tunnel adds avoidable
+    transfer time.  Compression is opt-in per request and never changes the
+    JSON contract; helper clients that do not advertise gzip keep the original
+    bytes.
+    """
+
+    raw = json.dumps(
+        json_safe_value(payload), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+    if len(raw) < 1024 or "gzip" not in str(accept_encoding or "").lower():
+        return raw, False
+    compressed = gzip.compress(raw, compresslevel=6, mtime=0)
+    if len(compressed) >= len(raw):
+        return raw, False
+    return compressed, True
+
+
+def encode_static_file_response(
+    path: Path,
+    accept_encoding: str = "",
+    static_root: Path | None = None,
+) -> tuple[bytes, dict[str, str]]:
+    """Return static bytes and delivery headers without changing ordinary assets.
+
+    Only the generated public-demo directory gets explicit cache semantics.
+    Content-addressed bundles are immutable and gzip-compressed when useful;
+    the stable manifest is short-lived so a deployment can point browsers at a
+    new hash without stale data.
+    """
+
+    resolved_path = Path(path).resolve()
+    resolved_root = Path(static_root or STATIC_DIR).resolve()
+    raw = resolved_path.read_bytes()
+    headers: dict[str, str] = {}
+    try:
+        relative = resolved_path.relative_to(resolved_root)
+    except ValueError:
+        return raw, headers
+    if not relative.parts or relative.parts[0] != "demo":
+        return raw, headers
+    headers["ETag"] = f'"{hashlib.sha256(raw).hexdigest()}"'
+    if relative.name == "manifest-v1.json":
+        headers["Cache-Control"] = "public, max-age=60, must-revalidate"
+        return raw, headers
+    if re.fullmatch(r"[A-Za-z0-9_-]+\.[0-9a-f]{16}\.json", relative.name):
+        headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        if len(raw) >= 1024 and "gzip" in str(accept_encoding or "").lower():
+            compressed = gzip.compress(raw, compresslevel=6, mtime=0)
+            if len(compressed) < len(raw):
+                headers["Content-Encoding"] = "gzip"
+                headers["Vary"] = "Accept-Encoding"
+                return compressed, headers
+    return raw, headers
+
+
+def local_mysql_profile() -> dict:
+    """Load machine-local defaults without embedding credentials in source."""
+    candidates: list[Path] = []
+    configured = str(os.environ.get("AFP_MYSQL_PROFILE_FILE") or "").strip()
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    candidates.extend(
+        [
+            APP_DIR.parent / "runtime" / "mysql.local.json",
+            APP_DIR.parent.parent / "runtime" / "mysql.local.json",
+        ]
+    )
+    for path in candidates:
+        try:
+            if path.is_file():
+                payload = json.loads(path.read_text(encoding="utf-8-sig"))
+                if isinstance(payload, dict):
+                    return payload
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+    return {
+        "target": {
+            "host": "192.168.101.31",
+            "port": 3306,
+            "user": "afp_app",
+            "password": "",
+            "database": "afp_state_warning",
+        },
+        "local": {
+            "host": "127.0.0.1",
+            "port": 3306,
+            "user": "root",
+            "password": "",
+            "database": "afp_state_warning",
+        },
+    }
+
+
+def public_mysql_profiles() -> dict:
+    """Return connection defaults without ever returning a password."""
+    payload = local_mysql_profile()
+    if not isinstance(payload, dict):
+        return {"target": {}, "local": {}}
+    safe = deepcopy(payload)
+    for section in ("target", "local"):
+        values = safe.get(section)
+        if isinstance(values, dict):
+            values.pop("password", None)
+            values.pop("mysql_password", None)
+    return safe
+
+
+def decorate_server_mysql_result(result: dict) -> dict:
+    """Annotate server-side MySQL responses without exposing credentials."""
+    payload = dict(result or {})
+    payload.setdefault("scope", "server_target")
+    payload.setdefault("execution_host", "server")
+    return payload
+
+
+def helper_real_capture_payload(payload: dict) -> dict:
+    """Remove server-target credentials before forwarding a real capture to helper."""
+    clean = dict(payload or {})
+    for key in (
+        "mysql_host", "mysql_port", "mysql_user", "mysql_password",
+        "mysql_database", "mysql_target_config_id",
+        "simulation_mysql_host", "simulation_mysql_port", "simulation_mysql_user",
+        "simulation_mysql_password", "simulation_mysql_database",
+    ):
+        clean.pop(key, None)
+    clean["mysql_enabled"] = False
+    return clean
+
+
+def prepare_helper_simulation_payload(
+    guest_manager: GuestSimulationManager,
+    transfer_store: SimulationSourceTicketStore,
+    identity: RequestIdentity,
+    helper_session_id: str,
+    payload: dict,
+) -> dict:
+    """Bind the browser-owned source to one helper without forwarding secrets."""
+
+    source_id = str(payload.get("simulation_source_id") or "").strip()
+    if not source_id:
+        raise GuestSimulationError(
+            "simulation_source_not_found",
+            "请先在当前浏览器选择并上传模拟 CSV 或文件夹",
+        )
+    manifest, source_root = guest_manager.source_transfer_manifest(
+        str(identity.guest_id or ""), source_id
+    )
+    transfer = transfer_store.issue(
+        web_session_id=str(identity.guest_id or ""),
+        helper_session_id=str(helper_session_id or ""),
+        manifest=manifest,
+        source_root=source_root,
+    )
+    clean = helper_real_capture_payload(payload)
+    clean["execution_host"] = "helper_local"
+    clean["simulation_source_transfer"] = transfer
+    clean.pop("simulation_source_path", None)
+    return clean
+
+
+def bind_ready_helper_simulation_payload(
+    guest_manager: GuestSimulationManager,
+    identity: RequestIdentity,
+    payload: dict,
+) -> dict:
+    """Bind a ready receipt to the current session source without retransferring bytes."""
+
+    source_id = str(payload.get("simulation_source_id") or "").strip()
+    ready = payload.get("simulation_source_ready")
+    if not source_id or not isinstance(ready, dict):
+        raise GuestSimulationError(
+            "simulation_source_not_ready",
+            "请先点击“下载到本机辅助程序并校验”，确认数据源已就绪",
+        )
+    manifest, _source_root = guest_manager.source_transfer_manifest(
+        str(identity.guest_id or ""), source_id
+    )
+    if (
+        str(ready.get("source_id") or "") != source_id
+        or str(ready.get("content_sha256") or "")
+        != str(manifest.get("content_sha256") or "")
+    ):
+        raise GuestSimulationError(
+            "simulation_source_not_ready",
+            "模拟数据源已变化，请重新下载到本机辅助程序并校验",
+        )
+    clean = helper_real_capture_payload(payload)
+    clean["execution_host"] = "helper_local"
+    clean["simulation_source_ready"] = {
+        "content_sha256": str(manifest.get("content_sha256") or ""),
+        "source_type": str(manifest.get("source_type") or ""),
+        "relative_paths": [
+            str(item.get("relative_path") or "")
+            for item in (manifest.get("files") or [])
+            if isinstance(item, dict)
+        ],
+    }
+    clean.pop("simulation_source_id", None)
+    return clean
+
+
+def authorized_target_selection(identity: RequestIdentity, profiles: ServerTargetProfiles, payload: dict):
+    """Resolve a remote target profile once, without making the browser own its password."""
+    if identity.role in REAL_ACCESS_ROLES and identity.role != "local_admin":
+        return profiles.for_request(str(identity.session_id or ""), payload)
+    return None
+APP_VERSION = "1.12.0"
+BUILD_ID = "20260823-schema-contract-fix"
+EXECUTABLE_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else APP_DIR
+)
+_ENV_MODEL_DIR = os.environ.get("AFP_MODELS_DIR", "").strip()
+RUNTIME_MODEL_DIR = (
+    Path(_ENV_MODEL_DIR).expanduser().resolve()
+    if _ENV_MODEL_DIR
+    else EXECUTABLE_DIR / "models"
+    if (EXECUTABLE_DIR / "models").exists()
+    else APP_DIR / "models"
+)
+STATIC_DIR = Path(os.environ.get("AFP_UI_DIR") or APP_DIR / "static").resolve()
+DATA_DIR = Path(os.environ.get("AFP_DATA_DIR") or APP_DIR / "data").resolve()
 _PACKAGED_REPLAY_DIR = DATA_DIR / "legacy_replay"
 OUTPUT_DIR = (
     _PACKAGED_REPLAY_DIR
@@ -54,6 +346,240 @@ OUTPUT_DIR = (
     else APP_DIR.parent / "outputs_tc_hi_soft_consistency_v13_8"
 )
 CAUSAL_OUTPUT_DIR = APP_DIR.parent / "outputs_causal_online_consistency_v13_9"
+
+DEFAULT_MYSQL_FLAT_QUERY = (
+    "SELECT * FROM afp_flat_all "
+    "ORDER BY specimen_key, layer_no, sample_index"
+)
+MYSQL_PREVIEW_LIMIT = 200
+MYSQL_EXPORT_LIMIT = 200_000
+_OPERATION_LOCKS: dict[str, threading.Lock] = {}
+_OPERATION_LOCKS_GUARD = threading.Lock()
+_OPERATION_LOCK_STARTED: dict[str, float] = {}
+# A crashed native probe or a client that disconnects cannot run the normal
+# ``finally`` release path.  Reclaim only locks that have been held well past
+# the normal probe duration; the old worker still owns its original lock and
+# will safely release it when/if it returns.
+OPERATION_LOCK_TTL_SECONDS = 30.0
+_MYSQL_FORBIDDEN_TOKENS = {
+    "ALTER", "ANALYZE", "CALL", "CREATE", "DELETE", "DO", "DROP",
+    "GRANT", "HANDLER", "INSERT", "LOAD", "LOCK", "OPTIMIZE",
+    "RENAME", "REPAIR", "REPLACE", "REVOKE", "SET", "TRUNCATE",
+    "UNLOCK", "UPDATE",
+}
+
+
+def _operation_lock(name: str) -> threading.Lock:
+    with _OPERATION_LOCKS_GUARD:
+        return _OPERATION_LOCKS.setdefault(name, threading.Lock())
+
+def _validate_agent_payload(payload: dict) -> dict:
+    from interface_agent import validate_agent_payload
+
+    return validate_agent_payload(payload)
+
+
+def _mysql_sql_tokens(sql: str) -> list[str]:
+    """Return SQL words outside quoted strings/identifiers.
+
+    This is intentionally conservative.  The browser is a data-view/export
+    surface, not a general SQL console, so comments and stacked statements are
+    rejected by :func:`validate_read_only_mysql_query` before tokenization.
+    """
+    scrubbed = re.sub(r"'(?:''|\\.|[^'])*'", " ", sql, flags=re.S)
+    scrubbed = re.sub(r'"(?:""|\\.|[^"])*"', " ", scrubbed, flags=re.S)
+    scrubbed = re.sub(r"`(?:``|[^`])*`", " ", scrubbed, flags=re.S)
+    return re.findall(r"[A-Za-z_]+", scrubbed.upper())
+
+
+def validate_read_only_mysql_query(
+    query: str,
+    default: str = DEFAULT_MYSQL_FLAT_QUERY,
+) -> str:
+    """Validate one browser-supplied MySQL SELECT/CTE statement.
+
+    Prefix checking alone is unsafe because ``WITH ... DELETE`` and
+    ``SELECT ... INTO OUTFILE`` can change server state.  We therefore reject
+    comments, statement separators and every data/schema/privilege mutation
+    token.  Database permissions remain the final security boundary; this
+    validation is an additional application-level guard.
+    """
+    sql = str(query or "").strip() or default
+    if len(sql) > 20_000:
+        raise ValueError("SQL 查询过长；只允许不超过 20000 个字符的只读查询")
+    if "\x00" in sql or ";" in sql:
+        raise ValueError("只允许一条 SELECT/WITH 查询，不能包含分号或多条语句")
+    if re.search(r"(?:--|#|/\*|\*/)", sql):
+        raise ValueError("只读查询不允许包含 SQL 注释")
+    tokens = _mysql_sql_tokens(sql)
+    if not tokens or tokens[0] not in {"SELECT", "WITH"}:
+        raise ValueError("只允许 SELECT 或 WITH ... SELECT 只读查询")
+    forbidden = sorted(set(tokens) & _MYSQL_FORBIDDEN_TOKENS)
+    if forbidden:
+        raise ValueError(f"只读查询包含禁止关键字：{', '.join(forbidden)}")
+    if "SELECT" not in tokens:
+        raise ValueError("WITH 查询必须以 SELECT 返回数据")
+    for unsafe_phrase in (r"\bINTO\s+(?:OUTFILE|DUMPFILE)\b", r"\bFOR\s+UPDATE\b"):
+        if re.search(unsafe_phrase, sql, flags=re.I):
+            raise ValueError("只读查询不能写文件或锁定数据")
+    return sql
+
+
+def _json_safe_mysql_value(value):
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).decode("utf-8", errors="replace")
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat(sep=" ")
+        except TypeError:
+            return value.isoformat()
+    return str(value)
+
+
+def _normalise_mysql_rows(result) -> tuple[list[str], list[dict]]:
+    if isinstance(result, dict):
+        rows = result.get("rows", [])
+        columns = list(result.get("columns", []) or [])
+    else:
+        rows = result or []
+        columns = []
+    normalised: list[dict] = []
+    for raw in rows:
+        if isinstance(raw, dict):
+            item = {str(key): _json_safe_mysql_value(value) for key, value in raw.items()}
+        else:
+            if not columns:
+                raise ValueError("MySQL 查询结果缺少列名")
+            item = {
+                str(key): _json_safe_mysql_value(value)
+                for key, value in zip(columns, raw)
+            }
+        normalised.append(item)
+    if not columns and normalised:
+        columns = list(normalised[0])
+    return columns, normalised
+
+
+def _call_compatible_mysql_rows(store, query: str, limit: int):
+    """Use a newer store query API when available, otherwise connect directly."""
+    for name in ("read_only_query", "query_readonly", "export_flat_rows"):
+        method = getattr(store, name, None)
+        if not callable(method):
+            continue
+        signature = inspect.signature(method)
+        parameters = signature.parameters
+        # A flat-export helper without a query argument is safe only for the
+        # canonical flat view; custom SELECTs use the compatibility fallback.
+        if "query" not in parameters and query != DEFAULT_MYSQL_FLAT_QUERY:
+            continue
+        kwargs = {}
+        if "query" in parameters:
+            kwargs["query"] = query
+        if "limit" in parameters:
+            kwargs["limit"] = limit
+        return method(**kwargs)
+
+    _, connection = store._connect(store.settings.database)
+    cursor = None
+    try:
+        cursor = connection.cursor()
+        cursor.execute(query)
+        columns = [str(item[0]) for item in (cursor.description or [])]
+        rows = cursor.fetchmany(limit + 1)
+        return {
+            "columns": columns,
+            "rows": [dict(zip(columns, row)) for row in rows[:limit]],
+            "truncated": len(rows) > limit,
+        }
+    finally:
+        if cursor is not None:
+            cursor.close()
+        connection.close()
+
+
+def mysql_read_only_rows(store, query: str, limit: int) -> dict:
+    sql = validate_read_only_mysql_query(query)
+    capped_limit = max(1, min(int(limit), MYSQL_EXPORT_LIMIT))
+    raw = _call_compatible_mysql_rows(store, sql, capped_limit)
+    columns, rows = _normalise_mysql_rows(raw)
+    truncated = bool(raw.get("truncated", False)) if isinstance(raw, dict) else False
+    return {
+        "ok": True,
+        "database": store.settings.database,
+        "host": store.settings.host,
+        "columns": columns,
+        "rows": rows[:capped_limit],
+        "count": min(len(rows), capped_limit),
+        "truncated": truncated or len(rows) > capped_limit,
+        "limit": capped_limit,
+        "query": sql,
+    }
+
+
+def mysql_rows_to_csv(columns: list[str], rows: list[dict]) -> bytes:
+    stream = io.StringIO(newline="")
+    writer = csv.DictWriter(stream, fieldnames=columns, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({name: row.get(name, "") for name in columns})
+    return ("\ufeff" + stream.getvalue()).encode("utf-8")
+
+
+def mysql_test_existing_database(store) -> dict:
+    """Test an already-initialized database without creating or altering it."""
+    verifier = getattr(store, "verify_connection", None)
+    if callable(verifier):
+        return verifier(require_schema=True)
+    for name in ("test_existing_database", "test_read_only_connection"):
+        method = getattr(store, name, None)
+        if callable(method):
+            return method()
+    connection = None
+    cursor = None
+    try:
+        driver, connection = store._connect(store.settings.database)
+        cursor = connection.cursor()
+        cursor.execute("SELECT 1")
+        cursor.fetchone()
+        cursor.execute(
+            "SELECT TABLE_NAME FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA=%s AND TABLE_NAME IN "
+            "('afp_condition','afp_specimen','afp_layer','afp_sensor_sample',"
+            "'afp_sample_all','afp_flat_all','afp_relation_map')",
+            (store.settings.database,),
+        )
+        existing = {str(row[0]) for row in cursor.fetchall()}
+        required = {
+            "afp_condition", "afp_specimen", "afp_layer", "afp_sample_all",
+            "afp_flat_all", "afp_relation_map",
+        }
+        missing = sorted(required - existing)
+        return {
+            "ok": True,
+            "enabled": True,
+            "database": store.settings.database,
+            "host": store.settings.host,
+            "driver": driver,
+            "schema_ready": not missing,
+            "missing_objects": missing,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "enabled": True,
+            "database": store.settings.database,
+            "host": store.settings.host,
+            "error": str(exc),
+        }
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if connection is not None:
+            connection.close()
 
 LEGACY_STATE_LABELS = {
     "normal": "正常",
@@ -85,6 +611,7 @@ LIVE_SENSOR_UNITS = {
     "转速": "device unit",
     "位移": "mm",
     "压力": "N / device unit",
+    "薄膜压力": "N",
     "振动": "device unit",
     "温度": "°C",
     "ROI平均温度": "°C",
@@ -95,14 +622,18 @@ LIVE_SENSOR_UNITS = {
     "ABB_Z": "mm",
     **{f"温度{index}": "°C" for index in range(1, 9)},
 }
-NEW_DEMO_ROOT = APP_DIR / "new_collection_demo_v11_3"
-NEW_DEMO_SOURCE = NEW_DEMO_ROOT / "simulator_stream.csv"
-NEW_DEMO_CHECKPOINT = (
-    NEW_DEMO_ROOT
-    / "models"
-    / "i_modern_tcn_new_collection_v11_3.pth"
+NEW_DEMO_ROOT = Path(
+    os.environ.get("AFP_NEW_DEMO_DIR") or APP_DIR / "new_collection_demo_v11_3"
+).resolve()
+SUPPLIED_SIMULATION_SOURCE = Path(
+    r"F:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv"
+).resolve()
+NEW_DEMO_SOURCE = (
+    SUPPLIED_SIMULATION_SOURCE
+    if SUPPLIED_SIMULATION_SOURCE.is_file()
+    else NEW_DEMO_ROOT / "simulator_stream.csv"
 )
-NEW_DEMO_METRICS = NEW_DEMO_ROOT / "models" / "test_metrics.json"
+NEW_DEMO_CHECKPOINT = RUNTIME_MODEL_DIR / "new" / "i_T_G" / "checkpoint.pth"
 
 
 def select_prediction_model_file(initial_path: str = "") -> str:
@@ -202,6 +733,15 @@ INDICATOR_VARIANTS = {
         }
     },
 }
+
+
+INDICATOR_VARIANTS["new_collection_v11_3"]["TC-HI"].update(
+    {
+        "variant_id": "TC-HI-New-16S4P",
+        "label": "新数据热－压实耦合指标（模型16路＋独立薄膜压力通道＋4工艺参数）",
+        "construction": "模型保持原16路实际传感器响应；独立薄膜压力通道单独采集保存，可在后续重训时纳入耦合特征",
+    }
+)
 
 
 def _finite_or_none(value):
@@ -416,6 +956,9 @@ class DashboardData:
             transformers=online_artifact["transformers"],
         )
         self.acquisition = AcquisitionManager()
+        self.local_capture_agent = LocalCaptureAgent(manager=self.acquisition)
+        self.helper_registry = HelperRegistry()
+        self.remote_acquisitions = RemoteAcquisitionRegistry()
         self.causal_online_optimizer = CausalOnlineConsistency(
                 (
                     DATA_DIR / "causal_online_consistency_artifact.joblib"
@@ -441,7 +984,10 @@ class DashboardData:
         # rolling forecast.  It is never used for historical alignment.
         self.live_rolling_prediction_cache: dict[str, dict[int, np.ndarray]] = {}
         self.live_cache_lock = threading.RLock()
-        self.replay_prediction_cache: dict[int, np.ndarray] = {}
+        # A replay prediction depends on both the archived window and the
+        # selected checkpoint.  Keying only by window reused stale results
+        # after the user changed the prediction algorithm.
+        self.replay_prediction_cache: dict[tuple[str, int], np.ndarray] = {}
         self.live_layer_health_path = (
             self.acquisition.capture_root / "specimen_layer_health.json"
         )
@@ -479,7 +1025,10 @@ class DashboardData:
             for key, group in self.layers.groupby("full_specimen_id", sort=False)
         }
 
-    def bootstrap(self) -> dict:
+    def bootstrap(self, *, include_discovery: bool = True) -> dict:
+        interface_discovery = (
+            self.acquisition.discover_interfaces() if include_discovery else {}
+        )
         specimens = []
         for _, row in self.specimens.iterrows():
             specimens.append(
@@ -597,7 +1146,11 @@ class DashboardData:
                         "label": (
                             variant_info["label"]
                             if str(indicator) == "TC-HI"
-                            else str(recommended["indicator_label"])
+                            else (
+                                "16通道预测残差融合指标"
+                                if str(indicator) == "RFHI"
+                                else str(recommended["indicator_label"])
+                            )
                         ),
                         "variant": variant_info,
                         "required_outputs": variant_info["required_outputs"],
@@ -606,6 +1159,7 @@ class DashboardData:
                     }
                 )
         return {
+            "application": {"version": APP_VERSION, "build_id": BUILD_ID},
             "manifest": self.manifest,
             "state_labels": STATE_LABELS,
             "sensors": self.sensors,
@@ -632,19 +1186,25 @@ class DashboardData:
                 "indicator": "TC-HI",
                 "model": "random_forest",
                 "prediction_horizon": 24,
+                "prediction_model_type": "i_T_G",
                 "forecast_lead": 1,
-                # Replay defaults to the causal checkpoint path so the
-                # displayed historical curve uses the selected forecast lead
-                # instead of the fixed archived target sequence.
+                # Real-time acquisition is the only visible run mode.  Local
+                # CSV/folder/MySQL playback is configured as a simulated
+                # acquisition source under the acquisition panel.
                 "realtime_prediction": True,
                 "use_optimized_warning": True,
-                "data_mode": "replay",
+                "data_mode": "live",
             },
             "acquisition": {
                 "drivers": self.acquisition.available_drivers(),
+                "interface_defaults": interface_discovery.get("defaults", []),
+                "sensor_types": interface_discovery.get("sensor_type_profiles", []),
+                "channel_metadata": interface_discovery.get("channel_metadata", {}),
+                "interface_discovery": interface_discovery,
                 "schemas": self.acquisition.available_schemas(),
                 "sensors": SENSOR_COLUMNS,
                 "prediction_model": self.online_predictor.profile,
+                "prediction_models": model_catalog(),
                 "best_prediction_models": {
                     schema_id: self.best_prediction_profile(schema_id)
                     for schema_id in ACQUISITION_SCHEMAS
@@ -656,7 +1216,9 @@ class DashboardData:
                         else ""
                     ),
                     "prediction_model": (
-                        inspect_prediction_model(NEW_DEMO_CHECKPOINT)
+                        inspect_prediction_model(
+                            NEW_DEMO_CHECKPOINT, schema_mode="new_collection_v11_3"
+                        )
                         if NEW_DEMO_CHECKPOINT.exists()
                         else None
                     ),
@@ -681,42 +1243,53 @@ class DashboardData:
             },
         }
 
-    def inspect_prediction_model(self, checkpoint: str = "") -> dict:
-        return inspect_prediction_model(checkpoint)
+    def inspect_prediction_model(
+        self, checkpoint: str = "", model_type: str = "", architecture: str = "",
+        schema_mode: str = "",
+    ) -> dict:
+        return inspect_prediction_model(
+            checkpoint, model_type=model_type, architecture=architecture,
+            schema_mode=schema_mode,
+        )
 
     def best_prediction_profile(self, dataset_schema: str) -> dict:
-        if (
-            dataset_schema == "new_collection_v11_3"
-            and NEW_DEMO_CHECKPOINT.exists()
-        ):
-            profile = inspect_prediction_model(NEW_DEMO_CHECKPOINT)
-            metric_value = None
-            if NEW_DEMO_METRICS.exists():
-                metrics = json.loads(
-                    NEW_DEMO_METRICS.read_text(encoding="utf-8")
+        schema_id = (
+            "new_collection_v11_3"
+            if dataset_schema == "new_collection_v11_3"
+            else "legacy_original"
+        )
+        candidates = []
+        for entry in model_catalog():
+            scope = "new" if schema_id == "new_collection_v11_3" else "legacy"
+            packaged_checkpoint = (
+                RUNTIME_MODEL_DIR / scope / str(entry["id"]) / "checkpoint.pth"
+            )
+            if not packaged_checkpoint.is_file():
+                continue
+            try:
+                profile = inspect_prediction_model(
+                    packaged_checkpoint,
+                    model_type=str(entry["id"]),
+                    schema_mode=schema_id,
                 )
-                metric_value = _finite(
-                    metrics.get("best_validation_mse_standardized"),
-                    None,
-                )
-            return {
-                **profile,
-                "selection_metric": "validation_mse_standardized",
-                "selection_metric_value": metric_value,
-                "selection_basis": (
-                    "仅使用冻结验证集误差；未使用内推/外推测试集"
-                ),
-                "registry_scope": "new_collection_v11_3",
-            }
-        profile = inspect_prediction_model(DEFAULT_CHECKPOINT)
+            except (FileNotFoundError, ValueError, RuntimeError):
+                continue
+            metric = profile.get("validation_loss")
+            if metric is not None and math.isfinite(float(metric)):
+                candidates.append((float(metric), profile))
+        if not candidates:
+            raise FileNotFoundError(
+                f"{schema_id}没有可用且带验证记录的预测模型权重"
+            )
+        metric_value, profile = min(candidates, key=lambda item: item[0])
         return {
             **profile,
-            "selection_metric": "registered_default",
-            "selection_metric_value": None,
+            "selection_metric": "minimum_validation_loss",
+            "selection_metric_value": metric_value,
             "selection_basis": (
-                "旧方案当前登记的唯一兼容论文检查点；未用测试集重选"
+                "仅比较训练时冻结验证集损失；未使用测试集重选"
             ),
-            "registry_scope": "legacy_original",
+            "registry_scope": schema_id,
         }
 
     def validate_prediction_setup(
@@ -739,7 +1312,11 @@ class DashboardData:
         profile = (
             self.best_prediction_profile(config.dataset_schema)
             if config.use_best_prediction_override
-            else inspect_prediction_model(config.prediction_model_file)
+            else inspect_prediction_model(
+                config.prediction_model_file,
+                model_type=getattr(config, "prediction_model_type", "i_T_G"),
+                schema_mode=config.dataset_schema,
+            )
         )
         auto_corrected = False
         schema_sensors = list(
@@ -754,46 +1331,21 @@ class DashboardData:
         missing_inputs = [
             name for name in model_inputs if name not in acquired_inputs
         ]
-        # The new collection plan intentionally omits rotation speed,
-        # displacement and vibration.  Older demo checkpoints may still list
-        # these as model columns; they are virtual baseline-filled inputs, not
-        # required physical channels.
-        virtual_missing_inputs = [
-            name for name in missing_inputs
-            if name in NEW_EXCLUDED_SENSOR_COLUMNS
-            and config.dataset_schema == "new_collection_v11_3"
-        ]
-        effective_missing_inputs = [
-            name for name in missing_inputs if name not in virtual_missing_inputs
-        ]
         unexpected_inputs = [
             name for name in acquired_inputs if name not in model_inputs
         ]
-        schema_conflict = bool(
-            unexpected_inputs
-            or any(name not in schema_sensors for name in acquired_inputs)
-            or any(
-                name not in schema_sensors
-                and name not in NEW_EXCLUDED_SENSOR_COLUMNS
-                for name in model_inputs
+        model_schema_violations = [
+            name for name in model_inputs if name not in schema_sensors
+        ]
+        if model_schema_violations:
+            raise ValueError(
+                f"所选模型与{config.dataset_schema}数据方案不兼容，"
+                f"模型包含该方案未采集的通道：{model_schema_violations}"
             )
-        )
-        if (effective_missing_inputs or unexpected_inputs) and schema_conflict:
-            profile = self.best_prediction_profile(config.dataset_schema)
-            config.prediction_model_file = profile["checkpoint"]
-            config.model_input_sensors = list(profile["input_sensors"])
-            config.model_output_sensors = list(profile["output_sensors"])
-            config.prediction_sensors = list(profile["output_sensors"])
-            config.selected_sensors = list(schema_sensors)
-            acquired_inputs = list(config.model_input_sensors)
-            model_inputs = list(profile["input_sensors"])
-            missing_inputs = []
-            unexpected_inputs = []
-            auto_corrected = True
-        if effective_missing_inputs or unexpected_inputs:
+        if missing_inputs or unexpected_inputs:
             raise ValueError(
                 "当前采集传感器与所选预测模型输入不一致。"
-                f"缺少：{effective_missing_inputs or '无'}；"
+                f"缺少：{missing_inputs or '无'}；"
                 f"模型未声明：{unexpected_inputs or '无'}"
             )
         if not set(acquired_inputs).issubset(
@@ -866,7 +1418,9 @@ class DashboardData:
             )
         if load_model:
             profile = self.online_predictor.configure(
-                profile["checkpoint"]
+                profile["checkpoint"],
+                model_type=getattr(config, "prediction_model_type", profile.get("model_type", "i_T_G")),
+                schema_mode=config.dataset_schema,
             )
         return {
             **profile,
@@ -917,7 +1471,7 @@ class DashboardData:
                 "candidate_index": -1 - candidate_index,
                 "indicator_family": candidate["indicator"],
                 "model_kind": candidate["model"],
-                "feature_key": "new_collection_multiphysics_v2",
+                "feature_key": "new_collection_multiphysics_v3_16s4p",
                 "recommended_for_indicator": candidate["recommended"],
             }
         )
@@ -1048,19 +1602,43 @@ class DashboardData:
     def _replay_live_predictions(
         self, visual_indices: np.ndarray
     ) -> np.ndarray:
+        profile = self.online_predictor.profile
+        mean, scale = self._prediction_model_scaler(profile)
+        target_columns = list(profile["model_columns"])
+        archived_columns = list(DEFAULT_MODEL_METADATA["model_columns"])
+        sensor_columns = [str(item["name"]) for item in self.sensors]
         outputs = []
         for visual_index in np.asarray(visual_indices, dtype=int):
-            cached = self.replay_prediction_cache.get(int(visual_index))
+            cache_key = (str(profile["checkpoint"]), int(visual_index))
+            cached = self.replay_prediction_cache.get(cache_key)
             if cached is None:
+                archived_physical = (
+                    self.model_input[int(visual_index)]
+                    * self.scaler_scale[None, :]
+                    + self.scaler_mean[None, :]
+                )
+                physical = np.broadcast_to(
+                    mean, (len(archived_physical), len(target_columns))
+                ).astype(float).copy()
+                for name in target_columns:
+                    if name in archived_columns:
+                        physical[:, target_columns.index(name)] = archived_physical[
+                            :, archived_columns.index(name)
+                        ]
+                model_input = ((physical - mean[None, :]) / scale[None, :]).astype(
+                    np.float32
+                )
                 standardized, _ = self.online_predictor.predict(
-                    self.model_input[int(visual_index)], 24
+                    model_input, 24
                 )
-                cached = (
-                    standardized[:, self.sensor_model_indices]
-                    * self.scaler_scale[self.sensor_model_indices]
-                    + self.scaler_mean[self.sensor_model_indices]
+                cached = self._prediction_to_sensor_matrix(
+                    standardized, profile, sensor_columns
                 )
-                self.replay_prediction_cache[int(visual_index)] = cached
+                if not np.isfinite(cached).all():
+                    raise ValueError(
+                        "所选预测模型未覆盖历史数据状态预警所需的全部传感器输出"
+                    )
+                self.replay_prediction_cache[cache_key] = cached
             outputs.append(cached)
         return np.stack(outputs, axis=0)
 
@@ -1288,7 +1866,24 @@ class DashboardData:
         realtime_prediction: bool = False,
         use_optimized_warning: bool = True,
         forecast_lead: int = 1,
+        dataset_schema: str = "legacy_original",
+        prediction_model_type: str = "i_T_G",
     ) -> dict:
+        if dataset_schema != "legacy_original":
+            raise ValueError("历史数据流仅支持旧数据12传感器方案")
+        selected_model_type = normalize_model_type(prediction_model_type)
+        active_profile = self.online_predictor.profile
+        if realtime_prediction and (
+            active_profile.get("schema_mode") != "legacy_original"
+            or active_profile.get("model_type") != selected_model_type
+            or int(active_profile.get("enc_in", 0)) not in {15, 17}
+        ):
+            self.online_predictor.configure(
+                "",
+                model_type=selected_model_type,
+                schema_mode="legacy_original",
+            )
+            active_profile = self.online_predictor.profile
         if specimen_id not in self.layer_groups:
             specimen_id = self.specimen_ids[0]
         sensor_id = int(np.clip(sensor_id, 0, len(self.sensors) - 1))
@@ -1354,11 +1949,6 @@ class DashboardData:
         ]
         specimen_actual = np.concatenate(actual_parts, axis=0)
         specimen_prediction = np.concatenate(prediction_parts, axis=0)
-        full_true_parts = [
-            self.model_true[block["visual_indices"]].reshape(-1, self.model_true.shape[-1])
-            for block in layer_blocks
-        ]
-        specimen_model_true = np.concatenate(full_true_parts, axis=0)
 
         history_start = max(0, cursor - history)
         observed_indices = np.arange(history_start, cursor, step, dtype=int)
@@ -1368,17 +1958,19 @@ class DashboardData:
         prediction_source = "archived_prediction"
         if realtime_prediction:
             first_visual_index = int(layer_blocks[0]["visual_indices"][0])
-            model_history_stream = np.concatenate(
-                [self.model_input[first_visual_index], specimen_model_true[:cursor]],
-                axis=0,
+            model_history_stream = self._legacy_replay_model_stream(
+                profile=active_profile,
+                first_visual_index=first_visual_index,
+                specimen_actual=specimen_actual[:cursor],
+                layer_blocks=layer_blocks,
             )
             online_standardized, forecast_mode = self.online_predictor.predict(
                 model_history_stream[-24:], prediction_horizon
             )
-            online_physical = (
-                online_standardized[:, self.sensor_model_indices]
-                * self.scaler_scale[self.sensor_model_indices]
-                + self.scaler_mean[self.sensor_model_indices]
+            online_physical = self._prediction_to_sensor_matrix(
+                online_standardized,
+                active_profile,
+                [str(item["name"]) for item in self.sensors],
             )
             future_prediction_matrix = online_physical
             future_time = (np.arange(prediction_horizon, dtype=int) + 1) / _finite(
@@ -1395,7 +1987,7 @@ class DashboardData:
                 model_history_stream=model_history_stream,
                 target_indices=causal_indices,
                 forecast_lead=forecast_lead,
-                profile=self.online_predictor.profile,
+                profile=active_profile,
                 sensor_columns=[str(item["name"]) for item in self.sensors],
             )
             # Start with an empty historical prediction series.  The first
@@ -1426,7 +2018,7 @@ class DashboardData:
         # predictions over it; the prediction curve begins after this window.
         input_context_points = min(
             len(historical_prediction_matrix),
-            int(self.online_predictor.profile.get("seq_len", 24)),
+            int(active_profile.get("seq_len", 24)),
         )
         if input_context_points:
             historical_prediction_matrix[:input_context_points] = np.nan
@@ -1693,7 +2285,7 @@ class DashboardData:
             "forecast": {
                 "requested_horizon": prediction_horizon,
                 "forecast_lead": forecast_lead,
-                "lead_semantics": "历史曲线使用已冻结的因果提前量；回放数据使用窗口起点对齐预测",
+                "lead_semantics": "历史曲线使用已冻结的因果提前量；历史数据使用窗口起点对齐预测",
                 "returned_horizon": int(len(future_prediction_matrix)),
                 "native_horizon": int(self.actual.shape[1]),
                 "mode": forecast_mode,
@@ -1701,6 +2293,11 @@ class DashboardData:
                 "checkpoint": (
                     self.online_predictor.checkpoint if realtime_prediction else None
                 ),
+                "model_type": active_profile.get("model_type"),
+                "input_sensors": active_profile.get("input_sensors", []),
+                "available_output_sensors": active_profile.get("output_sensors", []),
+                "checkpoint_sha256": active_profile.get("checkpoint_sha256"),
+                "atavn": active_profile.get("atavn"),
             },
             "progress": {
                 "cursor": cursor,
@@ -1789,11 +2386,10 @@ class DashboardData:
         full[:] = mean
         for sensor_name in profile["input_sensors"]:
             if sensor_name not in sensor_columns:
-                # New collection data intentionally does not acquire the
-                # legacy rotation/displacement/vibration channels.  Their
-                # model columns remain at the scaler baseline for backward
-                # compatibility with the existing checkpoint.
-                continue
+                raise ValueError(
+                    f"实时数据缺少模型输入通道：{sensor_name}；"
+                    "禁止用标准化基线伪造未采集的传感器数据"
+                )
             full[:, column_index[sensor_name]] = sensors[
                 :, sensor_columns.index(sensor_name)
             ]
@@ -1953,6 +2549,65 @@ class DashboardData:
         )
         output[np.asarray(valid_targets, dtype=int)] = physical
         return output
+
+    def _legacy_replay_model_stream(
+        self,
+        *,
+        profile: dict,
+        first_visual_index: int,
+        specimen_actual: np.ndarray,
+        layer_blocks: list[dict],
+    ) -> np.ndarray:
+        """Map archived physical replay data into the selected model contract."""
+        mean, scale = self._prediction_model_scaler(profile)
+        model_columns = list(profile["model_columns"])
+        physical = np.broadcast_to(
+            mean, (len(specimen_actual), len(model_columns))
+        ).astype(float).copy()
+        sensor_names = [str(item["name"]) for item in self.sensors]
+        for model_sensor in profile["input_sensors"]:
+            display_sensor = "压实力" if model_sensor == "压力" else model_sensor
+            if display_sensor not in sensor_names:
+                raise ValueError(f"历史数据缺少模型输入传感器：{model_sensor}")
+            physical[:, model_columns.index(model_sensor)] = specimen_actual[
+                :, sensor_names.index(display_sensor)
+            ]
+
+        point_offset = 0
+        for block in layer_blocks:
+            for _, row in block["group"].iterrows():
+                stop = min(point_offset + 24, len(physical))
+                for context_name in ("p", "v", "pr", "cycle", "l"):
+                    if context_name in model_columns:
+                        index = model_columns.index(context_name)
+                        physical[point_offset:stop, index] = _finite(
+                            row.get(context_name), mean[index]
+                        )
+                point_offset = stop
+
+        archived_columns = list(DEFAULT_MODEL_METADATA["model_columns"])
+        archived_physical = (
+            self.model_input[int(first_visual_index)] * self.scaler_scale[None, :]
+            + self.scaler_mean[None, :]
+        )
+        context = np.broadcast_to(
+            mean, (len(archived_physical), len(model_columns))
+        ).astype(float).copy()
+        for name in model_columns:
+            target_index = model_columns.index(name)
+            if name in archived_columns:
+                context[:, target_index] = archived_physical[
+                    :, archived_columns.index(name)
+                ]
+            elif len(physical):
+                context[:, target_index] = physical[0, target_index]
+        return np.concatenate(
+            [
+                ((context - mean[None, :]) / scale[None, :]).astype(np.float32),
+                ((physical - mean[None, :]) / scale[None, :]).astype(np.float32),
+            ],
+            axis=0,
+        )
 
     def _health_feature_arrays(
         self,
@@ -2202,15 +2857,35 @@ class DashboardData:
         prediction_sensors: list[str] | None = None,
         processing_mode: str | None = None,
         forecast_lead: int = 1,
+        dataset_schema: str | None = None,
+        prediction_model_type: str | None = None,
+        acquisition: AcquisitionManager | None = None,
     ) -> dict:
         """Real acquisition -> live model -> live HI features -> warning."""
-        status = self.acquisition.status()
-        rows, timestamps = self.acquisition.numeric_matrix()
+        active_acquisition = acquisition or self.acquisition
+        status = active_acquisition.status()
+        rows, timestamps = active_acquisition.numeric_matrix()
         config = status.get("config") or {}
+        requested_schema = (
+            dataset_schema
+            if dataset_schema in ACQUISITION_SCHEMAS
+            else str(config.get("dataset_schema") or "legacy_original")
+        )
+        if config.get("dataset_schema") and config.get("dataset_schema") != requested_schema:
+            raise ValueError(
+                "界面数据方案与当前采集会话不一致，请先停止采集后重新开始"
+            )
+        config = {**config, "dataset_schema": requested_schema}
+        requested_model_type = normalize_model_type(
+            prediction_model_type
+            or config.get("prediction_model_type")
+            or "i_T_G"
+        )
         if processing_mode in {"capture_only", "prediction_warning"}:
             config = {**config, "processing_mode": processing_mode}
         active_sensor_columns = list(
-            config.get("selected_sensors") or SENSOR_COLUMNS
+            config.get("selected_sensors")
+            or ACQUISITION_SCHEMAS[requested_schema]["sensors"]
         )
         sensor_id = int(
             np.clip(sensor_id, 0, max(len(active_sensor_columns) - 1, 0))
@@ -2250,24 +2925,48 @@ class DashboardData:
             and indicator == "TC-HI"
             and model_kind == "random_forest"
         )
+        calibrated_optimized = bool(use_optimized_warning and new_schema)
+        optimized_warning_applied = causal_optimized or calibrated_optimized
+        effective_rho = (
+            float(np.clip(_finite(candidate.get("cap_rho"), rho), 0.0, 1.0))
+            if calibrated_optimized
+            else rho
+        )
+        effective_window_threshold = (
+            float(
+                np.clip(
+                    _finite(candidate.get("window_threshold"), threshold),
+                    0.0,
+                    1.0,
+                )
+            )
+            if calibrated_optimized
+            else threshold
+        )
         active_profile = self.online_predictor.profile
         # A schema switch can arrive while an acquisition session is being
         # reused.  Reload the registered checkpoint compatible with the active
         # sensor set before constructing health features; otherwise an old
         # in-memory profile is reported as a health-indicator mismatch.
         active_sensor_names = set(active_sensor_columns)
-        if any(
+        if (
+            active_profile.get("schema_mode") != requested_schema
+            or active_profile.get("model_type") != requested_model_type
+            or any(
             str(name) not in active_sensor_names
-            and not (
-                new_schema
-                and str(name) in NEW_EXCLUDED_SENSOR_COLUMNS
-            )
             for name in active_profile.get("input_sensors", [])
-        ):
-            compatible_profile = self.best_prediction_profile(
-                "new_collection_v11_3" if new_schema else "legacy_original"
             )
-            self.online_predictor.configure(compatible_profile["checkpoint"])
+        ):
+            compatible_profile = inspect_prediction_model(
+                "",
+                model_type=requested_model_type,
+                schema_mode=requested_schema,
+            )
+            self.online_predictor.configure(
+                compatible_profile["checkpoint"],
+                model_type=compatible_profile.get("model_type", requested_model_type),
+                schema_mode=requested_schema,
+            )
             active_profile = self.online_predictor.profile
         configured_prediction_sensors = (
             prediction_sensors
@@ -2480,7 +3179,7 @@ class DashboardData:
                 type_probs = dict(cached_result["type_probabilities"])
                 predicted_state = (
                     "normal"
-                    if score < threshold
+                    if score < effective_window_threshold
                     else max(type_probs, key=type_probs.get)
                 )
                 completed.append(
@@ -2606,7 +3305,7 @@ class DashboardData:
         specimen_aggregate = None
         persist_layer_health = False
         if len(evidence_scores):
-            layer_health, weights = cap_pool(evidence_scores, rho)
+            layer_health, weights = cap_pool(evidence_scores, effective_rho)
             layer_type_probs = {
                 state: float(
                     np.dot(
@@ -2622,7 +3321,11 @@ class DashboardData:
                 )
                 for state in abnormal_states
             }
-            layer_threshold = _finite(candidate["layer_threshold"], threshold)
+            layer_threshold = (
+                _finite(candidate["layer_threshold"], threshold)
+                if optimized_warning_applied
+                else threshold
+            )
             layer_state = (
                 "normal"
                 if layer_health < layer_threshold
@@ -2636,8 +3339,12 @@ class DashboardData:
                 "evidence_count": len(completed),
                 "maximum_weight": float(np.max(weights)),
                 "effective_count": float(1.0 / np.sum(weights**2)),
-                "decision_mode": "live_features_and_classifier",
-                "optimized_warning_applied": False,
+                "decision_mode": (
+                    "validation_calibrated_cap_16s4p"
+                    if calibrated_optimized
+                    else "live_features_and_classifier"
+                ),
+                "optimized_warning_applied": calibrated_optimized,
             }
             causal_summary = None
             if not new_schema:
@@ -2713,7 +3420,9 @@ class DashboardData:
             layer_scores = np.asarray(
                 [item["health"] for item in layer_items], dtype=float
             )
-            specimen_health, specimen_weights = cap_pool(layer_scores, rho)
+            specimen_health, specimen_weights = cap_pool(
+                layer_scores, effective_rho
+            )
             specimen_type_probs = {
                 state: float(
                     np.dot(
@@ -2726,8 +3435,10 @@ class DashboardData:
                 )
                 for state in abnormal_states
             }
-            specimen_threshold = _finite(
-                candidate["specimen_threshold"], threshold
+            specimen_threshold = (
+                _finite(candidate["specimen_threshold"], threshold)
+                if optimized_warning_applied
+                else threshold
             )
             specimen_state = (
                 "normal"
@@ -2750,6 +3461,12 @@ class DashboardData:
                 ),
                 "complete": specimen_complete,
                 "aggregation": "CAP pooling across all available physical layers",
+                "decision_mode": (
+                    "validation_calibrated_cap_16s4p"
+                    if calibrated_optimized
+                    else "live_features_and_classifier"
+                ),
+                "optimized_warning_applied": calibrated_optimized,
             }
 
         latest = completed[-1] if completed else None
@@ -2778,8 +3495,12 @@ class DashboardData:
                 **latest,
                 "raw_realtime_score": latest["score"],
                 "complete": True,
-                "decision_mode": "live_features_and_classifier",
-                "optimized_warning_applied": False,
+                "decision_mode": (
+                    "validation_calibrated_cap_16s4p"
+                    if calibrated_optimized
+                    else "live_features_and_classifier"
+                ),
+                "optimized_warning_applied": calibrated_optimized,
             }
 
         if causal_optimized and latest is not None and layer_aggregate is not None:
@@ -3049,8 +3770,8 @@ class DashboardData:
                 "cursor": len(rows),
                 "history": history,
                 "step": step,
-                "threshold": threshold,
-                "rho": rho,
+                "threshold": effective_window_threshold,
+                "rho": effective_rho,
                 "score_mode": "live",
                 "indicator": indicator,
                 "model": model_kind,
@@ -3062,7 +3783,7 @@ class DashboardData:
                 "best_prediction_override": bool(
                     config.get("use_best_prediction_override", False)
                 ),
-                "use_optimized_warning": causal_optimized,
+                "use_optimized_warning": optimized_warning_applied,
             },
             "candidate": {
                 "indicator": indicator,
@@ -3089,14 +3810,18 @@ class DashboardData:
                 "test_specimen_balanced_accuracy": _finite(
                     candidate.get("test_specimen_balanced_accuracy"), None
                 ),
-                "window_threshold": threshold,
-                "layer_threshold": _finite(
-                    candidate["layer_threshold"], threshold
+                "window_threshold": effective_window_threshold,
+                "layer_threshold": (
+                    _finite(candidate["layer_threshold"], threshold)
+                    if optimized_warning_applied
+                    else threshold
                 ),
-                "specimen_threshold": _finite(
-                    candidate["specimen_threshold"], threshold
+                "specimen_threshold": (
+                    _finite(candidate["specimen_threshold"], threshold)
+                    if optimized_warning_applied
+                    else threshold
                 ),
-                "cap_rho": rho,
+                "cap_rho": effective_rho,
             },
                 "forecast": {
                     "requested_horizon": prediction_horizon,
@@ -3140,7 +3865,7 @@ class DashboardData:
             "layers": layers,
             "timeline": {
                 "scores": [item["score"] for item in completed] + [None],
-                "threshold": threshold,
+                "threshold": effective_window_threshold,
                 "active_index": len(completed),
                 "completed_count": len(completed),
             },
@@ -3180,6 +3905,8 @@ class DashboardData:
                 "warning_optimization": (
                     "causal_online_v13_9"
                     if causal_optimized
+                    else "validation_calibrated_cap_16s4p"
+                    if calibrated_optimized
                     else "none"
                 ),
             },
@@ -3406,17 +4133,434 @@ class DashboardData:
 
 class AppHandler(BaseHTTPRequestHandler):
     dashboard: DashboardData
+    security_store: SecurityStore
+    guest_manager: GuestSimulationManager
+    control_lease: RealControlLease
+    replay_cache: dict[str, tuple[int, dict]]
+    replay_lock: threading.Lock
+    model_limiter: SlidingWindowLimiter
+    model_call_lock: threading.Lock
+    diagnosis_jobs: DiagnosisJobStore
+    access_context: str = "public"
+    permission_policy = PermissionPolicy()
+    login_limiter = SlidingWindowLimiter()
+    network_status: dict[str, Any] = {}
+    network_status_provider: Any = None
+    service_started_at: float = 0.0
 
     def log_message(self, fmt: str, *args) -> None:
-        # 实时回放可达到10 Hz；逐请求打印会淹没终端并影响长时间运行。
+        # 实时数据流可达到10 Hz；逐请求打印会淹没终端并影响长时间运行。
         return
 
+    def _allowed_hosts(self) -> set[str]:
+        hosts = {"localhost", "127.0.0.1"}
+        for url in self._current_network_status().get("urls", []):
+            try:
+                host = urlsplit(str(url)).hostname
+            except ValueError:
+                host = None
+            if host:
+                hosts.add(host.lower())
+        return hosts
+
+    def _current_network_status(self) -> dict[str, Any]:
+        provider = self.network_status_provider
+        if callable(provider):
+            try:
+                latest = provider()
+            except Exception:
+                latest = None
+            if isinstance(latest, dict):
+                self.network_status.clear()
+                self.network_status.update(latest)
+        return dict(self.network_status or {})
+
+    def _is_allowed_host(self) -> bool:
+        host_header = str(self.headers.get("Host", "")).strip()
+        if not host_header:
+            return False
+        try:
+            host = urlsplit(f"http://{host_header}").hostname
+        except ValueError:
+            return False
+        if not host:
+            return False
+        normalized_host = host.lower()
+        if normalized_host in self._allowed_hosts():
+            return True
+        # Public reverse proxies can use either the legacy random Cloudflare
+        # hostname or the stable Tailscale Funnel hostname.  Trust either only
+        # when its provider-specific checks prove a loopback HTTPS proxy.
+        peer_host = str(self.client_address[0] if self.client_address else "")
+        return (
+            is_trusted_quick_tunnel_request(
+                peer_host, normalized_host, self.headers
+            )
+            or is_trusted_tailscale_funnel_request(
+                peer_host, normalized_host, self.headers
+            )
+        )
+
+    def _is_allowed_origin(self) -> bool:
+        if not self._is_allowed_host():
+            return False
+        origin = str(self.headers.get("Origin", "")).strip()
+        if not origin:
+            return True
+        try:
+            parsed = urlsplit(origin)
+            request_host = urlsplit(
+                f"http://{self.headers.get('Host', '')}"
+            ).netloc.lower()
+        except ValueError:
+            return False
+        return parsed.scheme in {"http", "https"} and parsed.netloc.lower() == request_host
+
+    def _reject_unsafe_request(self) -> bool:
+        if self._is_allowed_origin():
+            return False
+        self._send_json({"error": "请求来源或 Host 不被允许"}, HTTPStatus.FORBIDDEN)
+        return True
+
+    def _request_cookies(self) -> dict[str, str]:
+        if hasattr(self, "_parsed_cookies"):
+            return self._parsed_cookies
+        parsed: dict[str, str] = {}
+        try:
+            jar = SimpleCookie()
+            jar.load(str(self.headers.get("Cookie", "")))
+            parsed = {name: morsel.value for name, morsel in jar.items()}
+        except Exception:
+            parsed = {}
+        self._parsed_cookies = parsed
+        return parsed
+
+    def _queue_cookie(
+        self,
+        name: str,
+        value: str,
+        *,
+        http_only: bool,
+        same_site: str,
+        max_age: int | None = None,
+        secure: bool | None = None,
+    ) -> None:
+        parts = [f"{name}={value}", "Path=/", f"SameSite={same_site}"]
+        if http_only:
+            parts.append("HttpOnly")
+        if max_age is not None:
+            parts.append(f"Max-Age={int(max_age)}")
+        # Loopback HTTP is accepted for local setup, but a Secure cookie would
+        # then never be returned by the browser.  Mark cookies Secure only when
+        # the request is actually HTTPS (or Cloudflare forwarded HTTPS).
+        forwarded_proto = str(self.headers.get("X-Forwarded-Proto", "")).split(",", 1)[0].strip().lower()
+        use_secure = (forwarded_proto == "https") if secure is None else bool(secure)
+        if use_secure:
+            parts.append("Secure")
+        pending = getattr(self, "_pending_cookies", None)
+        if pending is None:
+            pending = []
+            self._pending_cookies = pending
+        pending.append("; ".join(parts))
+
+    def _ensure_browser_cookies(self) -> None:
+        cookies = self._request_cookies()
+        guest_id = str(cookies.get("afp_guest") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{32,64}", guest_id):
+            guest_id = secrets.token_urlsafe(24)
+            cookies["afp_guest"] = guest_id
+            self._queue_cookie(
+                "afp_guest", guest_id, http_only=True, same_site="Lax"
+            )
+        csrf = str(cookies.get("afp_csrf") or "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{32,64}", csrf):
+            csrf = secrets.token_urlsafe(32)
+            cookies["afp_csrf"] = csrf
+            self._queue_cookie(
+                "afp_csrf", csrf, http_only=False, same_site="Strict"
+            )
+
+    def _is_secure_transport(self) -> bool:
+        peer_host = str(self.client_address[0] if self.client_address else "")
+        return is_secure_request(peer_host, self.headers, self.access_context)
+
+    def _remote_label(self) -> str:
+        peer_host = str(self.client_address[0] if self.client_address else "")
+        if peer_host in {"127.0.0.1", "::1"}:
+            forwarded = str(self.headers.get("CF-Connecting-IP", "")).strip()
+            if re.fullmatch(r"[0-9A-Fa-f:.]{2,64}", forwarded):
+                return forwarded
+        return peer_host[:200]
+
+    def _identity(self) -> RequestIdentity:
+        cached = getattr(self, "_request_identity", None)
+        if cached is not None:
+            return cached
+        self._ensure_browser_cookies()
+        cookies = self._request_cookies()
+        guest_id = str(cookies["afp_guest"])
+        peer_host = str(self.client_address[0] if self.client_address else "")
+        if self.access_context == "local_admin" and peer_host in {
+            "127.0.0.1",
+            "::1",
+        }:
+            identity = RequestIdentity("local_admin", "local-admin", guest_id)
+        elif self.access_context == "public" and is_lan_client(peer_host, self.headers):
+            # A direct private-network client is the operator's LAN session.
+            # Cloudflare requests arrive through loopback with a CF identity
+            # header and remain guest/authorized according to web login.
+            identity = RequestIdentity(
+                "lan_operator", lan_session_id(guest_id), guest_id
+            )
+        else:
+            token = str(cookies.get("afp_session") or "")
+            session = self.security_store.resolve_session(token) if token else None
+            if session is None:
+                identity = RequestIdentity("guest", None, guest_id)
+            else:
+                identity = RequestIdentity(
+                    "authorized", session.session_id, guest_id
+                )
+                self._queue_cookie(
+                    "afp_session",
+                    token,
+                    http_only=True,
+                    same_site="Strict",
+                    max_age=2147483647,
+                )
+        self._request_identity = identity
+        return identity
+
+    def _require_permission(self, method: str, path: str) -> bool:
+        decision = self.permission_policy.authorize(method, path, self._identity())
+        if decision.allowed:
+            return True
+        self._send_json({"error": decision.error}, HTTPStatus(decision.status))
+        return False
+
+    def _require_csrf(self) -> bool:
+        if self._identity().role == "local_admin":
+            return True
+        expected = str(self._request_cookies().get("afp_csrf") or "")
+        supplied = str(self.headers.get("X-AFP-CSRF", ""))
+        if expected and supplied and hmac.compare_digest(expected, supplied):
+            return True
+        self._send_json({"error": "csrf_failed"}, HTTPStatus.FORBIDDEN)
+        return False
+
+    def _control_owner_id(self) -> str:
+        identity = self._identity()
+        return str(identity.session_id or "")
+
+    def _request_acquisition(self, requested_mode: str = ""):
+        identity = self._identity()
+        if (
+            str(requested_mode or "").lower() == "simulation"
+            and identity.role != "local_admin"
+        ):
+            with self.remote_simulation_hosts_lock:
+                execution_host = self.remote_simulation_hosts.get(
+                    str(identity.session_id or ""), "server"
+                )
+            if execution_host == "helper_local":
+                return self.dashboard.remote_acquisitions.for_session(
+                    str(identity.session_id or "")
+                )
+            return self.guest_manager.acquisition(identity.guest_id)
+        return select_acquisition_for_identity(
+            identity.role,
+            identity.session_id,
+            self.dashboard.acquisition,
+            self.dashboard.remote_acquisitions,
+            requested_mode=requested_mode,
+        )
+
+    def _target_status(self, session_id: str, status: dict[str, Any]) -> dict[str, Any]:
+        """Attach only public server-target progress to helper-backed status."""
+        value = dict(status or {})
+        capture_uuid = str(value.get("capture_uuid") or "")
+        if capture_uuid:
+            target = self.target_capture_journal.capture_status(session_id, capture_uuid)
+            if target is not None:
+                value["server_target"] = target
+        return value
+
+    def _schedule_target_save(self, session_id: str, capture_uuid: str) -> None:
+        state = self.target_capture_journal.capture_status(session_id, capture_uuid)
+        if not state or state.get("state") not in {"ready", "failed"}:
+            return
+        threading.Thread(
+            target=self.target_saver.save_now,
+            args=(session_id, capture_uuid),
+            name="AFP-server-target-save",
+            daemon=True,
+        ).start()
+
+    def _ingest_helper_sample(self, session_id: str, batch: dict[str, Any]) -> dict[str, Any]:
+        capture_uuid = str(batch.get("capture_uuid") or "") if isinstance(batch, dict) else ""
+        if self.target_capture_journal.manages(session_id, capture_uuid):
+            accepted = self.target_capture_journal.ingest(
+                session_id, batch if isinstance(batch, dict) else {},
+                self.dashboard.remote_acquisitions,
+            )
+            if accepted.get("ok"):
+                self._schedule_target_save(session_id, capture_uuid)
+            return accepted
+        return self.dashboard.remote_acquisitions.ingest(
+            session_id, batch if isinstance(batch, dict) else {}
+        )
+
+    def _accept_helper_result(
+        self, device_id: str, token: str, request_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        session_id = self.dashboard.helper_registry.authenticate(device_id, token)
+        if session_id is not None:
+            self.target_capture_journal.bind_start_result(session_id, request_id, payload)
+            self.dashboard.remote_acquisitions.for_session(
+                session_id
+            ).observe_helper_status(payload)
+        return self.dashboard.helper_registry.accept_result(
+            device_id, token, request_id, payload
+        )
+
+    def _diagnostic_context(
+        self, hardware_result: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        identity = self._identity()
+        acquisition_status = deepcopy(self._request_acquisition().status())
+        if identity.role == "local_admin":
+            return (
+                deepcopy(self.dashboard.acquisition.discover_interfaces()),
+                acquisition_status,
+            )
+        physical_interfaces = []
+        for item in hardware_result.get("interfaces") or []:
+            if not isinstance(item, dict):
+                continue
+            physical_interfaces.append(
+                {
+                    "id": item.get("physical_interface_id") or item.get("id"),
+                    "endpoint": item.get("endpoint"),
+                    "kind": item.get("physical_interface_kind"),
+                    "protocol": item.get("driver"),
+                    "detected": bool(item.get("ok")),
+                    "state": item.get("state"),
+                    "message": item.get("message"),
+                }
+            )
+        return (
+            {
+                "source": (
+                    "local_helper"
+                    if uses_local_capture_helper(identity.role)
+                    else "remote_browser_snapshot"
+                ),
+                "physical_interfaces": physical_interfaces,
+            },
+            acquisition_status,
+        )
+
+    def _require_real_control(self) -> bool:
+        identity = self._identity()
+        if identity.role not in REAL_ACCESS_ROLES:
+            self._send_json({"error": "real_access_required"}, HTTPStatus.FORBIDDEN)
+            return False
+        owner_id = self._control_owner_id()
+        current = self.control_lease.status()
+        if identity.role == "local_admin" and current.get("owner_id") in {
+            None,
+            "local-admin",
+        }:
+            if current.get("owner_id") is None:
+                self.control_lease.acquire("local-admin", "本机软件")
+            return True
+        if current.get("owner_id") != owner_id:
+            self._send_json(
+                {
+                    "error": "real_control_required",
+                    "control": current,
+                },
+                HTTPStatus.CONFLICT,
+            )
+            return False
+        return True
+
+    def _replay_key(self, path: str) -> str:
+        request_id = str(self.headers.get("X-AFP-Request-ID", "")).strip()
+        if not request_id or len(request_id) > 128:
+            return ""
+        return f"{path}:{request_id}"
+
+    def _replay_get(self, key: str) -> tuple[int, dict] | None:
+        if not key:
+            return None
+        with self.replay_lock:
+            return self.replay_cache.get(key)
+
+    def _replay_put(self, key: str, status: HTTPStatus, payload: dict) -> None:
+        if not key:
+            return
+        with self.replay_lock:
+            self.replay_cache[key] = (int(status), dict(payload))
+            while len(self.replay_cache) > 256:
+                self.replay_cache.pop(next(iter(self.replay_cache)))
+
+    def _send_security_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "same-origin")
+        for value in getattr(self, "_pending_cookies", []):
+            self.send_header("Set-Cookie", value)
+        self._pending_cookies = []
+
+    def _begin_operation(self, name: str) -> threading.Lock | None:
+        now = time.monotonic()
+        with _OPERATION_LOCKS_GUARD:
+            lock = _OPERATION_LOCKS.setdefault(name, threading.Lock())
+            if lock.acquire(blocking=False):
+                _OPERATION_LOCK_STARTED[name] = now
+                return lock
+            started = _OPERATION_LOCK_STARTED.get(name)
+            if started is not None and now - started > OPERATION_LOCK_TTL_SECONDS:
+                replacement = threading.Lock()
+                replacement.acquire()
+                _OPERATION_LOCKS[name] = replacement
+                _OPERATION_LOCK_STARTED[name] = now
+                return replacement
+        self._send_json(
+            {"error": "operation_in_progress", "operation": name},
+            HTTPStatus.CONFLICT,
+        )
+        return None
+
+    def _send_network_status(self) -> None:
+        payload = self._current_network_status()
+        payload.pop("api_key", None)
+        payload.pop("model_name", None)
+        started = float(self.service_started_at or time.time())
+        payload["service_uptime_seconds"] = round(
+            max(0.0, time.time() - started), 1
+        )
+        self._send_json(payload)
+
+    def _cloudflared_status(self) -> dict[str, object]:
+        try:
+            from public_web import inspect_cloudflared_service
+            config = dict(getattr(self, "public_web_config", {}) or {})
+            return inspect_cloudflared_service(str(config.get("cloudflared_service", "cloudflared")))
+        except Exception:
+            return {"installed": False, "running": False, "service_name": "cloudflared", "error_code": "inspection_unavailable"}
+
     def _send_json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
-        raw = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        raw, compressed = encode_json_response(
+            payload, self.headers.get("Accept-Encoding", "")
+        )
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
+        if compressed:
+            self.send_header("Content-Encoding", "gzip")
         self.send_header("Cache-Control", "no-store")
+        self._send_security_headers()
         self.end_headers()
         self.wfile.write(raw)
 
@@ -3424,11 +4568,33 @@ class AppHandler(BaseHTTPRequestHandler):
         if not path.exists() or not path.is_file():
             self.send_error(HTTPStatus.NOT_FOUND)
             return
-        raw = path.read_bytes()
+        raw, delivery_headers = encode_static_file_response(
+            path, self.headers.get("Accept-Encoding", ""), STATIC_DIR
+        )
         mime, _ = mimetypes.guess_type(path.name)
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", f"{mime or 'application/octet-stream'}; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
+        for name, value in delivery_headers.items():
+            self.send_header(name, value)
+        self._send_security_headers()
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _send_download(
+        self,
+        raw: bytes,
+        filename: str,
+        content_type: str = "application/octet-stream",
+    ) -> None:
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", filename).strip("._")
+        safe_name = safe_name or "download.bin"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{safe_name}"')
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
+        self._send_security_headers()
         self.end_headers()
         self.wfile.write(raw)
 
@@ -3436,10 +4602,460 @@ class AppHandler(BaseHTTPRequestHandler):
     def _one(query: dict[str, list[str]], key: str, default: str) -> str:
         return query.get(key, [default])[0]
 
+    def _live_payload(
+        self,
+        query: dict[str, list[str]],
+        acquisition: AcquisitionManager | None = None,
+    ) -> dict:
+        requested_mode = self._one(query, "acquisition_mode", "")
+        identity = self._identity()
+        with self.remote_simulation_hosts_lock:
+            simulation_execution_host = self.remote_simulation_hosts.get(
+                str(identity.session_id or ""), "server"
+            )
+        public_simulation = (
+            self.path.split("?", 1)[0] in {"/api/simulation/live", "/api/simulation/ws"}
+            or (
+                requested_mode == "simulation"
+                and identity.role != "local_admin"
+                and simulation_execution_host != "helper_local"
+            )
+        )
+        acquisition = acquisition or self._request_acquisition(
+            requested_mode
+        )
+        payload = self.dashboard.live(
+            sensor_id=int(self._one(query, "sensor", "2")),
+            history=int(self._one(query, "history", "240")),
+            step=int(self._one(query, "step", "1")),
+            threshold=float(self._one(query, "threshold", "0.5")),
+            rho=float(self._one(query, "rho", "0.5")),
+            indicator=self._one(query, "indicator", "TC-HI"),
+            model_kind=self._one(query, "model", "random_forest"),
+            prediction_horizon=int(
+                self._one(query, "prediction_horizon", "24")
+            ),
+            forecast_lead=int(self._one(query, "forecast_lead", "1")),
+            use_optimized_warning=self._one(
+                query, "use_optimized_warning", "true"
+            ).lower()
+            in {"1", "true", "yes", "on"},
+            prediction_sensors=(
+                (
+                    []
+                    if self._one(query, "prediction_sensors", "__none__")
+                    == "__none__"
+                    else [
+                        name
+                        for name in self._one(
+                            query, "prediction_sensors", ""
+                        ).split(",")
+                        if name in ALL_SENSOR_COLUMNS
+                    ]
+                )
+                if "prediction_sensors" in query
+                else None
+            ),
+            processing_mode=self._one(
+                query, "processing_mode", "prediction_warning"
+            ),
+            dataset_schema=self._one(
+                query, "dataset_schema", "legacy_original"
+            ),
+            prediction_model_type=self._one(
+                query, "prediction_model_type", "i_T_G"
+            ),
+            acquisition=acquisition,
+        )
+        acquisition_payload = payload.get("acquisition")
+        if isinstance(acquisition_payload, dict):
+            published_at = time.time()
+            acquisition_payload["remote_browser_published_at"] = published_at
+            try:
+                latest_sample_at = float(
+                    acquisition_payload.get("remote_latest_sample_at")
+                )
+            except (TypeError, ValueError):
+                latest_sample_at = 0.0
+            acquisition_payload["remote_sample_end_to_end_age_ms"] = (
+                max(0.0, (published_at - latest_sample_at) * 1000.0)
+                if latest_sample_at > 0
+                else None
+            )
+        if public_simulation and isinstance(payload.get("acquisition"), dict):
+            payload["acquisition"] = self.guest_manager.public_status(
+                self._identity().guest_id, payload["acquisition"]
+            )
+        return payload
+
+    def _serve_live_websocket(self, query: dict[str, list[str]]) -> None:
+        """Push live dashboard payloads over one RFC 6455 connection.
+
+        The existing acquisition and prediction code remains the source of
+        truth.  This endpoint only replaces repeated HTTP requests with a
+        persistent server-to-browser stream; local/LAN clients keep the
+        existing polling path.
+        """
+        from websocket_live import websocket_handshake_headers
+
+        key = str(self.headers.get("Sec-WebSocket-Key") or "").strip()
+        if not key:
+            self._send_json({"error": "websocket_key_missing"}, HTTPStatus.BAD_REQUEST)
+            return
+        headers = websocket_handshake_headers(key)
+        previous_protocol = self.protocol_version
+        self.protocol_version = "HTTP/1.1"
+        try:
+            self.send_response(HTTPStatus.SWITCHING_PROTOCOLS)
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+        finally:
+            self.protocol_version = previous_protocol
+        self.close_connection = True
+        # A server-initiated stream does not need browser application frames,
+        # but checking readability lets us acknowledge close/ping frames.
+        self.request.settimeout(5.0)
+        acquisition = None
+        if self.path.split("?", 1)[0] == "/api/simulation/ws":
+            acquisition = self.guest_manager.acquisition(self._identity().guest_id)
+        if acquisition is None:
+            acquisition = self._request_acquisition(
+                self._one(query, "acquisition_mode", "")
+            )
+        try:
+            next_push = 0.0
+            next_heartbeat = time.monotonic() + 5.0
+            payload_cache = VersionedPayloadCache()
+            while True:
+                now = time.monotonic()
+                wait_for = max(0.0, min(0.05, next_push - now))
+                readable, _, _ = select.select([self.request], [], [], wait_for)
+                if readable:
+                    try:
+                        control = self.request.recv(4096)
+                    except (OSError, TimeoutError):
+                        return
+                    if not control:
+                        return
+                    opcode = control[0] & 0x0F
+                    if opcode == 0x8:  # close
+                        self.request.sendall(encode_server_frame(b"", opcode=0x8))
+                        return
+                    if opcode == 0x9:  # ping
+                        self.request.sendall(encode_server_frame(b"", opcode=0xA))
+                    continue
+                if time.monotonic() < next_push:
+                    continue
+                try:
+                    payload = payload_cache.payload_for(
+                        acquisition,
+                        lambda: self._live_payload(query, acquisition=acquisition),
+                    )
+                    if payload is None:
+                        if time.monotonic() < next_heartbeat:
+                            next_push = time.monotonic() + 0.05
+                            continue
+                        payload = {
+                            "type": "heartbeat",
+                            "stream_version": payload_cache.version,
+                        }
+                        next_heartbeat = time.monotonic() + 5.0
+                    frame = encode_json_frame(payload)
+                except Exception as exc:
+                    frame = encode_json_frame({"type": "error", "error": str(exc)})
+                self.request.sendall(frame)
+                next_push = time.monotonic() + 0.05
+        except (BrokenPipeError, ConnectionResetError, OSError, TimeoutError):
+            return
+
+    def _serve_helper_websocket(self, query: dict[str, list[str]]) -> None:
+        """Keep one authenticated local-helper connection open over WSS.
+
+        The helper uses the same pairing token and command contract as the
+        legacy HTTPS poller.  This endpoint only changes message transport;
+        discovery and capture still execute in the existing helper process.
+        """
+        authorization = str(self.headers.get("Authorization", ""))
+        token = (
+            authorization[7:].strip()
+            if authorization.lower().startswith("bearer ")
+            else ""
+        )
+        device_id = str(
+            (query.get("device_id") or [""])[0]
+            or self.headers.get("X-AFP-Device-ID", "")
+        ).strip()
+        session_id = self.dashboard.helper_registry.authenticate(device_id, token)
+        if not session_id:
+            self._send_json({"ok": False, "error": "helper_authentication_failed"}, HTTPStatus.UNAUTHORIZED)
+            return
+        key = str(self.headers.get("Sec-WebSocket-Key") or "").strip()
+        if not key:
+            self._send_json({"ok": False, "error": "websocket_key_missing"}, HTTPStatus.BAD_REQUEST)
+            return
+        headers = websocket_handshake_headers(key)
+        previous_protocol = self.protocol_version
+        self.protocol_version = "HTTP/1.1"
+        try:
+            self.send_response(HTTPStatus.SWITCHING_PROTOCOLS)
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+        finally:
+            self.protocol_version = previous_protocol
+        self.close_connection = True
+
+        sender = synchronized_json_sender(self.request)
+
+        if not self.dashboard.helper_registry.attach(
+            session_id, device_id, token, sender
+        ):
+            return
+        self.request.settimeout(30.0)
+        try:
+            while True:
+                opcode, raw = recv_client_frame(self.request)
+                if opcode == 0x8:  # close
+                    try:
+                        self.request.sendall(encode_server_frame(b"", opcode=0x8))
+                    except OSError:
+                        pass
+                    return
+                if opcode == 0x9:  # ping
+                    self.request.sendall(encode_server_frame(raw, opcode=0xA))
+                    continue
+                if opcode != 0x1:  # only text application messages are needed
+                    continue
+                try:
+                    message = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, ValueError):
+                    sender({"type": "error", "error": "helper消息不是有效JSON"})
+                    continue
+                if not isinstance(message, dict):
+                    sender({"type": "error", "error": "helper消息必须是JSON对象"})
+                    continue
+                message_type = str(message.get("type") or "").strip().lower()
+                if message_type == "hello":
+                    capabilities = message.get("capabilities")
+                    self.dashboard.helper_registry.attach(
+                        session_id,
+                        device_id,
+                        token,
+                        sender,
+                        capabilities=capabilities
+                        if isinstance(capabilities, dict)
+                        else None,
+                    )
+                    sender({"type": "hello_ack", "ok": True})
+                elif message_type == "heartbeat":
+                    if self.dashboard.helper_registry.authenticate(device_id, token):
+                        sender({"type": "heartbeat_ack", "ok": True})
+                    else:
+                        sender({"type": "error", "error": "helper_authentication_failed"})
+                        return
+                elif message_type == "result":
+                    accepted = self._accept_helper_result(
+                        device_id, token,
+                        str(message.get("request_id") or ""),
+                        message.get("payload")
+                        if isinstance(message.get("payload"), dict)
+                        else {},
+                    )
+                    sender({"type": "result_ack", **accepted})
+                elif message_type == "sample_batch":
+                    batch = message.get("batch")
+                    accepted = self._ingest_helper_sample(session_id, batch if isinstance(batch, dict) else {})
+                    sender({"type": "sample_ack", **accepted})
+                else:
+                    sender({"type": "error", "error": "helper消息类型不受支持"})
+        except (BrokenPipeError, ConnectionResetError, ConnectionError, OSError, TimeoutError, ValueError):
+            return
+        finally:
+            self.dashboard.helper_registry.detach(session_id, sender=sender)
+
     def do_GET(self) -> None:  # noqa: N802
+        if not self._is_allowed_host():
+            self._send_json({"error": "请求 Host 不被允许"}, HTTPStatus.FORBIDDEN)
+            return
         parsed = urlparse(self.path)
+        self._ensure_browser_cookies()
+        if parsed.path.startswith("/api/") and not self._require_permission(
+            "GET", parsed.path
+        ):
+            return
+        if (
+            parsed.path in {"/api/simulation/ws", "/api/live/ws"}
+            and str(self.headers.get("Upgrade") or "").lower() == "websocket"
+        ):
+            self._serve_live_websocket(parse_qs(parsed.query))
+            return
+        if (
+            parsed.path == "/api/helper/ws"
+            and str(self.headers.get("Upgrade") or "").lower() == "websocket"
+        ):
+            self._serve_helper_websocket(parse_qs(parsed.query))
+            return
         if parsed.path == "/api/health":
-            self._send_json({"status": "ok", "version": "1.11.0"})
+            self._send_json(
+                {"status": "ok", "version": APP_VERSION, "build_id": BUILD_ID}
+            )
+            return
+        if parsed.path == "/api/network/status":
+            self._send_network_status()
+            return
+        if parsed.path == "/api/real/control/status":
+            self._send_json(self.control_lease.status())
+            return
+        if parsed.path == "/api/admin/status":
+            self._send_json(
+                {
+                    "security": self.security_store.safe_status(),
+                    "real_control": self.control_lease.status(),
+                    "network": dict(self.network_status or {}),
+                }
+            )
+            return
+        if parsed.path == "/api/admin/security/settings":
+            config = dict(getattr(self, "public_web_config", {}) or {})
+            self._send_json(
+                {
+                    "security": self.security_store.safe_status(),
+                    "hostname": str(config.get("hostname", config.get("domain", ""))),
+                    "guest_session_quota_mb": int(config.get("guest_session_quota_mb", 256)),
+                    "guest_total_quota_mb": int(config.get("guest_total_quota_mb", 2048)),
+                    "cloudflared": self._cloudflared_status(),
+                }
+            )
+            return
+        if parsed.path == "/api/auth/session":
+            identity = self._identity()
+            safe_status = self.security_store.safe_status()
+            self._send_json(
+                {
+                    "authenticated": identity.role in REAL_ACCESS_ROLES,
+                    "role": identity.role,
+                    "model_access": bool(
+                        identity.role in REAL_ACCESS_ROLES
+                        and safe_status.get("model_configured")
+                    ),
+                    "secure_transport": self._is_secure_transport(),
+                    "csrf_ready": bool(self._request_cookies().get("afp_csrf")),
+                }
+            )
+            return
+        if parsed.path == "/api/public/device-status":
+            self._send_json(
+                build_public_device_status(
+                    None,
+                    self.dashboard.acquisition.latest_check_result(),
+                    self.dashboard.acquisition.status(),
+                )
+            )
+            return
+        if parsed.path == "/api/simulation/status":
+            self._send_json(self.guest_manager.status(self._identity().guest_id))
+            return
+        if parsed.path == "/api/simulation/packages":
+            identity = self._identity()
+            if identity.role not in {"authorized", "lan_operator"}:
+                self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
+                return
+            self._send_json({"ok": True, "packages": simulation_package_catalog()})
+            return
+        if parsed.path == "/api/simulation/package-download":
+            identity = self._identity()
+            if identity.role not in {"authorized", "lan_operator"}:
+                self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
+                return
+            try:
+                package_id = self._one(parse_qs(parsed.query), "package_id", "")
+                package_path = resolve_simulation_package(package_id)
+                self._send_download(
+                    package_path.read_bytes(),
+                    package_path.name,
+                    "text/csv; charset=utf-8",
+                )
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+            return
+        if parsed.path == "/api/simulation/dataset":
+            try:
+                self._send_json(
+                    self.guest_manager.dataset(self._identity().guest_id)
+                )
+            except GuestSimulationError as exc:
+                self._send_json(
+                    {"ok": False, "error": str(exc), "code": exc.code},
+                    HTTPStatus.BAD_REQUEST,
+                )
+            except Exception as exc:
+                self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/simulation/live":
+            try:
+                query = parse_qs(parsed.query)
+                self._send_json(
+                    self._live_payload(
+                        query,
+                        self.guest_manager.acquisition(self._identity().guest_id),
+                    )
+                )
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path == "/api/simulation/download":
+            raw, filename = self.guest_manager.download_archive(
+                self._identity().guest_id
+            )
+            self._send_download(raw, filename, "application/zip")
+            return
+        if parsed.path == "/api/simulation/export-manifest":
+            self._send_json(self.guest_manager.export_manifest(self._identity().guest_id))
+            return
+        if parsed.path == "/api/simulation/export-file":
+            try:
+                relative_path = self._one(parse_qs(parsed.query), "path", "")
+                raw, _name = self.guest_manager.export_file(self._identity().guest_id, relative_path)
+                self._send_download(raw, Path(relative_path).name)
+            except (FileNotFoundError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+            return
+        if parsed.path == "/api/agent/defaults":
+            from interface_agent import DEFAULT_SILICONFLOW_MODEL
+
+            identity = self._identity()
+            if identity.role in REAL_ACCESS_ROLES:
+                _api_key, model_name = self.security_store.model_credentials()
+                self._send_json(
+                    {
+                        "model_name": model_name or DEFAULT_SILICONFLOW_MODEL,
+                        "model_access": bool(_api_key and model_name),
+                        "default_key_available": bool(_api_key),
+                    }
+                )
+            else:
+                self._send_json(
+                    {
+                        "model_name": DEFAULT_SILICONFLOW_MODEL,
+                        "model_access": False,
+                        "default_key_available": False,
+                    }
+                )
+            return
+        if parsed.path == "/api/agent/diagnose/result":
+            session_id = str(self._identity().session_id or "")
+            if not session_id:
+                self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
+                return
+            job_id = self._one(parse_qs(parsed.query), "job_id", "")
+            snapshot = self.diagnosis_jobs.get(session_id, job_id)
+            if snapshot is None:
+                self._send_json({"error": "job_not_found"}, HTTPStatus.NOT_FOUND)
+                return
+            self._send_json(snapshot)
             return
         if parsed.path == "/api/training/status":
             query = parse_qs(parsed.query)
@@ -3450,54 +5066,134 @@ class AppHandler(BaseHTTPRequestHandler):
             self._send_json(self.dashboard.web_training.defaults(self._one(query, "mode", "new")))
             return
         if parsed.path == "/api/bootstrap":
-            self._send_json(self.dashboard.bootstrap())
+            identity = self._identity()
+            # Server hardware belongs only to the loopback administrator.
+            # Remote roles either use their paired helper or browser uploads;
+            # probing PLC/ABB/RTSP here adds several seconds and the result is
+            # discarded below for helper-backed sessions anyway.
+            bootstrap = self.dashboard.bootstrap(
+                include_discovery=identity.role == "local_admin"
+            )
+            acquisition = bootstrap.get("acquisition") or {}
+            demo = acquisition.get("new_collection_demo") or {}
+            # Use the same administrator-approved CSV as the initial source in
+            # both guest playback and the unlocked desktop-style simulation.
+            # Guests receive only the display name below; authorized users need
+            # the full local path so the original chooser/start flow can read it.
+            default_source = str(demo.get("source_file") or "")
+            if default_source:
+                acquisition["simulation_source_type"] = "single_csv"
+                acquisition["simulation_source_name"] = default_source
+            if uses_local_capture_helper(identity.role):
+                # Real acquisition for remote operators belongs to the paired
+                # visitor helper.  Never seed its panel with server hardware
+                # or a server-local save folder while the helper reconnects.
+                # Static sensor roles/defaults do not probe server hardware;
+                # keep them so the browser does not fall back to custom JSON.
+                bootstrap = deepcopy(bootstrap)
+                acquisition = bootstrap.get("acquisition") or {}
+                acquisition["interface_defaults"] = default_capture_interfaces()
+                acquisition["sensor_types"] = sensor_interface_profiles()
+                acquisition["interface_discovery"] = {"physical_interfaces": []}
+                acquisition["default_save_root"] = ""
+                bootstrap["acquisition"] = acquisition
+            if identity.role == "guest":
+                bootstrap = deepcopy(bootstrap)
+                bootstrap["manifest"] = {
+                    key: value
+                    for key, value in (bootstrap.get("manifest") or {}).items()
+                    if key not in {"result_dir", "split_root", "output_root"}
+                }
+                acquisition = bootstrap.get("acquisition") or {}
+                discovery = acquisition.get("interface_discovery") or {}
+                physical_interfaces = []
+                for item in discovery.get("physical_interfaces") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    physical_interfaces.append({
+                        key: item.get(key)
+                        for key in (
+                            "id", "kind", "protocol", "endpoint", "label",
+                            "description", "detected", "driver_available",
+                            "auto_assignable", "shared_roles",
+                        )
+                        if key in item
+                    })
+                acquisition["interface_discovery"] = {
+                    "physical_interfaces": physical_interfaces,
+                }
+                acquisition["interface_defaults"] = default_capture_interfaces()
+                acquisition["sensor_types"] = sensor_interface_profiles()
+                acquisition["default_save_root"] = ""
+                source_status = self.guest_manager.source_status(identity.guest_id)
+                acquisition["simulation_source_type"] = source_status.get("source_type", "single_csv")
+                acquisition["simulation_source_name"] = source_status.get("name", "")
+                acquisition["simulation_source_channels"] = source_status.get("channels", [])
+                demo = acquisition.get("new_collection_demo") or {}
+                demo["source_file"] = ""
+                demo["prediction_model"] = None
+                bootstrap["acquisition"] = acquisition
+            self._send_json(bootstrap)
+            return
+        if parsed.path == "/api/mysql/defaults":
+            self._send_json(public_mysql_profiles())
+            return
+        if parsed.path == "/api/helper/status":
+            self._send_json(
+                self.dashboard.helper_registry.status(
+                    str(self._identity().session_id or self._identity().guest_id)
+                )
+            )
+            return
+        if parsed.path == "/api/helper/result":
+            request_id = self._one(parse_qs(parsed.query), "request_id", "")
+            session_id = str(self._identity().session_id or "")
+            result = self.dashboard.helper_registry.pop_result(session_id, request_id)
+            self._send_json({"ok": result is not None, "request_id": request_id, "payload": result})
             return
         if parsed.path == "/api/acquisition/status":
-            self._send_json(self.dashboard.acquisition.status())
+            query = parse_qs(parsed.query)
+            requested_mode = self._one(query, "acquisition_mode", "")
+            identity = self._identity()
+            with self.remote_simulation_hosts_lock:
+                simulation_execution_host = self.remote_simulation_hosts.get(
+                    str(identity.session_id or ""), "server"
+                )
+            if (
+                requested_mode == "simulation"
+                and identity.role != "local_admin"
+                and simulation_execution_host != "helper_local"
+            ):
+                self._send_json(self.guest_manager.status(identity.guest_id))
+            else:
+                status = self._request_acquisition(requested_mode).status()
+                if identity.role in REAL_ACCESS_ROLES and identity.role != "local_admin":
+                    status = self._target_status(str(identity.session_id or ""), status)
+                self._send_json(status)
+            return
+        if parsed.path == "/api/acquisition/save-status":
+            query = parse_qs(parsed.query)
+            requested = self._one(query, "path", "")
+            self._send_json(check_capture_save_root(requested))
+            return
+        if parsed.path == "/api/acquisition/export-manifest":
+            self._send_json(self.dashboard.acquisition.export_manifest())
+            return
+        if parsed.path == "/api/acquisition/export-file":
+            try:
+                relative_path = self._one(parse_qs(parsed.query), "path", "")
+                raw, _name = self.dashboard.acquisition.export_file(relative_path)
+                self._send_download(raw, Path(relative_path).name)
+            except (FileNotFoundError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
+            return
+        if parsed.path == "/api/acquisition/discover":
+            self._send_json(self.dashboard.acquisition.discover_interfaces())
             return
         if parsed.path == "/api/live":
             try:
                 query = parse_qs(parsed.query)
-                payload = self.dashboard.live(
-                    sensor_id=int(self._one(query, "sensor", "2")),
-                    history=int(self._one(query, "history", "240")),
-                    step=int(self._one(query, "step", "1")),
-                    threshold=float(self._one(query, "threshold", "0.5")),
-                    rho=float(self._one(query, "rho", "0.5")),
-                    indicator=self._one(query, "indicator", "TC-HI"),
-                    model_kind=self._one(
-                        query, "model", "random_forest"
-                    ),
-                    prediction_horizon=int(
-                        self._one(query, "prediction_horizon", "24")
-                    ),
-                    forecast_lead=int(
-                        self._one(query, "forecast_lead", "1")
-                    ),
-                    use_optimized_warning=self._one(
-                        query, "use_optimized_warning", "true"
-                    ).lower() in {"1", "true", "yes", "on"},
-                    prediction_sensors=(
-                        (
-                            []
-                            if self._one(
-                                query, "prediction_sensors", "__none__"
-                            ) == "__none__"
-                            else [
-                                name
-                                for name in self._one(
-                                    query, "prediction_sensors", ""
-                                ).split(",")
-                                if name in ALL_SENSOR_COLUMNS
-                            ]
-                        )
-                        if "prediction_sensors" in query
-                        else None
-                    ),
-                    processing_mode=self._one(
-                        query, "processing_mode", "prediction_warning"
-                    ),
-                )
+                payload = self._live_payload(query)
                 self._send_json(payload)
             except Exception as exc:
                 self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
@@ -3546,6 +5242,12 @@ class AppHandler(BaseHTTPRequestHandler):
                     use_optimized_warning=self._one(
                         query, "use_optimized_warning", "true"
                     ).lower() in {"1", "true", "yes", "on"},
+                    dataset_schema=self._one(
+                        query, "dataset_schema", "legacy_original"
+                    ),
+                    prediction_model_type=self._one(
+                        query, "prediction_model_type", "i_T_G"
+                    ),
                 )
                 self._send_json(payload)
             except Exception as exc:  # pragma: no cover - returned to browser
@@ -3561,14 +5263,576 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if self._reject_unsafe_request():
+            return
+        self._ensure_browser_cookies()
+        if not self._require_permission("POST", parsed.path):
+            return
+        helper_transport_path = parsed.path in {
+            "/api/helper/pair/complete",
+            "/api/helper/poll",
+            "/api/helper/result",
+            "/api/helper/samples",
+            "/api/helper/simulation-source/chunk",
+        }
+        if not helper_transport_path and not self._require_csrf():
+            return
+        if parsed.path == "/api/auth/login" and not self._is_secure_transport():
+            self._send_json({"error": "https_required"}, HTTPStatus.UPGRADE_REQUIRED)
+            return
+        content_type = str(self.headers.get("Content-Type", "")).lower()
+        if not content_type.startswith("application/json"):
+            self._send_json(
+                {"error": "POST 请求必须使用 application/json"},
+                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+            )
+            return
+        operation_name = None
+        if parsed.path in {
+            "/api/acquisition/test",
+            "/api/acquisition/reset-check",
+        }:
+            operation_name = "acquisition-check"
+        elif parsed.path == "/api/agent/diagnose":
+            # Model diagnosis may legitimately take longer than a hardware
+            # probe.  Keep its mutex independent so a timed-out/slow model
+            # request cannot block reset/recheck of the physical interfaces.
+            operation_name = "agent-diagnose"
+        elif parsed.path in {"/api/acquisition/start", "/api/acquisition/stop"}:
+            operation_name = "acquisition-control"
+        elif parsed.path in {"/api/training/start", "/api/training/stop"}:
+            operation_name = "training-control"
+        operation_lock = (
+            self._begin_operation(operation_name) if operation_name else None
+        )
+        if operation_name and operation_lock is None:
+            return
         try:
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length) if length else b"{}"
             payload = json.loads(body.decode("utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("请求体必须是JSON对象")
+            if parsed.path == "/api/helper/pair/complete":
+                result = self.dashboard.helper_registry.complete_pairing(
+                    str(payload.get("challenge") or ""),
+                    str(payload.get("device_id") or ""),
+                    payload.get("capabilities")
+                    if isinstance(payload.get("capabilities"), dict)
+                    else {},
+                )
+                self._send_json(result)
+                return
+            if parsed.path in {
+                "/api/helper/poll",
+                "/api/helper/result",
+                "/api/helper/samples",
+                "/api/helper/simulation-source/chunk",
+            }:
+                authorization = str(self.headers.get("Authorization", ""))
+                token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+                device_id = str(payload.get("device_id") or "")
+                if parsed.path == "/api/helper/poll":
+                    result = self.dashboard.helper_registry.poll(device_id, token)
+                elif parsed.path == "/api/helper/samples":
+                    session_id = self.dashboard.helper_registry.authenticate(device_id, token)
+                    if session_id is None:
+                        result = {"ok": False, "error": "helper_authentication_failed"}
+                    else:
+                        batch = payload.get("batch")
+                        result = self._ingest_helper_sample(
+                            session_id, batch if isinstance(batch, dict) else {}
+                        )
+                elif parsed.path == "/api/helper/simulation-source/chunk":
+                    session_id = self.dashboard.helper_registry.authenticate(device_id, token)
+                    if session_id is None:
+                        result = {"ok": False, "error": "helper_authentication_failed"}
+                    else:
+                        try:
+                            result = self.simulation_source_transfers.read_chunk(
+                                str(payload.get("ticket") or ""),
+                                session_id,
+                                file_index=int(payload.get("file_index", -1)),
+                                offset=int(payload.get("offset", 0)),
+                                limit=int(payload.get("limit", MAX_TRANSFER_CHUNK_BYTES)),
+                            )
+                        except SimulationSourceTransferError as exc:
+                            self._send_json(
+                                {"ok": False, "error": str(exc)},
+                                HTTPStatus.BAD_REQUEST,
+                            )
+                            return
+                else:
+                    result = self._accept_helper_result(
+                        device_id, token,
+                        str(payload.get("request_id") or ""),
+                        payload.get("payload") if isinstance(payload.get("payload"), dict) else {},
+                    )
+                self._send_json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.UNAUTHORIZED)
+                return
+            if parsed.path in {
+                "/api/real/control/acquire",
+                "/api/real/control/heartbeat",
+                "/api/real/control/release",
+            }:
+                owner_id = self._control_owner_id()
+                if parsed.path.endswith("/acquire"):
+                    decision = self.control_lease.acquire(
+                        owner_id,
+                        str(self.headers.get("User-Agent", "访客浏览器")),
+                    )
+                    self._send_json(
+                        {
+                            "granted": decision.granted,
+                            "error": decision.error,
+                            "control": self.control_lease.status(),
+                        },
+                        HTTPStatus.OK if decision.granted else HTTPStatus.CONFLICT,
+                    )
+                elif parsed.path.endswith("/heartbeat"):
+                    decision = self.control_lease.heartbeat(owner_id)
+                    self._send_json(
+                        {
+                            "granted": decision.granted,
+                            "error": decision.error,
+                            "control": self.control_lease.status(),
+                        },
+                        HTTPStatus.OK if decision.granted else HTTPStatus.CONFLICT,
+                    )
+                else:
+                    self._send_json(
+                        {
+                            "released": self.control_lease.release(owner_id),
+                            "control": self.control_lease.status(),
+                        }
+                    )
+                return
+            if parsed.path == "/api/admin/real-control/takeover":
+                decision = self.control_lease.force_takeover()
+                self._send_json(
+                    {
+                        "granted": decision.granted,
+                        "control": self.control_lease.status(),
+                    }
+                )
+                return
+            if parsed.path == "/api/admin/security/configure":
+                password = str(payload.get("password") or "")
+                api_key = str(payload.get("api_key") or "")
+                model_name = str(payload.get("model_name") or "")
+                self.security_store.configure_owner(password, api_key, model_name)
+                self._send_json(
+                    {
+                        "configured": True,
+                        "security": self.security_store.safe_status(),
+                    }
+                )
+                return
+            if parsed.path == "/api/admin/security/settings":
+                password = str(payload.get("password") or "")
+                model_name = str(payload.get("model_name") or "")
+                clear_key = bool(payload.get("clear_api_key", False))
+                if "api_key" in payload and not clear_key:
+                    api_key = str(payload.get("api_key") or "")
+                elif clear_key:
+                    api_key = ""
+                else:
+                    api_key, _previous_model = self.security_store.model_credentials()
+                if not model_name:
+                    _previous_key, model_name = self.security_store.model_credentials()
+                self.security_store.configure_owner(password, api_key, model_name)
+                self._send_json({"security": self.security_store.safe_status()})
+                return
+            if parsed.path == "/api/admin/security/revoke":
+                self.security_store.revoke(str(payload.get("session_id") or ""))
+                self._send_json({"revoked": True, "security": self.security_store.safe_status()})
+                return
+            if parsed.path == "/api/admin/simulation/cleanup":
+                self._send_json({"cleanup": self.guest_manager.cleanup_stopped()})
+                return
+            if parsed.path == "/api/admin/security/revoke-all":
+                self.security_store.revoke_all()
+                self._send_json({"revoked": True, "security": self.security_store.safe_status()})
+                return
+            if parsed.path == "/api/auth/login":
+                remote_key = self._remote_label() or "unknown"
+                if self.login_limiter.blocked("login", remote_key) or (
+                    self.login_limiter.count("login", remote_key, 600.0) >= 5
+                ):
+                    self._send_json(
+                        {"error": "login_rate_limited"},
+                        HTTPStatus.TOO_MANY_REQUESTS,
+                    )
+                    return
+                try:
+                    token, session = self.security_store.authenticate(
+                        str(payload.get("password") or ""),
+                        str(self.headers.get("User-Agent", "")),
+                        remote_key,
+                    )
+                except AuthenticationError:
+                    self.login_limiter.allow("login", remote_key, 5, 600.0)
+                    if self.login_limiter.count("login", remote_key, 600.0) >= 5:
+                        self.login_limiter.block("login", remote_key, 900.0)
+                    self._send_json(
+                        {"error": "authentication_failed"},
+                        HTTPStatus.UNAUTHORIZED,
+                    )
+                    return
+                self.login_limiter.clear("login", remote_key)
+                self._queue_cookie(
+                    "afp_session",
+                    token,
+                    http_only=True,
+                    same_site="Strict",
+                    max_age=2147483647,
+                )
+                self._request_identity = RequestIdentity(
+                    "authorized", session.session_id, self._identity().guest_id
+                )
+                safe_status = self.security_store.safe_status()
+                self._send_json(
+                    {
+                        "authenticated": True,
+                        "role": "authorized",
+                        "model_access": bool(safe_status.get("model_configured")),
+                    }
+                )
+                return
+            controlled_paths = {
+                "/api/acquisition/test",
+                "/api/acquisition/reset-check",
+                "/api/acquisition/start",
+                "/api/acquisition/stop",
+                "/api/acquisition/integrate",
+                "/api/training/import",
+                "/api/training/start",
+                "/api/training/stop",
+            }
+            simulation_session_control = (
+                parsed.path in {"/api/acquisition/start", "/api/acquisition/stop"}
+                and str(payload.get("acquisition_mode") or "").lower() == "simulation"
+            )
+            if (
+                parsed.path in controlled_paths
+                and not simulation_session_control
+                and not self._require_real_control()
+            ):
+                return
+            replay_key = self._replay_key(parsed.path)
+            replayed = self._replay_get(replay_key)
+            if replayed is not None:
+                self._send_json(replayed[1], HTTPStatus(replayed[0]))
+                return
+            if parsed.path == "/api/auth/logout":
+                token = str(self._request_cookies().get("afp_session") or "")
+                self.security_store.logout(token)
+                self._queue_cookie(
+                    "afp_session",
+                    "",
+                    http_only=True,
+                    same_site="Strict",
+                    max_age=0,
+                )
+                self._send_json({"authenticated": False, "role": "guest"})
+                return
+            if parsed.path == "/api/simulation/start":
+                self._send_json(
+                    self.guest_manager.start(self._identity().guest_id, payload)
+                )
+                return
+            if parsed.path == "/api/simulation/process-parameters":
+                self._send_json(
+                    self.guest_manager.read_process_parameters(
+                        self._identity().guest_id, payload
+                    )
+                )
+                return
+            if parsed.path == "/api/simulation/select-source":
+                self._send_json(
+                    {
+                        "error": "remote_path_not_accessible",
+                        "message": "远程路径不可由服务器直接访问，请使用浏览器选择并上传",
+                    },
+                    HTTPStatus.BAD_REQUEST,
+                )
+                return
+            if parsed.path == "/api/simulation/upload-source":
+                files = payload.get("files")
+                self._send_json(
+                    self.guest_manager.upload_source(
+                        self._identity().guest_id,
+                        str(payload.get("source_type") or "single_csv"),
+                        files if isinstance(files, list) else [],
+                    )
+                )
+                return
+            if parsed.path == "/api/acquisition/select-package":
+                identity = self._identity()
+                if identity.role not in {"authorized", "lan_operator"}:
+                    self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
+                    return
+                try:
+                    package_id = str(payload.get("package_id") or "")
+                    package_path = resolve_simulation_package(package_id)
+                    result = self.guest_manager.upload_source(
+                        identity.guest_id,
+                        "single_csv",
+                        [
+                            {
+                                "name": package_path.name,
+                                "data": base64.b64encode(package_path.read_bytes()).decode("ascii"),
+                            }
+                        ],
+                    )
+                    result["package_id"] = package_id
+                    result["synthetic"] = True
+                    self._send_json(result)
+                except (ValueError, GuestSimulationError) as exc:
+                    self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path == "/api/simulation/stop":
+                self._send_json(
+                    self.guest_manager.stop(self._identity().guest_id)
+                )
+                return
+            if parsed.path == "/api/agent/diagnose/start":
+                from interface_agent import (
+                    DEFAULT_SILICONFLOW_MODEL,
+                    run_interface_diagnoses,
+                )
+
+                identity = self._identity()
+                if identity.role not in REAL_ACCESS_ROLES:
+                    self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
+                    return
+                request_data = _validate_agent_payload(payload)
+                try:
+                    stored_key, stored_model = self.security_store.model_credentials()
+                except Exception:
+                    stored_key, stored_model = "", DEFAULT_SILICONFLOW_MODEL
+                api_key = request_data["api_key"] or stored_key
+                model_name = request_data["model_name"] or stored_model
+                session_id = str(identity.session_id or "local-admin")
+                events = deepcopy(request_data["events"])
+                hardware_result = deepcopy(request_data["hardware_result"])
+                discovery, acquisition_status = self._diagnostic_context(
+                    hardware_result
+                )
+                fingerprint_payload = {
+                    "events": events,
+                    "hardware_result": hardware_result,
+                }
+                fingerprint = hashlib.sha256(
+                    json.dumps(
+                        fingerprint_payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+
+                # Freeze a deterministic local result before any provider call
+                # so the page can render facts even when the model is slow or
+                # unavailable.  It is intentionally never labeled as a
+                # confirmed hardware diagnosis.
+                local_result = run_interface_diagnoses(
+                    events,
+                    api_key="",
+                    model_name=DEFAULT_SILICONFLOW_MODEL,
+                    hardware_result=hardware_result,
+                    discovery=discovery,
+                    acquisition_status=acquisition_status,
+                    diagnosis_mode="fast",
+                    use_environment_credentials=False,
+                )
+                local_result["model_used"] = False
+                if not api_key or not model_name:
+                    self._send_json(
+                        {
+                            "job_id": "",
+                            "fingerprint": fingerprint,
+                            "state": "success",
+                            "phase": "local_complete",
+                            "result": local_result,
+                            "local_result": local_result,
+                            "cache_hit": bool(local_result.get("cache_hit")),
+                        }
+                    )
+                    return
+                if self.model_limiter.count("model", session_id, 60.0) >= 3:
+                    self._send_json({"error": "model_rate_limited", "local_result": local_result}, HTTPStatus.TOO_MANY_REQUESTS)
+                    return
+                self.model_limiter.allow("model", session_id, 3, 60.0)
+
+                def run_model() -> dict:
+                    if not self.model_call_lock.acquire(blocking=False):
+                        raise RuntimeError("模型调用正在进行，请稍后重试")
+                    started = time.monotonic()
+                    try:
+                        result = run_interface_diagnoses(
+                            events,
+                            api_key=api_key,
+                            model_name=model_name,
+                            hardware_result=hardware_result,
+                            discovery=discovery,
+                            acquisition_status=acquisition_status,
+                            diagnosis_mode=str(request_data.get("diagnosis_mode") or "fast"),
+                            use_environment_credentials=False,
+                        )
+                        result["model_used"] = str(
+                            result.get("model_status") or ""
+                        ).startswith("success")
+                        self.security_store.append_audit(
+                            "model_success" if result["model_used"] else "model_failure",
+                            session_id=identity.session_id,
+                            remote_label=self._remote_label(),
+                            details={
+                                "model_name": model_name,
+                                "elapsed_seconds": round(max(0.0, time.monotonic() - started), 3),
+                                "job_fingerprint": fingerprint,
+                            },
+                        )
+                        return result
+                    finally:
+                        self.model_call_lock.release()
+
+                snapshot = self.diagnosis_jobs.submit(
+                    session_id,
+                    fingerprint,
+                    run_model,
+                    local_result=local_result,
+                )
+                self._send_json(snapshot, HTTPStatus.ACCEPTED)
+                return
+            if parsed.path == "/api/agent/diagnose":
+                from interface_agent import (
+                    DEFAULT_SILICONFLOW_MODEL,
+                    run_interface_diagnoses,
+                )
+
+                request_data = _validate_agent_payload(payload)
+                identity = self._identity()
+                if identity.role in REAL_ACCESS_ROLES:
+                    try:
+                        stored_key, stored_model = self.security_store.model_credentials()
+                    except Exception:
+                        stored_key, stored_model = "", DEFAULT_SILICONFLOW_MODEL
+                    # The web form mirrors the desktop model settings.  An
+                    # explicitly supplied pair is used for this diagnosis;
+                    # leaving both fields blank falls back to the protected
+                    # credentials configured by the local administrator.
+                    api_key = request_data["api_key"] or stored_key
+                    model_name = request_data["model_name"] or stored_model
+                    use_environment = False
+                else:
+                    # Public visitors can view and run local diagnostics, but
+                    # their browser cannot turn this endpoint into a proxy for
+                    # arbitrary provider keys.
+                    api_key, model_name = "", DEFAULT_SILICONFLOW_MODEL
+                    use_environment = False
+
+                def run_local() -> dict:
+                    discovery, acquisition_status = self._diagnostic_context(
+                        request_data["hardware_result"]
+                    )
+                    local_result = run_interface_diagnoses(
+                        request_data["events"],
+                        api_key="",
+                        model_name=DEFAULT_SILICONFLOW_MODEL,
+                        hardware_result=request_data["hardware_result"],
+                        discovery=discovery,
+                        acquisition_status=acquisition_status,
+                        diagnosis_mode="fast",
+                        use_environment_credentials=False,
+                    )
+                    local_result["model_used"] = False
+                    return local_result
+
+                if not api_key or not model_name:
+                    result = run_local()
+                else:
+                    session_key = str(identity.session_id or identity.guest_id or "public")
+                    if self.model_limiter.count("model", session_key, 60.0) >= 3:
+                        self.security_store.append_audit(
+                            "model_rate_limited",
+                            session_id=identity.session_id,
+                            remote_label=self._remote_label(),
+                            details={"model_name": model_name},
+                        )
+                        result = run_local()
+                        result["error"] = "model_rate_limited"
+                        self._send_json(result, HTTPStatus.TOO_MANY_REQUESTS)
+                        return
+                    if not self.model_call_lock.acquire(blocking=False):
+                        self.security_store.append_audit(
+                            "model_rate_limited",
+                            session_id=identity.session_id,
+                            remote_label=self._remote_label(),
+                            details={"model_name": model_name},
+                        )
+                        result = run_local()
+                        result["error"] = "model_rate_limited"
+                        self._send_json(result, HTTPStatus.TOO_MANY_REQUESTS)
+                        return
+                    started = time.monotonic()
+                    self.model_limiter.allow("model", session_key, 3, 60.0)
+                    try:
+                        discovery, acquisition_status = self._diagnostic_context(
+                            request_data["hardware_result"]
+                        )
+                        result = run_interface_diagnoses(
+                            request_data["events"],
+                            api_key=api_key,
+                            model_name=model_name,
+                            hardware_result=request_data["hardware_result"],
+                            discovery=discovery,
+                            acquisition_status=acquisition_status,
+                            diagnosis_mode=str(request_data.get("diagnosis_mode") or "fast"),
+                            use_environment_credentials=use_environment,
+                        )
+                        result["model_used"] = str(
+                            result.get("model_status") or ""
+                        ).startswith("success")
+                        self.security_store.append_audit(
+                            "model_success"
+                            if result["model_used"]
+                            else "model_failure",
+                            session_id=identity.session_id,
+                            remote_label=self._remote_label(),
+                            details={
+                                "model_name": model_name,
+                                "elapsed_seconds": round(
+                                    max(0.0, time.monotonic() - started), 3
+                                ),
+                            },
+                        )
+                    finally:
+                        self.model_call_lock.release()
+                self._send_json(result)
+                return
             if parsed.path == "/api/acquisition/test":
-                config = AcquisitionConfig(**payload)
+                identity = self._identity()
+                remote_simulation = (
+                    str(payload.get("acquisition_mode") or "").lower() == "simulation"
+                    and identity.role != "local_admin"
+                )
+                if remote_simulation:
+                    config = self.guest_manager.safe_config(identity.guest_id, payload, authorized=True)
+                    model_validation = self.dashboard.validate_prediction_setup(
+                        config, load_model=False
+                    )
+                    result = self.guest_manager.acquisition(
+                        identity.guest_id
+                    ).test_connection(config)
+                    result["prediction_model"] = model_validation
+                    self._send_json(result)
+                    return
+                if str(payload.get("simulation_source_type", "")).lower() == "mysql":
+                    payload["simulation_mysql_query"] = validate_read_only_mysql_query(
+                        str(payload.get("simulation_mysql_query", ""))
+                    )
+                config = acquisition_config_from_payload(payload)
                 model_validation = self.dashboard.validate_prediction_setup(
                     config, load_model=False
                 )
@@ -3576,7 +5840,38 @@ class AppHandler(BaseHTTPRequestHandler):
                 result["prediction_model"] = model_validation
                 self._send_json(result)
                 return
+            if parsed.path == "/api/acquisition/process-parameters":
+                identity = self._identity()
+                if (
+                    str(payload.get("acquisition_mode") or "").lower() == "simulation"
+                    and identity.role != "local_admin"
+                ):
+                    self._send_json(
+                        self.guest_manager.read_process_parameters(
+                            identity.guest_id, payload
+                        )
+                    )
+                    return
+                demo = (
+                    (self.dashboard.bootstrap(include_discovery=False).get("acquisition") or {})
+                    .get("new_collection_demo") or {}
+                )
+                payload = resolve_default_simulation_source(
+                    payload, str(demo.get("source_file") or "")
+                )
+                config = acquisition_config_from_payload(payload)
+                self._send_json(
+                    self.dashboard.acquisition.read_process_parameters(config)
+                )
+                return
+            if parsed.path == "/api/acquisition/reset-check":
+                self._send_json(self.dashboard.acquisition.reset_check_state())
+                return
             if parsed.path == "/api/training/import":
+                if str(payload.get("source", "")).lower() == "mysql":
+                    payload["query"] = validate_read_only_mysql_query(
+                        str(payload.get("query", ""))
+                    )
                 self._send_json(self.dashboard.web_training.import_source(payload))
                 return
             if parsed.path == "/api/training/start":
@@ -3593,15 +5888,215 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._send_json({"selected": bool(selected), "path": selected})
                 return
             if parsed.path == "/api/mysql/test":
-                settings = mysql_settings_from_mapping(payload)
-                self._send_json(MySQLCaptureStore(settings).test_connection())
+                identity = self._identity()
+                selection = authorized_target_selection(identity, self.target_profiles, payload)
+                settings = selection.settings if selection else mysql_settings_from_mapping(payload)
+                store = MySQLCaptureStore(settings)
+                result = (
+                    mysql_test_existing_database(store)
+                    if bool(payload.get("read_only", False))
+                    else store.test_connection()
+                )
+                result = decorate_server_mysql_result(result)
+                if selection is not None:
+                    result.update(selection.public())
+                if not result.get("ok"):
+                    result["error_detail"] = classify_mysql_error(result.get("error"))
+                self._send_json(result)
+                return
+            if parsed.path == "/api/helper/pair/start":
+                session_id = str(self._identity().session_id or "")
+                if not session_id:
+                    self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
+                    return
+                self._send_json(self.dashboard.helper_registry.start_pairing(session_id))
+                return
+            if parsed.path == "/api/helper/command":
+                identity = self._identity()
+                session_id = str(identity.session_id or "")
+                if not session_id:
+                    self._send_json({"error": "authorized_session_required"}, HTTPStatus.FORBIDDEN)
+                    return
+                command_name = str(payload.get("command") or "").strip().lower()
+                command_payload = (
+                    payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+                )
+                if command_name == "prepare_simulation_source":
+                    try:
+                        helper_payload = prepare_helper_simulation_payload(
+                            self.guest_manager,
+                            self.simulation_source_transfers,
+                            identity,
+                            session_id,
+                            command_payload,
+                        )
+                    except (ValueError, GuestSimulationError, SimulationSourceTransferError) as exc:
+                        self._send_json({"ok": False, "error": str(exc)})
+                        return
+                    result = self.dashboard.helper_registry.command(
+                        session_id, command_name, helper_payload
+                    )
+                    self._send_json(result)
+                    return
+                if command_name == "start_capture":
+                    capture_mode = str(
+                        command_payload.get("acquisition_mode") or "real"
+                    ).lower()
+                    if capture_mode == "simulation":
+                        execution = select_simulation_execution(
+                            self.dashboard.helper_registry.status(session_id)
+                        )
+                        if execution["execution_host"] != "helper_local":
+                            self._send_json(
+                                {
+                                    "ok": False,
+                                    "error": execution["fallback_reason"],
+                                    **execution,
+                                }
+                            )
+                            return
+                    elif capture_mode != "real":
+                        self._send_json({"ok": False, "error": "helper_capture_mode_invalid"})
+                        return
+                    target_enabled = mysql_settings_from_mapping(command_payload).enabled
+                    if capture_mode == "simulation":
+                        try:
+                            helper_payload = bind_ready_helper_simulation_payload(
+                                self.guest_manager,
+                                identity,
+                                command_payload,
+                            )
+                        except GuestSimulationError as exc:
+                            self._send_json(
+                                {"ok": False, "error": str(exc), "code": exc.code}
+                            )
+                            return
+                    else:
+                        helper_payload = helper_real_capture_payload(command_payload)
+                    if target_enabled:
+                        selection = self.target_profiles.for_request(session_id, command_payload)
+                        helper_payload["execution_host"] = "helper_local"
+                        result = self.dashboard.helper_registry.command(
+                            session_id, command_name, helper_payload
+                        )
+                        if capture_mode == "simulation" and result.get("ok"):
+                            with self.remote_simulation_hosts_lock:
+                                self.remote_simulation_hosts[session_id] = "helper_local"
+                        if result.get("ok") and result.get("request_id"):
+                            self.target_capture_journal.arm_start(
+                                session_id, str(result["request_id"]), selection.config_id,
+                                config=helper_payload, target=selection.public(),
+                            )
+                        self._send_json(result)
+                        return
+                    self.target_capture_journal.disarm(session_id)
+                    command_payload = helper_payload
+                    command_payload["execution_host"] = "helper_local"
+                result = self.dashboard.helper_registry.command(
+                    session_id, command_name, command_payload
+                )
+                if (
+                    command_name == "start_capture"
+                    and str(command_payload.get("acquisition_mode") or "").lower()
+                    == "simulation"
+                    and result.get("ok")
+                ):
+                    with self.remote_simulation_hosts_lock:
+                        self.remote_simulation_hosts[session_id] = "helper_local"
+                self._send_json(result)
+                return
+            if parsed.path == "/api/mysql/preflight":
+                identity = self._identity()
+                selection = authorized_target_selection(identity, self.target_profiles, payload)
+                settings = selection.settings if selection else mysql_settings_from_mapping(payload)
+                result = MySQLCaptureStore(settings).preflight(
+                    require_schema=bool(payload.get("require_schema", True)),
+                    write_test=bool(payload.get("write_test", False)),
+                )
+                result = decorate_server_mysql_result(result)
+                if selection is not None:
+                    result.update(selection.public())
+                self._send_json(result)
+                return
+            if parsed.path == "/api/mysql/target/retry":
+                identity = self._identity()
+                session_id = str(identity.session_id or "")
+                capture_uuid = str(payload.get("capture_uuid") or "").strip()
+                if identity.role not in {"authorized", "lan_operator"} or not session_id:
+                    self._send_json(
+                        {"ok": False, "error": "目标 MySQL 重试仅适用于已配对的本机辅助采集会话"},
+                        HTTPStatus.FORBIDDEN,
+                    )
+                    return
+                state = self.target_capture_journal.capture_status(session_id, capture_uuid)
+                if state is None:
+                    self._send_json(
+                        {"ok": False, "error": "未找到本会话可重试的目标 MySQL 采集记录"},
+                        HTTPStatus.NOT_FOUND,
+                    )
+                    return
+                if state.get("state") not in {"ready", "failed"}:
+                    self._send_json(
+                        {"ok": False, "error": "目标 MySQL 当前不可重试", "server_target": state},
+                        HTTPStatus.CONFLICT,
+                    )
+                    return
+                self._schedule_target_save(session_id, capture_uuid)
+                self._send_json(
+                    {
+                        "ok": True,
+                        "server_target": self.target_capture_journal.capture_status(
+                            session_id, capture_uuid
+                        ),
+                    }
+                )
                 return
             if parsed.path == "/api/mysql/relation-map":
-                settings = mysql_settings_from_mapping(payload)
+                selection = authorized_target_selection(self._identity(), self.target_profiles, payload)
+                settings = selection.settings if selection else mysql_settings_from_mapping(payload)
                 result = MySQLCaptureStore(settings).relation_map(
-                    int(payload.get("limit", 1000))
+                    int(payload.get("limit", 1000)),
+                    auto_initialize=True,
                 )
+                result = decorate_server_mysql_result(result)
+                if selection is not None:
+                    result.update(selection.public())
+                if not result.get("ok"):
+                    result["error_detail"] = classify_mysql_error(result.get("error"))
                 self._send_json(result)
+                return
+            if parsed.path == "/api/mysql/query":
+                selection = authorized_target_selection(self._identity(), self.target_profiles, payload)
+                settings = selection.settings if selection else mysql_settings_from_mapping(payload)
+                result = mysql_read_only_rows(
+                    MySQLCaptureStore(settings),
+                    str(payload.get("query", "")),
+                    max(1, min(int(payload.get("limit", MYSQL_PREVIEW_LIMIT)), 1000)),
+                )
+                result = decorate_server_mysql_result(result)
+                if selection is not None:
+                    result.update(selection.public())
+                self._send_json(result)
+                return
+            if parsed.path == "/api/mysql/export-csv":
+                selection = authorized_target_selection(self._identity(), self.target_profiles, payload)
+                settings = selection.settings if selection else mysql_settings_from_mapping(payload)
+                result = mysql_read_only_rows(
+                    MySQLCaptureStore(settings),
+                    str(payload.get("query", "")),
+                    max(
+                        1,
+                        min(
+                            int(payload.get("limit", MYSQL_EXPORT_LIMIT)),
+                            MYSQL_EXPORT_LIMIT,
+                        ),
+                    ),
+                )
+                self._send_download(
+                    mysql_rows_to_csv(result["columns"], result["rows"]),
+                    f"afp_{settings.database}_export.csv",
+                    "text/csv; charset=utf-8",
+                )
                 return
             if parsed.path == "/api/prediction-model/select-file":
                 selected = select_prediction_model_file(
@@ -3612,7 +6107,10 @@ class AppHandler(BaseHTTPRequestHandler):
                         "selected": bool(selected),
                         "path": selected,
                         "model": (
-                            self.dashboard.inspect_prediction_model(selected)
+                            self.dashboard.inspect_prediction_model(
+                                selected, str(payload.get("model_type", "")),
+                                schema_mode=str(payload.get("schema_mode", "")),
+                            )
                             if selected
                             else None
                         ),
@@ -3622,7 +6120,9 @@ class AppHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/prediction-model/inspect":
                 self._send_json(
                     self.dashboard.inspect_prediction_model(
-                        str(payload.get("path", ""))
+                        str(payload.get("path", "")),
+                        str(payload.get("model_type", "")),
+                        schema_mode=str(payload.get("schema_mode", "")),
                     )
                 )
                 return
@@ -3634,27 +6134,243 @@ class AppHandler(BaseHTTPRequestHandler):
                     {"selected": bool(selected), "path": selected}
                 )
                 return
+            if parsed.path == "/api/acquisition/select-source":
+                if self._identity().role != "local_admin":
+                    self._send_json(
+                        {
+                            "error": "remote_path_not_accessible",
+                            "message": "远程路径不可由服务器直接访问，请使用浏览器选择并上传",
+                        },
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                source_type = str(payload.get("source_type", "single_csv"))
+                if source_type == "mysql":
+                    self._send_json({"selected": False, "path": ""})
+                    return
+                selected = select_simulation_source(
+                    source_type, str(payload.get("initial_path", ""))
+                )
+                self._send_json({"selected": bool(selected), "path": selected})
+                return
+            if parsed.path == "/api/acquisition/upload-source":
+                identity = self._identity()
+                if identity.role == "local_admin":
+                    self._send_json(
+                        {"error": "browser_upload_not_required"},
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                files = payload.get("files")
+                self._send_json(
+                    self.guest_manager.upload_source(
+                        identity.guest_id,
+                        str(payload.get("source_type") or "single_csv"),
+                        files if isinstance(files, list) else [],
+                    )
+                )
+                return
+            if parsed.path == "/api/acquisition/integrate":
+                if str(payload.get("source_type", "")).lower() == "mysql":
+                    payload["query"] = validate_read_only_mysql_query(
+                        str(payload.get("query", ""))
+                    )
+                result = integrate_capture_sources(
+                    str(payload.get("source_type", "folder_csv")),
+                    str(payload.get("source_path", "")),
+                    str(payload.get("output_file", "")),
+                    payload.get("mysql_settings")
+                    if isinstance(payload.get("mysql_settings"), dict)
+                    else payload,
+                    str(payload.get("query", "")),
+                )
+                self._send_json(result)
+                return
             if parsed.path == "/api/acquisition/start":
-                config = AcquisitionConfig(**payload)
+                identity = self._identity()
+                remote_simulation = (
+                    str(payload.get("acquisition_mode") or "").lower() == "simulation"
+                    and identity.role != "local_admin"
+                )
+                if remote_simulation:
+                    if (
+                        str(payload.get("execution_host") or "") != "server"
+                        or str(payload.get("simulation_execution_choice") or "")
+                        != "server_explicit"
+                    ):
+                        self._send_json(
+                            {
+                                "error": "explicit_server_simulation_required",
+                                "message": (
+                                    "远程模拟默认由本机辅助程序执行；如需服务器备用模式，"
+                                    "请在页面明确选择“服务器模拟”"
+                                ),
+                            },
+                            HTTPStatus.CONFLICT,
+                        )
+                        return
+                    with self.remote_simulation_hosts_lock:
+                        self.remote_simulation_hosts[
+                            str(identity.session_id or "")
+                        ] = "server"
+                    if bool(payload.get("mysql_enabled")) and identity.role in REAL_ACCESS_ROLES:
+                        selection = self.target_profiles.for_request(
+                            str(identity.session_id or ""), payload
+                        )
+                        payload = {**payload, "mysql_password": selection.settings.password}
+                    config = self.guest_manager.safe_config(identity.guest_id, payload)
+                    model_validation = self.dashboard.validate_prediction_setup(
+                        config, load_model=True
+                    )
+                    result = self.guest_manager.start(identity.guest_id, payload, authorized=True)
+                    result["prediction_model"] = model_validation
+                    self._replay_put(replay_key, HTTPStatus.OK, result)
+                    self._send_json(result)
+                    return
+                demo = (
+                    (self.dashboard.bootstrap(include_discovery=False).get("acquisition") or {})
+                    .get("new_collection_demo") or {}
+                )
+                payload = resolve_default_simulation_source(
+                    payload, str(demo.get("source_file") or "")
+                )
+                if str(payload.get("simulation_source_type", "")).lower() == "mysql":
+                    payload["simulation_mysql_query"] = validate_read_only_mysql_query(
+                        str(payload.get("simulation_mysql_query", ""))
+                    )
+                config = acquisition_config_from_payload(payload)
                 model_validation = self.dashboard.validate_prediction_setup(
                     config, load_model=True
                 )
                 result = self.dashboard.acquisition.start(config)
                 result["prediction_model"] = model_validation
+                self._replay_put(replay_key, HTTPStatus.OK, result)
                 self._send_json(result)
                 return
             if parsed.path == "/api/acquisition/stop":
-                self._send_json(self.dashboard.acquisition.stop())
+                identity = self._identity()
+                if (
+                    str(payload.get("acquisition_mode") or "").lower() == "simulation"
+                    and identity.role != "local_admin"
+                ):
+                    result = self.guest_manager.stop(identity.guest_id)
+                else:
+                    result = self.dashboard.acquisition.stop()
+                self._replay_put(replay_key, HTTPStatus.OK, result)
+                self._send_json(result)
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
+        except GuestSimulationError as exc:
+            self._send_json(
+                {"error": exc.code, "message": str(exc)},
+                HTTPStatus.BAD_REQUEST,
+            )
         except Exception as exc:
             self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        finally:
+            if operation_lock is not None:
+                with _OPERATION_LOCKS_GUARD:
+                    if _OPERATION_LOCKS.get(operation_name) is operation_lock:
+                        _OPERATION_LOCK_STARTED.pop(operation_name, None)
+                operation_lock.release()
 
 
-def create_server(host: str = "127.0.0.1", port: int = 8765) -> ThreadingHTTPServer:
-    dashboard = DashboardData()
-    handler = type("ConfiguredAppHandler", (AppHandler,), {"dashboard": dashboard})
-    return ThreadingHTTPServer((host, port), handler)
+def create_server(
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    network_status: dict[str, Any] | None = None,
+    *,
+    dashboard: DashboardData | None = None,
+    security_store: SecurityStore | None = None,
+    guest_manager: GuestSimulationManager | None = None,
+    control_lease: RealControlLease | None = None,
+    access_context: str = "public",
+    public_web_config: dict[str, Any] | None = None,
+    network_status_provider: Any = None,
+) -> ThreadingHTTPServer:
+    active_dashboard = dashboard or DashboardData()
+    runtime_root = (APP_DIR.parent / "runtime").resolve()
+    active_security_store = security_store or SecurityStore(
+        runtime_root / "public_web_security.sqlite3"
+    )
+    simulation_candidates = [
+        Path(r"F:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv"),
+        APP_DIR / "new_collection_demo_v11_3" / "simulator_stream.csv",
+        DATA_DIR / "dashboard_candidate_catalog.csv",
+    ]
+    simulation_source = next((item for item in simulation_candidates if item.is_file()), simulation_candidates[-1])
+    capture_root = Path(
+        getattr(active_dashboard.acquisition, "capture_root", runtime_root / "capture")
+    ).resolve()
+    active_guest_manager = guest_manager or GuestSimulationManager(
+        capture_root / "public_simulation",
+        {
+            "builtin": {
+                "source_type": "single_csv",
+                "path": str(simulation_source),
+            }
+        },
+    )
+    active_control_lease = control_lease or RealControlLease()
+    helper_registry = HelperRegistry(
+        persistence_path=runtime_root / "helper_registry.json"
+    )
+    active_dashboard.helper_registry = helper_registry
+    active_dashboard.remote_acquisitions = RemoteAcquisitionRegistry()
+    target_profiles = ServerTargetProfiles(local_mysql_profile)
+    target_capture_journal = ServerCaptureJournal(
+        runtime_root / "server_target_capture_journal.sqlite3"
+    )
+    target_saver = TargetMySQLSaveCoordinator(target_capture_journal, target_profiles)
+    simulation_source_transfers = SimulationSourceTicketStore()
+    active_dashboard.target_capture_journal = target_capture_journal
+    replay_cache: dict[str, tuple[int, dict]] = {}
+    replay_lock = threading.Lock()
+    model_limiter = SlidingWindowLimiter()
+    model_call_lock = threading.Lock()
+    diagnosis_jobs = DiagnosisJobStore()
+    remote_simulation_hosts: dict[str, str] = {}
+    remote_simulation_hosts_lock = threading.RLock()
+    handler = type(
+        "ConfiguredAppHandler",
+        (AppHandler,),
+        {
+            "dashboard": active_dashboard,
+            "security_store": active_security_store,
+            "guest_manager": active_guest_manager,
+            "control_lease": active_control_lease,
+            "replay_cache": replay_cache,
+            "replay_lock": replay_lock,
+            "model_limiter": model_limiter,
+            "model_call_lock": model_call_lock,
+            "diagnosis_jobs": diagnosis_jobs,
+            "target_profiles": target_profiles,
+            "target_capture_journal": target_capture_journal,
+            "target_saver": target_saver,
+            "simulation_source_transfers": simulation_source_transfers,
+            "remote_simulation_hosts": remote_simulation_hosts,
+            "remote_simulation_hosts_lock": remote_simulation_hosts_lock,
+            "access_context": str(access_context),
+            "public_web_config": dict(public_web_config or {}),
+            "login_limiter": SlidingWindowLimiter(),
+            "network_status": dict(network_status or {}),
+            "network_status_provider": network_status_provider,
+            "service_started_at": time.time(),
+        },
+    )
+    server = ThreadingHTTPServer((host, port), handler)
+    server.network_status = handler.network_status
+    server.service_started_at = handler.service_started_at
+    server.dashboard = active_dashboard
+    server.security_store = active_security_store
+    server.guest_manager = active_guest_manager
+    server.control_lease = active_control_lease
+    server.access_context = handler.access_context
+    server.public_web_config = dict(public_web_config or {})
+    server.diagnosis_jobs = diagnosis_jobs
+    server.target_capture_journal = target_capture_journal
+    server.simulation_source_transfers = simulation_source_transfers
+    return server
 
 
 def main() -> None:

@@ -1,0 +1,79 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import tempfile
+import unittest
+
+from acquisition import (
+    M3232PressureDriver,
+    M3232_BAUDRATE,
+    NEW_COLLECTION_SENSOR_COLUMNS,
+    SimulatorDriver,
+    default_capture_interfaces,
+    _resolve_interface_channel_assignments,
+)
+from generate_pressure_simulation import generate as generate_pressure_simulation
+
+
+class M3232PressureDriverTests(unittest.TestCase):
+    def test_manual_default_baudrate_is_used(self) -> None:
+        self.assertEqual(M3232_BAUDRATE, 115200)
+
+    def test_parser_accepts_fragmented_variable_size_matrix_json(self) -> None:
+        driver = M3232PressureDriver("COM_TEST")
+        matrix = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+        encoded = json.dumps({"matrix": matrix}, separators=(",", ":"))
+        driver.rx_buffer = encoded[:7]
+        self.assertEqual(driver._extract_frames(), [])
+        driver.rx_buffer += encoded[7:]
+        frames = driver._extract_frames()
+        self.assertEqual(frames, [matrix])
+        self.assertEqual(driver.matrix_shape, (2, 3))
+
+    def test_pressure_metrics_expose_scalar_and_matrix_quality(self) -> None:
+        driver = M3232PressureDriver("COM_TEST")
+        matrix = [[0.0, 10.0], [20.0, 30.0]]
+        metrics = driver._frame_metrics(matrix)
+        self.assertEqual(metrics["pressure_peak"], 30.0)
+        self.assertEqual(metrics["contact_area"], 3)
+        self.assertGreater(metrics["pressure_total"], 0.0)
+        self.assertEqual(metrics["valid_fraction"], 0.75)
+
+    def test_generated_full_channel_csv_is_readable_by_simulator(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = generate_pressure_simulation(
+                Path(temporary) / "SIM_PRESSURE_M3232_new_collection.csv",
+                rows=8,
+            )
+            driver = SimulatorDriver(path, NEW_COLLECTION_SENSOR_COLUMNS)
+            try:
+                driver.open()
+                sample = driver.read_sample()
+                self.assertIsNotNone(sample)
+                self.assertEqual(set(NEW_COLLECTION_SENSOR_COLUMNS), set(sample))
+            finally:
+                driver.close()
+
+    def test_m3232_is_default_interface_five(self) -> None:
+        interfaces = default_capture_interfaces()
+        self.assertEqual(len(interfaces), 5)
+        pressure = interfaces[4]
+        self.assertEqual(pressure["id"], "m3232_pressure")
+        self.assertEqual(pressure["role"], "pressure")
+        self.assertEqual(pressure["driver"], "m3232_pressure")
+        self.assertEqual(pressure["channels"], ["薄膜压力"])
+
+    def test_process_pressure_and_film_pressure_route_to_different_interfaces(self) -> None:
+        interfaces = default_capture_interfaces()
+        assignments = _resolve_interface_channel_assignments(
+            interfaces,
+            requested=None,
+            capture_sensors=["压力", "薄膜压力"],
+        )
+        self.assertEqual(assignments["plc_process"], ["压力"])
+        self.assertEqual(assignments["m3232_pressure"], ["薄膜压力"])
+
+
+if __name__ == "__main__":
+    unittest.main()

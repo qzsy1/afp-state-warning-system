@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "categories": {
+    "external_update": [
+      {"pattern": "visualization_app/static/**", "reason": "Browser UI assets are loaded from the external app tree."},
+      {"pattern": "visualization_app/*.py", "reason": "Visualization business modules are external update content."},
+      {"pattern": "visualization_app/**/*.py", "reason": "Visualization business modules are external update content."},
+      {"pattern": "modular_runtime/app/**", "reason": "Modular application code is copied outside the stable launcher."},
+      {"pattern": "interface_monitor_demo/**", "reason": "The interface monitor demo is external application content."},
+      {"pattern": "validation/**", "reason": "Validation assets do not alter the launcher runtime."},
+      {"pattern": "harness/**", "reason": "Quality-gate tooling runs outside the packaged launcher."},
+      {"pattern": "tools/verification/run_quality_gate.ps1", "reason": "Compatibility wrapper runs outside the packaged launcher."},
+      {"pattern": ".github/**", "reason": "Repository automation does not alter the packaged launcher."},
+      {"pattern": "openspec/**", "reason": "Planning artifacts do not alter the packaged launcher."},
+      {"pattern": "docs/**", "reason": "Documentation does not alter the packaged launcher."},
+      {"pattern": "*.py", "reason": "Top-level analysis and business scripts are external to the launcher."},
+      {"pattern": "*.md", "reason": "Documentation does not alter the packaged launcher."},
+      {"pattern": ".gitignore", "reason": "Git ignore configuration does not alter the packaged launcher."},
+      {"pattern": "**/*.html", "reason": "HTML is loaded as an external UI asset."},
+      {"pattern": "**/*.css", "reason": "CSS is loaded as an external UI asset."},
+      {"pattern": "**/*.js", "reason": "JavaScript is loaded as an external UI asset."},
+      {"pattern": "**/*.sql", "reason": "SQL definitions are external application content."},
+      {"pattern": "**/*.json", "reason": "JSON configuration and model metadata are external content."},
+      {"pattern": "**/*.pth", "reason": "Model checkpoints are external content."},
+      {"pattern": "**/*.pt", "reason": "Model checkpoints are external content."},
+      {"pattern": "**/*.joblib", "reason": "Model artifacts are external content."},
+      {"pattern": "**/*.npz", "reason": "Model arrays and normalizers are external content."},
+      {"pattern": "**/*.csv", "reason": "External data and catalog files do not alter the launcher."},
+      {"pattern": "**/*.toml", "reason": "TOML configuration is external content unless a higher-priority rebuild rule matches."},
+      {"pattern": "**/*.yaml", "reason": "YAML configuration is external content."},
+      {"pattern": "**/*.yml", "reason": "YAML configuration is external content."},
+      {"pattern": "**/*.md", "reason": "Documentation does not alter the packaged launcher."},
+      {"pattern": "**/test_*.py", "reason": "Tests do not alter the packaged launcher."}
+    ],
+    "rebuild_required": [
+      {"pattern": "modular_runtime/launcher_entry.py", "reason": "The packaged launcher entry changed."},
+      {"pattern": "modular_runtime/dependency_anchor.py", "reason": "The packaged dependency anchor changed."},
+      {"pattern": "modular_runtime/build_modular_app.ps1", "reason": "The stable launcher build definition changed."},
+      {"pattern": "visualization_app/build*.ps1", "reason": "A desktop executable build definition changed."},
+      {"pattern": "**/*.spec", "reason": "A PyInstaller specification changed."},
+      {"pattern": "**/requirements*.txt", "reason": "Packaged third-party dependency declarations changed."},
+      {"pattern": "pyproject.toml", "reason": "Python runtime or dependency configuration changed."},
+      {"pattern": "**/*.lock", "reason": "A dependency lock file changed."},
+      {"pattern": "**/*.dll", "reason": "A native DLL changed."},
+      {"pattern": "**/*.pyd", "reason": "A native Python extension changed."},
+      {"pattern": "**/*.so", "reason": "A native shared library changed."},
+      {"pattern": "**/*.ico", "reason": "Executable icon resources changed."},
+      {"pattern": "**/*.manifest", "reason": "Executable manifest or signing input changed."}
+    ],
+    "manual_review": [
+      {"pattern": "delivery/**", "reason": "Tracked delivery changes require explicit release review."},
+      {"pattern": "runtime/**", "reason": "Runtime-state changes require explicit release review."},
+      {"pattern": "**/*.ps1", "reason": "Unclassified PowerShell changes may affect packaging or deployment."},
+      {"pattern": "**/*.bat", "reason": "Batch launcher changes require explicit runtime review."},
+      {"pattern": "**/*.exe", "reason": "Executable changes require explicit rebuild authorization."}
+    ]
+  }
+}

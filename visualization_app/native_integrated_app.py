@@ -33,8 +33,11 @@ from acquisition import (  # noqa: E402
     ACQUISITION_SCHEMAS,
     DEFAULT_SIMULATOR_FILE,
     AcquisitionConfig,
+    AcquisitionManager,
+    integrate_capture_sources,
 )
 from mysql_storage import MySQLCaptureStore, MySQLSettings  # noqa: E402
+from remote_mysql_setup import build_remote_setup_sql, classify_mysql_error  # noqa: E402
 from web_training import WebTrainingManager  # noqa: E402
 from web_training_pipeline import (  # noqa: E402
     default_columns,
@@ -53,6 +56,33 @@ COLORS = {
     "panel": "#ffffff",
     "line": "#c9d8e4",
     "muted": "#60798c",
+}
+
+
+RELATION_COLUMNS = (
+    "condition_id",
+    "schema_id",
+    "specimen_id",
+    "replicate_no",
+    "specimen_key",
+    "layer_no",
+    "sample_count",
+    "layer_file",
+    "timestamp_file",
+    "saved_at",
+)
+
+RELATION_COLUMN_LABELS = {
+    "condition_id": "工况编号",
+    "schema_id": "数据方案",
+    "specimen_id": "试样",
+    "replicate_no": "独立重复",
+    "specimen_key": "试样唯一键",
+    "layer_no": "铺层",
+    "sample_count": "数据行数",
+    "layer_file": "分层文件",
+    "timestamp_file": "时间戳文件",
+    "saved_at": "保存时间",
 }
 
 
@@ -173,7 +203,11 @@ class LineChart(tk.Canvas):
             self.create_text(left - 7, y, text=f"{value:.2f}", anchor="e", fill=COLORS["muted"], font=("Segoe UI", 8))
 
         def draw(series: list[tuple[float, float]], color: str, width_px: int = 2) -> None:
-            if len(series) < 2:
+            if not series:
+                return
+            if len(series) == 1:
+                x, y = point(series[0])
+                self.create_oval(x - 3, y - 3, x + 3, y + 3, fill=color, outline=color)
                 return
             coords: list[float] = []
             for pair in series:
@@ -219,6 +253,27 @@ class AcquisitionPanel(ttk.Frame):
         self._last_live: dict[str, Any] | None = None
         self.vars: dict[str, tk.Variable] = {}
         self._build()
+        self._load_mysql_defaults()
+
+    def _load_mysql_defaults(self) -> None:
+        candidates = [
+            APP_DIR.parent / "runtime" / "mysql.local.json",
+            APP_DIR.parent.parent / "runtime" / "mysql.local.json",
+        ]
+        for path in candidates:
+            try:
+                if not path.is_file():
+                    continue
+                payload = json.loads(path.read_text(encoding="utf-8-sig"))
+                for prefix, section_name in (("mysql", "target"), ("mysql_local", "local")):
+                    section = payload.get(section_name, {})
+                    for field in ("host", "port", "user", "password", "database"):
+                        variable = self.vars.get(f"{prefix}_{field}")
+                        if variable is not None and field in section:
+                            variable.set(section[field])
+                break
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
 
     def _v(self, name: str, value: Any = "") -> tk.Variable:
         var: tk.Variable
@@ -258,6 +313,8 @@ class AcquisitionPanel(ttk.Frame):
         ttk.Label(basic, text="数据方案").grid(row=0, column=0, sticky="w", padx=3, pady=3)
         self.schema_combo = ttk.Combobox(basic, textvariable=self._v("dataset_schema", "new_collection_v11_3"), state="readonly", values=("new_collection_v11_3", "legacy_original"), width=20)
         self.schema_combo.grid(row=0, column=1, columnspan=3, sticky="ew", padx=3, pady=3)
+        self.schema_info = tk.StringVar(value="")
+        ttk.Label(basic, textvariable=self.schema_info, foreground=COLORS["blue"]).grid(row=0, column=4, sticky="w", padx=4)
         self.schema_combo.bind("<<ComboboxSelected>>", lambda _e: self._schema_changed())
         ttk.Label(basic, text="处理模式").grid(row=1, column=0, sticky="w", padx=3, pady=3)
         self.mode_combo = ttk.Combobox(basic, textvariable=self._v("processing_mode", "prediction_warning"), state="readonly", values=("prediction_warning", "capture_only"), width=20)
@@ -266,14 +323,62 @@ class AcquisitionPanel(ttk.Frame):
         ttk.Label(basic, text="连接方式").grid(row=2, column=0, sticky="w", padx=3, pady=3)
         self.driver_combo = ttk.Combobox(basic, textvariable=self._v("driver", "simulator"), state="readonly", values=("simulator", "serial_json", "tcp_json"), width=15)
         self.driver_combo.grid(row=2, column=1, sticky="ew", padx=3, pady=3)
+        interfaces = ttk.LabelFrame(basic, text="多接口采集（默认热电偶 + 其它传感器）", padding=5)
+        interfaces.grid(row=5, column=0, columnspan=4, sticky="ew", padx=3, pady=4)
+        interfaces.columnconfigure(3, weight=1)
+        ttk.Button(interfaces, text="自动识别接口", command=self._discover_interfaces).grid(row=0, column=0, sticky="ew", padx=2)
+        ttk.Label(interfaces, text="勾选 / 角色 / 类型 / 地址 / 映射(JSON)").grid(row=0, column=1, columnspan=4, sticky="w")
+        self.interface_vars: list[dict[str, tk.Variable]] = []
+        for index, (role, endpoint) in enumerate((("thermocouple", "COM3"), ("other", "COM4")), start=1):
+            values = {
+                "enabled": self._v(f"interface_{index}_enabled", True), "role": self._v(f"interface_{index}_role", role),
+                "driver": self._v(f"interface_{index}_driver", "serial_json"), "endpoint": self._v(f"interface_{index}_endpoint", endpoint),
+                "map": self._v(f"interface_{index}_map", "{}"),
+            }
+            self.interface_vars.append(values)
+            ttk.Checkbutton(interfaces, variable=values["enabled"]).grid(row=index, column=0)
+            ttk.Combobox(interfaces, textvariable=values["role"], values=("thermocouple", "other"), state="readonly", width=14).grid(row=index, column=1, padx=2)
+            ttk.Combobox(interfaces, textvariable=values["driver"], values=("serial_json", "tcp_json", "simulator"), state="readonly", width=12).grid(row=index, column=2, padx=2)
+            ttk.Entry(interfaces, textvariable=values["endpoint"], width=15).grid(row=index, column=3, sticky="ew", padx=2)
+            ttk.Entry(interfaces, textvariable=values["map"], width=22).grid(row=index, column=4, sticky="ew", padx=2)
         self._entry(basic, "采样Hz", "sample_rate_hz", 10.0, 2, 2)
         self._entry(basic, "端点/模拟CSV", "endpoint", "", 3, 0, width=30)
         ttk.Button(basic, text="浏览", command=self._pick_endpoint).grid(row=3, column=2, columnspan=2, sticky="ew", padx=3)
         self._entry(basic, "串口波特率", "baudrate", 115200, 4, 0)
 
         identity = ttk.LabelFrame(parent, text="试样、工况与铺层", padding=8)
-        identity.grid(row=1, column=0, sticky="ew", pady=4)
+        identity.grid(row=2, column=0, sticky="ew", pady=4)
         identity.columnconfigure(1, weight=1); identity.columnconfigure(3, weight=1)
+
+        # Keep the simulation source explicit in the native UI.  This mirrors
+        # the web controls and prevents MySQL replay from silently falling
+        # back to the default CSV source.
+        simulation = ttk.LabelFrame(parent, text="模拟数据源（仅模拟采集时使用）", padding=8)
+        simulation.grid(row=1, column=0, sticky="ew", pady=4)
+        simulation.columnconfigure(1, weight=1); simulation.columnconfigure(3, weight=1)
+        ttk.Label(simulation, text="数据形式").grid(row=0, column=0, sticky="w", padx=3, pady=3)
+        self.simulation_source_combo = ttk.Combobox(
+            simulation,
+            textvariable=self._v("simulation_source_type", "single_csv"),
+            values=("single_csv", "folder_csv", "mysql"),
+            state="readonly",
+            width=15,
+        )
+        self.simulation_source_combo.grid(row=0, column=1, sticky="ew", padx=3, pady=3)
+        self.simulation_source_combo.bind("<<ComboboxSelected>>", lambda _e: self._simulation_source_changed())
+        self._entry(simulation, "文件/文件夹", "simulation_source_path", "", 1, 0, width=28)
+        ttk.Button(simulation, text="选择", command=self._pick_simulation_source).grid(row=1, column=2, columnspan=2, sticky="ew", padx=3)
+        ttk.Label(
+            simulation,
+            text="MySQL 模拟采集使用下方“本地与统一 MySQL 数据库”的同一组连接参数。",
+            foreground=COLORS["muted"],
+            wraplength=345,
+        ).grid(row=2, column=0, columnspan=4, sticky="ew", padx=3, pady=3)
+        ttk.Label(simulation, text="查询").grid(row=3, column=0, sticky="nw", padx=3, pady=3)
+        self.simulation_mysql_query = tk.Text(simulation, height=3, wrap="none")
+        self.simulation_mysql_query.grid(row=3, column=1, columnspan=3, sticky="ew", padx=3, pady=3)
+        self.simulation_mysql_query.insert("1.0", "SELECT * FROM afp_flat_all ORDER BY specimen_key, layer_no, sample_index")
+        self.simulation_frame = simulation
         self._entry(identity, "试样名", "specimen_id", "LIVE_SPECIMEN_001", 0, 0)
         self._entry(identity, "工况编号", "condition_id", "C001", 0, 2)
         self._entry(identity, "独立重复", "replicate", 1, 1, 0)
@@ -287,19 +392,22 @@ class AcquisitionPanel(ttk.Frame):
         self._entry(identity, "温度设定°C", "temperature_setpoint_C", 360.0, 5, 2)
 
         channels = ttk.LabelFrame(parent, text="采集、模型输入与模型输出", padding=8)
-        channels.grid(row=2, column=0, sticky="ew", pady=4)
+        channels.grid(row=3, column=0, sticky="ew", pady=4)
         for col, title in enumerate(("采集保存", "模型输入", "模型输出")):
             ttk.Label(channels, text=title, foreground=COLORS["navy"]).grid(row=0, column=col, pady=(0, 3))
         self.sensor_lists: list[tk.Listbox] = []
         for col in range(3):
-            box = tk.Listbox(channels, selectmode="multiple", exportselection=False, height=8, width=15)
+            # The new collection plan has 16 physical sensor channels.  Keep
+            # all channels visible in the native window instead of clipping
+            # the lower half of the checklist at the historical height of 8.
+            box = tk.Listbox(channels, selectmode="multiple", exportselection=False, height=16, width=15)
             box.grid(row=1, column=col, sticky="nsew", padx=2)
             self.sensor_lists.append(box)
             channels.columnconfigure(col, weight=1)
         ttk.Button(channels, text="当前方案全选", command=self._select_all_sensors).grid(row=2, column=0, columnspan=3, sticky="ew", pady=(5, 0))
 
         prediction = ttk.LabelFrame(parent, text="预测与健康指标", padding=8)
-        prediction.grid(row=3, column=0, sticky="ew", pady=4)
+        prediction.grid(row=4, column=0, sticky="ew", pady=4)
         prediction.columnconfigure(1, weight=1); prediction.columnconfigure(3, weight=1)
         ttk.Checkbutton(prediction, text="使用登记的最佳预测模型", variable=self._v("use_best_prediction_override", True)).grid(row=0, column=0, columnspan=4, sticky="w")
         self._entry(prediction, "模型文件", "prediction_model_file", "", 1, 0, width=30)
@@ -317,21 +425,53 @@ class AcquisitionPanel(ttk.Frame):
         self._entry(prediction, "CAP ρ", "rho", 0.5, 4, 2)
         ttk.Checkbutton(prediction, text="启用因果在线优化（兼容时）", variable=self._v("use_optimized_warning", True)).grid(row=5, column=0, columnspan=4, sticky="w")
 
-        saving = ttk.LabelFrame(parent, text="本地与 MySQL 保存", padding=8)
-        saving.grid(row=4, column=0, sticky="ew", pady=4)
+        saving = ttk.LabelFrame(parent, text="本地与统一 MySQL 数据库", padding=8)
+        saving.grid(row=5, column=0, sticky="ew", pady=4)
         saving.columnconfigure(1, weight=1); saving.columnconfigure(3, weight=1)
         self._entry(saving, "保存根目录", "save_root", r"F:\AFP_Capture", 0, 0, width=28)
         ttk.Button(saving, text="选择", command=self._pick_save_root).grid(row=0, column=2, columnspan=2, sticky="ew", padx=3)
-        ttk.Checkbutton(saving, text="试样结束后同步 MySQL", variable=self._v("mysql_enabled", False)).grid(row=1, column=0, columnspan=4, sticky="w")
-        self._entry(saving, "主机", "mysql_host", "127.0.0.1", 2, 0)
-        self._entry(saving, "端口", "mysql_port", 3306, 2, 2)
-        self._entry(saving, "用户", "mysql_user", "root", 3, 0)
-        self._entry(saving, "密码", "mysql_password", "", 3, 2, show="*")
-        self._entry(saving, "数据库", "mysql_database", "afp_state_warning", 4, 0, width=20)
-        ttk.Button(saving, text="查看工况—试样—铺层关系", command=self._show_mysql_relations).grid(row=5, column=0, columnspan=4, sticky="ew", pady=(5, 0))
+        ttk.Checkbutton(saving, text="保存到打开软件这台电脑的 MySQL", variable=self._v("mysql_local_enabled", False)).grid(row=1, column=0, columnspan=4, sticky="w")
+        self._entry(saving, "本机地址", "mysql_local_host", "127.0.0.1", 2, 0)
+        self._entry(saving, "本机端口", "mysql_local_port", 3306, 2, 2)
+        self._entry(saving, "本机用户", "mysql_local_user", "root", 3, 0)
+        self._entry(saving, "本机密码", "mysql_local_password", "", 3, 2, show="*")
+        self._entry(saving, "本机数据库", "mysql_local_database", "afp_state_warning", 4, 0, width=20)
+        ttk.Checkbutton(saving, text="保存到目标电脑 MySQL", variable=self._v("mysql_enabled", False)).grid(row=5, column=0, columnspan=4, sticky="w", pady=(5, 0))
+        self._entry(saving, "目标地址", "mysql_host", "192.168.101.31", 6, 0)
+        self._entry(saving, "目标端口", "mysql_port", 3306, 6, 2)
+        self._entry(saving, "目标用户", "mysql_user", "afp_app", 7, 0)
+        self._entry(saving, "目标密码", "mysql_password", "", 7, 2, show="*")
+        self._entry(saving, "目标数据库", "mysql_database", "afp_state_warning", 8, 0, width=20)
+        self._entry(saving, "允许客户端主机", "mysql_allowed_host", "192.168.101.%", 9, 0, width=20)
+        ttk.Label(
+            saving,
+            text="服务器管理员执行授权脚本后，另一台电脑使用目标账号上传；本机与目标电脑是两套独立连接。",
+            foreground=COLORS["muted"],
+            wraplength=345,
+        ).grid(row=10, column=0, columnspan=4, sticky="ew", pady=(3, 4))
+        mysql_actions = ttk.Frame(saving)
+        mysql_actions.grid(row=11, column=0, columnspan=4, sticky="ew")
+        mysql_actions.columnconfigure(0, weight=1); mysql_actions.columnconfigure(1, weight=1)
+        ttk.Button(mysql_actions, text="测试本机连接", command=lambda: self._test_mysql_connection(local=True)).grid(row=0, column=0, sticky="ew", padx=(0, 2), pady=2)
+        ttk.Button(mysql_actions, text="测试目标连接", command=self._test_mysql_connection).grid(row=0, column=1, sticky="ew", padx=(2, 0), pady=2)
+        ttk.Button(mysql_actions, text="查看本机关系", command=lambda: self._show_mysql_relations(local=True)).grid(row=1, column=0, sticky="ew", padx=(0, 2), pady=2)
+        ttk.Button(mysql_actions, text="查看目标关系", command=self._show_mysql_relations).grid(row=1, column=1, sticky="ew", padx=(2, 0), pady=2)
+        ttk.Button(mysql_actions, text="导出本机数据 CSV", command=lambda: self._export_mysql_csv(local=True)).grid(row=2, column=0, sticky="ew", padx=(0, 2), pady=2)
+        ttk.Button(mysql_actions, text="导出目标数据 CSV", command=self._export_mysql_csv).grid(row=2, column=1, sticky="ew", padx=(2, 0), pady=2)
+        ttk.Button(mysql_actions, text="初始化本机表结构", command=lambda: self._initialize_mysql_schema(local=True)).grid(row=3, column=0, sticky="ew", padx=(0, 2), pady=2)
+        ttk.Button(mysql_actions, text="初始化目标表结构", command=self._initialize_mysql_schema).grid(row=3, column=1, sticky="ew", padx=(2, 0), pady=2)
+        ttk.Button(mysql_actions, text="生成目标授权 SQL", command=self._export_remote_mysql_setup_sql).grid(row=4, column=0, sticky="ew", padx=(0, 2), pady=2)
+        self.mysql_retry_button = ttk.Button(mysql_actions, text="立即补传待同步数据", command=self._retry_pending_mysql, state="disabled")
+        self.mysql_retry_button.grid(row=4, column=1, sticky="ew", padx=(2, 0), pady=2)
+        self.mysql_local_status_text = tk.StringVar(value="本机数据库：尚未检查。")
+        self.mysql_target_status_text = tk.StringVar(value="目标电脑数据库：尚未检查。")
+        self.mysql_status_text = tk.StringVar(value="保存状态：本地 CSV 始终优先保存。")
+        ttk.Label(saving, textvariable=self.mysql_local_status_text, foreground=COLORS["muted"], wraplength=345).grid(row=12, column=0, columnspan=4, sticky="ew", pady=(3, 0))
+        ttk.Label(saving, textvariable=self.mysql_target_status_text, foreground=COLORS["muted"], wraplength=345).grid(row=13, column=0, columnspan=4, sticky="ew")
+        ttk.Label(saving, textvariable=self.mysql_status_text, foreground=COLORS["muted"], wraplength=345).grid(row=14, column=0, columnspan=4, sticky="ew")
 
         actions = ttk.Frame(parent)
-        actions.grid(row=5, column=0, sticky="ew", pady=8)
+        actions.grid(row=6, column=0, sticky="ew", pady=8)
         for col in range(4): actions.columnconfigure(col, weight=1)
         self.test_button = ttk.Button(actions, text="检查连接", command=self.test_connection, state="disabled")
         self.start_button = ttk.Button(actions, text="开始采集", command=self.start, state="disabled")
@@ -342,7 +482,7 @@ class AcquisitionPanel(ttk.Frame):
         self.stop_button.grid(row=0, column=2, sticky="ew", padx=2)
         self.open_button.grid(row=0, column=3, sticky="ew", padx=2)
         self.status_text = tk.StringVar(value="正在加载模型与健康指标资源……")
-        ttk.Label(parent, textvariable=self.status_text, wraplength=350, foreground=COLORS["muted"]).grid(row=6, column=0, sticky="ew", pady=4)
+        ttk.Label(parent, textvariable=self.status_text, wraplength=350, foreground=COLORS["muted"]).grid(row=7, column=0, sticky="ew", pady=4)
 
     def _build_monitor(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1); parent.rowconfigure(2, weight=1)
@@ -398,12 +538,19 @@ class AcquisitionPanel(ttk.Frame):
         self.test_button.config(state="normal"); self.start_button.config(state="normal")
         self.status_text.set("后台加载完成；可检查连接或开始采集。")
         self.monitor_status.set("就绪（原生直连，无本地网页服务）")
+        self._update_mysql_retry_capability()
         self._schema_changed()
+        self._simulation_source_changed()
         self.after(250, self._poll)
 
     def _schema_changed(self) -> None:
         schema = str(self.vars["dataset_schema"].get())
         sensors = list(ACQUISITION_SCHEMAS[schema]["sensors"])
+        self.schema_info.set(
+            f"{len(sensors)} 个传感器通道"
+            if schema == "new_collection_v11_3"
+            else f"{len(sensors)} 个传感器通道"
+        )
         for box in self.sensor_lists:
             box.delete(0, "end")
             for sensor in sensors: box.insert("end", sensor)
@@ -441,9 +588,37 @@ class AcquisitionPanel(ttk.Frame):
     def _select_all_sensors(self) -> None:
         for box in self.sensor_lists: box.select_set(0, "end")
 
+    def _discover_interfaces(self) -> None:
+        result = AcquisitionManager.discover_interfaces()
+        ports = result.get("ports", [])
+        defaults = result.get("defaults", [])
+        for values, item in zip(self.interface_vars, defaults):
+            values["endpoint"].set(item.get("endpoint", ""))
+            values["role"].set(item.get("role", "other"))
+        self.status_text.set(f"发现 {len(ports)} 个串口；已填入前两个接口，可继续修改角色和通道映射")
+
     def _pick_endpoint(self) -> None:
         selected = filedialog.askopenfilename(title="选择模拟采集CSV", filetypes=[("CSV", "*.csv"), ("所有文件", "*.*")])
         if selected: self.vars["endpoint"].set(selected)
+
+    def _simulation_source_changed(self) -> None:
+        source_type = str(self.vars["simulation_source_type"].get())
+        if hasattr(self, "simulation_frame"):
+            self.simulation_frame.configure(text=f"模拟数据源（{source_type}）")
+
+    def _pick_simulation_source(self) -> None:
+        source_type = str(self.vars["simulation_source_type"].get())
+        if source_type == "folder_csv":
+            selected = filedialog.askdirectory(title="选择模拟采集数据文件夹")
+        elif source_type == "mysql":
+            return
+        else:
+            selected = filedialog.askopenfilename(
+                title="选择模拟采集 CSV",
+                filetypes=[("CSV", "*.csv"), ("所有文件", "*.*")],
+            )
+        if selected:
+            self.vars["simulation_source_path"].set(selected)
 
     def _pick_model(self) -> None:
         selected = filedialog.askopenfilename(title="选择预测模型", filetypes=[("PyTorch模型", "*.pth *.pt"), ("所有文件", "*.*")])
@@ -459,11 +634,35 @@ class AcquisitionPanel(ttk.Frame):
         capture = self._selected(self.sensor_lists[0])
         inputs = self._selected(self.sensor_lists[1])
         outputs = self._selected(self.sensor_lists[2])
+        interfaces = []
+        for index, values in enumerate(getattr(self, "interface_vars", []), start=1):
+            try:
+                channel_map = json.loads(str(values["map"].get() or "{}"))
+            except json.JSONDecodeError:
+                channel_map = {}
+            interfaces.append({
+                "id": f"interface_{index}", "enabled": bool(values["enabled"].get()),
+                "role": str(values["role"].get()), "driver": str(values["driver"].get()),
+                "endpoint": str(values["endpoint"].get()).strip(), "baudrate": _safe_int(self.vars["baudrate"].get(), 115200, 1),
+                "channel_map": channel_map,
+            })
+        simulation_source_type = str(self.vars["simulation_source_type"].get() or "single_csv")
+        simulation_source_path = str(self.vars["simulation_source_path"].get()).strip()
+        acquisition_mode = "simulation" if str(self.vars["driver"].get()) == "simulator" else "real"
         return AcquisitionConfig(
             processing_mode=str(self.vars["processing_mode"].get()),
             dataset_schema=str(self.vars["dataset_schema"].get()),
             use_best_prediction_override=bool(self.vars["use_best_prediction_override"].get()),
-            driver=str(self.vars["driver"].get()), endpoint=str(self.vars["endpoint"].get()).strip(),
+            driver=str(self.vars["driver"].get()), endpoint=str(self.vars["endpoint"].get()).strip(), interfaces=interfaces,
+            acquisition_mode=acquisition_mode,
+            simulation_source_type=simulation_source_type,
+            simulation_source_path=simulation_source_path or (str(self.vars["endpoint"].get()).strip() if acquisition_mode == "simulation" else ""),
+            simulation_mysql_query=self.simulation_mysql_query.get("1.0", "end").strip(),
+            simulation_mysql_host=str(self.vars["mysql_host"].get()).strip(),
+            simulation_mysql_port=_safe_int(self.vars["mysql_port"].get(), 3306, 1),
+            simulation_mysql_user=str(self.vars["mysql_user"].get()).strip(),
+            simulation_mysql_password=str(self.vars["mysql_password"].get()),
+            simulation_mysql_database=str(self.vars["mysql_database"].get()).strip(),
             source_file=(str(self.vars["endpoint"].get()).strip() if str(self.vars["driver"].get()) == "simulator" else ""),
             baudrate=_safe_int(self.vars["baudrate"].get(), 115200, 1), sample_rate_hz=_safe_float(self.vars["sample_rate_hz"].get(), 10.0),
             selected_sensors=capture, model_input_sensors=inputs, model_output_sensors=outputs,
@@ -474,6 +673,7 @@ class AcquisitionPanel(ttk.Frame):
             p=_safe_float(self.vars["p"].get(), 600.0), v=_safe_float(self.vars["v"].get(), 100.0), pr=_safe_float(self.vars["pr"].get(), 600.0),
             initial_compaction_force_N=_safe_float(self.vars["initial_compaction_force_N"].get(), 400.0), placement_speed_mm_s=_safe_float(self.vars["placement_speed_mm_s"].get(), 80.0), pid_angle_deg=_safe_float(self.vars["pid_angle_deg"].get(), 5.0), temperature_setpoint_C=_safe_float(self.vars["temperature_setpoint_C"].get(), 360.0),
             save_root=str(self.vars["save_root"].get()).strip(), mysql_enabled=bool(self.vars["mysql_enabled"].get()), mysql_host=str(self.vars["mysql_host"].get()), mysql_port=_safe_int(self.vars["mysql_port"].get(), 3306, 1), mysql_user=str(self.vars["mysql_user"].get()), mysql_password=str(self.vars["mysql_password"].get()), mysql_database=str(self.vars["mysql_database"].get()),
+            mysql_local_enabled=bool(self.vars["mysql_local_enabled"].get()), mysql_local_host=str(self.vars["mysql_local_host"].get()), mysql_local_port=_safe_int(self.vars["mysql_local_port"].get(), 3306, 1), mysql_local_user=str(self.vars["mysql_local_user"].get()), mysql_local_password=str(self.vars["mysql_local_password"].get()), mysql_local_database=str(self.vars["mysql_local_database"].get()),
         )
 
     def _background(self, label: str, work: Callable[[], Any], done: Callable[[Any], None] | None = None) -> None:
@@ -485,6 +685,240 @@ class AcquisitionPanel(ttk.Frame):
             except Exception as exc:
                 self.after(0, lambda e=str(exc): (self.status_text.set(e), messagebox.showerror("操作失败", e)))
         threading.Thread(target=runner, daemon=True).start()
+
+    def _mysql_settings(self) -> MySQLSettings:
+        """Build the one MySQL profile shared by save, browse and export."""
+        return MySQLSettings(
+            enabled=True,
+            host=str(self.vars["mysql_host"].get()).strip() or "127.0.0.1",
+            port=_safe_int(self.vars["mysql_port"].get(), 3306, 1),
+            user=str(self.vars["mysql_user"].get()).strip() or "root",
+            password=str(self.vars["mysql_password"].get()),
+            database=str(self.vars["mysql_database"].get()).strip() or "afp_state_warning",
+        )
+
+    def _local_mysql_settings(self) -> MySQLSettings:
+        return MySQLSettings(
+            enabled=True,
+            host=str(self.vars["mysql_local_host"].get()).strip() or "127.0.0.1",
+            port=_safe_int(self.vars["mysql_local_port"].get(), 3306, 1),
+            user=str(self.vars["mysql_local_user"].get()).strip() or "root",
+            password=str(self.vars["mysql_local_password"].get()),
+            database=str(self.vars["mysql_local_database"].get()).strip() or "afp_state_warning",
+        )
+
+    def _test_mysql_connection(self, local: bool = False) -> None:
+        settings = self._local_mysql_settings() if local else self._mysql_settings()
+        status_variable = self.mysql_local_status_text if local else self.mysql_target_status_text
+
+        def work() -> dict[str, Any]:
+            store = MySQLCaptureStore(settings)
+            verifier = getattr(store, "verify_connection", None)
+            if callable(verifier):
+                return verifier(require_schema=True)
+            return store.test_connection()
+
+        def done(result: dict[str, Any]) -> None:
+            if result.get("ok"):
+                message = (
+                    f"{'本机' if local else '目标'}数据库连接正常：{settings.host}:{settings.port}/"
+                    f"{settings.database}"
+                )
+                if result.get("schema_ready") is False:
+                    message += "；连接已建立，但AFP表结构不完整，请先初始化表结构"
+            else:
+                detail = classify_mysql_error(result.get("error"))
+                message = (
+                    f"{'本机' if local else '目标'}数据库连接失败"
+                    f"[{detail.get('code') or detail.get('category')}]："
+                    f"{detail.get('message') or result.get('error') or '未知错误'}"
+                )
+            status_variable.set(message)
+            self.status_text.set(message)
+
+        self._background(f"正在测试{'本机' if local else '目标电脑'} MySQL 连接……", work, done)
+
+    def _initialize_mysql_schema(self, local: bool = False) -> None:
+        settings = self._local_mysql_settings() if local else self._mysql_settings()
+        label = "本机" if local else "目标电脑"
+        if not messagebox.askyesno(
+            "初始化 MySQL",
+            f"将使用{label}连接创建数据库（如不存在）、数据表、索引和外键。是否继续？",
+        ):
+            return
+
+        def work() -> dict[str, Any]:
+            store = MySQLCaptureStore(settings)
+            initializer = getattr(store, "initialize_schema", None)
+            if callable(initializer):
+                return initializer(create_database=True)
+            # Compatibility with a package built before initialization and
+            # connection verification were split into two public operations.
+            return store.test_connection()
+
+        def done(result: dict[str, Any]) -> None:
+            if result.get("ok"):
+                message = f"表结构已就绪：{settings.host}/{settings.database}"
+            else:
+                detail = classify_mysql_error(result.get("error"))
+                message = (
+                    f"表结构初始化失败[{detail.get('code') or detail.get('category')}]："
+                    f"{detail.get('message') or result.get('error') or '未知错误'}"
+                )
+            (self.mysql_local_status_text if local else self.mysql_target_status_text).set(message)
+            self.status_text.set(message)
+
+        self._background(f"正在初始化{label} MySQL 表结构……", work, done)
+
+    def _export_remote_mysql_setup_sql(self) -> None:
+        """Generate the server-admin SQL needed by a second acquisition PC."""
+        try:
+            sql = build_remote_setup_sql(
+                database=str(self.vars["mysql_database"].get()).strip(),
+                user=str(self.vars["mysql_user"].get()).strip(),
+                password=str(self.vars["mysql_password"].get()),
+                allowed_host=str(self.vars["mysql_allowed_host"].get()).strip(),
+            )
+            database = str(self.vars["mysql_database"].get()).strip() or "afp_state_warning"
+            selected = filedialog.asksaveasfilename(
+                title="保存目标数据库授权脚本",
+                defaultextension=".sql",
+                initialfile=f"AFP_{database}_remote_setup.sql",
+                filetypes=[("MySQL SQL", "*.sql"), ("所有文件", "*.*")],
+            )
+            if not selected:
+                return
+            Path(selected).write_text(sql, encoding="utf-8-sig")
+            messagebox.showinfo(
+                "目标数据库脚本已生成",
+                "请把该 SQL 文件交给目标数据库电脑的管理员执行。\n"
+                "执行完成后，在本软件中点击“测试目标连接”和“刷新目标关系表”。",
+            )
+            self.mysql_target_status_text.set(f"授权脚本已保存：{selected}")
+        except Exception as exc:
+            messagebox.showerror("生成授权脚本失败", str(exc))
+            self.mysql_target_status_text.set(f"授权脚本生成失败：{exc}")
+
+    def _update_mysql_retry_capability(self) -> None:
+        manager = getattr(self.dashboard, "acquisition", None) if self.dashboard else None
+        retry = getattr(manager, "retry_pending_mysql", None)
+        if callable(retry):
+            self.mysql_retry_button.config(text="立即补传待同步数据", state="normal")
+            self.mysql_status_text.set("数据库功能已就绪；可测试连接、查看关系、导出或立即补传。")
+        else:
+            self.mysql_retry_button.config(text="立即补传（当前后端未开放）", state="disabled")
+            self.mysql_status_text.set(
+                "当前采集后端未开放手动补传接口；试样保存及下次连接恢复时仍会自动补传。"
+            )
+
+    def _retry_pending_mysql(self) -> None:
+        manager = getattr(self.dashboard, "acquisition", None) if self.dashboard else None
+        retry = getattr(manager, "retry_pending_mysql", None)
+        if not callable(retry):
+            self.mysql_status_text.set(
+                "无法立即补传：当前后端未开放手动补传接口；采集结束时会自动尝试补传。"
+            )
+            return
+        settings_list: list[tuple[str, MySQLSettings]] = []
+        if bool(self.vars["mysql_local_enabled"].get()):
+            settings_list.append(("本机", self._local_mysql_settings()))
+        if bool(self.vars["mysql_enabled"].get()):
+            settings_list.append(("目标", self._mysql_settings()))
+        if not settings_list:
+            self.mysql_status_text.set("请先勾选“保存到本机”或“保存到目标电脑”。")
+            return
+        root = Path(str(self.vars["save_root"].get()) or r"F:\AFP_Capture")
+
+        def work() -> dict[str, Any]:
+            results = {
+                name: retry(settings=settings, root=root, limit=100)
+                for name, settings in settings_list
+            }
+            return {
+                "attempted": sum(int(item.get("attempted", 0)) for item in results.values()),
+                "succeeded": sum(int(item.get("succeeded", 0)) for item in results.values()),
+                "failed": sum(int(item.get("failed", 0)) for item in results.values()),
+                "skipped": sum(int(item.get("skipped", 0)) for item in results.values()),
+                "results": results,
+            }
+
+        def done(result: dict[str, Any]) -> None:
+            message = (
+                f"补传完成：尝试 {result.get('attempted', 0)}，"
+                f"成功 {result.get('succeeded', 0)}，失败 {result.get('failed', 0)}，"
+                f"跳过 {result.get('skipped', 0)}。"
+            )
+            if result.get("connection_error"):
+                message += " 连接错误：" + str(result["connection_error"])
+            self.mysql_status_text.set(message)
+            self.status_text.set(message)
+
+        self._background("正在补传本地待同步数据……", work, done)
+
+    def _export_mysql_csv(
+        self,
+        filters: dict[str, Any] | None = None,
+        parent: tk.Misc | None = None,
+        local: bool = False,
+    ) -> None:
+        active_filters = {
+            key: value for key, value in (filters or {}).items()
+            if value not in (None, "")
+        }
+        destination = filedialog.asksaveasfilename(
+            parent=parent or self,
+            title=f"导出{'本机' if local else '目标电脑'} MySQL 数据",
+            initialdir=str(self.vars["save_root"].get() or r"F:\AFP_Capture"),
+            initialfile=time.strftime(f"AFP{'本机' if local else '目标'}数据库导出_%Y%m%d_%H%M%S.csv"),
+            defaultextension=".csv",
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
+        )
+        if not destination:
+            return
+        settings = self._local_mysql_settings() if local else self._mysql_settings()
+        settings_mapping = {
+            "enabled": True,
+            "host": settings.host,
+            "port": settings.port,
+            "user": settings.user,
+            "password": settings.password,
+            "database": settings.database,
+            "charset": settings.charset,
+            "connect_timeout": settings.connect_timeout,
+        }
+
+        def work() -> dict[str, Any]:
+            store = MySQLCaptureStore(settings)
+            exporter = getattr(store, "export_flat_csv", None)
+            if callable(exporter):
+                return exporter(destination, **active_filters)
+            if active_filters:
+                raise RuntimeError(
+                    "当前 MySQL 后端版本不支持按筛选条件导出，请更新后端或清空筛选后导出全部数据。"
+                )
+            return integrate_capture_sources(
+                "mysql",
+                output_file=destination,
+                mysql_settings=settings_mapping,
+            )
+
+        def done(result: dict[str, Any]) -> None:
+            message = (
+                f"{'本机' if local else '目标电脑'}数据已导出：{result.get('saved_rows', result.get('rows', 0))} 行，"
+                f"保存到 {result.get('output_file') or destination}"
+            )
+            (self.mysql_local_status_text if local else self.mysql_target_status_text).set(message)
+            self.status_text.set(message)
+            owner: tk.Misc = self
+            if parent is not None:
+                try:
+                    if parent.winfo_exists():
+                        owner = parent
+                except tk.TclError:
+                    pass
+            messagebox.showinfo("导出完成", message, parent=owner)
+
+        self._background(f"正在分批读取{'本机' if local else '目标电脑'}数据库并导出 CSV……", work, done)
 
     def test_connection(self) -> None:
         config = self._config()
@@ -510,7 +944,18 @@ class AcquisitionPanel(ttk.Frame):
         def done(result: dict[str, Any]) -> None:
             self.start_button.config(state="normal"); self.stop_button.config(state="disabled")
             mysql = result.get("mysql", {})
-            suffix = f"；MySQL已保存{mysql.get('saved_rows', 0)}行" if mysql.get("ok") else (f"；MySQL未保存：{mysql.get('error', '')}" if mysql.get("enabled") else "")
+            if mysql.get("ok"):
+                suffix = (
+                    f"；MySQL {mysql.get('successful_destinations', 1)}个目标已保存，"
+                    f"共写入{mysql.get('saved_rows', 0)}行"
+                )
+            elif mysql.get("enabled"):
+                suffix = (
+                    f"；MySQL成功{mysql.get('successful_destinations', 0)}个、"
+                    f"失败{mysql.get('failed_destinations', 1)}个：{mysql.get('error', '')}"
+                )
+            else:
+                suffix = ""
             self.status_text.set(f"采集已停止并保存{suffix}")
             self.app.set_runtime("就绪")
         self._background("正在停止并保存完整试样/分层数据……", self.dashboard.acquisition.stop, done)
@@ -520,16 +965,205 @@ class AcquisitionPanel(ttk.Frame):
         path.mkdir(parents=True, exist_ok=True)
         os.startfile(path)
 
-    def _show_mysql_relations(self) -> None:
-        settings = MySQLSettings(enabled=True, host=str(self.vars["mysql_host"].get()), port=_safe_int(self.vars["mysql_port"].get(), 3306, 1), user=str(self.vars["mysql_user"].get()), password=str(self.vars["mysql_password"].get()), database=str(self.vars["mysql_database"].get()))
-        def show(result: dict[str, Any]) -> None:
-            window = tk.Toplevel(self); window.title("工况—试样—铺层关系"); window.geometry("1100x620")
-            columns = list(result.get("columns") or [])
-            tree = ttk.Treeview(window, columns=columns, show="headings")
-            for name in columns: tree.heading(name, text=name); tree.column(name, width=130)
-            for row in result.get("rows", []): tree.insert("", "end", values=[row.get(name, "") for name in columns])
-            tree.pack(fill="both", expand=True, padx=8, pady=8)
-        self._background("正在读取数据库关系视图……", lambda: MySQLCaptureStore(settings).relation_map(2000), show)
+    def _show_mysql_relations(self, local: bool = False) -> None:
+        settings = self._local_mysql_settings() if local else self._mysql_settings()
+        scope_label = "本机" if local else "目标电脑"
+        window = tk.Toplevel(self)
+        window.title(f"{scope_label} MySQL｜工况—试样—铺层关系")
+        window.geometry("1240x680")
+        window.minsize(860, 480)
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(2, weight=1)
+
+        header = ttk.Frame(window, padding=(8, 8, 8, 3))
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(7, weight=1)
+        condition_var = tk.StringVar()
+        specimen_var = tk.StringVar()
+        layer_var = tk.StringVar()
+        auto_var = tk.BooleanVar(value=False)
+        status_var = tk.StringVar(
+            value=(
+                f"{scope_label}数据库：{settings.host}:"
+                f"{settings.port}/{settings.database}"
+            )
+        )
+        ttk.Label(header, text="工况编号").grid(row=0, column=0, padx=(0, 3))
+        ttk.Entry(header, textvariable=condition_var, width=16).grid(row=0, column=1, padx=(0, 8))
+        ttk.Label(header, text="试样").grid(row=0, column=2, padx=(0, 3))
+        ttk.Entry(header, textvariable=specimen_var, width=18).grid(row=0, column=3, padx=(0, 8))
+        ttk.Label(header, text="铺层").grid(row=0, column=4, padx=(0, 3))
+        ttk.Entry(header, textvariable=layer_var, width=8).grid(row=0, column=5, padx=(0, 8))
+        refresh_button = ttk.Button(header, text="立即刷新")
+        refresh_button.grid(row=0, column=6, padx=(0, 8))
+        ttk.Checkbutton(header, text="每 5 秒自动刷新", variable=auto_var).grid(row=0, column=7, sticky="w")
+        export_button = ttk.Button(header, text="导出当前筛选")
+        export_button.grid(row=0, column=8, padx=(8, 0))
+        ttk.Label(
+            window,
+            textvariable=status_var,
+            foreground=COLORS["muted"],
+            padding=(8, 0, 8, 5),
+        ).grid(row=1, column=0, sticky="ew")
+
+        table = ttk.Frame(window, padding=(8, 0, 8, 8))
+        table.grid(row=2, column=0, sticky="nsew")
+        table.columnconfigure(0, weight=1)
+        table.rowconfigure(0, weight=1)
+        tree = ttk.Treeview(table, columns=RELATION_COLUMNS, show="headings")
+        widths = {
+            "condition_id": 130,
+            "schema_id": 150,
+            "specimen_id": 150,
+            "replicate_no": 80,
+            "specimen_key": 260,
+            "layer_no": 65,
+            "sample_count": 80,
+            "layer_file": 250,
+            "timestamp_file": 220,
+            "saved_at": 155,
+        }
+        for name in RELATION_COLUMNS:
+            tree.heading(name, text=RELATION_COLUMN_LABELS.get(name, name))
+            tree.column(name, width=widths.get(name, 130), minwidth=55, anchor="center")
+        tree.grid(row=0, column=0, sticky="nsew")
+        yscroll = ttk.Scrollbar(table, orient="vertical", command=tree.yview)
+        xscroll = ttk.Scrollbar(table, orient="horizontal", command=tree.xview)
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+
+        state: dict[str, Any] = {"busy": False, "after_id": None, "closed": False}
+
+        def current_filters() -> dict[str, Any]:
+            layer_text = layer_var.get().strip()
+            layer_no: int | None = None
+            if layer_text:
+                try:
+                    layer_no = int(layer_text)
+                except ValueError as exc:
+                    raise ValueError("铺层筛选必须填写整数，例如 1；留空表示全部铺层") from exc
+                if layer_no < 1:
+                    raise ValueError("铺层筛选必须大于或等于 1")
+            return {
+                "condition_id": condition_var.get().strip() or None,
+                "specimen_id": specimen_var.get().strip() or None,
+                "layer_no": layer_no,
+            }
+
+        def schedule_next() -> None:
+            previous = state.get("after_id")
+            if previous is not None:
+                try:
+                    window.after_cancel(previous)
+                except tk.TclError:
+                    pass
+                state["after_id"] = None
+            if auto_var.get() and not state["closed"]:
+                state["after_id"] = window.after(5000, refresh)
+
+        def apply_result(result: dict[str, Any]) -> None:
+            state["busy"] = False
+            if state["closed"] or not window.winfo_exists():
+                return
+            refresh_button.config(state="normal")
+            if not result.get("ok"):
+                status_var.set("读取失败：" + str(result.get("error") or "未知错误"))
+                schedule_next()
+                return
+            rows = list(result.get("rows") or [])
+            reported_columns = list(result.get("columns") or [])
+            columns = [name for name in RELATION_COLUMNS if name in reported_columns or not reported_columns]
+            columns.extend(name for name in reported_columns if name not in columns)
+            if not columns:
+                columns = list(RELATION_COLUMNS)
+            tree.delete(*tree.get_children())
+            tree["columns"] = columns
+            for name in columns:
+                tree.heading(name, text=RELATION_COLUMN_LABELS.get(name, name))
+                tree.column(name, width=widths.get(name, 130), minwidth=55, anchor="center")
+            for row in rows:
+                tree.insert("", "end", values=[row.get(name, "") for name in columns])
+            total = result.get("total_count", result.get("count", len(rows)))
+            status_var.set(
+                f"当前显示 {len(rows)} 条；符合筛选条件共 {total} 条。"
+                + (" 数据较多，仅显示前 10000 条。" if result.get("has_more") else "")
+                + (" 已自动创建/补齐 AFP 数据库关系结构。" if result.get("auto_initialized") else "")
+            )
+            schedule_next()
+
+        def refresh() -> None:
+            if state["closed"] or state["busy"]:
+                return
+            try:
+                filters = current_filters()
+            except ValueError as exc:
+                status_var.set(str(exc))
+                schedule_next()
+                return
+            state["busy"] = True
+            refresh_button.config(state="disabled")
+            status_var.set(f"正在读取{scope_label}数据库……")
+
+            def worker() -> None:
+                try:
+                    store = MySQLCaptureStore(settings)
+                    try:
+                        result = store.relation_map(
+                            10000, auto_initialize=True, **filters
+                        )
+                    except TypeError:
+                        # Older packages did not yet expose server-side
+                        # filters. Keep the relationship viewer functional and
+                        # filter the bounded result locally.
+                        result = store.relation_map(10000)
+                        if result.get("ok"):
+                            rows = list(result.get("rows") or [])
+                            for name, value in filters.items():
+                                if value is not None:
+                                    rows = [row for row in rows if str(row.get(name, "")) == str(value)]
+                            result["rows"] = rows
+                            result["count"] = len(rows)
+                            result["total_count"] = len(rows)
+                    self.after(0, lambda: apply_result(result))
+                except Exception as exc:
+                    self.after(
+                        0,
+                        lambda error=str(exc): apply_result(
+                            {"ok": False, "error": error, "rows": []}
+                        ),
+                    )
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def export_current() -> None:
+            try:
+                filters = current_filters()
+            except ValueError as exc:
+                status_var.set(str(exc))
+                return
+            self._export_mysql_csv(filters, parent=window, local=local)
+
+        def auto_changed() -> None:
+            schedule_next()
+            if auto_var.get():
+                refresh()
+
+        def close_window() -> None:
+            state["closed"] = True
+            previous = state.get("after_id")
+            if previous is not None:
+                try:
+                    window.after_cancel(previous)
+                except tk.TclError:
+                    pass
+            window.destroy()
+
+        refresh_button.config(command=refresh)
+        export_button.config(command=export_current)
+        auto_var.trace_add("write", lambda *_args: auto_changed())
+        window.protocol("WM_DELETE_WINDOW", close_window)
+        refresh()
 
     def _poll(self) -> None:
         if self.dashboard is None:
@@ -634,14 +1268,15 @@ class TrainingPanel(ttk.Frame):
         self._field(source, "窗口滑动步长", "stride", 24, 3, 2)
 
         mysql = ttk.LabelFrame(parent, text="MySQL 来源（选择 MySQL 时使用）", padding=8); mysql.grid(row=1, column=0, sticky="ew", pady=4)
-        for col in range(3): mysql.columnconfigure(col, weight=1)
-        self._field(mysql, "主机", "train_mysql_host", "127.0.0.1", 0, 0)
-        self._field(mysql, "端口", "train_mysql_port", 3306, 0, 1)
-        self._field(mysql, "用户", "train_mysql_user", "root", 0, 2)
-        self._field(mysql, "密码", "train_mysql_password", "", 1, 0, show="*")
-        self._field(mysql, "数据库", "train_mysql_database", "afp_state_warning", 1, 1)
-        ttk.Label(mysql, text="SQL查询").grid(row=4, column=0, sticky="w", padx=4)
-        self.query_text = tk.Text(mysql, height=8, wrap="none"); self.query_text.grid(row=5, column=0, columnspan=3, sticky="ew", padx=4, pady=4)
+        mysql.columnconfigure(0, weight=1)
+        ttk.Label(
+            mysql,
+            text="使用“实时采集 · 预测 · 预警”页中的统一 MySQL 地址、账号和数据库名称，避免保存与训练读取指向不同数据库。",
+            foreground=COLORS["muted"],
+            wraplength=620,
+        ).grid(row=0, column=0, sticky="ew", padx=4, pady=(2, 5))
+        ttk.Label(mysql, text="SQL查询").grid(row=1, column=0, sticky="w", padx=4)
+        self.query_text = tk.Text(mysql, height=8, wrap="none"); self.query_text.grid(row=2, column=0, sticky="ew", padx=4, pady=4)
 
         train = ttk.LabelFrame(parent, text="2. I-ModernTCN 训练设置", padding=8); train.grid(row=2, column=0, sticky="ew", pady=4)
         for col in range(4): train.columnconfigure(col, weight=1)
@@ -699,7 +1334,8 @@ class TrainingPanel(ttk.Frame):
         if selected: self.vars["output_root"].set(selected)
 
     def import_data(self) -> None:
-        payload = {"source": str(self.vars["source_kind"].get()), "path": str(self.vars["source_path"].get()), "data_mode": str(self.vars["data_mode"].get()), "condition_columns": str(self.vars["condition_columns"].get()), "input_columns": str(self.vars["input_columns"].get()), "output_columns": str(self.vars["output_columns"].get()), "history_length": _safe_int(self.vars["history_length"].get(), 24, 1), "prediction_length": _safe_int(self.vars["prediction_length"].get(), 24, 1), "stride": _safe_int(self.vars["stride"].get(), 24, 1), "query": self.query_text.get("1.0", "end").strip(), "mysql": {"host": str(self.vars["train_mysql_host"].get()), "port": _safe_int(self.vars["train_mysql_port"].get(), 3306, 1), "user": str(self.vars["train_mysql_user"].get()), "password": str(self.vars["train_mysql_password"].get()), "database": str(self.vars["train_mysql_database"].get())}}
+        mysql_settings = self.app.acquisition_panel._mysql_settings()
+        payload = {"source": str(self.vars["source_kind"].get()), "path": str(self.vars["source_path"].get()), "data_mode": str(self.vars["data_mode"].get()), "condition_columns": str(self.vars["condition_columns"].get()), "input_columns": str(self.vars["input_columns"].get()), "output_columns": str(self.vars["output_columns"].get()), "history_length": _safe_int(self.vars["history_length"].get(), 24, 1), "prediction_length": _safe_int(self.vars["prediction_length"].get(), 24, 1), "stride": _safe_int(self.vars["stride"].get(), 24, 1), "query": self.query_text.get("1.0", "end").strip(), "mysql": {"host": mysql_settings.host, "port": mysql_settings.port, "user": mysql_settings.user, "password": mysql_settings.password, "database": mysql_settings.database, "charset": mysql_settings.charset, "connect_timeout": mysql_settings.connect_timeout}}
         self.precheck.set("正在读取、筛选并整合数据……")
         def work() -> None:
             try:
@@ -881,6 +1517,9 @@ def main() -> None:
                 "min_delta": 1e-6,
                 "device": "cpu",
                 "seed": 20260813,
+                # Exercise the packaged comparison-model import path here;
+                # --model-smoke separately covers inference for all 22 weights.
+                "model_type": "TCN",
                 "task_name": "packaged_integration_smoke",
             },
             report_root / "training",

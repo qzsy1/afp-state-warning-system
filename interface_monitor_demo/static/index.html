@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AFP 接口状态监控 · LangChain 诊断 Demo</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">AFP INTEGRATED SYSTEM · M3232 · v2.0.6</p>
+        <h1>接口状态监控与智能诊断</h1>
+        <p class="subtitle">确定性监控负责发现异常，LangChain 负责组织证据与解释流程</p>
+      </div>
+      <div class="system-summary" aria-label="系统状态摘要">
+        <span class="pulse-dot"></span>
+        <div><strong id="healthyCount">5 / 5</strong><small>接口正常</small></div>
+        <div><strong id="eventCount">0</strong><small>活动事件</small></div>
+      </div>
+    </header>
+
+    <div id="simulationBanner" class="simulation-banner">
+      <span>LOCAL SIMULATION</span>
+      <p>本页面只使用模拟接口数据与本地规则，不读取真实硬件，也不会访问外部模型。</p>
+    </div>
+
+    <main>
+      <section class="overview-layout">
+        <article class="panel interface-panel">
+          <div class="panel-heading">
+            <div><span class="section-number">01</span><h2>接口状态总览</h2></div>
+            <p>五个物理接口 · 17 个采集通道</p>
+          </div>
+          <div class="pressure-contract">
+            <span><b>PLC</b> 压力</span><i>≠</i><span><b>M3232</b> 薄膜压力</span>
+          </div>
+          <div id="interfaceGrid" class="interface-grid" aria-live="polite"></div>
+        </article>
+
+        <aside class="panel agent-panel">
+          <div class="panel-heading">
+            <div><span class="section-number">02</span><h2>Agent 配置</h2></div>
+            <span id="agentEnabledState" class="gate-state off">未启用</span>
+          </div>
+          <label class="field-label" for="apiKeyInput">API Key</label>
+          <div class="input-shell">
+            <span>KEY</span>
+            <input id="apiKeyInput" type="password" autocomplete="off" placeholder="仅用于启用演示，不会发送">
+          </div>
+          <label class="field-label" for="modelNameInput">模型名称</label>
+          <div class="input-shell">
+            <span>AI</span>
+            <input id="modelNameInput" type="text" autocomplete="off" placeholder="例如 local-demo-model">
+          </div>
+          <div class="privacy-note">
+            <strong>Key 留在浏览器</strong>
+            <span>后端只接收“已填写”标志；模型名称仅作为流程标签。</span>
+          </div>
+          <button id="diagnoseButton" class="primary-button" type="button" disabled>
+            <span>运行 LangChain 本地诊断</span><b>→</b>
+          </button>
+        </aside>
+      </section>
+
+      <section class="panel control-flow-panel">
+        <div class="scenario-bar">
+          <div class="scenario-title"><span class="section-number">03</span><div><h2>故障场景</h2><small>选择一个接口并注入模拟异常</small></div></div>
+          <label>目标接口<select id="scenarioInterface"></select></label>
+          <label>异常类型<select id="scenarioType"></select></label>
+          <button id="injectScenarioButton" class="warning-button" type="button">注入异常</button>
+          <button id="resetButton" class="ghost-button" type="button">全部恢复</button>
+        </div>
+
+        <div class="thought-header">
+          <div><span class="section-number">04</span><h2>LangChain 诊断思路</h2></div>
+          <p>页面展示的是可审计的工具编排过程，不是自由聊天。</p>
+        </div>
+        <div id="thoughtFlow" class="thought-flow" aria-label="LangChain诊断流程">
+          <div id="flow-monitor" class="flow-node">
+            <span class="flow-index">1</span><b>确定性监控</b><small>发现接口异常</small>
+          </div>
+          <span class="flow-arrow">→</span>
+          <div id="flow-event" class="flow-node">
+            <span class="flow-index">2</span><b>标准事件</b><small>整理接口与证据</small>
+          </div>
+          <span class="flow-arrow">→</span>
+          <div id="flow-gate" class="flow-node">
+            <span class="flow-index">3</span><b>安全门控</b><small>Key + 模型名称</small>
+          </div>
+          <span class="flow-arrow">→</span>
+          <div id="flow-langchain" class="flow-node emphasis">
+            <span class="flow-index">4</span><b>LangChain 编排</b><small>依次调用本地工具</small>
+          </div>
+          <span class="flow-arrow">→</span>
+          <div id="flow-report" class="flow-node">
+            <span class="flow-index">5</span><b>结构化诊断</b><small>原因、证据与建议</small>
+          </div>
+        </div>
+      </section>
+
+      <section class="result-layout">
+        <article class="panel trace-panel">
+          <div class="panel-heading">
+            <div><span class="section-number">05</span><h2>工具调用轨迹</h2></div>
+            <span class="local-badge">LANGCHAIN · LOCAL</span>
+          </div>
+          <div id="toolTrace" class="tool-trace empty-state" aria-live="polite">
+            注入异常并运行诊断后，这里会逐步展示实际执行顺序。
+          </div>
+        </article>
+        <article class="panel diagnosis-card">
+          <div class="panel-heading">
+            <div><span class="section-number">06</span><h2>诊断结果</h2></div>
+            <span id="diagnosisStatus" class="result-state">等待诊断</span>
+          </div>
+          <div id="diagnosisPanel" class="diagnosis-panel empty-state" aria-live="polite">
+            当前没有诊断结果。模拟结果只用于演示流程，不代表真实硬件故障概率。
+          </div>
+        </article>
+      </section>
+    </main>
+
+    <footer>
+      <span>AFP Interface Monitor Demo</span>
+      <span>确定性发现 · 可审计编排 · 人工确认处置</span>
+    </footer>
+  </div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>

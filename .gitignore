@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.venv/
 *.pid
 *.log
 
@@ -22,6 +23,7 @@ thesis_draft/*
 *.joblib
 
 # Generated desktop distribution and acquisition records
+/AFP_Capture/
 visualization_app/desktop_build/
 visualization_app/release/
 visualization_app/captured_data/
@@ -30,10 +32,35 @@ visualization_app/new_collection_demo_v11_3/
 visualization_app/portable_build*.log
 visualization_app/server_*.log
 visualization_app/AFP_State_Warning_System.exe
+visualization_app/runtime/verification/
 
 # User-specific editor files
 .idea/
 .vscode/
 visualization_app/trained_models_web/
+visualization_app/models/
 visualization_app/req.json
 visualization_app/test_training_request.json
+
+# Modular runtime: generated delivery, user data, models and local state
+/delivery/
+/runtime/
+modular_runtime/dist/
+modular_runtime/build/
+modular_runtime/runtime/
+modular_runtime/logs/
+modular_runtime/rollback/
+modular_runtime/updates/inbox/
+modular_runtime/updates/staging/
+modular_runtime/config/local/
+modular_runtime/models/
+!modular_runtime/models/README.md
+*.zip
+*.7z
+*.bak
+
+# Quality-gate runtime evidence (source matrices and rules remain tracked)
+/verification/results/
+/harness/logs/
+/harness/reports/
+/harness/config/local-settings.json
