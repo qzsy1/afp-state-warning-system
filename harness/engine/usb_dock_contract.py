@@ -155,6 +155,30 @@ def validate_frontend_source(source: str) -> tuple[str, ...]:
     return tuple(issues)
 
 
+def validate_acquisition_source(source: str) -> tuple[str, ...]:
+    issues: list[str] = []
+    obsolete_skip = 'if physical_fallback or item.get("physical_verified") is False:'
+    if obsolete_skip in source:
+        issues.append(
+            "unverified physical-port bindings must not skip the configured sensor driver check"
+        )
+    requirements = {
+        "interface checks must keep probing configured drivers": (
+            "if physical_fallback:",
+            "MultiInterfaceDriver",
+            "physical_unverified",
+        ),
+        "interface checks must keep the real-capture port gate separate": (
+            "physical_verified",
+            "不能启动真实采集",
+        ),
+    }
+    for message, tokens in requirements.items():
+        if not all(token in source for token in tokens):
+            issues.append(message)
+    return tuple(issues)
+
+
 def run_repo_contract(repo_root: Path) -> tuple[str, ...]:
     root = repo_root.resolve()
     app_dir = root / "visualization_app"
@@ -178,6 +202,11 @@ def run_repo_contract(repo_root: Path) -> tuple[str, ...]:
         issues.append(f"front-end source does not exist: {frontend_path}")
     else:
         issues.extend(validate_frontend_source(frontend_path.read_text(encoding="utf-8")))
+    acquisition_path = app_dir / "acquisition.py"
+    if not acquisition_path.is_file():
+        issues.append(f"acquisition source does not exist: {acquisition_path}")
+    else:
+        issues.extend(validate_acquisition_source(acquisition_path.read_text(encoding="utf-8")))
     return tuple(issues)
 
 

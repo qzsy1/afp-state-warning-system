@@ -2893,9 +2893,15 @@ class AcquisitionManager:
             physical_kind = str(item.get("physical_interface_kind") or profile.get("physical_kind") or "")
             protocol = str(profile.get("protocol") or item.get("driver") or "")
             physical_fallback = bool(item.get("physical_fallback", False))
+            physical_verified = item.get("physical_verified") is not False
             physical_warning = (
                 "当前未识别到匹配协议，已临时分配串口，仅用于测试"
-                if physical_fallback else ""
+                if physical_fallback
+                else (
+                    "物理端口尚未与实时设备关联；接口检查仍会读取原驱动，"
+                    "但检查结果不能解除真实采集门禁"
+                    if not physical_verified else ""
+                )
             )
             expected = [
                 name for name in config.interface_channel_assignments.get(interface_id, [])
@@ -2936,22 +2942,17 @@ class AcquisitionManager:
             # A serial fallback is deliberately a test-only binding.  The
             # selected protocol driver (for example UVC or SMRF HID) may call
             # a vendor DLL/API that blocks when the real device is absent.
-            # Do not invoke that driver on an unverified fallback; report a
-            # deterministic not-connected result so the remaining interfaces
-            # and the diagnostic agent can continue.
-            if physical_fallback or item.get("physical_verified") is False:
+            # Skip only that incompatible fallback.  A valid configured
+            # driver must still be probed when its physical-port association
+            # is not verified so the operator keeps the original interface
+            # and sensor-data check.  Port verification remains a separate
+            # real-capture gate below.
+            if physical_fallback:
                 state = "not_connected"
-                if physical_fallback:
-                    message = (
-                        "未识别到匹配协议，已临时分配串口，仅用于测试；"
-                        "跳过真实协议探测，请连接设备后重新检查"
-                    )
-                else:
-                    message = (
-                        "端口存在，未检测到兼容设备；请连接设备后重新识别接口并检查"
-                        if physical_port_id and not physical_id
-                        else "实际物理接口尚未验证，跳过真实协议探测；请重新识别接口后检查"
-                    )
+                message = (
+                    "未识别到匹配协议，已临时分配串口，仅用于测试；"
+                    "跳过真实协议探测，请连接设备后重新检查"
+                )
                 errors.append(f"{endpoint}：{message}")
                 interface_results.append({
                     "id": interface_id, "role": item.get("role", "custom"),
@@ -3004,9 +3005,12 @@ class AcquisitionManager:
             missing = [name for name in expected if detected.get(name, 0) <= 0]
             invalid_channels = [name for name in missing if invalid.get(name, 0) > 0]
             if detected:
-                state, message = "ok", f"接口已收到有效数据：{'、'.join(sorted(detected))}"
+                state = "ok" if physical_verified else "physical_unverified"
+                message = f"接口已收到有效数据：{'、'.join(sorted(detected))}"
                 if missing:
                     message += f"；未收到通道不阻止采集：{'、'.join(missing)}"
+                if not physical_verified:
+                    message += "；物理端口尚未与该实时设备关联，不能启动真实采集"
             elif probe_errors:
                 state, message = "not_connected", f"接口无法打开或读取：{'；'.join(probe_errors)}"
             elif invalid_channels:
@@ -3021,6 +3025,7 @@ class AcquisitionManager:
                 "physical_interface_id": physical_id, "physical_port_id": physical_port_id,
                 "physical_interface_kind": physical_kind,
                 "protocol": protocol, "physical_fallback": physical_fallback,
+                "physical_verified": physical_verified,
                 "physical_warning": physical_warning,
                 "enabled": True, "expected_channels": expected,
                 "detected_channels": sorted(detected), "missing_channels": missing,

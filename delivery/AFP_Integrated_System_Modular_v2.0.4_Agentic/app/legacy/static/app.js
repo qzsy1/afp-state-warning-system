@@ -6490,6 +6490,7 @@ function hardwareStateLabel(value) {
     ok: "正常", precomputed_success: "预计算演示成功", disabled: "已停用", video_only: "仅视频",
     no_channels: "无已选通道", waiting: "等待数据",
     not_connected: "未连接", no_data: "没有采集数据",
+    physical_unverified: "数据已读，物理端口未验证",
     identity_unconfirmed: "目标设备身份未确认",
     endpoint_unreachable: "目标网络端点不可达",
     open_failed: "接口无法打开或读取",

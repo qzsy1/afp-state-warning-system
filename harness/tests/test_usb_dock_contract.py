@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from harness.engine.usb_dock_contract import (
+    validate_acquisition_source,
     validate_discovery_payload,
     validate_frontend_source,
 )
@@ -191,6 +192,24 @@ class UsbDockContractValidatorTests(unittest.TestCase):
         issues = "\n".join(validate_discovery_payload(payload))
 
         self.assertIn("confirmation must be observed_current or observed_history", issues)
+
+    def test_interface_check_keeps_driver_probe_separate_from_port_gate(self) -> None:
+        compliant = '''
+        physical_verified = item.get("physical_verified") is not False
+        if physical_fallback:
+            return
+        interface_driver = MultiInterfaceDriver()
+        state = "ok" if physical_verified else "physical_unverified"
+        message = "不能启动真实采集"
+        '''
+        self.assertEqual(validate_acquisition_source(compliant), ())
+
+        obsolete = '''
+        if physical_fallback or item.get("physical_verified") is False:
+            return
+        '''
+        issues = "\n".join(validate_acquisition_source(obsolete))
+        self.assertIn("must not skip", issues)
 
 
 if __name__ == "__main__":
