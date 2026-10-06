@@ -81,6 +81,7 @@ const controls = {
   mysqlDatabase: $("mysqlDatabaseInput"),
   testMysql: $("testMysqlButton"),
   predictionModel: $("predictionModelInput"),
+  predictionModelType: $("predictionModelTypeSelect"),
   livePower: $("livePowerInput"),
   liveSpeed: $("liveSpeedInput"),
   livePressure: $("livePressureInput"),
@@ -113,10 +114,54 @@ function option(value, text) {
   return node;
 }
 
+function populatePredictionModelTypes() {
+  if (!controls.predictionModelType) return;
+  const models = state.bootstrap?.acquisition?.prediction_models || [];
+  const current = state.bootstrap?.acquisition?.prediction_model?.model_type || "i_T_G";
+  controls.predictionModelType.replaceChildren(
+    ...models.map((item) => option(
+      item.id,
+      `${item.label || item.id}${item.training_only ? "（需训练专用模型）" : ""}`
+    ))
+  );
+  controls.predictionModelType.value = models.some((item) => item.id === current)
+    ? current
+    : (models[0]?.id || "i_T_G");
+}
+
 function fmt(value, digits = 3) {
   if (value === null || value === undefined || value === "") return "—";
   const number = Number(value);
   return Number.isFinite(number) ? number.toFixed(digits) : "—";
+}
+
+// v2 intentionally starts clean so an older installation cannot restore a
+// source-tree/internal checkpoint instead of the matching EXE-local weight.
+// New manual selections are still remembered from this version onward.
+const MODEL_SELECTION_HISTORY_KEY = "afp-model-selection-history-v2";
+function modelSelectionKey(schemaMode, modelType) {
+  return `${schemaMode || "legacy_original"}::${modelType || "i_T_G"}`;
+}
+function readModelSelectionHistory() {
+  try {
+    const value = JSON.parse(localStorage.getItem(MODEL_SELECTION_HISTORY_KEY) || "{}");
+    return value && typeof value === "object" ? value : {};
+  } catch (_) {
+    return {};
+  }
+}
+function rememberModelPath(schemaMode, modelType, checkpoint) {
+  if (!checkpoint) return;
+  const history = readModelSelectionHistory();
+  history[modelSelectionKey(schemaMode, modelType)] = checkpoint;
+  try {
+    localStorage.setItem(MODEL_SELECTION_HISTORY_KEY, JSON.stringify(history));
+  } catch (_) {
+    // Browser storage can be disabled; the server-side history remains active.
+  }
+}
+function lastModelPath(schemaMode, modelType) {
+  return readModelSelectionHistory()[modelSelectionKey(schemaMode, modelType)] || "";
 }
 
 function toast(message) {
@@ -156,6 +201,7 @@ function acquisitionConfig() {
     model_input_sensors: selectedModelInputSensors(),
     model_output_sensors: selectedPredictionSensors(),
     prediction_model_file: controls.predictionModel.value.trim(),
+    prediction_model_type: controls.predictionModelType?.value || "i_T_G",
     health_indicator: controls.indicator.value || "TC-HI",
     run_id: controls.runId.value.trim() || "LIVE_RUN",
     specimen_id: controls.liveSpecimen.value.trim() || "LIVE_SPECIMEN",
@@ -361,6 +407,9 @@ function renderRuntimeStatus(payload = state.payload) {
 function applyPredictionModelProfile(profile, setSelections = true) {
   if (!profile) return;
   controls.predictionModel.value = profile.checkpoint || "";
+  if (controls.predictionModelType && profile.model_type) {
+    controls.predictionModelType.value = profile.model_type;
+  }
   const inputSet = new Set(profile.input_sensors || []);
   const outputSet = new Set(profile.output_sensors || []);
   if (setSelections) {
@@ -422,10 +471,15 @@ function configureBestPredictionOverride() {
 
 async function inspectPredictionModel(setSelections = true) {
   try {
+    const schemaMode = controls.datasetSchema.value || "legacy_original";
+    const modelType = controls.predictionModelType?.value || "i_T_G";
     const profile = await postJson("/api/prediction-model/inspect", {
       path: controls.predictionModel.value.trim(),
+      model_type: modelType,
+      schema_mode: schemaMode,
     });
     applyPredictionModelProfile(profile, setSelections);
+    rememberModelPath(schemaMode, modelType, profile.checkpoint || "");
     return profile;
   } catch (error) {
     const status = $("predictionModelStatus");
@@ -438,11 +492,16 @@ async function inspectPredictionModel(setSelections = true) {
 
 async function selectPredictionModel() {
   try {
+    const schemaMode = controls.datasetSchema.value || "legacy_original";
+    const modelType = controls.predictionModelType?.value || "i_T_G";
     const result = await postJson("/api/prediction-model/select-file", {
       initial_path: controls.predictionModel.value.trim(),
+      model_type: modelType,
+      schema_mode: schemaMode,
     });
     if (result.selected) {
       applyPredictionModelProfile(result.model, true);
+      rememberModelPath(schemaMode, modelType, result.path || result.model?.checkpoint || "");
       toast("预测模型已选择，并已按模型元数据设置输入/输出通道");
     }
   } catch (error) {
@@ -879,6 +938,14 @@ function configureDatasetSchema(useDefaults = true) {
       );
       state.manualPredictionModels[schema.id] =
         state.bootstrap.acquisition.prediction_model.checkpoint;
+    }
+    const rememberedPath = lastModelPath(
+      schema.id,
+      controls.predictionModelType?.value || "i_T_G"
+    );
+    if (rememberedPath) {
+      controls.predictionModel.value = rememberedPath;
+      inspectPredictionModel(true).catch(() => {});
     }
   }
   // Rebuild indicator/model selections after the channel checklist has been
@@ -1588,6 +1655,7 @@ async function initialize() {
     if (!response.ok) throw new Error(payload.error || "初始化失败");
     state.bootstrap = payload;
     state.defaults = payload.defaults;
+    populatePredictionModelTypes();
     controls.specimen.replaceChildren(...payload.specimens.map((item) =>
       option(item.id, `${item.id} · ${item.true_state_label}`)
     ));
@@ -1683,6 +1751,12 @@ controls.processingMode.addEventListener("change", () => {
 controls.datasetSchema.addEventListener("change", () => {
   configureDatasetSchema(true);
   markLiveScopeChanged();
+  if (!controls.bestPredictionOverride.checked && controls.predictionModelType) {
+    const schemaMode = controls.datasetSchema.value || "legacy_original";
+    const modelType = controls.predictionModelType.value || "i_T_G";
+    controls.predictionModel.value = lastModelPath(schemaMode, modelType);
+    inspectPredictionModel(true).catch(() => {});
+  }
 });
 controls.autoIndicator.addEventListener("change", () => {
   configureAutomaticIndicator(true);
@@ -1720,11 +1794,23 @@ $("selectSaveRootButton").addEventListener("click", selectSaveRoot);
 $("selectPredictionModelButton").addEventListener("click", selectPredictionModel);
 controls.predictionModel.addEventListener("change", () => {
   if (!controls.bestPredictionOverride.checked) {
+    const schemaMode = controls.datasetSchema.value || "legacy_original";
+    const modelType = controls.predictionModelType?.value || "i_T_G";
+    rememberModelPath(schemaMode, modelType, controls.predictionModel.value.trim());
     state.manualPredictionModels[
-      controls.datasetSchema.value || "legacy_original"
+      schemaMode
     ] = controls.predictionModel.value.trim();
     inspectPredictionModel(false).catch(() => {});
   }
+});
+controls.predictionModelType?.addEventListener("change", () => {
+  if (controls.bestPredictionOverride.checked) return;
+  const schemaMode = controls.datasetSchema.value || "legacy_original";
+  const modelType = controls.predictionModelType.value || "i_T_G";
+  controls.predictionModel.value = lastModelPath(schemaMode, modelType);
+  inspectPredictionModel(true)
+    .then(() => toast(`已切换预测算法：${controls.predictionModelType.value}`))
+    .catch(() => {});
 });
 $("startAcquisitionButton").addEventListener("click", startAcquisition);
 $("stopAcquisitionButton").addEventListener("click", stopAcquisition);

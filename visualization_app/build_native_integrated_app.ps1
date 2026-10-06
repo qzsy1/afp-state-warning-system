@@ -4,19 +4,28 @@
 )
 $ErrorActionPreference = "Stop"
 $AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$RuntimeModelsRoot = Join-Path $AppDir "models"
 $StateMonitorDir = Split-Path -Parent $AppDir
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $StateMonitorDir))
 $LegacyCheckpoint = Join-Path $ProjectRoot "checkpoints\health_i_T_G_MyCustom_ftM_sl24_ll24_pl24_dm128_nh8_el2_dl1_df2048_fc1_ebtimeF_dtTrue_health_v9_conditional_normal_no_param_score_lr0.001_bs128\checkpoint.pth"
 $LegacyReplayDir = Join-Path $StateMonitorDir "outputs_tc_hi_soft_consistency_v13_8"
 $CausalArtifact = Join-Path $StateMonitorDir "outputs_causal_online_consistency_v13_9\causal_online_consistency_artifact.joblib"
 $ModelRuntimeRoot = "F:\program\XJUsorceopen"
+$ProjectModelRoot = Join-Path $ProjectRoot "models"
+$ProjectLayersRoot = Join-Path $ProjectRoot "layers"
+$ProjectUtilsRoot = Join-Path $ProjectRoot "utilsaa"
+$ComparisonCheckpointRoot = Join-Path $ProjectRoot "checkpoints"
+$TCNCheckpoint = (Get-ChildItem -LiteralPath $ComparisonCheckpointRoot -Directory -Filter "test_TCN_*sl24_ll24_pl24*" | Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName "checkpoint.pth" })
+$TransformerCheckpoint = (Get-ChildItem -LiteralPath $ComparisonCheckpointRoot -Directory -Filter "test_Transformer_*sl24_ll24_pl24*" | Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName "checkpoint.pth" })
+$FNN2024Checkpoint = (Get-ChildItem -LiteralPath $ComparisonCheckpointRoot -Directory -Filter "test_FNN_2024_*sl24_ll24_pl24*" | Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName "checkpoint.pth" })
+$FNN2025Checkpoint = (Get-ChildItem -LiteralPath $ComparisonCheckpointRoot -Directory -Filter "test_FNN_2025_Base_*sl24_ll24_pl24*" | Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName "checkpoint.pth" })
 $TrainingCore = Join-Path (Split-Path -Parent $StateMonitorDir) "final_training_packages\new_data_full_pipeline"
 $LegacySource = Get-ChildItem -LiteralPath (Split-Path -Parent $StateMonitorDir) -File -Filter "*.csv" | Where-Object { $_.Length -eq 22912911 } | Select-Object -First 1 -ExpandProperty FullName
 $BuildRoot = Join-Path $env:TEMP "AFPIntegratedNativeBuild"
 $DistDir = Join-Path $BuildRoot "dist"
 $WorkDir = Join-Path $BuildRoot "work"
 
-foreach ($Required in @($PythonExecutable, $LegacyCheckpoint, $LegacyReplayDir, $CausalArtifact, $LegacySource, $TrainingCore, (Join-Path $ModelRuntimeRoot "shijie"))) {
+foreach ($Required in @($PythonExecutable, $LegacyCheckpoint, $LegacyReplayDir, $CausalArtifact, $LegacySource, $TrainingCore, (Join-Path $ModelRuntimeRoot "shijie"), $ProjectModelRoot, $ProjectLayersRoot, $ProjectUtilsRoot, $TCNCheckpoint, $TransformerCheckpoint, $FNN2024Checkpoint, $FNN2025Checkpoint)) {
     if (-not (Test-Path -LiteralPath $Required)) { throw "Required asset missing: $Required" }
 }
 if (Test-Path -LiteralPath $BuildRoot) { Remove-Item -LiteralPath $BuildRoot -Recurse -Force }
@@ -25,15 +34,23 @@ New-Item -ItemType Directory -Force -Path $BuildRoot | Out-Null
 & $PythonExecutable -m PyInstaller `
     --noconfirm --clean --onedir --noconsole `
     --name "AFP_Integrated_System" `
+    --paths "$ProjectRoot" --paths "$ModelRuntimeRoot" `
     --add-data "$AppDir\static;static" `
     --add-data "$AppDir\data;data" `
     --add-data "$AppDir\new_collection_demo_v11_3;new_collection_demo_v11_3" `
     --add-data "$LegacyReplayDir;data\legacy_replay" `
     --add-data "$CausalArtifact;data" `
     --add-data "$LegacyCheckpoint;models" `
+    --add-data "$TCNCheckpoint;models\TCN" `
+    --add-data "$TransformerCheckpoint;models\Transformer" `
+    --add-data "$FNN2024Checkpoint;models\FNN_2024" `
+    --add-data "$FNN2025Checkpoint;models\FNN_2025_Base" `
     --add-data "$LegacySource;data" `
     --add-data "$ModelRuntimeRoot\shijie;model_runtime\shijie" `
     --add-data "$ModelRuntimeRoot\modern_TCN_models;model_runtime\modern_TCN_models" `
+    --add-data "$ProjectModelRoot;model_runtime\models" `
+    --add-data "$ProjectLayersRoot;model_runtime\layers" `
+    --add-data "$ProjectUtilsRoot;model_runtime\utilsaa" `
     --add-data "$TrainingCore;training_core" `
     --collect-all torch_geometric `
     --collect-submodules mysql.connector `
@@ -46,7 +63,10 @@ New-Item -ItemType Directory -Force -Path $BuildRoot | Out-Null
     --hidden-import app --hidden-import acquisition --hidden-import mysql_storage `
     --hidden-import native_integrated_app --hidden-import native_frontend_launcher `
     --hidden-import webview --hidden-import webview.platforms.winforms `
-    --hidden-import online_inference --hidden-import online_health_features `
+    --hidden-import online_inference --hidden-import atavn --hidden-import online_health_features `
+    --hidden-import models.TCN --hidden-import models.Transformer --hidden-import models.Informer `
+    --hidden-import models.DeepVAR --hidden-import models.DLinear --hidden-import models.NLinear `
+    --hidden-import models.Linear --hidden-import models.MLP --hidden-import models.FNN `
     --hidden-import causal_online_runtime --hidden-import runtime_scaler `
     --hidden-import new_collection_health --hidden-import runtime_health_primitives `
     --hidden-import web_training --hidden-import web_training_pipeline `
@@ -64,11 +84,16 @@ if (Test-Path -LiteralPath $TargetDir) {
     Move-Item -LiteralPath $TargetDir -Destination $Backup
 }
 Copy-Item -LiteralPath $Built -Destination $TargetDir -Recurse
+if (Test-Path -LiteralPath $RuntimeModelsRoot) {
+    # Keep trained runtime weights beside the executable so the user can
+    # replace or inspect them without unpacking the PyInstaller internals.
+    Copy-Item -LiteralPath $RuntimeModelsRoot -Destination (Join-Path $TargetDir "models") -Recurse -Force
+}
 $SourceTarget = Join-Path $TargetDir "source\visualization_app"
 New-Item -ItemType Directory -Force -Path $SourceTarget | Out-Null
 $SourceFiles = @(
     "native_frontend_launcher.py", "native_integrated_app.py", "app.py", "acquisition.py", "mysql_storage.py",
-    "online_inference.py", "online_health_features.py", "causal_online_runtime.py",
+    "online_inference.py", "atavn.py", "online_health_features.py", "causal_online_runtime.py",
     "runtime_scaler.py", "new_collection_health.py", "runtime_health_primitives.py",
     "web_training.py", "web_training_pipeline.py", "training_data.py",
     "build_native_integrated_app.ps1", "test_native_integrated_app.py"
@@ -83,8 +108,8 @@ $ReadmeLines = @(
     "Start: AFP_Integrated_System.exe",
     "",
     "Pages:",
-    "1. Acquisition, I-ModernTCN prediction, window/layer/specimen warning",
-    "2. CSV/MySQL integration, I-ModernTCN training and warning training",
+    "1. Acquisition, selectable forecasting algorithm (I-ModernTCN/TCN/Transformer/FNN), window/layer/specimen warning",
+    "2. CSV/MySQL integration, selectable thesis-model training and warning training",
     "",
     "The original three-column frontend is embedded in the native window; no external browser or fixed localhost URL is needed.",
     "Keep the _internal folder beside the executable."
