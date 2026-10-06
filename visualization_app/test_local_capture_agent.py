@@ -29,6 +29,13 @@ class LocalCaptureAgentTests(unittest.TestCase):
         manager.discover_interfaces.return_value = {
             "physical_interfaces": [],
             "usb_topology": topology,
+            "interface_transport_catalog": {
+                "schema_version": 1,
+                "usb_ports": [{"id": "usbport:1", "endpoints": []}],
+                "unlocated_usb_interface_ids": [],
+                "native_serial_interface_ids": [],
+                "ethernet_interface_ids": [],
+            },
             "defaults": [],
             "sensor_type_profiles": [],
             "channel_metadata": {},
@@ -38,6 +45,8 @@ class LocalCaptureAgentTests(unittest.TestCase):
         self.assertEqual(payload["usb_topology"], topology)
         self.assertEqual(payload["interfaces"], [])
         self.assertTrue(payload["capabilities"]["usb_topology_v1"])
+        self.assertTrue(payload["capabilities"]["interface_transport_catalog_v1"])
+        self.assertEqual(payload["interface_transport_catalog"]["usb_ports"][0]["id"], "usbport:1")
 
     def test_sample_batch_reads_only_incremental_rows_when_manager_supports_cursor(self):
         manager = Mock()

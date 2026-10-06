@@ -105,7 +105,7 @@ const fetch = async () => { requests += 1; return {ok: true, json: async () => (
     def test_failed_server_target_mysql_has_a_session_bound_retry_control(self):
         html = (Path(__file__).with_name("static") / "index.html").read_text(encoding="utf-8")
         self.assertIn('id="retryTargetMysqlButton"', html)
-        self.assertIn('/app.js?v=20261006-usb-topology-v1', html)
+        self.assertIn('/app.js?v=20261006-usb-transport-v2', html)
         text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
         start = text.index("async function retryServerTargetMysql()")
         end = text.index("async function stopAcquisition()", start)
@@ -765,7 +765,7 @@ const stopPublicDemo = () => {};
         body = text[start:end]
         self.assertIn("autoAssignPhysicalInterfaces", body)
         self.assertIn("physical_interface_id: physicalId", body)
-        self.assertIn("enabled: Boolean(physicalId)", body)
+        self.assertIn("enabled: Boolean(physicalId || physicalPortId)", body)
 
     def test_initialize_does_not_render_unassigned_defaults_before_discovery(self):
         source = Path(__file__).with_name("static") / "app.js"
@@ -832,11 +832,9 @@ const stopPublicDemo = () => {};
         start = text.index("function autoAssignPhysicalInterfaces")
         end = text.index("function refreshPhysicalInterfaceOptions", start)
         body = text[start:end]
-        self.assertIn(
-            "allowSerialFallback && profile.physical_kind === \"serial\"",
-            body,
-            "real discovery must keep USB HID/UVC roles on protocol-compatible interfaces",
-        )
+        self.assertIn("physicalCandidatesForRole(role)", body)
+        self.assertIn("item.physical_fallback = false", body)
+        self.assertIn("USB_SENSOR_ROLES", text)
 
     def test_real_mapping_accepts_protocol_driver_placeholder_without_sensor_data(self):
         source = Path(__file__).with_name("static") / "app.js"
@@ -844,11 +842,9 @@ const stopPublicDemo = () => {};
         start = text.index("function autoAssignPhysicalInterfaces")
         end = text.index("function refreshPhysicalInterfaceOptions", start)
         body = text[start:end]
-        self.assertIn(
-            "candidate.auto_assignable || candidate.driver_available",
-            body,
-            "a detected protocol driver can be mapped before sensor data is streamed",
-        )
+        self.assertIn("const candidates = physicalCandidatesForRole(role)", body)
+        self.assertIn("item.enabled = true", body)
+        self.assertIn("driver_available", text)
 
     def test_switching_to_simulation_rebuilds_logical_catalog_instead_of_reusing_real_bindings(self):
         source = Path(__file__).with_name("static") / "app.js"

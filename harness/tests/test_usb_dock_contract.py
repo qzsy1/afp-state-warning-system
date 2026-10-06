@@ -20,7 +20,19 @@ def compliant_discovery() -> dict:
             ],
             "usb_ports": [
                 {
+                    "id": "usbport:host:1",
+                    "owner_kind": "host",
+                    "dock_id": "",
+                    "system_port_number": 2,
+                    "connector_type": "usb3",
+                    "supported_protocols": ["usb2", "usb3"],
+                    "state": "empty",
+                    "user_connectable": True,
+                    "device_id": None,
+                },
+                {
                     "id": "usbport:a:1",
+                    "owner_kind": "dock",
                     "dock_id": "dock:a",
                     "system_port_number": 1,
                     "connector_type": "usb3",
@@ -31,6 +43,7 @@ def compliant_discovery() -> dict:
                 },
                 {
                     "id": "usbport:a:2",
+                    "owner_kind": "dock",
                     "dock_id": "dock:a",
                     "system_port_number": 2,
                     "connector_type": "usb3",
@@ -41,6 +54,7 @@ def compliant_discovery() -> dict:
                 },
                 {
                     "id": "usbport:a:4",
+                    "owner_kind": "dock",
                     "dock_id": "dock:a",
                     "system_port_number": 4,
                     "connector_type": "internal",
@@ -77,9 +91,27 @@ def compliant_discovery() -> dict:
             {
                 "id": "hid:smrf-01",
                 "kind": "usb_hid",
+                "transport_family": "usb",
                 "parent_port_id": "usbport:a:2",
                 "dock_id": "dock:a",
                 "topology_label": "拓展坞 1 · USB3-2 · SMRFCT08B",
+            },
+            {
+                "id": "serial:COM8",
+                "kind": "serial",
+                "transport_family": "usb",
+                "endpoint_kind": "serial",
+                "endpoint": "COM8",
+                "parent_port_id": "usbport:a:1",
+                "dock_id": "dock:a",
+                "topology_label": "拓展坞 1 · USB3-1 · COM8",
+            },
+            {
+                "id": "serial:COM1",
+                "kind": "serial",
+                "transport_family": "serial_native",
+                "endpoint_kind": "serial",
+                "endpoint": "COM1",
             },
             {
                 "id": "ethernet:asix",
@@ -98,7 +130,7 @@ class UsbDockContractValidatorTests(unittest.TestCase):
 
     def test_rejects_duplicate_ports_and_dangling_device_parent(self) -> None:
         payload = compliant_discovery()
-        payload["usb_topology"]["usb_ports"][1]["id"] = "usbport:a:1"
+        payload["usb_topology"]["usb_ports"][2]["id"] = "usbport:a:1"
         payload["usb_topology"]["devices"][0]["parent_port_id"] = "usbport:missing"
 
         issues = "\n".join(validate_discovery_payload(payload))
@@ -127,13 +159,29 @@ class UsbDockContractValidatorTests(unittest.TestCase):
         config.physical_port_id = selected.value;
         const group = document.createElement("optgroup");
         group.label = "拓展坞 USB 端口";
+        const host = "电脑本机 USB";
+        const nativeSerial = "主机原生串口";
         const ethernet = "拓展坞网口";
         status.textContent = "端口存在，未检测到兼容设备";
+        const USB_SENSOR_ROLES = new Set(["thermocouple", "thermal_uvc", "pressure"]);
+        const interfaceTransportFamily = () => "usb";
+        item.selection_origin = item.selection_origin || "auto";
+        item.selection_origin = "manual";
         """
         self.assertEqual(validate_frontend_source(source), ())
 
         issues = validate_frontend_source("const physical_interface_id = '';")
         self.assertGreaterEqual(len(issues), 4)
+
+    def test_requires_host_owner_and_usb_serial_transport_parentage(self) -> None:
+        payload = compliant_discovery()
+        del payload["usb_topology"]["usb_ports"][0]["owner_kind"]
+        payload["physical_interfaces"][1]["transport_family"] = "serial_native"
+
+        issues = "\n".join(validate_discovery_payload(payload))
+
+        self.assertIn("owner_kind must be host or dock", issues)
+        self.assertIn("serial transport_family must be usb", issues)
 
 
 if __name__ == "__main__":

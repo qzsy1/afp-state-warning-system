@@ -250,6 +250,63 @@ class LaunchTests(unittest.TestCase):
                 bootstrap._afp_server_available("http://127.0.0.1:8771/api/health")
             )
 
+    def test_existing_server_revision_must_match_current_delivery(self) -> None:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = (
+            b'{"status":"ok","version":"2.0","runtime_revision":"new-revision"}'
+        )
+        url = "http://127.0.0.1:8771/api/health"
+        with patch.object(bootstrap.urllib.request, "urlopen", return_value=response):
+            self.assertTrue(
+                bootstrap._afp_server_available(
+                    url, expected_revision="new-revision"
+                )
+            )
+            self.assertFalse(
+                bootstrap._afp_server_available(
+                    url, expected_revision="old-revision"
+                )
+            )
+
+    def test_runtime_revision_uses_integrity_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "SHA256SUMS.txt"
+            manifest.write_bytes(b"first")
+            first = bootstrap._runtime_revision(root)
+            manifest.write_bytes(b"second")
+            self.assertNotEqual(first, bootstrap._runtime_revision(root))
+
+    def test_stale_listener_stop_is_limited_to_same_executable(self) -> None:
+        current = str(Path(sys.executable).resolve())
+        matching = MagicMock()
+        matching.pid = 41
+        matching.exe.return_value = current
+        other = MagicMock()
+        other.pid = 42
+        other.exe.return_value = str(Path(current).with_name("other.exe"))
+        fake_psutil = types.SimpleNamespace(
+            CONN_LISTEN="LISTEN",
+            AccessDenied=RuntimeError,
+            NoSuchProcess=LookupError,
+            net_connections=MagicMock(
+                return_value=[
+                    types.SimpleNamespace(laddr=types.SimpleNamespace(port=8770), status="LISTEN", pid=41),
+                    types.SimpleNamespace(laddr=types.SimpleNamespace(port=8771), status="LISTEN", pid=42),
+                ]
+            ),
+            Process=lambda pid: matching if pid == 41 else other,
+            wait_procs=MagicMock(return_value=([matching], [])),
+        )
+        with patch.dict(sys.modules, {"psutil": fake_psutil}):
+            stopped = bootstrap._stop_stale_local_afp_servers(
+                {8770, 8771}, executable=current
+            )
+        self.assertEqual(stopped, [41])
+        matching.terminate.assert_called_once_with()
+        other.terminate.assert_not_called()
+
     def test_launch_uses_configured_fixed_port_and_lan_bind(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

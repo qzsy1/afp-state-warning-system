@@ -347,10 +347,8 @@ def normalize_usb_topology(
 
     error_list = [str(item) for item in errors if str(item)]
     hubs = [{**hub, "ports": [dict(port) for port in hub.get("ports", [])]} for hub in raw_hubs]
+    root_hubs = [hub for hub in hubs if bool(hub.get("is_root"))]
     public_hubs = [hub for hub in hubs if not bool(hub.get("is_root"))]
-    if not public_hubs:
-        state = "partial" if error_list else "complete"
-        return _empty_topology(state, PROVIDER_NAME, error_list)
 
     hub_by_id = {str(hub["id"]): hub for hub in public_hubs}
     path_to_hub = {
@@ -507,12 +505,19 @@ def normalize_usb_topology(
                     "serial": str(device.get("serial") or ""),
                     "live_interface_id": str(device.get("live_interface_id") or ""),
                     "network_name": str(device.get("network_name") or ""),
+                    "instance_key": _stable_id("pnp", device.get("instance_id") or "") if device.get("instance_id") else "",
+                    "location_keys": [
+                        _stable_id("location", path)
+                        for path in device.get("location_paths", [])
+                        if path
+                    ],
                 })
 
         port_numbers = [int(port["number"]) for _, port in members]
         display_number = min(port_numbers)
         ports.append({
             "id": port_id,
+            "owner_kind": "dock",
             "dock_id": dock_id,
             "system_port_number": display_number,
             "connector_type": "usb3" if "usb3" in protocols else "usb2",
@@ -521,6 +526,148 @@ def normalize_usb_topology(
             "user_connectable": bool(user_connectable),
             "device_id": device_id,
             "internal_function": internal_function,
+            "merge_state": "companion" if len(members) > 1 else "independent",
+        })
+
+    # Root hubs represent connectors owned by the computer.  Include only
+    # ports that Windows explicitly marks user-connectable.  A root port that
+    # leads to a discovered downstream hub is the upstream link for that hub,
+    # not an additional sensor connector.
+    root_by_id = {str(hub["id"]): hub for hub in root_hubs}
+    root_path_to_id = {
+        _canonical_link(str(hub.get("device_path") or "")): str(hub["id"])
+        for hub in root_hubs
+        if hub.get("device_path")
+    }
+    downstream_paths = {
+        _canonical_link(str(hub.get("device_path") or ""))
+        for hub in public_hubs
+        if hub.get("device_path")
+    }
+    downstream_instance_ids = {
+        str(hub.get("instance_id") or "").strip().upper()
+        for hub in public_hubs
+        if hub.get("instance_id")
+    }
+    root_keys = [
+        (str(hub["id"]), int(port["number"]))
+        for hub in root_hubs
+        if hub.get("location_paths")
+        for port in hub.get("ports", [])
+    ]
+    root_union = _UnionFind(root_keys)
+    for hub in root_hubs:
+        if not hub.get("location_paths"):
+            continue
+        hub_id = str(hub["id"])
+        for port in hub.get("ports", []):
+            companion = port.get("companion") or {}
+            companion_hub = str(companion.get("hub_id") or "")
+            if not companion_hub and companion.get("hub_path"):
+                companion_hub = root_path_to_id.get(
+                    _canonical_link(str(companion.get("hub_path") or "")), ""
+                )
+            companion_port = int(companion.get("port_number") or 0)
+            if companion_hub and companion_port:
+                root_union.union(
+                    (hub_id, int(port["number"])),
+                    (companion_hub, companion_port),
+                )
+
+    root_connectors: dict[tuple[str, int], list[tuple[str, dict[str, Any]]]] = defaultdict(list)
+    for hub in root_hubs:
+        if not hub.get("location_paths"):
+            continue
+        for port in hub.get("ports", []):
+            key = (str(hub["id"]), int(port["number"]))
+            root_connectors[root_union.find(key)].append((str(hub["id"]), port))
+
+    for members in root_connectors.values():
+        if not any(port.get("user_connectable") is True for _, port in members):
+            continue
+        if any(
+            _canonical_link(str(port.get("child_hub_path") or "")) in downstream_paths
+            for _, port in members
+            if port.get("child_hub_path")
+        ):
+            continue
+        if any(
+            str((port.get("device") or {}).get("instance_id") or "").strip().upper()
+            in downstream_instance_ids
+            for _, port in members
+            if isinstance(port.get("device"), Mapping)
+        ):
+            continue
+        active = [port for _, port in members if str(port.get("state")) == "occupied"]
+        candidate = active[0] if active else members[0][1]
+        protocols = sorted({
+            protocol
+            for _, port in members
+            for protocol in port.get("supported_protocols", [])
+            if protocol
+        })
+        states = {str(port.get("state") or "unknown") for _, port in members}
+        state = (
+            "occupied" if "occupied" in states
+            else "enumerating" if "enumerating" in states
+            else "error" if "error" in states
+            else "disabled" if "disabled" in states
+            else "empty" if "empty" in states
+            else "unknown"
+        )
+        member_identity = ",".join(
+            f"{hub_id}:{int(port['number'])}"
+            for hub_id, port in sorted(members, key=lambda value: (value[0], int(value[1]["number"])))
+        )
+        locations = [
+            path
+            for hub_id, _ in members
+            for path in root_by_id[hub_id].get("location_paths", [])
+            if path
+        ]
+        port_id = _stable_id("usbport", "host", _common_location(locations), member_identity)
+        device = candidate.get("device") if isinstance(candidate.get("device"), Mapping) else None
+        device_id: str | None = None
+        if device:
+            device_id = _stable_id(
+                "usbdev",
+                device.get("instance_id") or "",
+                port_id,
+                device.get("vid"),
+                device.get("pid"),
+                device.get("serial") or "",
+            )
+            if device_id not in device_ids:
+                device_ids.add(device_id)
+                devices.append({
+                    "id": device_id,
+                    "parent_port_id": port_id,
+                    "class": str(device.get("class") or "usb"),
+                    "friendly_name": str(device.get("friendly_name") or device.get("description") or "USB 设备"),
+                    "vid": device.get("vid"),
+                    "pid": device.get("pid"),
+                    "serial": str(device.get("serial") or ""),
+                    "live_interface_id": str(device.get("live_interface_id") or ""),
+                    "network_name": str(device.get("network_name") or ""),
+                    "instance_key": _stable_id("pnp", device.get("instance_id") or "") if device.get("instance_id") else "",
+                    "location_keys": [
+                        _stable_id("location", path)
+                        for path in device.get("location_paths", [])
+                        if path
+                    ],
+                })
+        numbers = [int(port["number"]) for _, port in members]
+        ports.append({
+            "id": port_id,
+            "owner_kind": "host",
+            "dock_id": "",
+            "system_port_number": min(numbers),
+            "connector_type": "usb3" if "usb3" in protocols else "usb2",
+            "supported_protocols": protocols or ["usb2"],
+            "state": state,
+            "user_connectable": True,
+            "device_id": device_id,
+            "internal_function": "",
             "merge_state": "companion" if len(members) > 1 else "independent",
         })
 
@@ -535,10 +682,17 @@ def normalize_usb_topology(
             if child_dock_id and parent_port_id and child_dock_id != dock_by_hub.get(parent_hub_id):
                 dock_records[child_dock_id]["parent_port_id"] = parent_port_id
 
-    ports.sort(key=lambda item: (item["dock_id"], not item["user_connectable"], item["system_port_number"], item["id"]))
+    ports.sort(key=lambda item: (item.get("owner_kind") != "host", item["dock_id"], not item["user_connectable"], item["system_port_number"], item["id"]))
+    host_count = 0
     external_counts: dict[str, int] = defaultdict(int)
     for port in ports:
-        if port["user_connectable"]:
+        if port.get("owner_kind") == "host":
+            host_count += 1
+            port["label"] = (
+                f"电脑本机 · {str(port['connector_type']).upper()}-{host_count}"
+                f"（系统端口 {port['system_port_number']}）"
+            )
+        elif port["user_connectable"]:
             external_counts[port["dock_id"]] += 1
             port["label"] = (
                 f"{dock_records[port['dock_id']]['label']} · "
@@ -970,6 +1124,7 @@ def _query_port(
             "serial": serial,
             "network_name": pnp.network_name if pnp else "",
             "driver_key": driver_key,
+            "location_paths": list(pnp.location_paths) if pnp else [],
         }
     child_hub_path = ""
     if bool(info.DeviceIsHub):
@@ -1031,6 +1186,7 @@ def _enrich_port_device_from_pnp(
         "class": record.class_name.lower() if record.class_name else device.get("class", "usb"),
         "network_name": record.network_name,
         "driver_key": record.driver_key,
+        "location_paths": list(record.location_paths),
     })
     tail = record.instance_id.rsplit("\\", 1)[-1]
     if "&" not in tail:

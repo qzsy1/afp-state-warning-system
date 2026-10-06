@@ -76,9 +76,14 @@ def validate_discovery_payload(payload: object) -> tuple[str, ...]:
             issues.append(f"usb_topology.docks[{index}].label is required")
 
     for index, port in enumerate(ports):
+        owner_kind = str(port.get("owner_kind") or "")
         dock_id = str(port.get("dock_id") or "")
-        if dock_id not in dock_ids:
+        if owner_kind not in {"host", "dock"}:
+            issues.append(f"usb_topology.usb_ports[{index}].owner_kind must be host or dock")
+        if owner_kind == "dock" and dock_id not in dock_ids:
             issues.append(f"usb_topology.usb_ports[{index}].dock_id must reference a dock")
+        if owner_kind == "host" and dock_id:
+            issues.append(f"usb_topology.usb_ports[{index}] host port must not reference a dock")
         if port.get("user_connectable") not in {True, False}:
             issues.append(f"usb_topology.usb_ports[{index}].user_connectable must be boolean")
         if not str(port.get("connector_type") or "").strip():
@@ -103,11 +108,21 @@ def validate_discovery_payload(payload: object) -> tuple[str, ...]:
             continue
         parent = str(item.get("parent_port_id") or "")
         dock_id = str(item.get("dock_id") or "")
+        kind = str(item.get("kind") or "")
+        transport = str(item.get("transport_family") or "")
         if parent and parent not in port_ids:
             issues.append(f"physical_interfaces[{index}].parent_port_id must reference usb_topology")
         if dock_id and dock_id not in dock_ids:
             issues.append(f"physical_interfaces[{index}].dock_id must reference usb_topology")
-        if dock_id and str(item.get("kind") or "") in {"ethernet", "ethernet_adapter"}:
+        if kind in {"usb_hid", "usb_uvc"} and transport != "usb":
+            issues.append(f"physical_interfaces[{index}] USB endpoint must use transport_family usb")
+        if kind in {"serial", "com"}:
+            expected_transport = "usb" if parent else "serial_native"
+            if transport != expected_transport:
+                issues.append(
+                    f"physical_interfaces[{index}] serial transport_family must be {expected_transport}"
+                )
+        if dock_id and kind in {"ethernet", "ethernet_adapter"}:
             if "拓展坞网口" not in str(item.get("topology_label") or item.get("label") or ""):
                 issues.append(f"physical_interfaces[{index}] dock ethernet label must contain 拓展坞网口")
 
@@ -121,6 +136,9 @@ def validate_frontend_source(source: str) -> tuple[str, ...]:
         "interface choices must use optgroup grouping": ("optgroup",),
         "dock network adapters must be labelled as 拓展坞网口": ("拓展坞网口",),
         "empty selected ports must explain that no compatible device is present": ("端口存在", "未检测到兼容设备"),
+        "USB sensor roles must share one physical transport pool": ("USB_SENSOR_ROLES", "interfaceTransportFamily"),
+        "host USB and native serial groups must be explicit": ("电脑本机 USB", "主机原生串口"),
+        "default selections must track their origin": ("selection_origin", "manual", "auto"),
     }
     issues: list[str] = []
     for message, tokens in requirements.items():

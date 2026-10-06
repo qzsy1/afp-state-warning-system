@@ -156,9 +156,17 @@ class LocalCaptureAgent:
                 "usb_ports": [],
                 "devices": [],
             },
+            "interface_transport_catalog": discovered.get("interface_transport_catalog") or {
+                "schema_version": 1,
+                "usb_ports": [],
+                "unlocated_usb_interface_ids": [],
+                "native_serial_interface_ids": [],
+                "ethernet_interface_ids": [],
+            },
             "capabilities": {
                 "hardware_discovery": True,
                 "usb_topology_v1": bool(discovered.get("usb_topology")),
+                "interface_transport_catalog_v1": bool(discovered.get("interface_transport_catalog")),
                 "real_capture": True,
                 "process_parameter_read": True,
                 "local_csv_save": True,

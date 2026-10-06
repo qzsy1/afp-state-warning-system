@@ -32,6 +32,7 @@ from app import (
     _operation_lock,
     _OPERATION_LOCK_STARTED,
     create_server,
+    health_payload,
 )
 from online_inference import NEW_MODEL_SENSOR_COLUMNS, inspect_prediction_model
 
@@ -43,6 +44,13 @@ class PoolingTests(unittest.TestCase):
         self.assertGreaterEqual(health, 0.1)
         self.assertLessEqual(health, 0.9)
         self.assertGreater(weights[-1], weights[0])
+
+
+class HealthPayloadTests(unittest.TestCase):
+    def test_health_reports_loaded_delivery_revision(self) -> None:
+        with patch.dict(app_module.os.environ, {"AFP_RUNTIME_REVISION": "manifest-sha"}):
+            payload = health_payload()
+        self.assertEqual(payload["runtime_revision"], "manifest-sha")
 
 
 class DashboardTests(unittest.TestCase):

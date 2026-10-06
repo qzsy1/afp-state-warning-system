@@ -32,17 +32,13 @@ from mysql_storage import MySQLCaptureStore, MySQLSettings, validate_database_na
 from smrf_hid import SmrfHidDriver, enumerate_smrf_hid_devices
 from simulation_replay import MonotonicReplayScheduler
 try:
-    from windows_usb_topology import (
-        discover_windows_usb_topology,
-        find_topology_device,
-        topology_dock,
-        topology_port,
-    )
+    from windows_usb_topology import discover_windows_usb_topology
 except ImportError:  # Compatibility with older modular runtimes.
     discover_windows_usb_topology = None
-    find_topology_device = None
-    topology_dock = None
-    topology_port = None
+try:
+    from interface_transport_catalog import enrich_interface_transports
+except ImportError:  # Compatibility with older modular runtimes.
+    enrich_interface_transports = None
 
 
 APP_DIR = Path(os.environ.get("AFP_LEGACY_APP_DIR") or Path(__file__).resolve().parent).resolve()
@@ -485,44 +481,26 @@ def _physical_interface_key(value: Any) -> str:
 
 def _associate_usb_topology(
     topology: dict[str, Any], physical_interfaces: list[dict[str, Any]]
-) -> None:
-    """Add public dock/port references to already discovered live interfaces."""
+) -> dict[str, Any]:
+    """Add physical transport metadata while preserving legacy endpoints."""
 
-    if not find_topology_device or not topology_port or not topology_dock:
-        return
-    for interface in physical_interfaces:
-        kind = str(interface.get("kind") or "")
-        match = None
-        if kind == "ethernet":
-            match = find_topology_device(
-                topology, network_name=str(interface.get("name") or interface.get("endpoint") or "")
-            )
-        elif kind in {"serial", "usb_hid", "usb_uvc"}:
-            vid = interface.get("vid")
-            pid = interface.get("pid")
-            if vid is not None and pid is not None:
-                match = find_topology_device(
-                    topology,
-                    vid=int(vid),
-                    pid=int(pid),
-                    serial=str(interface.get("serial") or ""),
-                )
-        if not isinstance(match, dict):
-            continue
-        port = topology_port(topology, str(match.get("parent_port_id") or ""))
-        if not port:
-            continue
-        dock = topology_dock(topology, str(port.get("dock_id") or ""))
-        interface["parent_port_id"] = str(port.get("id") or "")
-        interface["dock_id"] = str(port.get("dock_id") or "")
-        if kind == "ethernet" or port.get("internal_function") == "ethernet":
-            topology_label = f"{(dock or {}).get('label', '拓展坞')} · 拓展坞网口"
-        else:
-            topology_label = str(port.get("label") or "")
-        interface["topology_label"] = topology_label
-        if topology_label:
-            interface["label"] = f"{topology_label} · {interface.get('label', interface.get('id', ''))}"
-        match["live_interface_id"] = str(interface.get("id") or "")
+    if enrich_interface_transports is None:
+        return {
+            "schema_version": 1,
+            "usb_ports": [],
+            "unlocated_usb_interface_ids": [],
+            "native_serial_interface_ids": [
+                str(item.get("id") or "")
+                for item in physical_interfaces
+                if str(item.get("kind") or "") in {"serial", "com"}
+            ],
+            "ethernet_interface_ids": [
+                str(item.get("id") or "")
+                for item in physical_interfaces
+                if str(item.get("kind") or "") in {"ethernet", "ethernet_adapter"}
+            ],
+        }
+    return enrich_interface_transports(topology, physical_interfaces)
 
 
 def _validate_physical_interface_bindings(
@@ -2623,6 +2601,8 @@ class AcquisitionManager:
                     "vid": item.vid,
                     "pid": item.pid,
                     "serial": str(item.serial_number or ""),
+                    "hwid": str(getattr(item, "hwid", "") or ""),
+                    "location": str(getattr(item, "location", "") or ""),
                 })
                 physical_interfaces.append({
                     "id": f"serial:{str(item.device).upper()}",
@@ -2635,6 +2615,8 @@ class AcquisitionManager:
                     "vid": item.vid,
                     "pid": item.pid,
                     "serial": str(item.serial_number or ""),
+                    "hwid": str(getattr(item, "hwid", "") or ""),
+                    "location": str(getattr(item, "location", "") or ""),
                     "detected": True,
                 })
         except Exception as exc:
@@ -2795,11 +2777,12 @@ class AcquisitionManager:
             rtsp_reachable = True
         except OSError:
             pass
-        _associate_usb_topology(usb_topology, physical_interfaces)
+        interface_transport_catalog = _associate_usb_topology(usb_topology, physical_interfaces)
         return {
             "ports": ports,
             "physical_interfaces": physical_interfaces,
             "usb_topology": usb_topology,
+            "interface_transport_catalog": interface_transport_catalog,
             "hid_devices": smrf_devices,
             "defaults": default_capture_interfaces(),
             "sensor_type_profiles": sensor_interface_profiles(),

@@ -112,6 +112,15 @@ from websocket_live import (
 APP_DIR = Path(os.environ.get("AFP_LEGACY_APP_DIR") or Path(__file__).resolve().parent).resolve()
 
 
+def health_payload() -> dict[str, str]:
+    return {
+        "status": "ok",
+        "version": APP_VERSION,
+        "build_id": BUILD_ID,
+        "runtime_revision": str(os.environ.get("AFP_RUNTIME_REVISION") or ""),
+    }
+
+
 def encode_json_response(payload: dict, accept_encoding: str = "") -> tuple[bytes, bool]:
     """Serialize a JSON response and compress large browser payloads when supported.
 
@@ -4899,9 +4908,7 @@ class AppHandler(BaseHTTPRequestHandler):
             self._serve_helper_websocket(parse_qs(parsed.query))
             return
         if parsed.path == "/api/health":
-            self._send_json(
-                {"status": "ok", "version": APP_VERSION, "build_id": BUILD_ID}
-            )
+            self._send_json(health_payload())
             return
         if parsed.path == "/api/network/status":
             self._send_network_status()

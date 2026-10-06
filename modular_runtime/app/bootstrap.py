@@ -18,6 +18,15 @@ APP_VERSION = "2.0.1-dev"
 API_VERSION = "2.0"
 
 
+def _runtime_revision(root: Path) -> str:
+    """Return a content revision that changes with an assembled delivery."""
+    for relative in ("SHA256SUMS.txt", "VERSION.json", "config/runtime.json"):
+        candidate = root / relative
+        if candidate.is_file():
+            return hashlib.sha256(candidate.read_bytes()).hexdigest()
+    return ""
+
+
 def _prepare_imports(root: Path) -> Path:
     app_dir = root / "app"
     core_dir = app_dir / "core"
@@ -35,6 +44,7 @@ def initialize(root: Path):
     context = RuntimeContext.load(root)
     context.prepare()
     context.export_environment()
+    os.environ["AFP_RUNTIME_REVISION"] = _runtime_revision(root)
     for path in (
         context.paths.legacy_dir,
         context.paths.legacy_dir / "model_runtime",
@@ -80,14 +90,82 @@ def _persist_lan_web_status(context: Any, status: dict[str, Any]) -> None:
     path.write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _afp_server_available(url: str, timeout: float = 1.5) -> bool:
-    """Return true only when an existing listener is this AFP application."""
+def _afp_server_health(url: str, timeout: float = 1.5) -> dict[str, Any] | None:
+    """Read the health payload only when the listener is an AFP server."""
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
-        return payload.get("status") == "ok" and bool(payload.get("version"))
+        if payload.get("status") == "ok" and bool(payload.get("version")):
+            return payload
     except Exception:
+        pass
+    return None
+
+
+def _afp_server_available(
+    url: str,
+    timeout: float = 1.5,
+    *,
+    expected_revision: str | None = None,
+) -> bool:
+    """Return true only when an existing listener is this AFP application."""
+    payload = _afp_server_health(url, timeout=timeout)
+    if payload is None:
         return False
+    if expected_revision is not None:
+        return str(payload.get("runtime_revision") or "") == expected_revision
+    return True
+
+
+def _stop_stale_local_afp_servers(
+    ports: set[int], *, executable: str | Path | None = None
+) -> list[int]:
+    """Stop stale AFP listeners only when they use this launcher executable."""
+    try:
+        import psutil
+    except ImportError as exc:
+        raise RuntimeError("无法替换旧版 AFP 后台：运行时缺少 psutil") from exc
+
+    expected = os.path.normcase(str(Path(executable or sys.executable).resolve()))
+    processes: list[Any] = []
+    seen: set[int] = set()
+    for connection in psutil.net_connections(kind="tcp"):
+        local = getattr(connection, "laddr", None)
+        if hasattr(local, "port"):
+            port = int(local.port or 0)
+        elif local:
+            port = int(local[1] or 0)
+        else:
+            port = 0
+        pid = int(getattr(connection, "pid", 0) or 0)
+        if (
+            port not in ports
+            or getattr(connection, "status", "") != psutil.CONN_LISTEN
+            or not pid
+            or pid == os.getpid()
+            or pid in seen
+        ):
+            continue
+        try:
+            process = psutil.Process(pid)
+            actual = os.path.normcase(str(Path(process.exe()).resolve()))
+            if actual != expected:
+                continue
+            process.terminate()
+            processes.append(process)
+            seen.add(pid)
+        except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+            continue
+    if processes:
+        _gone, alive = psutil.wait_procs(processes, timeout=5.0)
+        for process in alive:
+            try:
+                process.kill()
+            except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+                pass
+        if alive:
+            psutil.wait_procs(alive, timeout=3.0)
+    return sorted(seen)
 
 
 def _show_desktop_window(context: Any, url: str) -> None:
@@ -522,13 +600,29 @@ def _launch_public_web(
     if not config.enabled:
         return
     existing_admin_url = f"http://127.0.0.1:{config.local_admin_port}/"
-    if _afp_server_available(existing_admin_url + "api/health"):
+    health_url = existing_admin_url + "api/health"
+    expected_revision = os.environ.get("AFP_RUNTIME_REVISION") or _runtime_revision(context.root)
+    if _afp_server_available(health_url, expected_revision=expected_revision):
         # The watchdog may already own the shared acquisition server.  A
         # second desktop launch reuses it instead of creating another server
         # process that can disagree about capture state or fail on the port.
         if not server_only and config.open_desktop_window:
             _show_desktop_window(context, existing_admin_url)
         return
+    if _afp_server_available(health_url):
+        stopped = _stop_stale_local_afp_servers(
+            {config.public_port, config.local_admin_port},
+            executable=sys.executable,
+        )
+        if not stopped:
+            raise RuntimeError(
+                "检测到旧版 AFP 后台，但它不属于当前程序，无法安全替换；请关闭旧软件后重试。"
+            )
+        deadline = time.time() + 8.0
+        while _afp_server_available(health_url, timeout=0.25) and time.time() < deadline:
+            time.sleep(0.1)
+        if _afp_server_available(health_url, timeout=0.25):
+            raise RuntimeError("旧版 AFP 后台未能退出，请在任务管理器中关闭后重试。")
     legacy_app = _legacy_module("app", context)
     dashboard = legacy_app.DashboardData()
     security_store = legacy_app.SecurityStore(

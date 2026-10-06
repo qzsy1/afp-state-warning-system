@@ -123,6 +123,7 @@ class WindowsUsbTopologyTests(unittest.TestCase):
         internal = [port for port in result["usb_ports"] if not port["user_connectable"]]
         self.assertEqual(len(external), 3)
         self.assertEqual(len(internal), 1)
+        self.assertTrue(all(port["owner_kind"] == "dock" for port in result["usb_ports"]))
         self.assertTrue(all(port["merge_state"] == "companion" for port in result["usb_ports"]))
         self.assertEqual(internal[0]["internal_function"], "ethernet")
         device = next(item for item in result["devices"] if item["id"] == internal[0]["device_id"])
@@ -197,6 +198,49 @@ class WindowsUsbTopologyTests(unittest.TestCase):
             unavailable = topology.discover_windows_usb_topology()
         self.assertEqual(unavailable["state"], "unavailable")
         self.assertEqual(unavailable["usb_ports"], [])
+
+    def test_host_user_connectable_ports_join_dock_ports_and_skip_upstream_link(self) -> None:
+        dock_hubs = _genesys_fixture()
+        root_path = r"\\?\usb#root_hub30#root#{hub}"
+        root = _hub(
+            "root",
+            vid=0,
+            pid=0,
+            path=root_path,
+            ports=[
+                _port(1, child_hub_path=dock_hubs[0]["device_path"]),
+                _port(2, protocol="usb3", user_connectable=True),
+                _port(3, protocol="usb3", user_connectable=False),
+            ],
+            location="PCIROOT(0)#USBROOT(0)",
+        )
+        root["is_root"] = True
+        root["instance_id"] = r"USB\ROOT_HUB30\ROOT"
+
+        result = topology.normalize_usb_topology([root, *dock_hubs])
+
+        host_ports = [item for item in result["usb_ports"] if item["owner_kind"] == "host"]
+        dock_ports = [item for item in result["usb_ports"] if item["owner_kind"] == "dock"]
+        self.assertEqual(len(host_ports), 1)
+        self.assertEqual(host_ports[0]["system_port_number"], 2)
+        self.assertIn("电脑本机", host_ports[0]["label"])
+        self.assertEqual(len(dock_ports), 4)
+
+    def test_locationless_root_hub_is_not_published_as_empty_host_connectors(self) -> None:
+        root = _hub(
+            "virtual-root",
+            vid=0,
+            pid=0,
+            path=r"\\?\usb#root_hub30#virtual#{hub}",
+            ports=[_port(1), _port(2, protocol="usb3")],
+            location="",
+        )
+        root["is_root"] = True
+        root["location_paths"] = []
+
+        result = topology.normalize_usb_topology([root])
+
+        self.assertEqual(result["usb_ports"], [])
 
 
 if __name__ == "__main__":
