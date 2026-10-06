@@ -41,7 +41,7 @@
 
 - [x] 7.1 运行OpenSpec严格校验，确认proposal、三项能力Spec、design和tasks无结构错误或未解析占位内容
 - [x] 7.2 检查Git差异，确认没有生成新的重复EXE或交付目录，没有提交运行凭据、API Key、数据库密码和运行报告
-- [ ] 7.3 提交规格与Harness源码到当前功能分支，运行最终full门禁后推送GitHub，并记录提交号与远端分支
+- [x] 7.3 提交规格与Harness源码到当前功能分支，运行最终full门禁后推送GitHub，并记录提交号与远端分支（实现提交 `a4af69e`，远端分支 `origin/main`）
 
 ## 8. 独立Harness目录与兼容迁移
 
