@@ -61,6 +61,8 @@ git pull --ff-only origin main
 git lfs pull
 ```
 
+若已有仓库中存在此前被忽略、未由 Git 管理的同名 v2.0.4 目录，首次更新前先将该目录重命名为 `_local_backup`，再执行上述命令，避免 Git 拒绝覆盖未跟踪文件。新目录通过完整性检查和自检后再清理备份。
+
 同步后执行：
 
 ```powershell

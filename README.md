@@ -74,6 +74,19 @@ git lfs pull
 .\delivery\AFP_Integrated_System_Modular_v2.0.4_Agentic\AFP_Integrated_System_Modular.exe --self-test
 ```
 
+如果该电脑在本次发布前已经有一个未被 Git 管理的同名 `v2.0.4` 目录，首次更新前先将它改名备份，否则 Git 会拒绝覆盖未跟踪文件：
+
+```powershell
+Rename-Item `
+  .\delivery\AFP_Integrated_System_Modular_v2.0.4_Agentic `
+  AFP_Integrated_System_Modular_v2.0.4_Agentic_local_backup
+git switch main
+git pull --ff-only origin main
+git lfs pull
+```
+
+新目录通过 `--verify-files` 和 `--self-test` 后，可以自行删除 `_local_backup` 备份。
+
 两台电脑的 `git rev-parse HEAD` 相同且 `--verify-files` 通过时，发布程序内容一致。原始采集数据、正式实验数据库、个人路径和运行时状态继续保留在各自电脑中。
 
 模拟/OOD/弱标签预警只表示模型证据，不等同于独立确认的真实缺陷。生产部署和论文结论应使用真实传感器、独立缺陷检测或力学性能证据重新确认阈值、精度和适用范围。
