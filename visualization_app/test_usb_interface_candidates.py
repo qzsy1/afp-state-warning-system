@@ -38,6 +38,33 @@ function sensorTypeProfile(role) {{ return profiles[role] || {{}}; }}
 
 
 class UsbInterfaceCandidateTests(unittest.TestCase):
+    def test_type_c_and_dock_upstream_are_excluded_from_usb_a_sensor_pool(self) -> None:
+        result = run_candidate_script(
+            r"""
+state.usbTopology = {
+  usb_ports: [
+    {id:"host:a1", owner_kind:"host", label:"电脑本机 · USB-A-1", connector_form_factor:"type_a", state:"empty", user_connectable:true},
+    {id:"host:a2", owner_kind:"host", label:"电脑本机 · USB-A-2", connector_form_factor:"type_a", state:"empty", user_connectable:true},
+    {id:"host:c1", owner_kind:"host", label:"电脑本机 · Type-C-1", connector_form_factor:"type_c", internal_function:"dock_upstream", state:"occupied", user_connectable:true},
+    {id:"host:c2", owner_kind:"host", label:"电脑本机 · Type-C-2", connector_form_factor:"type_c", state:"occupied", user_connectable:true},
+    {id:"dock:1", owner_kind:"dock", dock_id:"d1", label:"拓展坞 1 · USB3-1", connector_form_factor:"type_a", state:"empty", user_connectable:true},
+  ],
+  devices: [],
+};
+const roles = ["thermocouple", "thermal_uvc", "pressure"];
+const candidateIds = Object.fromEntries(roles.map((role) => [role,
+  physicalCandidatesForRole(role).filter((item) => item.transport_family === "usb").map((item) => item.id).sort()
+]));
+const groups = physicalCandidatesForRole("thermocouple").map((item) => item.group_label);
+console.log(JSON.stringify({candidateIds, groups}));
+"""
+        )
+        expected = ["dock:1", "host:a1", "host:a2"]
+        self.assertEqual(result["candidateIds"]["thermocouple"], expected)
+        self.assertEqual(result["candidateIds"]["thermal_uvc"], expected)
+        self.assertEqual(result["candidateIds"]["pressure"], expected)
+        self.assertIn("电脑本机 USB-A 接口", result["groups"])
+
     def test_three_usb_sensor_roles_receive_same_physical_usb_pool(self) -> None:
         result = run_candidate_script(
             r"""

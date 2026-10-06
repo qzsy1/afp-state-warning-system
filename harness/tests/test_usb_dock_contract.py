@@ -26,6 +26,7 @@ def compliant_discovery() -> dict:
                     "dock_id": "",
                     "system_port_number": 2,
                     "connector_type": "usb3",
+                    "connector_form_factor": "type_a",
                     "supported_protocols": ["usb2", "usb3"],
                     "state": "empty",
                     "user_connectable": True,
@@ -38,6 +39,7 @@ def compliant_discovery() -> dict:
                     "dock_id": "dock:a",
                     "system_port_number": 1,
                     "connector_type": "usb3",
+                    "connector_form_factor": "type_a",
                     "supported_protocols": ["usb2", "usb3"],
                     "state": "empty",
                     "user_connectable": True,
@@ -49,6 +51,7 @@ def compliant_discovery() -> dict:
                     "dock_id": "dock:a",
                     "system_port_number": 2,
                     "connector_type": "usb3",
+                    "connector_form_factor": "type_a",
                     "supported_protocols": ["usb2", "usb3"],
                     "state": "occupied",
                     "user_connectable": True,
@@ -60,6 +63,7 @@ def compliant_discovery() -> dict:
                     "dock_id": "dock:a",
                     "system_port_number": 4,
                     "connector_type": "internal",
+                    "connector_form_factor": "type_a",
                     "supported_protocols": ["usb3"],
                     "state": "occupied",
                     "user_connectable": False,
@@ -161,12 +165,14 @@ class UsbDockContractValidatorTests(unittest.TestCase):
         config.physical_port_id = selected.value;
         const group = document.createElement("optgroup");
         group.label = "拓展坞 USB 端口";
-        const host = "电脑本机 USB";
+        const host = "电脑本机 USB-A";
         const nativeSerial = "主机原生串口";
         const ethernet = "拓展坞网口";
         status.textContent = "端口存在，未检测到兼容设备";
         const USB_SENSOR_ROLES = new Set(["thermocouple", "thermal_uvc", "pressure"]);
         const interfaceTransportFamily = () => "usb";
+        const connector_form_factor = "type_c";
+        const usbA = item.connector_form_factor !== "type_c" && item.internal_function !== "dock_upstream";
         item.selection_origin = item.selection_origin || "auto";
         item.selection_origin = "manual";
         """
@@ -191,7 +197,15 @@ class UsbDockContractValidatorTests(unittest.TestCase):
 
         issues = "\n".join(validate_discovery_payload(payload))
 
-        self.assertIn("confirmation must be observed_current or observed_history", issues)
+        self.assertIn("confirmation must be observed_current, observed_history, or connector_metadata", issues)
+
+    def test_rejects_missing_connector_form_factor(self) -> None:
+        payload = compliant_discovery()
+        del payload["usb_topology"]["usb_ports"][0]["connector_form_factor"]
+
+        issues = "\n".join(validate_discovery_payload(payload))
+
+        self.assertIn("connector_form_factor must be type_a, type_c, or unknown", issues)
 
     def test_interface_check_keeps_driver_probe_separate_from_port_gate(self) -> None:
         compliant = '''

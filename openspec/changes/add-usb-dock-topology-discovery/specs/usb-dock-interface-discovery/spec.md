@@ -7,7 +7,9 @@
 ## ADDED Requirements
 
 ### Requirement: Windows USB 拓扑发现
-系统 SHALL 在支持的 Windows 环境中发现 USB Hub、每个下行物理连接器、连接状态、支持的 USB 协议和当前所接设备，并 SHALL 包含没有接入设备的可用端口。电脑本机端口记录 MUST 以 `confirmation` 区分 `observed_current` 与 `observed_history`，不得把未经观察的控制器逻辑端口发布为物理接口。系统 MUST 将拓扑查询与传感器数据读取分开，发现端口时不得要求传感器正在输出数据。
+系统 SHALL 在支持的 Windows 环境中发现 USB Hub、每个下行物理连接器、连接状态、支持的 USB 协议、连接器形态和当前所接设备，并 SHALL 包含没有接入设备的可用端口。电脑本机端口记录 MUST 以 `confirmation` 区分 `observed_current`、`observed_history` 与 `connector_metadata`；`connector_metadata` 只可用于系统明确报告为用户可连接、非 Type-C 且具有 USB2/SuperSpeed 伴随关系的空闲连接器，不得把未配对的控制器逻辑端口发布为物理接口。系统 MUST 将拓扑查询与传感器数据读取分开，发现端口时不得要求传感器正在输出数据。
+
+系统 MUST 以 `connector_form_factor` 区分 `type_a`、`type_c` 与 `unknown`，并 MUST 将该字段与表示协议能力的 `connector_type`/`supported_protocols` 分开。当前热电偶、UVC 和 M3232 的 USB 物理候选池 SHALL 只包含用户可连接的 USB-A 端口；Type-C 及 `internal_function=dock_upstream` SHALL 保留在拓扑诊断中但 MUST NOT 进入该候选池。
 
 #### Scenario: 显示空闲和占用端口
 - **WHEN** 操作员刷新接口，且一个拓展坞包含空闲端口和已接设备的端口
@@ -19,15 +21,27 @@
 
 #### Scenario: 电脑原生 USB 端口与拓展坞端口同时存在
 - **WHEN** Windows 能够确认电脑 Root Hub 上的用户可连接端口，且电脑同时连接一个拓展坞
-- **THEN** 系统 MUST 同时返回经过当前占用或历史观察确认的电脑原生 USB 物理端口和拓展坞外部 USB 端口，并 MUST 排除不可供用户连接的内部设备端口；连接拓展坞的电脑上游插孔 MUST 作为已占用的电脑原生物理端口保留
+- **THEN** 系统 MUST 同时返回经过当前占用、历史观察或明确伴随关系确认的电脑原生 USB-A 物理端口和拓展坞外部 USB-A 端口，并 MUST 排除不可供用户连接的内部设备端口；连接拓展坞的 Type-C 上游插孔只作为拓扑关系保留，不得进入 USB-A 传感器候选
 
 #### Scenario: Root Hub 报告未实际布线的可连接端口
-- **WHEN** Windows 将某个空 Root Hub 逻辑端口报告为 `user_connectable`，但该端口从未出现设备或下级 Hub，也没有本机历史观察记录
+- **WHEN** Windows 将某个空 Root Hub 逻辑端口报告为 `user_connectable`，但该端口没有 USB2/SuperSpeed 伴随关系、从未出现设备或下级 Hub，也没有本机历史观察记录
 - **THEN** 系统 MUST NOT 将该逻辑端口显示为电脑机身物理插孔，并 MUST NOT 仅凭 `user_connectable` 推断机身端口数量
 
 #### Scenario: 已观察本机端口恢复为空闲
 - **WHEN** 一个经过设备或下级 Hub 实际占用确认的电脑原生端口被持久记录，随后设备被拔出
 - **THEN** 系统 MUST 继续以相同端口标识显示该端口，将状态更新为空闲，并将 `confirmation` 从 `observed_current` 更新为 `observed_history`
+
+#### Scenario: Type-C 不计入 USB-A 传感器接口
+- **GIVEN** Windows 将两个系统连接器报告为 `PortIsTypeC=true`，其中一个连接拓展坞且另一个连接手机或为空闲
+- **WHEN** 系统生成电脑本机 USB-A 传感器候选
+- **THEN** 这两个连接器 MUST NOT 出现在“电脑本机 USB-A 接口”候选组
+- **AND** 拓展坞上游连接器 MAY 保留在拓扑诊断中并标记为 `type_c` 与 `dock_upstream`
+
+#### Scenario: 伴随关系确认两个空闲 USB-A
+- **GIVEN** Windows 报告两组没有历史观察记录、`user_connectable=true`、`PortIsTypeC=false` 的 USB2/SuperSpeed 伴随连接器，并另有未配对的空逻辑端口
+- **WHEN** 两个实际 USB-A 插孔均未接入设备
+- **THEN** 系统 MUST 发布且只发布这两组 USB-A 连接器，并设置 `confirmation=connector_metadata`
+- **AND** 系统 MUST 将每组伴随通道合并为一个物理接口，不得发布未配对的空逻辑端口
 
 ### Requirement: 伴随 Hub 合并为物理连接器
 系统 SHALL 使用 Windows 报告的伴随端口关系，将共享同一连接器的 USB 2.x 与 SuperSpeed 端口合并为一个逻辑物理端口。系统 MUST 保留各通道支持的协议和状态，且在缺少可靠伴随关系时不得仅凭端口数量猜测合并。

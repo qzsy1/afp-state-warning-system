@@ -54,11 +54,13 @@ Windows 8 及以后提供用户态 USB Hub IOCTL，可枚举端口连接状态�
 
 **替代方案：** 按两套 Hub 端口序号直接一一配对。不同厂商可能改变端口编号或包含内部端口，该方法会错误合并，故不采用。
 
-### 3. 拓展坞使用“用户可连接”属性，本机 Root Hub 还需实际观察证据
+### 3. 拓展坞使用“用户可连接”属性，本机 Root Hub 还需物理证据
 
 若连接器属性明确报告是否可供用户连接，以此区分外部端口和固定内部功能。无法获得该属性时，默认保持端口可见，避免隐藏真实接口。针对当前实物建立窄范围、版本化规则：只有 Hub VID/PID、父级关系、端口布局和 ASIX VID/PID 全部匹配时，才将相应端口建模为 `internal_function=ethernet`，并把 ASIX 设备投影到该拓展坞的以太网接口。
 
-Root Hub 的 `PortIsUserConnectable` 在部分电脑上会覆盖同一平台不同配置的预留或未布线端口，不能单独证明机身插孔存在。本机端口只有在用户可连接属性成立且当前出现设备/下级 Hub，或稳定端口 ID 已存在于本机观察记录时才进入候选。观察记录写入本机可变运行目录，不进入发行清单；设备拔出后依靠该记录保留空闲端口。连接拓展坞的 Root Hub 上游连接器属于真实机身插孔，继续显示为“电脑本机 USB”并标记已占用；拓展坞下行端口另行显示且不会与上游插孔合并。
+Root Hub 的 `PortIsUserConnectable` 在部分电脑上会覆盖同一平台不同配置的预留或未布线端口，不能单独证明机身插孔存在。本机 USB-A 只有在用户可连接属性成立且当前出现设备、稳定端口 ID 已存在于本机观察记录，或系统提供 USB2 与 SuperSpeed 伴随连接器关系时才进入候选；只有 `user_connectable=true` 且没有伴随关系的空逻辑端口仍被排除。观察记录写入本机可变运行目录，不进入发行清单；设备拔出后依靠该记录保留空闲端口。
+
+`IOCTL_USB_GET_PORT_CONNECTOR_PROPERTIES` 的 `PortIsTypeC` 单独保存为 `connector_form_factor=type_c|type_a|unknown`，不得再用 `connector_type=usb2|usb3` 代替插座形态。Type-C 仍保留在拓扑中以表达拓展坞上游或当前设备关系，并使用“Type-C”标签；当前传感器使用的 USB-A 候选池排除 Type-C 和 `internal_function=dock_upstream`。因此连接在 Type-C 上的拓展坞或手机不会增加“电脑本机 USB-A 接口”数量，拓展坞三个下行 USB-A 仍单独显示。
 
 规则不依赖当前动态 COM 号或 IPv4 地址。规则未完全匹配时不排除端口，并输出原因供测试和诊断。
 
@@ -76,7 +78,8 @@ usb_topology
 │  └─ id, label, state, upstream_location, hub_refs[]
 ├─ usb_ports[]
 │  └─ id, dock_id, system_port_number, connector_type,
-│     supported_protocols[], state, user_connectable, device_id
+│     connector_form_factor, supported_protocols[], state,
+│     user_connectable, device_id
 └─ devices[]
    └─ id, parent_port_id, class, friendly_name, vid, pid,
       serial, live_interface_id
@@ -102,11 +105,11 @@ USB 类接口增加可选 `physical_port_id`，表示操作员选择的物理连
 
 后端返回规范化拓扑，前端只执行展示和按逻辑类型筛选：
 
-- 热电偶、UVC 和 M3232 共享 `usb_ports` 中全部用户可连接端口；标签包含电脑或拓展坞归属、系统端口号、连接器能力、状态和当前设备。
+- 热电偶、UVC 和 M3232 共享 `usb_ports` 中全部用户可连接 USB-A 端口；标签包含电脑或拓展坞归属、系统端口号、连接器能力、状态和当前设备。Type-C 和拓展坞上游连接器保留在拓扑诊断中，但不进入这三个角色的 USB-A 候选池。
 - HID、UVC 和 USB 转串口 COM 是物理 USB 端口下的实时通信端点。M3232 选择 USB 转串口时同时保存 `physical_port_id`、`physical_interface_id` 和 COM `endpoint`。
 - 只有无法关联 USB 父级或 USB 位置路径的真正主机原生 COM 才在 M3232 下显示为独立串口候选。
 - 以太网显示全部实时网卡；已知父级时显示“拓展坞网口”。
-- 通过 `<optgroup>` 或等效结构按“电脑本机 USB”“拓展坞 USB”“位置未解析的 USB 设备”“主机原生串口”和“网卡”组织，保持键盘选择和现有表单行为。
+- 通过 `<optgroup>` 或等效结构按“电脑本机 USB-A”“拓展坞 USB”“位置未解析的 USB 设备”“主机原生串口”和“网卡”组织，保持键盘选择和现有表单行为。
 
 前端不生成用户备注，不将 `USB3-1` 解释为物理左侧第一口。空闲和不兼容端口可作为计划位置选择，但启用真实采集前的校验显示具体阻断原因。真正的主机原生 COM 不进入 HID/UVC 候选列表。
 
@@ -116,7 +119,7 @@ USB 类接口增加可选 `physical_port_id`，表示操作员选择的物理连
 
 USB COM 优先通过 PnP 实例、父级链和 Location Path 定位物理端口；VID/PID/序列号只在结果唯一时回退。无法解析位置的原有 HID/UVC/USB 串口仍保留在“位置未解析的 USB 设备”组，避免拓扑增强删除旧候选。物理端口先按 `physical_port_id` 去重，未定位端点再按实时接口 ID 和 endpoint 去重。
 
-拓扑提供器同时处理 Root Hub 中系统报告为用户可连接且已被当前占用或历史观察确认的端口。Root Hub 内部功能、未观察到的预留/未布线空逻辑端口和已确认不可供用户连接的端口不进入候选。拓展坞上游连接作为电脑本机已占用插孔保留，拓展坞下行端口仍单独归入拓展坞。Root Hub 属性或观察证据不足时不伪造空端口，但保留已枚举实时设备作为兼容降级。
+拓扑提供器同时处理 Root Hub 中系统报告为用户可连接且已被当前占用、历史观察或 USB2/SuperSpeed 伴随关系确认的端口。Root Hub 内部功能、未配对且未观察到的预留/未布线空逻辑端口和已确认不可供用户连接的端口不进入候选。拓展坞 Type-C 上游连接只作为拓扑关系保留，拓展坞下行 USB-A 端口单独归入拓展坞候选。Root Hub 属性或物理证据不足时不伪造空端口，但保留已枚举实时设备作为兼容降级。
 
 ### 11. 默认选择使用确定性优先级并记录选择来源
 
@@ -147,7 +150,8 @@ Git LFS 继续承载完整 v2.0.4 中已配置的大文件；实现阶段应校�
 ## Risks / Trade-offs
 
 - [厂商固件不完整或错误报告伴随端口] → 仅接受显式伴随映射或完整匹配的窄范围规则；不确定时保留端口并标记未知。
-- [Root Hub 将预留或未布线端口报告为用户可连接] → 仅发布当前实际占用或本机历史观察确认的端口；通过稳定 ID 记录使已观察端口在拔出设备后仍保持可见。
+- [Root Hub 将预留或未布线端口报告为用户可连接] → 仅发布当前实际占用、本机历史观察确认或具有明确 USB2/SuperSpeed 伴随关系的 USB-A；通过稳定 ID 记录使已观察端口在拔出设备后仍保持可见。
+- [Type-C 同样承载 USB 协议而被误计为 USB-A] → 分开保存协议能力与连接器形态，Type-C 只保留在拓扑诊断和上游关系中，不进入当前传感器的 USB-A 候选池。
 - [当前拓展坞内部网卡端口缺少用户可连接标志] → 使用包含 Hub、父级、布局和 ASIX 身份的版本化规则，并以三 USB 加一网口实物验收防止误隐藏。
 - [无序列号拓展坞移动到另一上游端口后身份变化] → 使用位置相关 ID 并明确不跨位置继承；避免把另一台同型号拓展坞误认为原设备。
 - [冻结运行时 ctypes 结构体布局错误] → 对齐 Windows SDK 结构定义，增加大小、偏移、二进制夹具和真实 Windows smoke test；API 失败时局部降级。

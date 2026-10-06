@@ -87,15 +87,21 @@ def validate_discovery_payload(payload: object) -> tuple[str, ...]:
         if owner_kind == "host" and str(port.get("confirmation") or "") not in {
             "observed_current",
             "observed_history",
+            "connector_metadata",
         }:
             issues.append(
                 f"usb_topology.usb_ports[{index}].confirmation must be "
-                "observed_current or observed_history"
+                "observed_current, observed_history, or connector_metadata"
             )
         if port.get("user_connectable") not in {True, False}:
             issues.append(f"usb_topology.usb_ports[{index}].user_connectable must be boolean")
         if not str(port.get("connector_type") or "").strip():
             issues.append(f"usb_topology.usb_ports[{index}].connector_type is required")
+        if str(port.get("connector_form_factor") or "") not in {"type_a", "type_c", "unknown"}:
+            issues.append(
+                f"usb_topology.usb_ports[{index}].connector_form_factor must be "
+                "type_a, type_c, or unknown"
+            )
         protocols = port.get("supported_protocols")
         if not isinstance(protocols, list) or not all(isinstance(item, str) and item for item in protocols):
             issues.append(f"usb_topology.usb_ports[{index}].supported_protocols must be a string list")
@@ -145,7 +151,12 @@ def validate_frontend_source(source: str) -> tuple[str, ...]:
         "dock network adapters must be labelled as 拓展坞网口": ("拓展坞网口",),
         "empty selected ports must explain that no compatible device is present": ("端口存在", "未检测到兼容设备"),
         "USB sensor roles must share one physical transport pool": ("USB_SENSOR_ROLES", "interfaceTransportFamily"),
-        "host USB and native serial groups must be explicit": ("电脑本机 USB", "主机原生串口"),
+        "host USB-A and native serial groups must be explicit": ("电脑本机 USB-A", "主机原生串口"),
+        "Type-C and dock upstream connectors must be excluded from USB-A candidates": (
+            "connector_form_factor",
+            "type_c",
+            "dock_upstream",
+        ),
         "default selections must track their origin": ("selection_origin", "manual", "auto"),
     }
     issues: list[str] = []

@@ -4893,7 +4893,11 @@ function usbPhysicalCandidatesForRole(role) {
       if (!liveByPort.has(key)) liveByPort.set(key, []);
       liveByPort.get(key).push(item);
     });
-  const result = ports.filter((port) => port.user_connectable !== false).map((port) => {
+  const result = ports.filter((port) => (
+    port.user_connectable !== false
+    && String(port.connector_form_factor || "") !== "type_c"
+    && String(port.internal_function || "") !== "dock_upstream"
+  )).map((port) => {
     const liveItems = liveByPort.get(String(port.id)) || [];
     const compatibleLive = liveItems.find((item) => endpointCompatibleWithRole(item, role));
     const device = devices.get(String(port.device_id || ""));
@@ -4913,7 +4917,7 @@ function usbPhysicalCandidatesForRole(role) {
       label: `${port.label || "USB 端口"} · ${detail}`,
       topology_label: port.label || "USB 端口",
       group_label: ownerKind === "host"
-        ? "电脑本机 USB 接口"
+        ? "电脑本机 USB-A 接口"
         : `${String(port.label || "拓展坞").split(" · ")[0]} USB 接口`,
       owner_kind: ownerKind,
       dock_id: port.dock_id || "",

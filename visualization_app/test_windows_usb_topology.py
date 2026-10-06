@@ -24,6 +24,7 @@ def _port(
     user_connectable: bool | None = True,
     child_hub_path: str = "",
     device_is_hub: bool = False,
+    connector_is_type_c: bool | None = None,
 ) -> dict:
     return {
         "number": number,
@@ -34,6 +35,7 @@ def _port(
         "device": device,
         "child_hub_path": child_hub_path,
         "device_is_hub": device_is_hub,
+        "connector_is_type_c": connector_is_type_c,
     }
 
 
@@ -258,6 +260,54 @@ class WindowsUsbTopologyTests(unittest.TestCase):
         self.assertTrue(all(port["confirmation"] == "observed_current" for port in host_ports))
         self.assertEqual(host_ports[0]["internal_function"], "dock_upstream")
         self.assertEqual(len(dock_ports), 4)
+
+    def test_type_c_is_separate_and_companion_metadata_confirms_two_empty_usb_a_ports(self) -> None:
+        root_path = r"\\?\usb#root_hub30#root#{hub}"
+        root = _hub(
+            "root",
+            vid=0,
+            pid=0,
+            path=root_path,
+            ports=[
+                _port(
+                    1,
+                    state="occupied",
+                    protocol="usb2",
+                    connector_is_type_c=True,
+                    device={
+                        "instance_id": r"USB\VID_05E3&PID_0610\DOCK",
+                        "friendly_name": "USB Hub",
+                        "class": "hub",
+                        "vid": 0x05E3,
+                        "pid": 0x0610,
+                    },
+                ),
+                _port(8, connector_is_type_c=False, companion={"hub_path": root_path, "port_number": 13}),
+                _port(9, connector_is_type_c=False, companion={"hub_path": root_path, "port_number": 14}),
+                _port(11, connector_is_type_c=False),
+                _port(12, connector_is_type_c=False),
+                _port(13, protocol="usb3", connector_is_type_c=False, companion={"hub_path": root_path, "port_number": 8}),
+                _port(14, protocol="usb3", connector_is_type_c=False, companion={"hub_path": root_path, "port_number": 9}),
+            ],
+            location="PCIROOT(0)#USBROOT(0)",
+        )
+        root["is_root"] = True
+        root["instance_id"] = r"USB\ROOT_HUB30\ROOT"
+
+        result = topology.normalize_usb_topology([root])
+
+        host_ports = [item for item in result["usb_ports"] if item["owner_kind"] == "host"]
+        usb_a = [item for item in host_ports if item["connector_form_factor"] == "type_a"]
+        type_c = [item for item in host_ports if item["connector_form_factor"] == "type_c"]
+        self.assertEqual([port["system_port_number"] for port in usb_a], [8, 9])
+        self.assertTrue(all(port["confirmation"] == "connector_metadata" for port in usb_a))
+        self.assertTrue(all(port["state"] == "empty" for port in usb_a))
+        self.assertEqual(len(type_c), 1)
+        self.assertEqual(type_c[0]["confirmation"], "observed_current")
+        self.assertTrue(type_c[0]["label"].startswith("电脑本机 · Type-C-1"))
+        self.assertTrue(all("USB-A-" in port["label"] for port in usb_a))
+        self.assertNotIn(11, [port["system_port_number"] for port in host_ports])
+        self.assertNotIn(12, [port["system_port_number"] for port in host_ports])
 
     def test_locationless_root_hub_is_not_published_as_empty_host_connectors(self) -> None:
         root = _hub(

@@ -520,12 +520,23 @@ def normalize_usb_topology(
 
         port_numbers = [int(port["number"]) for _, port in members]
         display_number = min(port_numbers)
+        connector_values = [
+            port.get("connector_is_type_c")
+            for _, port in members
+            if port.get("connector_is_type_c") is not None
+        ]
+        connector_form_factor = (
+            "type_c" if any(value is True for value in connector_values)
+            else "type_a" if connector_values
+            else "unknown"
+        )
         ports.append({
             "id": port_id,
             "owner_kind": "dock",
             "dock_id": dock_id,
             "system_port_number": display_number,
             "connector_type": "usb3" if "usb3" in protocols else "usb2",
+            "connector_form_factor": connector_form_factor,
             "supported_protocols": protocols or ["usb2"],
             "state": state,
             "user_connectable": bool(user_connectable),
@@ -536,9 +547,9 @@ def normalize_usb_topology(
 
     # Root hubs represent connectors owned by the computer.  Some firmware
     # marks unpopulated or un-routed controller ports as user-connectable, so
-    # that flag alone cannot prove a chassis connector exists.  Publish only
-    # connectors that have been physically observed; the discovery wrapper
-    # restores previously observed connectors after they become empty.
+    # that flag alone cannot prove a chassis connector exists.  Current or
+    # historical occupation is evidence; an explicit USB2/SuperSpeed companion
+    # pair is also sufficient evidence for an empty USB-A chassis connector.
     root_by_id = {str(hub["id"]): hub for hub in root_hubs}
     root_path_to_id = {
         _canonical_link(str(hub.get("device_path") or "")): str(hub["id"])
@@ -615,7 +626,19 @@ def normalize_usb_topology(
         currently_observed = any(
             str(port.get("state") or "") == "occupied" for _, port in members
         )
-        if not currently_observed and port_id not in known_host_ports:
+        connector_values = [
+            port.get("connector_is_type_c")
+            for _, port in members
+            if port.get("connector_is_type_c") is not None
+        ]
+        connector_form_factor = (
+            "type_c" if any(value is True for value in connector_values)
+            else "type_a" if connector_values
+            else "unknown"
+        )
+        companion_confirmed_usb_a = connector_form_factor == "type_a" and len(members) > 1
+        historically_observed = port_id in known_host_ports
+        if not currently_observed and not historically_observed and not companion_confirmed_usb_a:
             continue
         active = [port for _, port in members if str(port.get("state")) == "occupied"]
         candidate = active[0] if active else members[0][1]
@@ -671,10 +694,15 @@ def normalize_usb_topology(
             "dock_id": "",
             "system_port_number": min(numbers),
             "connector_type": "usb3" if "usb3" in protocols else "usb2",
+            "connector_form_factor": connector_form_factor,
             "supported_protocols": protocols or ["usb2"],
             "state": state,
             "user_connectable": True,
-            "confirmation": "observed_current" if currently_observed else "observed_history",
+            "confirmation": (
+                "observed_current" if currently_observed
+                else "observed_history" if historically_observed
+                else "connector_metadata"
+            ),
             "device_id": device_id,
             "internal_function": "dock_upstream" if dock_upstream else "",
             "merge_state": "companion" if len(members) > 1 else "independent",
@@ -692,13 +720,19 @@ def normalize_usb_topology(
                 dock_records[child_dock_id]["parent_port_id"] = parent_port_id
 
     ports.sort(key=lambda item: (item.get("owner_kind") != "host", item["dock_id"], not item["user_connectable"], item["system_port_number"], item["id"]))
-    host_count = 0
+    host_counts: dict[str, int] = defaultdict(int)
     external_counts: dict[str, int] = defaultdict(int)
     for port in ports:
         if port.get("owner_kind") == "host":
-            host_count += 1
+            form_factor = str(port.get("connector_form_factor") or "unknown")
+            host_counts[form_factor] += 1
+            connector_label = (
+                "Type-C" if form_factor == "type_c"
+                else "USB-A" if form_factor == "type_a"
+                else str(port["connector_type"]).upper()
+            )
             port["label"] = (
-                f"电脑本机 · {str(port['connector_type']).upper()}-{host_count}"
+                f"电脑本机 · {connector_label}-{host_counts[form_factor]}"
                 f"（系统端口 {port['system_port_number']}）"
             )
         elif port["user_connectable"]:
@@ -1337,6 +1371,7 @@ def discover_windows_usb_topology() -> dict[str, Any]:
         str(port.get("id") or "")
         for port in topology.get("usb_ports", [])
         if port.get("owner_kind") == "host"
+        and port.get("confirmation") == "observed_current"
     }
     _save_known_host_port_ids(
         registry_path,
