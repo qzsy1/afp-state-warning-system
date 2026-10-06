@@ -65,6 +65,16 @@ Harness提供 `quick`、`full`、`release` 三个profile。后一级包含前一
 
 当判定为重建时，Harness只输出 `rebuild_required` 及理由；真正的构建仍由现有模块化构建脚本执行，并在构建后重新运行release profile。
 
+### 6.1 拆分启动器构建与交付目录组装
+
+`modular_runtime/build_launcher.ps1` 只负责校验Python与启动器输入、运行PyInstaller并生成包含EXE和配套运行时的启动器目录；该文件属于明确的EXE重建边界。
+
+`modular_runtime/assemble_modular_delivery.ps1` 只负责把已有启动器目录或稳定EXE与外置 `app`、`config`、`models`、`native_dll`、文档和运维脚本组装到既定交付目录，并生成 `VERSION.json`、`README.txt` 和 `SHA256SUMS.txt`。修改该文件不得单独触发EXE重建，但发布门禁仍必须验证稳定EXE哈希不变及交付完整性。
+
+`modular_runtime/build_modular_app.ps1` 保留为兼容编排入口，维持原参数，按需调用上述两个脚本。由于兼容入口能够决定是否进入构建路径，其自身变化进入人工确认；若同一变更同时修改 `build_launcher.ps1`、启动器入口、依赖或原生运行时，优先采用 `rebuild_required`。
+
+Harness规则分别映射为：`build_launcher.ps1` 属于“必须重建”，`assemble_modular_delivery.ps1` 属于“外部更新”，`build_modular_app.ps1` 属于“人工确认”。契约测试必须锁定该映射并验证混合变更仍由最高风险规则决定。
+
 ### 7. 将原始结果与人工错误报告分离
 
 每个命令的原始stdout/stderr和最小机器状态写入 `harness/logs/<run-id>/`，供CI、诊断和复现使用。`harness/engine/diagnostics.py` 从unittest traceback、Python异常、Node.js错误、PowerShell/进程错误及EXE诊断结果中归一化 `DiagnosticIssue`，记录分类、严重度、检查ID、测试名称、消息、文件、行号、退出码、日志和建议重跑命令。
@@ -93,6 +103,7 @@ Harness提供 `quick`、`full`、`release` 三个profile。后一级包含前一
 - [旧latest报告被误认为当前结果] → 每次运行先写运行状态，全部通过时删除或显式失效 `latest-errors.html`。
 - [GitHub无法验证真实设备] → 将云端、本机和现场证据分层，涉及硬件的发布要求人工签署现场结果。
 - [变更文件模式误判EXE重建] → 未匹配文件进入人工确认，不自动重建；规则本身具有单元测试。
+- [兼容入口掩盖启动器构建变化] → 独立构建脚本进入强制重建规则，兼容入口只负责转发且由契约测试限制不得重新嵌入PyInstaller参数。
 - [门禁脚本被绕过] → GitHub分支保护负责合并门禁，正式发布入口检查最新release报告的提交号和通过状态。
 
 ## Migration Plan
@@ -104,5 +115,6 @@ Harness提供 `quick`、`full`、`release` 三个profile。后一级包含前一
 5. 将旧PowerShell入口改为兼容转发，更新GitHub Actions和使用文档。
 6. 运行单项、quick、full和release验证；确认原EXE复用与SHA-256策略不变，现场项仍为明确待验证。
 7. 兼容期结束后可移除旧Python实现，但保留旧PowerShell转发入口直到所有外部调用迁移完成。
+8. 拆分模块化启动器构建和交付目录组装，保留 `build_modular_app.ps1` 参数兼容，并以契约测试和EXE规则验证职责边界。
 
 回滚时恢复旧入口和配置路径即可；Harness不迁移业务数据，也不修改现有EXE，因此不会影响现有软件继续运行。`harness/logs/`、`harness/reports/` 和本机设置均为可删除运行产物。

@@ -13,6 +13,8 @@
 
 `checks/` 中其余每个 `.cmd` 对应 `config/regression-matrix.json` 中同名检查 ID，只运行该检查。所有 `.cmd` 都是 ASCII 文本，使用自身路径定位仓库，保留 Harness 退出码并在结束时等待按键。
 
+EXE判定按职责边界处理：`modular_runtime/build_launcher.ps1` 变化要求授权重建；`modular_runtime/assemble_modular_delivery.ps1` 变化复用稳定EXE并校验SHA-256；兼容入口 `modular_runtime/build_modular_app.ps1` 变化要求人工确认，且不会覆盖同时命中的更高风险重建规则。
+
 双击后会立即显示 `AFP Harness launcher started`，随后显示预检状态及 `[当前项/总项] START`。具体测试的输出会被捕获到日志，因此某一项运行期间暂时没有新文字属于正常现象；窗口中会同时显示该项最长超时时间，结束后显示 `PASSED`、`FAILED`、`TIMED_OUT` 或 `PENDING_FIELD`。
 
 ## 命令行

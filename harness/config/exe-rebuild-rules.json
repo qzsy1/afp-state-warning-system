@@ -6,6 +6,7 @@
       {"pattern": "visualization_app/*.py", "reason": "Visualization business modules are external update content."},
       {"pattern": "visualization_app/**/*.py", "reason": "Visualization business modules are external update content."},
       {"pattern": "modular_runtime/app/**", "reason": "Modular application code is copied outside the stable launcher."},
+      {"pattern": "modular_runtime/assemble_modular_delivery.ps1", "reason": "Delivery assembly updates external files and must reuse the stable launcher."},
       {"pattern": "interface_monitor_demo/**", "reason": "The interface monitor demo is external application content."},
       {"pattern": "validation/**", "reason": "Validation assets do not alter the launcher runtime."},
       {"pattern": "harness/**", "reason": "Quality-gate tooling runs outside the packaged launcher."},
@@ -35,7 +36,7 @@
     "rebuild_required": [
       {"pattern": "modular_runtime/launcher_entry.py", "reason": "The packaged launcher entry changed."},
       {"pattern": "modular_runtime/dependency_anchor.py", "reason": "The packaged dependency anchor changed."},
-      {"pattern": "modular_runtime/build_modular_app.ps1", "reason": "The stable launcher build definition changed."},
+      {"pattern": "modular_runtime/build_launcher.ps1", "reason": "The stable launcher build definition changed."},
       {"pattern": "visualization_app/build*.ps1", "reason": "A desktop executable build definition changed."},
       {"pattern": "**/*.spec", "reason": "A PyInstaller specification changed."},
       {"pattern": "**/requirements*.txt", "reason": "Packaged third-party dependency declarations changed."},
@@ -50,7 +51,7 @@
     "manual_review": [
       {"pattern": "delivery/**", "reason": "Tracked delivery changes require explicit release review."},
       {"pattern": "runtime/**", "reason": "Runtime-state changes require explicit release review."},
-      {"pattern": "**/*.ps1", "reason": "Unclassified PowerShell changes may affect packaging or deployment."},
+      {"pattern": "modular_runtime/build_modular_app.ps1", "reason": "The compatibility build orchestrator requires review unless a launcher rebuild input also changed."},
       {"pattern": "**/*.bat", "reason": "Batch launcher changes require explicit runtime review."},
       {"pattern": "**/*.exe", "reason": "Executable changes require explicit rebuild authorization."}
     ]

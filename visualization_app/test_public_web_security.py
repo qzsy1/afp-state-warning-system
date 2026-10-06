@@ -1360,7 +1360,7 @@ class FrontendAccessContractTests(unittest.TestCase):
 
 class BuildManifestTests(unittest.TestCase):
     def test_build_script_copies_every_public_web_module(self):
-        script = (Path(__file__).resolve().parent.parent / "modular_runtime" / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
+        script = (Path(__file__).resolve().parent.parent / "modular_runtime" / "assemble_modular_delivery.ps1").read_text(encoding="utf-8-sig")
         for name in (
             "web_auth.py",
             "web_access.py",
@@ -1373,16 +1373,16 @@ class BuildManifestTests(unittest.TestCase):
             self.assertIn(f'"{name}"', script)
 
     def test_build_script_contains_delivery_secret_scan(self):
-        script = (Path(__file__).resolve().parent.parent / "modular_runtime" / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
+        script = (Path(__file__).resolve().parent.parent / "modular_runtime" / "assemble_modular_delivery.ps1").read_text(encoding="utf-8-sig")
         self.assertIn("public_web_security.sqlite3", script)
         self.assertIn("sk-[A-Za-z0-9_-]{20,}", script)
 
     def test_build_script_packages_edge_capture_runtime(self):
-        script = (Path(__file__).resolve().parent.parent / "modular_runtime" / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
+        script = (Path(__file__).resolve().parent.parent / "modular_runtime" / "assemble_modular_delivery.ps1").read_text(encoding="utf-8-sig")
         self.assertIn('"edge_capture.py"', script)
 
     def test_build_script_packages_server_target_mysql_runtime(self):
-        script = (Path(__file__).resolve().parent.parent / "modular_runtime" / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
+        script = (Path(__file__).resolve().parent.parent / "modular_runtime" / "assemble_modular_delivery.ps1").read_text(encoding="utf-8-sig")
         self.assertIn('"server_target_mysql.py"', script)
         self.assertIn('"server_capture_journal.py"', script)
 

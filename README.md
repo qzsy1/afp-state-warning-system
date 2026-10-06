@@ -23,7 +23,9 @@
 - `modular_runtime/app/core`：模块契约、装载、事件和更新回滚；
 - `modular_runtime/app/modules`：九个可独立维护的业务模块；
 - `visualization_app`：已经验证的原有业务兼容实现与前端；
-- `modular_runtime/build_modular_app.ps1`：Windows 自包含软件构建；
+- `modular_runtime/build_launcher.ps1`：仅构建稳定启动器EXE；
+- `modular_runtime/assemble_modular_delivery.ps1`：复用已有启动器并组装外置业务文件、配置和完整性清单；
+- `modular_runtime/build_modular_app.ps1`：保持原参数兼容的构建/组装编排入口；
 - `modular_runtime/scripts/create_module_patch.py`：按 Git 差异制作模块补丁。
 
 详细方案见 [模块化 Git 开发维护与发布方案](docs/模块化Git开发维护与发布方案.md)，当前复测见 [模块化 v2 验证报告](docs/模块化v2验证报告.md)。

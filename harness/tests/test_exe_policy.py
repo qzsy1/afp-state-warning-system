@@ -29,20 +29,21 @@ class ExePolicyTests(unittest.TestCase):
                 "visualization_app/static/app.js",
                 "docs/quality-gate.md",
                 "harness/config/regression-matrix.json",
+                "harness/engine/run.ps1",
                 "models/predictor.pth",
                 ".github/workflows/quality-gate.yml",
             ],
             rules,
         )
         self.assertEqual(decision.decision, "reuse")
-        self.assertEqual(len(decision.matches), 6)
+        self.assertEqual(len(decision.matches), 7)
         self.assertIn(".github/workflows/quality-gate.yml", decision.changed_files)
 
     def test_launcher_runtime_and_native_dependencies_require_rebuild(self) -> None:
         rules = load_exe_rules(self.real_rules)
         for path in (
             "modular_runtime/launcher_entry.py",
-            "modular_runtime/build_modular_app.ps1",
+            "modular_runtime/build_launcher.ps1",
             "visualization_app/native_driver.dll",
             "visualization_app/requirements.txt",
         ):
@@ -50,6 +51,33 @@ class ExePolicyTests(unittest.TestCase):
                 decision = classify_changed_files([path], rules)
                 self.assertEqual(decision.decision, "rebuild_required")
                 self.assertEqual(decision.matches[0].path, path)
+
+    def test_delivery_assembly_reuses_exe_and_compatibility_entry_requires_review(self) -> None:
+        rules = load_exe_rules(self.real_rules)
+        assembly = classify_changed_files(
+            ["modular_runtime/assemble_modular_delivery.ps1"], rules
+        )
+        self.assertEqual(assembly.decision, "reuse")
+        self.assertEqual(assembly.matches[0].category, "external_update")
+
+        compatibility = classify_changed_files(
+            ["modular_runtime/build_modular_app.ps1"], rules
+        )
+        self.assertEqual(compatibility.decision, "manual_review")
+        self.assertEqual(compatibility.matches[0].category, "manual_review")
+
+    def test_launcher_build_rule_wins_over_assembly_and_compatibility_changes(self) -> None:
+        rules = load_exe_rules(self.real_rules)
+        decision = classify_changed_files(
+            [
+                "modular_runtime/assemble_modular_delivery.ps1",
+                "modular_runtime/build_modular_app.ps1",
+                "modular_runtime/build_launcher.ps1",
+            ],
+            rules,
+        )
+        self.assertEqual(decision.decision, "rebuild_required")
+        self.assertTrue(any(match.category == "rebuild_required" for match in decision.matches))
 
     def test_rebuild_rule_wins_over_external_overlap_and_mixed_changes(self) -> None:
         rules = load_exe_rules(self.real_rules)
@@ -62,9 +90,11 @@ class ExePolicyTests(unittest.TestCase):
 
     def test_unmatched_file_requires_manual_review(self) -> None:
         rules = load_exe_rules(self.real_rules)
-        decision = classify_changed_files(["unclassified/runtime.magic"], rules)
-        self.assertEqual(decision.decision, "manual_review")
-        self.assertIn("unclassified/runtime.magic", decision.reasons[0])
+        for path in ("unclassified/runtime.magic", "unclassified/deploy.ps1"):
+            with self.subTest(path=path):
+                decision = classify_changed_files([path], rules)
+                self.assertEqual(decision.decision, "manual_review")
+                self.assertIn(path, decision.reasons[0])
 
     def test_empty_change_set_is_reuse(self) -> None:
         rules = load_exe_rules(self.real_rules)

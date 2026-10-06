@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import sys
 import tempfile
 import threading
@@ -40,50 +41,107 @@ class ContractTests(unittest.TestCase):
 
 
 class BuildScriptContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.compatibility = (RUNTIME_ROOT / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
+        cls.launcher = (RUNTIME_ROOT / "build_launcher.ps1").read_text(encoding="utf-8-sig")
+        cls.assembly = (RUNTIME_ROOT / "assemble_modular_delivery.ps1").read_text(encoding="utf-8-sig")
+
+    def test_build_responsibilities_are_split_behind_compatible_entrypoint(self) -> None:
+        self.assertIn('"build_launcher.ps1"', self.compatibility)
+        self.assertIn('"assemble_modular_delivery.ps1"', self.compatibility)
+        self.assertNotIn("PyInstaller", self.compatibility)
+        self.assertNotIn("SHA256SUMS.txt", self.compatibility)
+        self.assertNotIn("$launcherSource = &", self.compatibility)
+        for parameter in (
+            "PythonExecutable", "ReferenceRelease", "TargetDir", "ApplicationVersion",
+            "SkipExecutableBuild", "AllowExistingTarget", "ExistingExecutable",
+        ):
+            self.assertIn(f"${parameter}", self.compatibility)
+
     def test_integrity_manifest_excludes_nested_app_runtime_state(self) -> None:
-        script = (RUNTIME_ROOT / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
-        self.assertIn('$nestedRuntime = $segments.Count -ge 2 -and $segments[0] -eq "app" -and $segments[1] -eq "runtime"', script)
-        self.assertIn("-not $nestedRuntime", script)
+        self.assertIn('$nestedRuntime = $segments.Count -ge 2 -and $segments[0] -eq "app" -and $segments[1] -eq "runtime"', self.assembly)
+        self.assertIn("-not $nestedRuntime", self.assembly)
 
     def test_build_keeps_primary_and_legacy_static_assets_in_sync(self) -> None:
-        script = (RUNTIME_ROOT / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
-        self.assertIn('$legacyStaticTarget = Join-Path $legacyTarget "static"', script)
-        self.assertIn('Copy-Item -LiteralPath $_.FullName -Destination $legacyStaticTarget -Recurse -Force', script)
-        self.assertIn('Copy-Item -LiteralPath $_.FullName -Destination $uiTarget -Recurse -Force', script)
+        self.assertIn('$legacyStaticTarget = Join-Path $legacyTarget "static"', self.assembly)
+        self.assertIn('Copy-Item -LiteralPath $_.FullName -Destination $legacyStaticTarget -Recurse -Force', self.assembly)
+        self.assertIn('Copy-Item -LiteralPath $_.FullName -Destination $uiTarget -Recurse -Force', self.assembly)
 
     def test_build_keeps_pywebview_windows_runtime_dependencies(self) -> None:
-        script = (RUNTIME_ROOT / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
-        self.assertIn('"--hidden-import", "webview.platforms.winforms"', script)
-        self.assertNotIn('"--exclude-module", "clr_loader"', script)
-        self.assertNotIn('"--exclude-module", "pythonnet"', script)
+        self.assertIn('"--hidden-import", "webview.platforms.winforms"', self.launcher)
+        self.assertNotIn('"--exclude-module", "clr_loader"', self.launcher)
+        self.assertNotIn('"--exclude-module", "pythonnet"', self.launcher)
 
     def test_build_places_launcher_at_delivery_root(self) -> None:
-        script = (RUNTIME_ROOT / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
-        self.assertIn("Get-ChildItem -LiteralPath $built -Force", script)
-        self.assertNotIn("Copy-Item -LiteralPath $built -Destination $TargetDir -Recurse", script)
+        self.assertIn("Get-ChildItem -LiteralPath $LauncherSourceDir -Force", self.assembly)
+        self.assertNotIn("Copy-Item -LiteralPath $LauncherSourceDir -Destination $TargetDir -Recurse", self.assembly)
 
     def test_build_copies_simulation_and_diagnosis_runtime_modules(self) -> None:
-        script = (RUNTIME_ROOT / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
-        self.assertIn('"diagnosis_jobs.py"', script)
-        self.assertIn('"simulation_packages.py"', script)
-        self.assertIn('Join-Path $LegacySource "simulation_packages"', script)
+        self.assertIn('"diagnosis_jobs.py"', self.assembly)
+        self.assertIn('"simulation_packages.py"', self.assembly)
+        self.assertIn('Join-Path $LegacySource "simulation_packages"', self.assembly)
 
     def test_build_stamps_requested_version_into_runtime_config(self) -> None:
-        script = (RUNTIME_ROOT / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
-        self.assertIn("$runtimeConfig.application_version = $ApplicationVersion", script)
+        self.assertIn("$runtimeConfig.application_version = $ApplicationVersion", self.assembly)
 
     def test_build_copies_release_operational_scripts(self) -> None:
-        script = (RUNTIME_ROOT / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
         for name in (
             "install_local_helper_autostart.ps1",
             "public_tunnel_watchdog.ps1",
             "tailscale_funnel_watchdog.ps1",
         ):
-            self.assertIn(f'"{name}"', script)
+            self.assertIn(f'"{name}"', self.assembly)
 
     def test_build_does_not_embed_external_legacy_entrypoint(self) -> None:
-        script = (RUNTIME_ROOT / "build_modular_app.ps1").read_text(encoding="utf-8-sig")
-        self.assertNotIn('"--hidden-import", "interface_agent"', script)
+        self.assertNotIn('"--hidden-import", "interface_agent"', self.launcher)
+
+    def test_delivery_assembly_reuses_existing_launcher_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            reference = root / "reference"
+            (reference / "_internal" / "data").mkdir(parents=True)
+            (reference / "_internal" / "data" / "reference.txt").write_text("data", encoding="utf-8")
+            (reference / "models").mkdir()
+            (reference / "models" / "model.txt").write_text("model", encoding="utf-8")
+
+            launcher = root / "trusted-launcher"
+            (launcher / "_internal").mkdir(parents=True)
+            executable = launcher / "AFP_Integrated_System_Modular.exe"
+            executable.write_bytes(b"trusted-launcher-bytes")
+            (launcher / "_internal" / "runtime.txt").write_text("runtime", encoding="utf-8")
+            (launcher / "VERSION.json").write_text(
+                json.dumps({"application_version": "2.0.4", "launcher_version": "2.0.4"}),
+                encoding="utf-8",
+            )
+            expected_hash = hashlib.sha256(executable.read_bytes()).hexdigest()
+
+            target = root / "delivery"
+            completed = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                    str(RUNTIME_ROOT / "assemble_modular_delivery.ps1"),
+                    "-ReferenceRelease", str(reference),
+                    "-TargetDir", str(target),
+                    "-ApplicationVersion", "test-split",
+                    "-ExistingExecutable", str(executable),
+                ],
+                cwd=RUNTIME_ROOT.parent,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+            assembled = target / "AFP_Integrated_System_Modular.exe"
+            self.assertEqual(hashlib.sha256(assembled.read_bytes()).hexdigest(), expected_hash)
+            self.assertTrue((target / "_internal" / "runtime.txt").is_file())
+            self.assertTrue((target / "config" / "runtime.json").is_file())
+            self.assertIn("AFP_Integrated_System_Modular.exe", (target / "SHA256SUMS.txt").read_text(encoding="utf-8-sig"))
+            version = json.loads((target / "VERSION.json").read_text(encoding="utf-8-sig"))
+            self.assertEqual(version["application_version"], "test-split")
+            self.assertEqual(version["launcher_version"], "2.0.4")
 
 
 class UpdateTests(unittest.TestCase):

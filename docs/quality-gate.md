@@ -27,6 +27,8 @@ py -3.11 -m venv .venv
 
 `-BaselineExe` 同时指定哈希复用检查和五项打包诊断实际执行的 EXE，报告会记录解析后的绝对路径，防止新版本发布时误测旧 EXE。也可以使用多个 `-ChangedFile` 代替 `-BaseRef`，用于审核一份明确的变更清单。Harness 不会调用 PyInstaller、复制 EXE 或创建交付目录。
 
+模块化发布脚本按职责分类：`modular_runtime/build_launcher.ps1` 修改启动器二进制构建边界并要求授权重建；`modular_runtime/assemble_modular_delivery.ps1` 只组装外置文件，默认复用稳定EXE并校验哈希；兼容入口 `modular_runtime/build_modular_app.ps1` 本身进入人工确认，若同一变更同时命中启动器构建输入则以重建规则为准。
+
 ## 退出码和报告
 
 | 退出码 | 含义 |

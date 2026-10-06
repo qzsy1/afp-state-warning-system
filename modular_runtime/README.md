@@ -18,16 +18,31 @@ prediction/warning and one-epoch training chain.  Run `--verify-files` to check
 all immutable delivery files against `SHA256SUMS.txt`; acquisition records,
 logs, rollback snapshots and verification outputs are deliberately excluded.
 
-## One-time launcher build
+## Launcher build and delivery assembly
 
 ```powershell
+# Rebuild the launcher only when its packaged runtime boundary changes.
+powershell -NoProfile -ExecutionPolicy Bypass -File .\modular_runtime\build_launcher.ps1 `
+  -PythonExecutable .\.venv\Scripts\python.exe
+
+# Assemble external application files around an already trusted launcher.
+powershell -NoProfile -ExecutionPolicy Bypass -File .\modular_runtime\assemble_modular_delivery.ps1 `
+  -ReferenceRelease <reference-release> `
+  -TargetDir <target-delivery> `
+  -ApplicationVersion <version> `
+  -ExistingExecutable <trusted-exe> `
+  -AllowExistingTarget
+
+# Existing callers may continue to use the compatibility orchestrator.
 powershell -NoProfile -ExecutionPolicy Bypass -File .\modular_runtime\build_modular_app.ps1
 ```
 
-After that build, changing `app/modules`, `app/legacy`, `app/ui`, `config` or
-model files does not require a new EXE.  Restart the affected module/application
-and run `--self-test`.  Rebuild only when the Python runtime, PyTorch, pywebview,
- PyInstaller or a native dependency must change.
+`build_launcher.ps1` owns PyInstaller and the packaged runtime. Changes to
+`assemble_modular_delivery.ps1`, `app/modules`, `app/legacy`, `app/ui`, `config`
+or model files do not require a new EXE. Reuse the trusted launcher, verify its
+SHA-256 is unchanged, then run `--verify-files`, `--self-test` and the release
+smoke checks. Rebuild only when the Python runtime, PyTorch, pywebview,
+PyInstaller inputs or a native dependency must change.
 
 ## Public HTTPS access (Tailscale Funnel)
 
