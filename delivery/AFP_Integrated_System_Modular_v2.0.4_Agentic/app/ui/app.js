@@ -5736,6 +5736,7 @@ function setPublicDemoControlVisibility(publicDemo) {
 function updateSimulationSettings() {
   const simulation = controls.acquisitionMode?.value === "simulation";
   const publicDemo = isPublicPrecomputedSimulationMode();
+  updateReadinessModePresentation();
   const saveRuleNote = document.querySelector(".save-rule-note");
   if (saveRuleNote) {
     saveRuleNote.textContent =
@@ -5807,6 +5808,12 @@ function updateSimulationSettings() {
         .map((item) => ({...item}));
       renderInterfacePanel(state.interfaceCatalog);
     }
+    document.querySelectorAll(".interface-config-row").forEach((row) => {
+      row.classList.remove("check-error", "check-waiting");
+      row.classList.add("check-ok");
+      row.dataset.checkState = "模拟接口正常";
+      row.title = "模拟采集不使用物理接口；数据源通道覆盖由模拟数据源检查单独判断";
+    });
   } else {
     if (state.interfaceModeRendered !== "real") {
       if (state.interfaceModeRendered === "simulation") {
@@ -6646,6 +6653,27 @@ function currentReadinessMode() {
   return controls.acquisitionMode?.value === "simulation" ? "simulation" : "real";
 }
 
+function updateReadinessModePresentation() {
+  const simulation = currentReadinessMode() === "simulation";
+  const indicator = $("acquisitionSourceIndicator");
+  const checkButton = $("testSensorsButton");
+  const resetButton = controls.resetSensorCheck;
+  if (indicator) {
+    indicator.dataset.mode = simulation ? "simulation" : "real";
+    indicator.textContent = simulation
+      ? "当前采集来源：模拟数据源；检查不会访问物理接口。"
+      : "当前采集来源：真实物理接口；检查会验证接口、协议和传感器通道。";
+  }
+  if (checkButton) {
+    checkButton.textContent = simulation ? "立即检查模拟数据源" : "立即检查真实接口";
+  }
+  if (resetButton) {
+    resetButton.textContent = simulation
+      ? "重置并重新检查模拟数据源"
+      : "重置并重新检查真实接口";
+  }
+}
+
 function storeReadinessResult(mode, result, fingerprint = hardwareConfigFingerprint()) {
   if (mode === "simulation") {
     state.simulationSourceCheck = result;
@@ -6697,6 +6725,11 @@ function renderSimulationSourceCheckResult(result, {automatic = false} = {}) {
   const node = controls.hardwareCheckStatus;
   if (!node) return;
   clearHardwareRowStates();
+  document.querySelectorAll(".interface-config-row").forEach((row) => {
+    row.classList.add("check-ok");
+    row.dataset.checkState = "模拟接口正常";
+    row.title = "模拟采集不使用物理接口；数据源通道覆盖由模拟数据源检查单独判断";
+  });
   const readiness = result?.simulation_readiness || {};
   const stages = Array.isArray(readiness.stages) ? readiness.stages : [];
   const sensors = (Array.isArray(result?.sensors) ? result.sensors : [])
@@ -7022,7 +7055,7 @@ async function testSensorConnection({automatic = false} = {}) {
       updateAgentFromHardwareResult(failedCheck, {automatic});
       if (node) {
         node.className = "hardware-check-status error";
-        node.textContent = `本机辅助程序检查失败：${error.message}`;
+        node.textContent = `真实接口检查失败：${error.message}；如需使用模拟数据，请在“采集来源”选择“模拟采集”。`;
       }
       if (!automatic) toast(error.message);
       return null;
@@ -7070,7 +7103,7 @@ async function testSensorConnection({automatic = false} = {}) {
     state.hardwareCheckFingerprint = "";
     if (node) {
       node.className = "hardware-check-status error";
-      node.textContent = `检查失败：${error.message}`;
+      node.textContent = `真实接口检查失败：${error.message}；如需使用模拟数据，请在“采集来源”选择“模拟采集”。`;
     }
     if (!automatic) toast(error.message);
     return null;

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import json
+import subprocess
 import sys
 import tempfile
 import time
@@ -340,6 +341,155 @@ class RealAcquisitionRegressionTests(unittest.TestCase):
         self.assertIn("renderSimulationSourceCheckResult", body)
         simulation_branch = body[:body.index("if (usesLocalCaptureHelper()")]
         self.assertNotIn("renderHardwareCheckResult(result", simulation_branch)
+
+    def test_frontend_names_the_active_readiness_source_in_controls(self) -> None:
+        source = (DELIVERY_ROOT / "app" / "ui" / "app.js").read_text(encoding="utf-8")
+        marker = "function updateReadinessModePresentation()"
+        self.assertIn(marker, source)
+        start = source.index(marker)
+        end = source.index("\nfunction ", start + len(marker))
+        function = source[start:end]
+        script = r'''
+const mode = {value: "simulation"};
+const indicator = {textContent: "", dataset: {}};
+const checkButton = {textContent: ""};
+const resetButton = {textContent: ""};
+const controls = {acquisitionMode: mode, resetSensorCheck: resetButton};
+const nodes = {
+  acquisitionSourceIndicator: indicator,
+  testSensorsButton: checkButton,
+};
+const $ = (id) => nodes[id] || null;
+const currentReadinessMode = () => mode.value === "simulation" ? "simulation" : "real";
+''' + function + r'''
+updateReadinessModePresentation();
+if (indicator.dataset.mode !== "simulation") process.exit(1);
+if (!indicator.textContent.includes("模拟数据源")) process.exit(2);
+if (!checkButton.textContent.includes("模拟数据源")) process.exit(3);
+if (!resetButton.textContent.includes("模拟数据源")) process.exit(4);
+mode.value = "real";
+updateReadinessModePresentation();
+if (indicator.dataset.mode !== "real") process.exit(5);
+if (!indicator.textContent.includes("真实物理接口")) process.exit(6);
+if (!checkButton.textContent.includes("真实接口")) process.exit(7);
+if (!resetButton.textContent.includes("真实接口")) process.exit(8);
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_simulation_interface_cards_default_to_normal_without_hardware_probe(self) -> None:
+        source = (DELIVERY_ROOT / "app" / "ui" / "app.js").read_text(encoding="utf-8")
+        start = source.index("function renderSimulationSourceCheckResult(")
+        end = source.index("\nfunction renderHardwareCheckResult", start)
+        function = source[start:end]
+        script = r'''
+const statusNode = {
+  className: "", children: [],
+  replaceChildren(...items) { this.children = items; },
+  appendChild(item) { this.children.push(item); },
+};
+const makeRow = () => ({
+  dataset: {}, title: "", added: [],
+  classList: {add(value) { this.owner.added.push(value); }, owner: null},
+  querySelector() { return null; },
+});
+const interfaceRows = [makeRow(), makeRow(), makeRow(), makeRow(), makeRow()];
+interfaceRows.forEach((row) => { row.classList.owner = row; });
+const controls = {hardwareCheckStatus: statusNode};
+const clearHardwareRowStates = () => {};
+const document = {
+  createElement() { return {textContent: "", className: ""}; },
+  querySelectorAll(selector) {
+    if (selector === ".interface-config-row") return interfaceRows;
+    return [];
+  },
+};
+''' + function + r'''
+renderSimulationSourceCheckResult({
+  ok: false,
+  simulation_readiness: {replay_ready: false, stages: []},
+  sensors: [],
+  interfaces: [],
+});
+if (interfaceRows.some((row) => !row.added.includes("check-ok"))) process.exit(1);
+if (interfaceRows.some((row) => row.dataset.checkState !== "模拟接口正常")) process.exit(2);
+if (interfaceRows.some((row) => row.added.includes("check-error"))) process.exit(3);
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_simulation_mode_ignores_stale_physical_kind_mismatch(self) -> None:
+        source = (DELIVERY_ROOT / "app" / "ui" / "app.js").read_text(encoding="utf-8")
+        start = source.index("function validatePhysicalInterfaceBindings(")
+        end = source.index("\ncontrols.acquisitionMode?.addEventListener", start)
+        function = source[start:end]
+        script = r'''
+const sensorTypeProfile = () => ({physical_kind: "usb_hid"});
+const staleRealBinding = [{
+  id: "thermocouple_8ch", enabled: true, role: "thermocouple",
+  physical_interface_id: "ethernet:stale", physical_interface_kind: "ethernet",
+  physical_fallback: false,
+}];
+''' + function + r'''
+validatePhysicalInterfaceBindings(staleRealBinding, false);
+let realBlocked = false;
+try { validatePhysicalInterfaceBindings(staleRealBinding, true); }
+catch (error) { realBlocked = error.message.includes("物理接口类型与协议不匹配"); }
+if (!realBlocked) process.exit(1);
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_real_readiness_failure_can_run_rules_and_langchain_diagnosis(self) -> None:
+        source = (DELIVERY_ROOT / "app" / "ui" / "app.js").read_text(encoding="utf-8")
+        events_start = source.index("function buildAgentEvents(")
+        events_end = source.index("\nfunction renderAgentGate", events_start)
+        events_function = source[events_start:events_end]
+        run_start = source.index("async function runAgentDiagnosis(")
+        run_end = source.index("\nasync function testSensorConnection", run_start)
+        run_function = source[run_start:run_end]
+        script = r'''
+const hardwareResult = {
+  ok: false,
+  acquisition_mode: "real",
+  interfaces: [{
+    id: "thermocouple_8ch", label: "SMRF 八通道热电偶", role: "thermocouple",
+    driver: "smrf_hid", endpoint: "SMRFCT08B", enabled: true, ok: false,
+    state: "not_connected", message: "未连接真实设备",
+    expected_channels: ["温度1"], missing_channels: ["温度1"],
+    detected_channels: [], invalid_channels: [],
+  }],
+  sensors: [{name: "温度1", selected: true, ok: false, state: "no_data", message: "没有数据"}],
+};
+''' + events_function + r'''
+const events = buildAgentEvents(hardwareResult);
+if (events.length !== 1 || events[0].interface_id !== "thermocouple_8ch") process.exit(1);
+const calls = [];
+const state = {
+  agentEvents: events, agentRequestId: 0, agentBusy: false, agentJobId: "",
+  agentResult: null, hardwareCheck: hardwareResult, accessRole: "local_admin",
+};
+const controls = {};
+const agentApiKeyInput = {value: "test-key"};
+const agentModelNameInput = {value: "test-model"};
+const autoStatus = {textContent: ""};
+const $ = (id) => id === "agentAutoStatus" ? autoStatus : null;
+const renderAgentGate = () => true;
+const renderHardwareCheckResult = () => {};
+const postJson = async (url, payload) => {
+  calls.push({url, payload});
+  return {job_id: "", local_result: {execution_mode: "local_rules", diagnoses: [{}]}};
+};
+''' + run_function + r'''
+(async () => {
+  const result = await runAgentDiagnosis({automatic: false});
+  if (calls.length !== 1 || calls[0].url !== "/api/agent/diagnose/start") process.exit(2);
+  if (calls[0].payload.hardware_result !== hardwareResult) process.exit(3);
+  if (!result || state.agentResult !== result) process.exit(4);
+})().catch((error) => { console.error(error); process.exit(5); });
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_m3232_uses_canonical_thin_film_pressure_channel(self) -> None:
         driver = acquisition.M3232PressureDriver("COM8")

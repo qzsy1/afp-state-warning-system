@@ -260,14 +260,15 @@
                  title="上下拖动调整传感器通道区域高度；双击恢复默认高度">
                 <span aria-hidden="true">•••</span>
               </div>
-              <p class="control-note sensor-prediction-note">仅采集模式只使用“采集保存”；预测模式要求输入通道与模型元数据一致，输出通道决定预测曲线及健康指标数据。</p>
+              <p class="control-note sensor-prediction-note">“仅采集”表示不运行预测，不等于“模拟采集”；当前数据来源以上方“采集来源”为准。预测模式要求输入通道与模型元数据一致，输出通道决定预测曲线及健康指标数据。</p>
+              <div id="acquisitionSourceIndicator" class="control-note" data-mode="real">当前采集来源：真实物理接口；检查会验证接口、协议和传感器通道。</div>
               <label class="hardware-auto-toggle">
               <input id="autoHardwareCheckInput" type="checkbox" checked>
               启动时自动检查接口与传感器通道（仅一次）
               </label>
               <div class="transport hardware-check-actions">
-              <button id="testSensorsButton" class="secondary-button" type="button">立即检查</button>
-              <button id="resetSensorCheckButton" class="secondary-button" type="button">重置并重新检查</button>
+              <button id="testSensorsButton" class="secondary-button" type="button">立即检查真实接口</button>
+              <button id="resetSensorCheckButton" class="secondary-button" type="button">重置并重新检查真实接口</button>
               </div>
               <div id="hardwareCheckStatus" class="hardware-check-status checking">
               等待自动检查；检查会逐项确认接口、通道和有效数据。
@@ -524,6 +525,6 @@
   <script src="/mysql_visibility.js?v=20260909-mysql-toggle-2"></script>
   <script src="/process_parameters.js?v=20260916-auto-process-1"></script>
   <script src="/public_demo.js?v=20261001-stable-public-demo-v2"></script>
-  <script src="/app.js?v=20261007-interface-check-v6"></script>
+  <script src="/app.js?v=20261007-interface-check-v7"></script>
 </body>
 </html>

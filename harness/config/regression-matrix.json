@@ -5,13 +5,13 @@
     {"id": "HARNESS-001", "title": "质量门禁配置、执行、报告和退出码可靠", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "STARTUP-001", "title": "软件启动、服务探测和前端加载保持可用", "mandatory": true, "profiles": ["full", "release"]},
     {"id": "SIMULATION-001", "title": "模拟采集导入、运行和结果链路保持可用", "mandatory": true, "profiles": ["full", "release"]},
-    {"id": "MODE_ISOLATION-001", "title": "模拟和真实采集状态相互隔离", "mandatory": true, "profiles": ["full", "release"]},
+    {"id": "MODE_ISOLATION-001", "title": "模拟和真实采集状态相互隔离，模拟逻辑接口默认正常", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "INTERFACES-001", "title": "SMRF、PLC、UVC、ABB和M3232接口映射保持完整", "mandatory": true, "profiles": ["full", "release"]},
     {"id": "USB_TOPOLOGY-001", "title": "USB拓展坞物理端口识别、同类型接口展示和设备验证边界正确", "mandatory": true, "profiles": ["full", "release"]},
     {"id": "EDGE_HELPER-001", "title": "边缘辅助程序传输、确认、重连和会话隔离正确", "mandatory": true, "profiles": ["full", "release"]},
     {"id": "CSV-001", "title": "CSV目录、层文件、完整试样和完整性证据正确", "mandatory": true, "profiles": ["full", "release"]},
     {"id": "MYSQL-001", "title": "MySQL保存、重试、目标库隔离和凭据边界正确", "mandatory": true, "profiles": ["full", "release"]},
-    {"id": "DIAGNOSIS-001", "title": "本地诊断可独立运行且模型失败时安全降级", "mandatory": true, "profiles": ["full", "release"]},
+    {"id": "DIAGNOSIS-001", "title": "真实Readiness失败可运行本地规则和LangChain增强诊断，模型失败时安全降级且不改变门禁", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "LAN_PUBLIC-001", "title": "局域网和公网访问、安全边界及管理端隔离正确", "mandatory": true, "profiles": ["full", "release"]},
     {"id": "WEBSOCKET-001", "title": "WebSocket实时数据和Helper WebSocket链路正确", "mandatory": true, "profiles": ["full", "release"]},
     {"id": "MODEL_CHANNELS-001", "title": "模型输入通道和独立M3232薄膜压力通道保持完整", "mandatory": true, "profiles": ["full", "release"]},
@@ -20,7 +20,7 @@
     {"id": "RELEASE_EVIDENCE-001", "title": "发布交付诊断和证据对应当前提交", "mandatory": true, "profiles": ["release"]},
     {"id": "FIELD_BOUNDARY-001", "title": "现场硬件和目标MySQL证据不得由模拟结果冒充", "mandatory": true, "profiles": ["release"]},
     {"id": "REAL_ACQUISITION-001", "title": "真实采集使用独立驱动、统一单调时钟和逐通道质量合同", "mandatory": true, "profiles": ["quick", "full", "release"]},
-    {"id": "PHYSICAL_READINESS-001", "title": "五类物理传感器按协议身份和全部必需通道失败关闭", "mandatory": true, "profiles": ["full", "release"]},
+    {"id": "PHYSICAL_READINESS-001", "title": "五类物理传感器按协议身份和全部必需通道失败关闭", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "LIVE_PREDICTION_SAFETY-001", "title": "实时预测只使用兼容频率下最近连续完整模型窗口", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "CAPTURE_PERSISTENCE-001", "title": "统一帧、质量侧车、数据库和停止终结可对账恢复", "mandatory": true, "profiles": ["full", "release"]},
     {"id": "REAL_RELEASE_GATE-001", "title": "G0至G5证据按交付修订分级且不可由低等级越级替代", "mandatory": true, "profiles": ["release"]}
@@ -211,8 +211,8 @@
       "environments": ["local"],
       "blocking": true,
       "evidence_tier": "protocol_simulation",
-      "requirements": ["REAL_ACQUISITION-001", "PHYSICAL_READINESS-001", "LIVE_PREDICTION_SAFETY-001", "CAPTURE_PERSISTENCE-001"],
-      "change_patterns": ["delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/legacy/acquisition.py", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/legacy/real_acquisition.py", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/verification/test_real_acquisition_pipeline.py", "openspec/changes/harden-real-acquisition-pipeline/**"]
+      "requirements": ["REAL_ACQUISITION-001", "PHYSICAL_READINESS-001", "MODE_ISOLATION-001", "DIAGNOSIS-001", "LIVE_PREDICTION_SAFETY-001", "CAPTURE_PERSISTENCE-001"],
+      "change_patterns": ["delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/ui/**", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/legacy/static/**", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/legacy/acquisition.py", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/legacy/real_acquisition.py", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/verification/test_real_acquisition_pipeline.py", "openspec/changes/harden-real-acquisition-pipeline/**"]
     },
     {
       "id": "release-module-status",
