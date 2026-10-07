@@ -49,6 +49,7 @@ from acquisition import (
     check_capture_save_root,
     integrate_capture_sources,
     default_capture_interfaces,
+    recent_complete_window,
     resolve_default_simulation_source,
     sensor_interface_profiles,
     select_capture_folder,
@@ -1168,7 +1169,11 @@ class DashboardData:
                     }
                 )
         return {
-            "application": {"version": APP_VERSION, "build_id": BUILD_ID},
+            "application": {
+                "version": APP_VERSION,
+                "build_id": BUILD_ID,
+                "runtime_revision": str(os.environ.get("AFP_RUNTIME_REVISION") or ""),
+            },
             "manifest": self.manifest,
             "state_labels": STATE_LABELS,
             "sensors": self.sensors,
@@ -3071,16 +3076,19 @@ class DashboardData:
             active_sensor_columns.index(name)
             for name in acquired_model_inputs
         ]
-        all_channels_ready = (
-            len(rows) >= 24
-            and bool(input_indices)
-            and np.isfinite(sensors[:, input_indices]).all()
+        seq_len = int(active_profile.get("seq_len", 24))
+        window_readiness = recent_complete_window(
+            rows[-seq_len:],
+            acquired_model_inputs,
+            seq_len,
+            quality_rows=(status.get("recent_frame_quality") or [])[-seq_len:],
         )
+        all_channels_ready = bool(input_indices) and window_readiness["ready"]
         model_tensor = (
             self._live_model_tensor(
                 rows, sensors, active_profile, active_sensor_columns
             )
-            if all_channels_ready
+            if rows
             else None
         )
 
@@ -3095,14 +3103,22 @@ class DashboardData:
         # chart uses a separate target-aligned causal prediction series below.
         warning_prediction = np.full_like(sensors, np.nan)
         historical_prediction = np.full_like(sensors, np.nan)
-        if all_channels_ready and len(rows) >= 48:
+        if model_tensor is not None and len(rows) >= seq_len * 2:
             for target_start in range(24, len(rows) - 23, 24):
+                history_tensor = model_tensor[target_start - seq_len : target_start]
+                actual_window = sensors[target_start : target_start + 24]
+                if (
+                    history_tensor.shape[0] != seq_len
+                    or not np.isfinite(history_tensor).all()
+                    or not np.isfinite(actual_window[:, input_indices]).all()
+                ):
+                    continue
                 cache_key = (session_key, target_start)
                 with self.live_cache_lock:
                     prediction = self.live_prediction_cache.get(cache_key)
                 if prediction is None:
                     predicted_standardized, _ = self.online_predictor.predict(
-                        model_tensor[target_start - 24 : target_start], 24
+                        history_tensor, 24
                     )
                     prediction = self._prediction_to_sensor_matrix(
                         predicted_standardized,
@@ -3111,7 +3127,6 @@ class DashboardData:
                     )
                     with self.live_cache_lock:
                         self.live_prediction_cache[cache_key] = prediction
-                actual_window = sensors[target_start : target_start + 24]
                 warning_prediction[
                     target_start : target_start + 24
                 ] = prediction
@@ -3224,7 +3239,7 @@ class DashboardData:
                 cached_forecast = self.live_forecast_cache.get(forecast_key)
             if cached_forecast is None:
                 forecast_standardized, forecast_mode = self.online_predictor.predict(
-                    model_tensor[-24:], inference_horizon
+                    model_tensor[-seq_len:], inference_horizon
                 )
                 rolling_forecast_prediction = self._prediction_to_sensor_matrix(
                     forecast_standardized,
@@ -3482,7 +3497,8 @@ class DashboardData:
         if latest is None:
             message = (
                 f"需要全部{len(active_profile['input_sensors'])}个模型输入"
-                "通道连续收到24点才能预测"
+                f"通道连续收到{seq_len}点才能预测；还需"
+                f"{window_readiness['remaining_points']}点"
                 if not all_channels_ready
                 else "首次窗口预警需要24点历史＋24点实测"
             )

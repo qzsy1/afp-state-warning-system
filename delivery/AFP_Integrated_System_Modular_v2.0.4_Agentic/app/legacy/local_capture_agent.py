@@ -87,10 +87,9 @@ class LocalCaptureAgent:
             for item in physical
             if str(item.get("kind") or "") == kind
             and str(item.get("protocol") or "") in protocols
+            and bool(item.get("auto_bind_eligible"))
             and (allow_used or str(item.get("id") or "") not in used)
         ]
-        # A driver placeholder is a valid protocol binding, but is clearly
-        # marked as not yet sensor-verified in the returned state.
         candidates.sort(
             key=lambda item: (
                 not bool(item.get("detected")),
@@ -117,6 +116,8 @@ class LocalCaptureAgent:
                 used.add(physical_id)
             detected = bool(candidate and candidate.get("detected"))
             driver_available = bool(candidate and candidate.get("driver_available"))
+            identity_verified = bool(candidate and candidate.get("identity_verified"))
+            protocol_ready = bool(candidate and candidate.get("protocol_ready"))
             bindings.append(
                 {
                     "role": role,
@@ -126,18 +127,21 @@ class LocalCaptureAgent:
                     "protocol": protocols[0],
                     "interface_detected": detected,
                     "driver_available": driver_available,
+                    "endpoint_present": bool(candidate and candidate.get("endpoint_present")),
+                    "identity_verified": identity_verified,
+                    "protocol_ready": protocol_ready,
                     "sensor_data_state": "unknown",
                     "acquisition_state": "not_started",
                     "state": (
-                        "interface_detected"
-                        if detected
+                        "identity_verified"
+                        if detected and identity_verified
                         else "driver_available"
                         if driver_available
                         else "unavailable"
                     ),
                     "message": (
-                        "接口已识别，传感器数据待采集验证"
-                        if detected
+                        "接口与设备身份已识别，协议数据待采集验证"
+                        if detected and identity_verified
                         else "驱动或协议已配置，传感器数据待采集验证"
                         if driver_available
                         else "未找到兼容的实际接口"

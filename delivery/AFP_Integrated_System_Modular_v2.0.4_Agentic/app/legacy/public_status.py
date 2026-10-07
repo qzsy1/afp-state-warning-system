@@ -41,15 +41,28 @@ PUBLIC_INTERFACE_DEFINITIONS = (
 
 _PUBLIC_STATE_MESSAGES = {
     "ok": "接口在线并已收到有效数据",
+    "ready": "全部必需通道已就绪",
     "not_connected": "接口无法打开或设备未连接",
     "no_data": "接口已打开但未检测到数据",
+    "no_valid_frame": "驱动已打开但未收到有效协议帧",
     "invalid_data": "接口收到的数据格式或数值无效",
+    "invalid_protocol": "设备协议响应无效",
+    "partial": "仅部分必需通道就绪",
+    "partial_data": "仅部分必需通道就绪",
+    "network_path_invalid": "工业网络路径无效或经过代理/隧道",
+    "hardware_protocol_unverified": "实物协议尚未完成验证",
+    "physical_unverified": "设备数据存在但物理身份尚未确认",
+    "identity_unconfirmed": "设备身份尚未确认",
+    "endpoint_unreachable": "设备端点不可达",
+    "open_failed": "驱动无法打开设备",
+    "hardware_check_timeout": "设备检查超时",
     "disabled": "接口当前未启用",
     "video_only": "接口仅提供视频状态",
     "no_channels": "接口尚未分配采集通道",
     "waiting": "正在等待设备数据",
     "stale": "设备数据已中断",
     "unchecked": "尚未执行真实接口检查",
+    "unknown_failure": "设备返回未登记的失败状态",
 }
 
 
@@ -87,14 +100,15 @@ def build_public_device_status(
     interfaces: list[dict[str, Any]] = []
     for definition in PUBLIC_INTERFACE_DEFINITIONS:
         source = source_by_role.get(definition["role"], {})
-        state = str(source.get("state") or "unchecked").strip().lower()
-        if state not in _PUBLIC_STATE_MESSAGES:
-            state = "unchecked"
+        raw_state = str(source.get("state") or "unchecked").strip().lower()
+        state = raw_state if raw_state in _PUBLIC_STATE_MESSAGES else "unknown_failure"
+        success_state = state in {"ok", "ready", "video_only", "disabled", "no_channels"}
         interfaces.append(
             {
                 **definition,
                 "state": state,
-                "ok": bool(source.get("ok", False)) if source else False,
+                "raw_state": raw_state,
+                "ok": bool(source.get("ok", False)) and success_state if source else False,
                 "message_code": state,
                 "message": _PUBLIC_STATE_MESSAGES[state],
                 "checked_at": checked_at,

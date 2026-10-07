@@ -26,6 +26,10 @@ const state = {
   sensorTypeProfiles: [],
   acquisitionStatus: null,
   acquisitionExecutionHost: "",
+  simulationSourceCheck: null,
+  simulationSourceCheckFingerprint: "",
+  realHardwareCheck: null,
+  realHardwareCheckFingerprint: "",
   hardwareCheck: null,
   hardwareCheckFingerprint: "",
   hardwareCheckInProgress: false,
@@ -578,6 +582,9 @@ const controls = {
   optimizedWarning: $("optimizedWarningInput"),
   bestPredictionOverride: $("bestPredictionOverrideInput"),
   processingMode: $("processingModeSelect"),
+  capturePolicy: $("capturePolicySelect"),
+  degradedConfirmation: $("degradedConfirmationInput"),
+  degradedConfirmationLabel: $("degradedConfirmationLabel"),
   datasetSchema: $("datasetSchemaSelect"),
   driver: $("driverSelect"),
   firstInterfaceRole: $("firstInterfaceRole"),
@@ -2247,7 +2254,11 @@ async function runAgentDiagnosis({automatic = false} = {}) {
 
 async function testSensorConnection({automatic = false} = {}) {
   try {
-    const result = await postJson("/api/acquisition/test", acquisitionConfig(), {timeoutMs: 20000});
+    const result = await postJson(
+      "/api/acquisition/test",
+      acquisitionConfig({allowUnverifiedPhysical: true}),
+      {timeoutMs: 20000},
+    );
     if (controls.processingMode.value !== "capture_only") {
       applyPredictionModelProfile(result.prediction_model, false);
     }
@@ -4785,7 +4796,17 @@ function interfaceConfigs() {
       physical_live_interface_id: selectedPhysical?.dataset?.liveId || "",
       physical_interface_kind: selectedPhysical?.dataset?.kind || "",
       physical_transport_family: selectedPhysical?.dataset?.transportFamily || "",
-      physical_verified: selectedPhysical?.dataset?.detected === "true",
+      physical_vid: selectedPhysical?.dataset?.vid ? Number(selectedPhysical.dataset.vid) : null,
+      physical_pid: selectedPhysical?.dataset?.pid ? Number(selectedPhysical.dataset.pid) : null,
+      physical_serial: selectedPhysical?.dataset?.serial || "",
+      physical_location: selectedPhysical?.dataset?.location || "",
+      device_profile_id: selectedPhysical?.dataset?.deviceProfileId || "",
+      identity_confirmed: selectedPhysical?.dataset?.identityVerified === "true",
+      source_address: selectedPhysical?.dataset?.sourceAddress || "",
+      network_interface_name: selectedPhysical?.dataset?.interfaceName || "",
+      device_subnet: selectedPhysical?.dataset?.deviceSubnet || "",
+      physical_verified: selectedPhysical?.dataset?.endpointPresent === "true"
+        && selectedPhysical?.dataset?.identityVerified === "true",
       physical_fallback: selectedPhysical?.dataset?.fallback === "true",
       selection_origin: row.dataset.selectionOrigin || "manual",
       channel_map: channelMap,
@@ -4925,6 +4946,10 @@ function usbPhysicalCandidatesForRole(role) {
       physical_port_id: port.id,
       physical_interface_id: compatibleLive?.id || "",
       detected: Boolean(compatibleLive && compatibleLive.detected !== false),
+      endpoint_present: Boolean(compatibleLive?.endpoint_present ?? (compatibleLive && compatibleLive.detected !== false)),
+      identity_verified: Boolean(compatibleLive?.identity_verified),
+      protocol_ready: Boolean(compatibleLive?.protocol_ready),
+      auto_bind_eligible: Boolean(compatibleLive?.auto_bind_eligible),
       compatible: Boolean(compatibleLive),
       auto_assignable: true,
       port_state: port.state || "unknown",
@@ -4942,6 +4967,10 @@ function usbPhysicalCandidatesForRole(role) {
         physical_interface_id: endpointCompatibleWithRole(item, role) ? String(item.id) : "",
         compatible: endpointCompatibleWithRole(item, role),
         detected: endpointCompatibleWithRole(item, role) && item.detected !== false,
+        endpoint_present: Boolean(item.endpoint_present ?? item.detected),
+        identity_verified: Boolean(item.identity_verified),
+        protocol_ready: Boolean(item.protocol_ready),
+        auto_bind_eligible: Boolean(item.auto_bind_eligible),
         label: endpointCompatibleWithRole(item, role)
           ? item.label || item.endpoint || item.id
           : `${item.label || item.endpoint || item.id} · 当前设备与${sensorTypeProfile(role).label || role}不兼容`,
@@ -4974,6 +5003,14 @@ function physicalCandidatesForRole(role) {
     .filter((item) => item.detected !== false || item.driver_available || item.auto_assignable)
     .map((item) => ({
       ...item,
+      auto_bind_eligible: Boolean(
+        item.auto_bind_eligible
+        && (!(role === "plc" || role === "robot") || (item.addresses || []).some((address) => {
+          const targetHost = String(profile.endpoint || "").replace(/^https?:\/\//, "").split(/[/:]/)[0];
+          const targetPrefix = targetHost.split(".").slice(0, 3).join(".");
+          return targetPrefix && String(address).startsWith(`${targetPrefix}.`);
+        }))
+      ),
       group_label: interfaceTransportFamily(item) === "ethernet"
         ? (item.dock_id ? "拓展坞网口" : "电脑网卡")
         : "系统接口",
@@ -5003,6 +5040,18 @@ function autoAssignPhysicalInterfaces(configs, {allowSerialFallback = true} = {}
     let selected = desired ? candidates.find((candidate) =>
       [candidate.id, candidate.physical_port_id, candidate.physical_interface_id].map(String).includes(desired),
     ) : null;
+    if (!selected && role === "pressure" && item.physical_serial) {
+      selected = candidates.find((candidate) => (
+        String(candidate.vid ?? "") === String(item.physical_vid ?? "")
+        && String(candidate.pid ?? "") === String(item.physical_pid ?? "")
+        && String(candidate.serial || "") === String(item.physical_serial || "")
+      ));
+      if (selected) {
+        selected = {...selected, identity_verified: false, auto_bind_eligible: false};
+        item.selection_origin = "identity_moved_requires_confirmation";
+        item.identity_confirmed = false;
+      }
+    }
     if (!selected && desired && ["manual", "saved"].includes(item.selection_origin)) {
       const keptResource = String(item.physical_port_id || item.physical_interface_id || "");
       if (keptResource && !(role === "plc" || role === "robot")) used.add(keptResource);
@@ -5013,6 +5062,7 @@ function autoAssignPhysicalInterfaces(configs, {allowSerialFallback = true} = {}
     }
     if (!selected) {
       selected = [...candidates]
+        .filter((candidate) => candidate.auto_bind_eligible === true)
         .filter((candidate) => !used.has(resourceId(candidate)))
         .sort((left, right) => rank(left, role) - rank(right, role) || resourceId(left).localeCompare(resourceId(right)))[0];
     }
@@ -5022,8 +5072,22 @@ function autoAssignPhysicalInterfaces(configs, {allowSerialFallback = true} = {}
       ? "" : String(selected.physical_interface_id || (!item.physical_port_id ? selected.id : "") || "");
     item.physical_interface_kind = profile.physical_kind || normalizedKind(selected);
     item.physical_transport_family = interfaceTransportFamily(selected);
-    item.physical_verified = Boolean(item.physical_interface_id && selected.detected !== false && selected.compatible !== false);
+    item.physical_verified = Boolean(
+      item.physical_interface_id
+      && selected.endpoint_present !== false
+      && selected.identity_verified === true
+      && selected.compatible !== false
+    );
+    item.physical_vid = selected.vid ?? null;
+    item.physical_pid = selected.pid ?? null;
+    item.physical_serial = selected.serial || "";
+    item.physical_location = selected.location || "";
+    item.device_profile_id = selected.device_profile_id || "";
+    item.identity_confirmed = Boolean(selected.identity_verified);
     item.physical_fallback = false;
+    const addresses = Array.isArray(selected.addresses) ? selected.addresses : [];
+    item.source_address = String(selected.source_address || addresses[0] || "");
+    item.network_interface_name = String(selected.name || selected.description || selected.label || "");
     item.selection_origin = item.selection_origin || (desired ? "saved" : "auto");
     if (selected.endpoint && selected.compatible !== false) {
       item.endpoint = selected.endpoint;
@@ -5081,13 +5145,31 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
     const node = option(item.id, item.label || item.endpoint || item.id);
     node.dataset.kind = item.kind || "";
     node.dataset.detected = String(Boolean(item.detected));
-    node.dataset.assignable = String(Boolean(item.auto_assignable || item.driver_available));
+    node.dataset.endpointPresent = String(Boolean(item.endpoint_present ?? item.detected));
+    node.dataset.identityVerified = String(Boolean(item.identity_verified));
+    node.dataset.protocolReady = String(Boolean(item.protocol_ready));
+    node.dataset.assignable = String(Boolean(item.auto_bind_eligible));
+    node.dataset.vid = item.vid == null ? "" : String(item.vid);
+    node.dataset.pid = item.pid == null ? "" : String(item.pid);
+    node.dataset.serial = item.serial || "";
+    node.dataset.location = item.location || "";
+    node.dataset.deviceProfileId = item.device_profile_id || "";
     node.dataset.fallback = String(item.kind === "serial" && profile.physical_kind !== "serial");
     node.dataset.endpoint = item.endpoint || "";
     node.dataset.portId = item.physical_port_id || "";
     node.dataset.liveId = item.physical_interface_id || "";
     node.dataset.compatible = String(item.compatible !== false);
     node.dataset.transportFamily = interfaceTransportFamily(item);
+    node.disabled = item.endpoint_present === false;
+    const addresses = Array.isArray(item.addresses) ? item.addresses : [];
+    const targetHost = String(profile.endpoint || "").replace(/^https?:\/\//, "").split(/[/:]/)[0];
+    const targetPrefix = targetHost.split(".").slice(0, 3).join(".");
+    node.dataset.sourceAddress = item.source_address
+      || addresses.find((address) => targetPrefix && String(address).startsWith(`${targetPrefix}.`))
+      || addresses.find((address) => !String(address).startsWith("169.254."))
+      || addresses[0] || "";
+    node.dataset.interfaceName = item.name || item.description || item.label || "";
+    node.dataset.deviceSubnet = item.device_subnet || "";
     groups.get(groupLabel).append(node);
   });
   const currentCandidate = candidates.find((item) =>
@@ -5166,19 +5248,23 @@ function buildSimulationInterfaceCatalog() {
   }));
 }
 
+function uniqueLogicalInterfaceConfigs(configs) {
+  const unique = [];
+  const usedIds = new Set();
+  (configs || []).forEach((item, index) => {
+    const id = String(item?.id || `interface_${index + 1}`);
+    if (usedIds.has(id)) return;
+    usedIds.add(id);
+    unique.push({...item, id});
+  });
+  return unique;
+}
+
 function renderInterfacePanel(configs) {
   if (!controls.interfacePanel) return;
   const defaults = Array.isArray(configs) ? configs : [];
   const initial = defaults.length ? defaults : defaultInterfaceCatalog();
-  const unique = [];
-  const usedEndpoints = new Set();
-  initial.forEach((item, index) => {
-    const endpoint = String(item.endpoint || "").trim();
-    const key = endpoint.toUpperCase();
-    if (key && usedEndpoints.has(key)) return;
-    if (key) usedEndpoints.add(key);
-    unique.push({...item, id: item.id || `interface_${index + 1}`});
-  });
+  const unique = uniqueLogicalInterfaceConfigs(initial);
   controls.interfacePanel.replaceChildren(...unique.map((item, index) => {
     const row = document.createElement("div");
     row.className = "interface-config-row";
@@ -5282,7 +5368,8 @@ function mergeRememberedInterfaceSelections(defaults) {
   const bindingFields = [
     "physical_interface_id", "physical_port_id", "physical_interface_kind",
     "physical_transport_family", "physical_verified", "physical_fallback",
-    "selection_origin", "endpoint",
+    "physical_vid", "physical_pid", "physical_serial", "physical_location",
+    "device_profile_id", "identity_confirmed", "selection_origin", "endpoint",
   ];
   return (defaults || []).map((item) => {
     const previous = byId.get(String(item.id || ""));
@@ -5364,7 +5451,10 @@ async function discoverInterfaces() {
           physical_interface_id: physicalId,
           physical_port_id: physicalPortId,
           physical_interface_kind: binding?.physical_kind || item.physical_interface_kind || "",
-          physical_verified: Boolean(item.physical_verified || binding?.interface_detected || binding?.driver_available),
+          physical_verified: Boolean(
+            item.physical_verified
+            || (binding?.endpoint_present && binding?.identity_verified)
+          ),
           enabled: Boolean(physicalId || physicalPortId),
         };
       });
@@ -6083,15 +6173,32 @@ async function uploadSimulationSource() {
 }
 
 function acquisitionConfig() {
+  const allowUnverifiedPhysical = arguments[0]?.allowUnverifiedPhysical === true;
   const newSchema = controls.datasetSchema.value === "new_collection_v11_3";
   const interfaceState = interfaceConfigs();
-  validatePhysicalInterfaceBindings(interfaceState.interfaces, controls.acquisitionMode?.value !== "simulation");
+  validatePhysicalInterfaceBindings(
+    interfaceState.interfaces,
+    controls.acquisitionMode?.value !== "simulation",
+    {allowUnverifiedPhysical},
+  );
   const first = interfaceState.interfaces[0] || {};
   const simulation = controls.acquisitionMode?.value === "simulation";
   const remoteSimulation = simulation && state.accessRole !== "local_admin";
+  const executionHost = usesLocalCaptureHelper() ? "helper_local" : "server";
+  const executionDeviceId = executionHost === "helper_local"
+    ? String(state.helperStatus?.device_id || state.helperStatus?.helper_id || "")
+    : String(state.bootstrap?.application?.build_id || "server");
+  const runtimeRevision = executionHost === "helper_local"
+    ? String(state.helperStatus?.capabilities?.runtime_revision || state.helperStatus?.runtime_revision || state.helperStatus?.version || "")
+    : String(state.bootstrap?.application?.runtime_revision || "");
   return {
     processing_mode: controls.processingMode.value,
+    capture_policy: simulation ? "simulation" : (controls.capturePolicy?.value || "formal"),
+    degraded_confirmed: Boolean(controls.degradedConfirmation?.checked),
     acquisition_mode: simulation ? "simulation" : "real",
+    execution_host: executionHost,
+    execution_device_id: executionDeviceId,
+    runtime_revision: runtimeRevision,
     simulation_source_type: controls.simulationSourceType?.value || "single_csv",
     simulation_source_path: simulation && !remoteSimulation ? (controls.simulationSourcePath?.value.trim() || "") : "",
     ...(remoteSimulation ? {simulation_source_id: state.simulationSourceId || ""} : {}),
@@ -6218,7 +6325,11 @@ async function readProcessParameters({automatic = false} = {}) {
   }
 }
 
-function validatePhysicalInterfaceBindings(items, realMode) {
+function validatePhysicalInterfaceBindings(
+  items,
+  realMode,
+  {allowUnverifiedPhysical = false} = {},
+) {
   if (!realMode) return;
   const seen = new Map();
   for (const item of items.filter((entry) => entry.enabled)) {
@@ -6227,7 +6338,7 @@ function validatePhysicalInterfaceBindings(items, realMode) {
     if (!resourceId) {
       throw new Error(`接口“${item.id}”未选择实际物理接口，不能启用`);
     }
-    if (item.physical_port_id && !item.physical_interface_id) {
+    if (item.physical_port_id && !item.physical_interface_id && !allowUnverifiedPhysical) {
       throw new Error(`接口“${item.id}”：端口存在，未检测到兼容设备；连接设备后重新识别接口`);
     }
     const expectedKind = profile.physical_kind || "";
@@ -6247,12 +6358,22 @@ controls.acquisitionMode?.addEventListener("change", () => {
   updateSimulationSettings();
   void loadSimulationPackages();
   if (!isPublicPrecomputedSimulationMode() && !state.publicDemoRestoredRealStatus) {
-    markHardwareCheckStale("采集模式已变化");
+    activateReadinessNamespace();
   }
   state.publicDemoRestoredRealStatus = false;
   if (controls.autoProcessParameters?.checked) {
     readProcessParameters({automatic: true});
   }
+});
+controls.capturePolicy?.addEventListener("change", () => {
+  const degraded = controls.capturePolicy.value === "degraded_engineering";
+  controls.degradedConfirmationLabel?.classList.toggle("hidden", !degraded);
+  if (degraded) controls.processingMode.value = "capture_only";
+  if (!degraded && controls.degradedConfirmation) controls.degradedConfirmation.checked = false;
+  markHardwareCheckStale("真实采集策略已变化");
+});
+controls.degradedConfirmation?.addEventListener("change", () => {
+  markHardwareCheckStale("降级采集确认状态已变化");
 });
 controls.simulationExecutionHost?.addEventListener("change", updateSimulationSettings);
 controls.simulationSourceType?.addEventListener("change", updateSimulationSettings);
@@ -6470,9 +6591,14 @@ controls.interfacePanel?.addEventListener("change", (event) => {
 
 function hardwareConfigFingerprint() {
   try {
-    const config = acquisitionConfig();
+    const config = acquisitionConfig({allowUnverifiedPhysical: true});
     return JSON.stringify({
       acquisition_mode: config.acquisition_mode,
+      execution_host: config.execution_host,
+      execution_device_id: config.execution_device_id,
+      runtime_revision: config.runtime_revision,
+      capture_policy: config.capture_policy,
+      degraded_confirmed: config.degraded_confirmed,
       dataset_schema: config.dataset_schema,
       selected_sensors: [...(config.selected_sensors || [])].sort(),
       interfaces: (config.interfaces || []).map((item) => ({
@@ -6480,6 +6606,8 @@ function hardwareConfigFingerprint() {
         driver: item.driver, endpoint: item.endpoint, baudrate: item.baudrate,
         physical_interface_id: item.physical_interface_id,
         physical_interface_kind: item.physical_interface_kind,
+        source_address: item.source_address,
+        network_interface_name: item.network_interface_name,
       })),
       assignments: config.interface_channel_assignments || {},
       source_file: config.source_file || "",
@@ -6491,9 +6619,11 @@ function hardwareConfigFingerprint() {
 
 function hardwareStateLabel(value) {
   return ({
-    ok: "正常", precomputed_success: "预计算演示成功", disabled: "已停用", video_only: "仅视频",
+    ok: "正常", ready: "全部必需通道就绪", precomputed_success: "预计算演示成功", disabled: "已停用", video_only: "仅视频",
     no_channels: "无已选通道", waiting: "等待数据",
-    not_connected: "未连接", no_data: "没有采集数据",
+    not_connected: "未连接", no_data: "没有采集数据", no_valid_frame: "驱动已打开但无有效帧",
+    network_path_invalid: "工业网卡或路由无效",
+    hardware_protocol_unverified: "实物协议尚未验证",
     physical_unverified: "数据已读，物理端口未验证",
     identity_unconfirmed: "目标设备身份未确认",
     endpoint_unreachable: "目标网络端点不可达",
@@ -6509,6 +6639,92 @@ function clearHardwareRowStates() {
   document.querySelectorAll(".interface-config-row, .sensor-checklist-row").forEach((row) => {
     row.classList.remove("check-ok", "check-error", "check-waiting");
     row.removeAttribute("data-check-state");
+  });
+}
+
+function currentReadinessMode() {
+  return controls.acquisitionMode?.value === "simulation" ? "simulation" : "real";
+}
+
+function storeReadinessResult(mode, result, fingerprint = hardwareConfigFingerprint()) {
+  if (mode === "simulation") {
+    state.simulationSourceCheck = result;
+    state.simulationSourceCheckFingerprint = fingerprint;
+  } else {
+    state.realHardwareCheck = result;
+    state.realHardwareCheckFingerprint = fingerprint;
+  }
+  state.hardwareCheck = result;
+  state.hardwareCheckFingerprint = fingerprint;
+}
+
+function activateReadinessNamespace() {
+  const simulation = currentReadinessMode() === "simulation";
+  state.hardwareCheck = simulation ? state.simulationSourceCheck : state.realHardwareCheck;
+  state.hardwareCheckFingerprint = simulation
+    ? state.simulationSourceCheckFingerprint : state.realHardwareCheckFingerprint;
+  const currentFingerprint = hardwareConfigFingerprint();
+  if (
+    state.hardwareCheck
+    && state.hardwareCheckFingerprint
+    && currentFingerprint
+    && state.hardwareCheckFingerprint !== currentFingerprint
+  ) {
+    clearHardwareRowStates();
+    if (controls.hardwareCheckStatus) {
+      controls.hardwareCheckStatus.className = "hardware-check-status stale";
+      controls.hardwareCheckStatus.textContent = simulation
+        ? "模拟数据源检查已过期；数据源、执行端或运行修订已变化，请重新检查。"
+        : "真实硬件检查已过期；执行端、运行修订或配置已变化，请重新检查。";
+    }
+    return;
+  }
+  if (state.hardwareCheck) {
+    if (simulation) renderSimulationSourceCheckResult(state.hardwareCheck);
+    else renderHardwareCheckResult(state.hardwareCheck, {automatic: false});
+    return;
+  }
+  clearHardwareRowStates();
+  if (controls.hardwareCheckStatus) {
+    controls.hardwareCheckStatus.className = "hardware-check-status stale";
+    controls.hardwareCheckStatus.textContent = simulation
+      ? "模拟数据源尚未检查；不会探测或显示物理接口错误。"
+      : "真实硬件尚未按当前执行端、运行修订和配置完成检查。";
+  }
+}
+
+function renderSimulationSourceCheckResult(result, {automatic = false} = {}) {
+  const node = controls.hardwareCheckStatus;
+  if (!node) return;
+  clearHardwareRowStates();
+  const readiness = result?.simulation_readiness || {};
+  const stages = Array.isArray(readiness.stages) ? readiness.stages : [];
+  const sensors = (Array.isArray(result?.sensors) ? result.sensors : [])
+    .filter((item) => item.selected);
+  const ok = Boolean(result?.ok && readiness.replay_ready !== false);
+  node.className = `hardware-check-status ${ok ? "ok" : "error"}`;
+  const title = document.createElement("strong");
+  title.textContent = ok
+    ? `${automatic ? "自动" : "手动"}模拟数据源检查通过`
+    : `${automatic ? "自动" : "手动"}模拟数据源检查未通过`;
+  node.replaceChildren(title);
+  const summary = document.createElement("div");
+  summary.textContent = `模拟通道覆盖 ${sensors.filter((item) => item.ok).length}/${sensors.length}；未探测物理设备`;
+  node.appendChild(summary);
+  const failures = stages.filter((stage) => stage.state !== "passed");
+  if (failures.length) {
+    const detail = document.createElement("div");
+    detail.className = "hardware-check-detail";
+    detail.textContent = `数据源未通过层级：${failures.map((stage) => `${stage.name}（${stage.remediation || "请修复数据源或通道映射"}）`).join("；")}`;
+    node.appendChild(detail);
+  }
+  sensors.forEach((item) => {
+    const row = [...document.querySelectorAll("#liveSensorChecklist .sensor-checklist-row")]
+      .find((candidate) => candidate.querySelector(".save-sensor-checkbox")?.value === item.name);
+    if (!row) return;
+    row.classList.add(item.ok ? "check-ok" : "check-error");
+    row.dataset.checkState = item.ok ? "模拟通道已匹配" : "模拟数据源缺少通道";
+    row.title = item.message || row.dataset.checkState;
   });
 }
 
@@ -6550,6 +6766,14 @@ function renderHardwareCheckResult(result, {automatic = false, live = false} = {
     return `${profile.label || item.role || "接口"} ${item.endpoint || item.id || "未填写地址"}${physical}（${item.message || hardwareStateLabel(item.state)}）`;
   });
   appendDetails("接口绑定警告", fallbackInterfaces, (item) => `${item.id || "接口"}：${item.physical_warning}`);
+  const failedStages = interfaces.flatMap((item) => (Array.isArray(item.stages) ? item.stages : [])
+    .filter((stage) => stage.state === "failed")
+    .map((stage) => ({interfaceId: item.id, ...stage})));
+  appendDetails(
+    "未通过层级",
+    failedStages,
+    (stage) => `${stage.interfaceId}/${stage.name}（${stage.remediation || "请修复后重新检查"}）`,
+  );
   appendDetails("异常通道", badSensors, (item) => `${item.name}（${item.message || hardwareStateLabel(item.state)}）`);
   appendDetails(
     "未采集通道（不阻止启动）",
@@ -6573,9 +6797,10 @@ function renderHardwareCheckResult(result, {automatic = false, live = false} = {
     const row = [...document.querySelectorAll(".interface-config-row")]
       .find((candidate) => candidate.dataset.interfaceId === String(item.id || ""));
     if (!row) return;
-    const className = item.state === "waiting" || (!item.ok && item.blocking === false)
+    const completeReady = item.state === "ready" && item.readiness?.ready !== false;
+    const className = item.state === "waiting" || item.state === "partial" || (!item.ok && item.blocking === false)
       ? "check-waiting"
-      : item.ok ? "check-ok" : "check-error";
+      : completeReady ? "check-ok" : "check-error";
     row.classList.add(className);
     row.dataset.checkState = hardwareStateLabel(item.state);
     row.title = item.message || hardwareStateLabel(item.state);
@@ -6600,13 +6825,23 @@ function markHardwareCheckStale(reason = "配置已变化") {
   state.agentEvents = [];
   state.agentResult = null;
   state.agentFingerprint = "";
+  const simulation = currentReadinessMode() === "simulation";
+  if (simulation) {
+    state.simulationSourceCheck = null;
+    state.simulationSourceCheckFingerprint = "";
+  } else {
+    state.realHardwareCheck = null;
+    state.realHardwareCheckFingerprint = "";
+  }
   state.hardwareCheck = null;
   state.hardwareCheckFingerprint = "";
   clearHardwareRowStates();
   const node = controls.hardwareCheckStatus;
   if (node) {
     node.className = "hardware-check-status stale";
-    node.textContent = `${reason}，需要重新检查接口和传感器通道。`;
+    node.textContent = simulation
+      ? `${reason}，需要重新检查模拟数据源和通道映射。`
+      : `${reason}，需要重新检查真实接口和传感器通道。`;
   }
 }
 
@@ -6695,14 +6930,14 @@ async function testSensorConnection({automatic = false} = {}) {
     const sensors = selected.map((name) => ({
       name,
       selected: true,
-      state: sourceChannels.has(name) ? "ok" : "no_data",
+      state: sourceChannels.has(name) ? "ready" : "source_channel_missing",
       message: sourceChannels.has(name) ? "模拟数据已匹配" : "模拟数据未包含该通道",
       observed_samples: 0,
       received_samples: 0,
       ok: sourceChannels.has(name),
-      blocking: false,
+      blocking: true,
     }));
-    const interfaces = [...(controls.interfacePanel?.querySelectorAll(".interface-config-row") || [])].map((row) => {
+    const channelGroups = [...(controls.interfacePanel?.querySelectorAll(".interface-config-row") || [])].map((row) => {
       const role = row.querySelector(".interface-role")?.value || "custom";
       const profile = sensorTypeProfile(role);
       const expected = (profile.channels || []).filter((name) => selected.includes(name));
@@ -6710,22 +6945,46 @@ async function testSensorConnection({automatic = false} = {}) {
       return {
         id: row.dataset.interfaceId,
         role,
-        driver: row.querySelector(".interface-driver")?.value || profile.driver || "serial_json",
-        endpoint: "模拟数据源",
-        enabled: row.querySelector(".interface-enabled")?.checked !== false,
+        label: "模拟通道覆盖",
         expected_channels: expected,
-        detected_channels: matched,
+        matched_channels: matched,
         missing_channels: expected.filter((name) => !sourceChannels.has(name)),
-        state: matched.length || !expected.length ? "ok" : "no_data",
-        message: matched.length ? `已匹配 ${matched.join("、")}` : "模拟数据未包含该接口通道",
         ok: Boolean(matched.length || !expected.length),
       };
     });
-    const result = {ok: sensors.every((item) => item.ok), sensors, interfaces, errors: []};
-    state.hardwareCheck = result;
-    state.hardwareCheckFingerprint = hardwareConfigFingerprint();
-    renderHardwareCheckResult(result, {automatic});
-    updateAgentFromHardwareResult(result, {automatic});
+    const sourceOpen = Boolean(
+      state.simulationSourceId
+      || controls.simulationSourcePath?.value?.trim()
+      || sourceChannels.size
+      || isPublicPrecomputedSimulationMode()
+    );
+    const complete = sensors.every((item) => item.ok);
+    const stageFacts = [
+      ["source_open", sourceOpen, "请选择并打开模拟数据源"],
+      ["schema_compatible", sourceOpen && sourceChannels.size > 0, "模拟数据源结构无法解析"],
+      ["channels_complete", complete, "补齐模拟数据源通道或调整通道映射"],
+      ["values_valid", complete, "修复模拟数据中的无效数值"],
+      ["replay_ready", sourceOpen && complete, "修复模拟数据源后重新检查"],
+    ];
+    const replayReady = sourceOpen && complete;
+    const result = {
+      ok: replayReady,
+      acquisition_mode: "simulation",
+      readiness_namespace: "simulation_source",
+      sensors,
+      interfaces: [],
+      channel_groups: channelGroups,
+      errors: replayReady ? [] : ["模拟数据源或通道映射未就绪"],
+      simulation_readiness: {
+        state: replayReady ? "replay_ready" : "source_not_ready",
+        replay_ready: replayReady,
+        stages: stageFacts.map(([name, passed, remediation]) => ({
+          name, state: passed ? "passed" : "failed", remediation: passed ? "" : remediation,
+        })),
+      },
+    };
+    storeReadinessResult("simulation", result);
+    renderSimulationSourceCheckResult(result, {automatic});
     return result;
   }
   if (usesLocalCaptureHelper() && controls.acquisitionMode?.value !== "simulation") {
@@ -6743,10 +7002,12 @@ async function testSensorConnection({automatic = false} = {}) {
       // separate thread, so allow the command enough time to finish instead
       // of reporting a client-side timeout while the check is still running.
       const result = normalizeHardwareCheckResult(
-        await requestLocalHelper("check_capture", acquisitionConfig(), {timeoutMs: 120000}),
+        await requestLocalHelper("check_capture",
+          acquisitionConfig({allowUnverifiedPhysical: true}),
+          {timeoutMs: 120000},
+        ),
       );
-      state.hardwareCheck = result;
-      state.hardwareCheckFingerprint = hardwareConfigFingerprint();
+      storeReadinessResult("real", result);
       renderHardwareCheckResult(result, {automatic});
       updateAgentFromHardwareResult(result, {automatic});
       return result;
@@ -6756,8 +7017,7 @@ async function testSensorConnection({automatic = false} = {}) {
         error: error.message || "hardware_check_timed_out",
         hardware_check_timed_out: true,
       });
-      state.hardwareCheck = failedCheck;
-      state.hardwareCheckFingerprint = hardwareConfigFingerprint();
+      storeReadinessResult("real", failedCheck);
       renderHardwareCheckResult(failedCheck, {automatic});
       updateAgentFromHardwareResult(failedCheck, {automatic});
       if (node) {
@@ -6788,7 +7048,7 @@ async function testSensorConnection({automatic = false} = {}) {
   try {
     const result = await postJson(
       state.accessRole === "guest" ? "/api/simulation/start" : "/api/acquisition/test",
-      acquisitionConfig(),
+      acquisitionConfig({allowUnverifiedPhysical: true}),
       {timeoutMs: 20000, controller},
     );
     if (state.accessRole === "guest") {
@@ -6798,13 +7058,14 @@ async function testSensorConnection({automatic = false} = {}) {
     if (controls.processingMode.value !== "capture_only") {
       applyPredictionModelProfile(result.prediction_model, false);
     }
-    state.hardwareCheck = result;
-    state.hardwareCheckFingerprint = hardwareConfigFingerprint();
+    storeReadinessResult("real", result);
     renderHardwareCheckResult(result, {automatic});
     updateAgentFromHardwareResult(result, {automatic});
     if (!result.ok && !automatic) toast("检查发现接口或传感器通道异常，详情已列出");
     return result;
   } catch (error) {
+    state.realHardwareCheck = null;
+    state.realHardwareCheckFingerprint = "";
     state.hardwareCheck = null;
     state.hardwareCheckFingerprint = "";
     if (node) {

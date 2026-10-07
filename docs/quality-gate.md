@@ -11,8 +11,8 @@ py -3.11 -m venv .venv
 
 ## 验证配置
 
-- `quick`：运行 Harness 契约和低成本核心契约，适合日常开发。
-- `full`：运行全部可移植核心回归，覆盖启动、采集、USB 拓展坞拓扑与接口展示、五类接口、保存、诊断、网络、WebSocket、模型通道和预警链路。
+- `quick`：运行 Harness 契约、低成本核心契约和生产前端关键行为，适合日常开发；PLC/ABB 共用网卡渲染和未验证端口检查属于阻断项。
+- `full`：运行全部可移植核心回归，覆盖启动、采集、USB 拓展坞拓扑与接口展示、五类接口、保存、诊断、局域网、公网访问与权限隔离、WebSocket、模型通道和预警链路。
 - `release`：在 full 基础上运行交付 EXE 的模块状态、自检、文件完整性、集成冒烟和功能冒烟，并检查稳定 EXE 的 SHA-256。
 
 ```powershell
@@ -48,6 +48,8 @@ py -3.11 -m venv .venv
 ## GitHub 和分支保护
 
 GitHub Actions 的必需检查名称为 `quality-gate`。稳定分支应在 GitHub 分支保护中把该检查设置为必需状态；检查失败时禁止合并。工作流运行 `full/ci`，不使用仓库外私密凭据，也不连接现场硬件或目标 MySQL。
+
+生产前端行为、LAN 和公网不是由测试名称隐式带过：`frontend-behavior-contracts` 执行真实 JavaScript 行为回归，`modular-runtime-contracts` 检查 LAN 地址与双端口配置，`frontend-public-contracts` 检查 LAN 操作员、远程 helper、公网访客、脱敏和隧道健康。矩阵契约会在任何一项从 full/release 或命令清单中移除时直接失败。
 
 云端检查不得冒充现场验收。真实 USB 拓展坞、SMRF、PLC、ABB、UVC、M3232 和目标 MySQL 在 release 报告中保持“现场待验证”，直到负责人补充真实设备证据。拓展坞验收必须按 `harness/field/usb-dock-topology.md` 核对三个外部 USB 口、一个内置网口、伴随 Hub 去重和界面分组；模拟采集通过只说明软件链路通过，不得表述为真实采集通过。
 

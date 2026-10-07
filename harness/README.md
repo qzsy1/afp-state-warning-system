@@ -5,8 +5,8 @@
 ## 直接双击
 
 - `setup.cmd`：首次配置可信 Python 和稳定 EXE，设置仅写入被 Git 忽略的 `config/local-settings.json`。
-- `quick.cmd`：环境预检、Harness 契约和模块化运行时检查。
-- `full.cmd`：全部软件回归；不运行 EXE 和现场检查。
+- `quick.cmd`：环境预检、Harness 契约、模块化运行时和生产前端关键行为检查。
+- `full.cmd`：全部软件回归，显式覆盖生产前端、局域网和公网访问；不运行 EXE 和现场检查。
 - `release.cmd`：full 加五项稳定 EXE 检查及三项现场待验证。
 - `check_all.cmd`：与 release 范围相同，用于人工查看全部检查。
 - `checks/00_environment.cmd`：只检查 Python 3.11、项目 `.venv`、Node.js 22、目录、配置和 EXE。
@@ -47,6 +47,8 @@ EXE判定按职责边界处理：`modular_runtime/build_launcher.ps1` 变化要�
 
 ## 单项入口索引
 
-软件检查：`harness-contracts`、`modular-runtime-contracts`、`interface-monitor-contracts`、`usb-dock-topology-contracts`、`native-function-contracts`、`frontend-public-contracts`、`acquisition-storage-contracts`、`dashboard-runtime-contracts`、`diagnosis-interface-contracts`、`causal-history-evidence`、`edge-helper-websocket-contracts`、`model-prediction-contracts`。
+软件检查：`harness-contracts`、`modular-runtime-contracts`、`interface-monitor-contracts`、`usb-dock-topology-contracts`、`frontend-behavior-contracts`、`native-function-contracts`、`frontend-public-contracts`、`acquisition-storage-contracts`、`dashboard-runtime-contracts`、`diagnosis-interface-contracts`、`causal-history-evidence`、`edge-helper-websocket-contracts`、`model-prediction-contracts`。
+
+`frontend-behavior-contracts` 执行生产 `app.js` 的关键行为场景，而不是只搜索源码关键字：PLC 与 ABB 共用网卡时两张逻辑接口卡必须同时保留；端口尚未识别时“立即检查”必须继续提交驱动检查，而真实采集门禁仍须阻断。`frontend-public-contracts` 覆盖 LAN 操作员会话与 helper 权限、公网访客隔离和脱敏、Cloudflare/Tailscale 隧道健康；`modular-runtime-contracts` 另外覆盖 LAN 地址选择以及 8770/8771 服务边界。
 
 EXE 检查：`release-module-status`、`release-self-test`、`release-verify-files`、`release-integration-smoke`、`release-functional-smoke`。现场项：`field-usb-dock-topology`、`field-real-hardware`、`field-target-mysql`。

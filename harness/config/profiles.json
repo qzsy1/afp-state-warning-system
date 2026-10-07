@@ -3,27 +3,16 @@
   "profiles": {
     "quick": [
       "harness-contracts",
-      "modular-runtime-contracts"
+      "modular-runtime-contracts",
+      "frontend-behavior-contracts",
+      "real-acquisition-protocol-contracts"
     ],
     "full": [
       "harness-contracts",
       "modular-runtime-contracts",
       "interface-monitor-contracts",
       "usb-dock-topology-contracts",
-      "native-function-contracts",
-      "frontend-public-contracts",
-      "acquisition-storage-contracts",
-      "dashboard-runtime-contracts",
-      "diagnosis-interface-contracts",
-      "causal-history-evidence",
-      "edge-helper-websocket-contracts",
-      "model-prediction-contracts"
-    ],
-    "release": [
-      "harness-contracts",
-      "modular-runtime-contracts",
-      "interface-monitor-contracts",
-      "usb-dock-topology-contracts",
+      "frontend-behavior-contracts",
       "native-function-contracts",
       "frontend-public-contracts",
       "acquisition-storage-contracts",
@@ -32,6 +21,23 @@
       "causal-history-evidence",
       "edge-helper-websocket-contracts",
       "model-prediction-contracts",
+      "real-acquisition-protocol-contracts"
+    ],
+    "release": [
+      "harness-contracts",
+      "modular-runtime-contracts",
+      "interface-monitor-contracts",
+      "usb-dock-topology-contracts",
+      "frontend-behavior-contracts",
+      "native-function-contracts",
+      "frontend-public-contracts",
+      "acquisition-storage-contracts",
+      "dashboard-runtime-contracts",
+      "diagnosis-interface-contracts",
+      "causal-history-evidence",
+      "edge-helper-websocket-contracts",
+      "model-prediction-contracts",
+      "real-acquisition-protocol-contracts",
       "release-module-status",
       "release-self-test",
       "release-verify-files",

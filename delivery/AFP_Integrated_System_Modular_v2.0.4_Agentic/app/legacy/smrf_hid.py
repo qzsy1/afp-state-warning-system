@@ -106,6 +106,7 @@ def smrf_measurement_payload(
     payload: bytes,
     channel_types: tuple[str, ...] | list[str] = DEFAULT_SMRF_TYPES,
     calibration_offsets: tuple[float, ...] | list[float] | None = None,
+    quality: dict[str, Any] | None = None,
 ) -> dict[str, float] | None:
     """Decode the vendor DeviceData buffer (HID report ID already removed)."""
     if len(payload) < 29:
@@ -128,16 +129,27 @@ def smrf_measurement_payload(
         start = 2 + index * 3
         measured_mv = _signed_big_endian(payload[start:start + 3]) / 10000.0
         channel_type = types[index]
-        if channel_type in _NIST_TABLES:
-            compensated_mv = measured_mv + thermocouple_emf_mv(channel_type, cold_c)
-            temperature = thermocouple_temperature_c(channel_type, compensated_mv)
-        elif channel_type == "-":
+        channel_name = f"温度{index + 1}"
+        if channel_type == "-":
+            if quality is not None:
+                quality.setdefault("open_channels", []).append(channel_name)
             continue
-        else:
+        if channel_type not in _NIST_TABLES:
             # PT100/1820 use model-specific paths in the vendor program and are
             # not thermocouples.  Do not mislabel their raw values as degrees C.
+            if quality is not None:
+                quality.setdefault("unsupported_channels", []).append(channel_name)
             continue
-        result[f"温度{index + 1}"] = temperature + float(offsets[index])
+        try:
+            compensated_mv = measured_mv + thermocouple_emf_mv(channel_type, cold_c)
+            temperature = thermocouple_temperature_c(channel_type, compensated_mv)
+            result[channel_name] = temperature + float(offsets[index])
+        except ValueError:
+            # Preserve the channel identity as an invalid numeric event so the
+            # readiness layer can report the exact overrange/broken channel.
+            result[channel_name] = math.nan
+            if quality is not None:
+                quality.setdefault("overrange_channels", []).append(channel_name)
     return result
 
 
@@ -265,6 +277,18 @@ class SmrfHidDriver:
         self._stop = threading.Event()
         self._reader: threading.Thread | None = None
         self._next_poll = 0.0
+        self.quality_metadata: dict[str, Any] = {
+            "device_identity": {},
+            "command_response": False,
+            "valid_frames": 0,
+            "checksum_failures": 0,
+            "configured_channel_types": list(self.channel_types),
+            "reported_channel_types": [],
+            "cold_junction_compensation": True,
+            "calibration_offsets": list(self.calibration_offsets),
+            "open_channels": [],
+            "overrange_channels": [],
+        }
 
     def _select_device(self) -> SmrfHidDevice:
         devices = enumerate_smrf_hid_devices()
@@ -283,6 +307,13 @@ class SmrfHidDriver:
         if handle == ctypes.c_void_p(-1).value:
             raise OSError(ctypes.get_last_error(), f"SMRF HID接口无法打开：{device.label}")
         self.device, self.handle, self._kernel32, self._hid = device, handle, kernel32, hid
+        self.quality_metadata["device_identity"] = {
+            "product": device.product,
+            "serial": device.serial,
+            "vendor_id": device.vendor_id,
+            "product_id": device.product_id,
+            "path": device.path,
+        }
         preparsed = ctypes.c_void_p()
         try:
             if hid.HidD_GetPreparsedData(handle, ctypes.byref(preparsed)):
@@ -346,6 +377,9 @@ class SmrfHidDriver:
             received_types.append(SMRF_CHANNEL_TYPES[value] if 0 <= value < len(SMRF_CHANNEL_TYPES) else "-")
         if any(value != "-" for value in received_types):
             self.channel_types = tuple(received_types)
+            self.quality_metadata["reported_channel_types"] = list(received_types)
+        self.quality_metadata["calibration_offsets"] = list(self.calibration_offsets)
+        self.quality_metadata["command_response"] = True
         return True
 
     def read_sample(self) -> dict[str, float] | None:
@@ -362,9 +396,27 @@ class SmrfHidDriver:
             payload = frame[1:] if frame and frame[0] == 0 else frame
             if self._consume_calibration(payload):
                 continue
-            decoded = smrf_measurement_payload(payload, self.channel_types, self.calibration_offsets)
+            if len(payload) >= 29:
+                checksum = 0
+                for value in payload[2:28]:
+                    checksum ^= value
+                if checksum != payload[28]:
+                    self.quality_metadata["checksum_failures"] += 1
+                    continue
+            frame_quality: dict[str, Any] = {}
+            decoded = smrf_measurement_payload(
+                payload,
+                self.channel_types,
+                self.calibration_offsets,
+                frame_quality,
+            )
             if decoded:
                 latest = {name: value for name, value in decoded.items() if name.startswith("温度")}
+                self.quality_metadata["valid_frames"] += 1
+                self.quality_metadata["command_response"] = True
+                self.quality_metadata["open_channels"] = list(frame_quality.get("open_channels", []))
+                self.quality_metadata["overrange_channels"] = list(frame_quality.get("overrange_channels", []))
+                self.quality_metadata["unsupported_channels"] = list(frame_quality.get("unsupported_channels", []))
         return latest
 
     def close(self) -> None:

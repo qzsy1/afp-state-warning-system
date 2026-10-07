@@ -18,7 +18,12 @@
     {"id": "PREDICTION_WARNING-001", "title": "采集、预测、健康指标和预警链路保持可用", "mandatory": true, "profiles": ["full", "release"]},
     {"id": "EXE_REUSE-001", "title": "稳定EXE默认复用并验证哈希不变", "mandatory": true, "profiles": ["release"]},
     {"id": "RELEASE_EVIDENCE-001", "title": "发布交付诊断和证据对应当前提交", "mandatory": true, "profiles": ["release"]},
-    {"id": "FIELD_BOUNDARY-001", "title": "现场硬件和目标MySQL证据不得由模拟结果冒充", "mandatory": true, "profiles": ["release"]}
+    {"id": "FIELD_BOUNDARY-001", "title": "现场硬件和目标MySQL证据不得由模拟结果冒充", "mandatory": true, "profiles": ["release"]},
+    {"id": "REAL_ACQUISITION-001", "title": "真实采集使用独立驱动、统一单调时钟和逐通道质量合同", "mandatory": true, "profiles": ["quick", "full", "release"]},
+    {"id": "PHYSICAL_READINESS-001", "title": "五类物理传感器按协议身份和全部必需通道失败关闭", "mandatory": true, "profiles": ["full", "release"]},
+    {"id": "LIVE_PREDICTION_SAFETY-001", "title": "实时预测只使用兼容频率下最近连续完整模型窗口", "mandatory": true, "profiles": ["quick", "full", "release"]},
+    {"id": "CAPTURE_PERSISTENCE-001", "title": "统一帧、质量侧车、数据库和停止终结可对账恢复", "mandatory": true, "profiles": ["full", "release"]},
+    {"id": "REAL_RELEASE_GATE-001", "title": "G0至G5证据按交付修订分级且不可由低等级越级替代", "mandatory": true, "profiles": ["release"]}
   ],
   "checks": [
     {
@@ -32,7 +37,7 @@
       "environments": ["local", "ci"],
       "blocking": true,
       "evidence_tier": "automated",
-      "requirements": ["HARNESS-001", "EXE_REUSE-001"],
+      "requirements": ["HARNESS-001", "EXE_REUSE-001", "REAL_ACQUISITION-001", "LIVE_PREDICTION_SAFETY-001", "REAL_RELEASE_GATE-001"],
       "change_patterns": ["harness/**", "tools/verification/run_quality_gate.ps1", "openspec/changes/release-regression-harness/**"]
     },
     {
@@ -77,6 +82,20 @@
       "change_patterns": ["visualization_app/**", "harness/engine/usb_dock_contract.py", "harness/field/usb-dock-topology.md", "openspec/changes/add-usb-dock-topology-discovery/**"]
     },
     {
+      "id": "frontend-behavior-contracts",
+      "title": "生产前端接口渲染与检查行为契约",
+      "kind": "command",
+      "command": ["{python}", "-m", "unittest", "test_frontend_guest_simulation", "test_usb_interface_candidates", "-v"],
+      "cwd": "visualization_app",
+      "timeout_seconds": 300,
+      "profiles": ["quick", "full", "release"],
+      "environments": ["local", "ci"],
+      "blocking": true,
+      "evidence_tier": "automated",
+      "requirements": ["STARTUP-001", "INTERFACES-001", "USB_TOPOLOGY-001", "PHYSICAL_READINESS-001"],
+      "change_patterns": ["visualization_app/static/**", "visualization_app/test_frontend_guest_simulation.py", "visualization_app/test_usb_interface_candidates.py"]
+    },
+    {
       "id": "native-function-contracts",
       "title": "原生集成界面与MySQL显隐函数契约",
       "kind": "command",
@@ -91,16 +110,17 @@
     },
     {
       "id": "frontend-public-contracts",
-      "title": "前端、访客模拟、公网与安全契约",
+      "title": "局域网、公网、访客模拟与安全契约",
       "kind": "command",
-      "command": ["{python}", "-m", "unittest", "test_frontend_guest_simulation", "test_guest_web", "test_public_demo_bundles", "test_public_demo_frontend", "test_public_demo_static_delivery", "test_process_parameter_frontend", "test_public_web_security", "test_public_tunnel_watchdog", "test_tailscale_funnel_watchdog", "-v"],
+      "command": ["{python}", "-m", "unittest", "test_guest_web", "test_public_demo_bundles", "test_public_demo_frontend", "test_public_demo_static_delivery", "test_process_parameter_frontend", "test_public_web_security", "test_public_tunnel_watchdog", "test_tailscale_funnel_watchdog", "-v"],
       "cwd": "visualization_app",
       "timeout_seconds": 600,
       "profiles": ["full", "release"],
       "environments": ["local", "ci"],
       "blocking": true,
       "evidence_tier": "automated",
-      "requirements": ["STARTUP-001", "SIMULATION-001", "LAN_PUBLIC-001"]
+      "requirements": ["STARTUP-001", "SIMULATION-001", "LAN_PUBLIC-001", "EDGE_HELPER-001"],
+      "change_patterns": ["modular_runtime/app/core/lan_web.py", "modular_runtime/app/core/public_web.py", "visualization_app/app.py", "visualization_app/web_access.py", "visualization_app/web_auth.py", "visualization_app/public_status.py", "visualization_app/guest_simulation.py", "visualization_app/*tunnel*", "visualization_app/*funnel*", "visualization_app/test_public*.py", "visualization_app/test_guest_web.py"]
     },
     {
       "id": "acquisition-storage-contracts",
@@ -113,7 +133,7 @@
       "environments": ["local", "ci"],
       "blocking": true,
       "evidence_tier": "automated",
-      "requirements": ["SIMULATION-001", "MODE_ISOLATION-001", "CSV-001", "MYSQL-001", "PREDICTION_WARNING-001"]
+      "requirements": ["SIMULATION-001", "MODE_ISOLATION-001", "CSV-001", "MYSQL-001", "PREDICTION_WARNING-001", "REAL_ACQUISITION-001", "CAPTURE_PERSISTENCE-001"]
     },
     {
       "id": "dashboard-runtime-contracts",
@@ -139,7 +159,7 @@
       "environments": ["local", "ci"],
       "blocking": true,
       "evidence_tier": "automated",
-      "requirements": ["INTERFACES-001", "DIAGNOSIS-001", "MODEL_CHANNELS-001"]
+      "requirements": ["INTERFACES-001", "DIAGNOSIS-001", "MODEL_CHANNELS-001", "PHYSICAL_READINESS-001"]
     },
     {
       "id": "causal-history-evidence",
@@ -178,7 +198,21 @@
       "environments": ["local", "ci"],
       "blocking": true,
       "evidence_tier": "automated",
-      "requirements": ["MODEL_CHANNELS-001", "PREDICTION_WARNING-001"]
+      "requirements": ["MODEL_CHANNELS-001", "PREDICTION_WARNING-001", "LIVE_PREDICTION_SAFETY-001"]
+    },
+    {
+      "id": "real-acquisition-protocol-contracts",
+      "title": "真实采集统一时钟、通道质量和协议仿真契约",
+      "kind": "command",
+      "command": ["{python}", "-m", "unittest", "verification.test_real_acquisition_pipeline", "-v"],
+      "cwd": "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic",
+      "timeout_seconds": 180,
+      "profiles": ["quick", "full", "release"],
+      "environments": ["local"],
+      "blocking": true,
+      "evidence_tier": "protocol_simulation",
+      "requirements": ["REAL_ACQUISITION-001", "PHYSICAL_READINESS-001", "LIVE_PREDICTION_SAFETY-001", "CAPTURE_PERSISTENCE-001"],
+      "change_patterns": ["delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/legacy/acquisition.py", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/legacy/real_acquisition.py", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/verification/test_real_acquisition_pipeline.py", "openspec/changes/harden-real-acquisition-pipeline/**"]
     },
     {
       "id": "release-module-status",
@@ -269,7 +303,7 @@
       "environments": ["local"],
       "blocking": false,
       "evidence_tier": "field",
-      "requirements": ["INTERFACES-001", "FIELD_BOUNDARY-001"]
+      "requirements": ["INTERFACES-001", "FIELD_BOUNDARY-001", "REAL_ACQUISITION-001", "PHYSICAL_READINESS-001", "REAL_RELEASE_GATE-001"]
     },
     {
       "id": "field-target-mysql",

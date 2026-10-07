@@ -76,6 +76,7 @@ modular_runtime/models/
 /delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/updates/inbox/**
 /delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/updates/staging/**
 /delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/verification/**
+!/delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/verification/test_real_acquisition_pipeline.py
 /delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/config/local/**
 /delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/runtime/**
 /delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/**/__pycache__/**

@@ -484,6 +484,7 @@ def helper_capabilities(server_url: str = "") -> dict[str, Any]:
     result = {
         "protocol_version": HELPER_PROTOCOL_VERSION,
         "build_id": HELPER_BUILD_ID,
+        "runtime_revision": str(os.environ.get("AFP_RUNTIME_REVISION") or HELPER_BUILD_ID),
         "command_lifecycle": "isolated_hardware_check",
         "hardware_check_timeout_seconds": HARDWARE_CHECK_TIMEOUT_SECONDS,
         "hardware_discovery": True,
