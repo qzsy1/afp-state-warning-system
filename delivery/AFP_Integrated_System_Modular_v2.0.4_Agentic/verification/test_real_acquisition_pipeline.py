@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,7 @@ LEGACY_APP = DELIVERY_ROOT / "app" / "legacy"
 sys.path.insert(0, str(LEGACY_APP))
 
 import acquisition  # noqa: E402
+import app as delivery_app  # noqa: E402
 import public_status  # noqa: E402
 
 
@@ -377,6 +379,67 @@ if (!resetButton.textContent.includes("真实接口")) process.exit(8);
         completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
+    def test_local_admin_shell_safely_defaults_to_simulation(self) -> None:
+        for relative in (
+            Path("app/ui/index.html"),
+            Path("app/legacy/static/index.html"),
+        ):
+            source = (DELIVERY_ROOT / relative).read_text(encoding="utf-8")
+            select = re.search(
+                r'<select id="acquisitionModeSelect">(?P<body>.*?)</select>',
+                source,
+                flags=re.DOTALL,
+            )
+            self.assertIsNotNone(select, relative)
+            body = select.group("body")
+            self.assertRegex(body, r'<option value="simulation" selected>')
+            self.assertNotRegex(body, r'<option value="real" selected>')
+            self.assertIn('data-mode="simulation"', source)
+            self.assertIn("立即检查模拟数据源", source)
+            self.assertIn("20261008-safe-simulation-v8", source)
+
+    def test_mutable_delivery_shell_disables_browser_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for name in ("index.html", "app.js", "styles.css"):
+                path = root / name
+                path.write_text(name, encoding="utf-8")
+                body, headers = delivery_app.encode_static_file_response(
+                    path, static_root=root
+                )
+                self.assertEqual(body, name.encode("utf-8"))
+                self.assertEqual(headers.get("Cache-Control"), "no-store")
+
+    def test_simulation_mode_marks_interfaces_normal_before_source_check(self) -> None:
+        source = (DELIVERY_ROOT / "app" / "ui" / "app.js").read_text(encoding="utf-8")
+        start = source.index("function markSimulationInterfacesNormal()")
+        end = source.index("\nfunction ", start + 1)
+        function = source[start:end]
+        script = r'''
+const makeRow = () => ({
+  dataset: {}, title: "", added: [], removed: [],
+  classList: {
+    add(value) { this.owner.added.push(value); },
+    remove(...values) { this.owner.removed.push(...values); },
+    owner: null,
+  },
+});
+const interfaceRows = [makeRow(), makeRow(), makeRow(), makeRow(), makeRow()];
+interfaceRows.forEach((row) => { row.classList.owner = row; });
+const document = {
+  querySelectorAll(selector) {
+    return selector === ".interface-config-row" ? interfaceRows : [];
+  },
+};
+''' + function + r'''
+markSimulationInterfacesNormal();
+if (interfaceRows.some((row) => !row.added.includes("check-ok"))) process.exit(1);
+if (interfaceRows.some((row) => row.dataset.checkState !== "模拟接口正常")) process.exit(2);
+if (interfaceRows.some((row) => !row.removed.includes("check-error"))) process.exit(3);
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_simulation_interface_cards_default_to_normal_without_hardware_probe(self) -> None:
         source = (DELIVERY_ROOT / "app" / "ui" / "app.js").read_text(encoding="utf-8")
         start = source.index("function renderSimulationSourceCheckResult(")
@@ -397,6 +460,12 @@ const interfaceRows = [makeRow(), makeRow(), makeRow(), makeRow(), makeRow()];
 interfaceRows.forEach((row) => { row.classList.owner = row; });
 const controls = {hardwareCheckStatus: statusNode};
 const clearHardwareRowStates = () => {};
+const markSimulationInterfacesNormal = () => {
+  interfaceRows.forEach((row) => {
+    row.classList.add("check-ok");
+    row.dataset.checkState = "模拟接口正常";
+  });
+};
 const document = {
   createElement() { return {textContent: "", className: ""}; },
   querySelectorAll(selector) {

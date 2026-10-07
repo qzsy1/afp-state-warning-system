@@ -5808,12 +5808,7 @@ function updateSimulationSettings() {
         .map((item) => ({...item}));
       renderInterfacePanel(state.interfaceCatalog);
     }
-    document.querySelectorAll(".interface-config-row").forEach((row) => {
-      row.classList.remove("check-error", "check-waiting");
-      row.classList.add("check-ok");
-      row.dataset.checkState = "模拟接口正常";
-      row.title = "模拟采集不使用物理接口；数据源通道覆盖由模拟数据源检查单独判断";
-    });
+    markSimulationInterfacesNormal();
   } else {
     if (state.interfaceModeRendered !== "real") {
       if (state.interfaceModeRendered === "simulation") {
@@ -6649,6 +6644,15 @@ function clearHardwareRowStates() {
   });
 }
 
+function markSimulationInterfacesNormal() {
+  document.querySelectorAll(".interface-config-row").forEach((row) => {
+    row.classList.remove("check-error", "check-waiting");
+    row.classList.add("check-ok");
+    row.dataset.checkState = "模拟接口正常";
+    row.title = "模拟采集不使用物理接口；数据源通道覆盖由模拟数据源检查单独判断";
+  });
+}
+
 function currentReadinessMode() {
   return controls.acquisitionMode?.value === "simulation" ? "simulation" : "real";
 }
@@ -6699,6 +6703,7 @@ function activateReadinessNamespace() {
     && state.hardwareCheckFingerprint !== currentFingerprint
   ) {
     clearHardwareRowStates();
+    if (simulation) markSimulationInterfacesNormal();
     if (controls.hardwareCheckStatus) {
       controls.hardwareCheckStatus.className = "hardware-check-status stale";
       controls.hardwareCheckStatus.textContent = simulation
@@ -6713,6 +6718,7 @@ function activateReadinessNamespace() {
     return;
   }
   clearHardwareRowStates();
+  if (simulation) markSimulationInterfacesNormal();
   if (controls.hardwareCheckStatus) {
     controls.hardwareCheckStatus.className = "hardware-check-status stale";
     controls.hardwareCheckStatus.textContent = simulation
@@ -6725,11 +6731,7 @@ function renderSimulationSourceCheckResult(result, {automatic = false} = {}) {
   const node = controls.hardwareCheckStatus;
   if (!node) return;
   clearHardwareRowStates();
-  document.querySelectorAll(".interface-config-row").forEach((row) => {
-    row.classList.add("check-ok");
-    row.dataset.checkState = "模拟接口正常";
-    row.title = "模拟采集不使用物理接口；数据源通道覆盖由模拟数据源检查单独判断";
-  });
+  markSimulationInterfacesNormal();
   const readiness = result?.simulation_readiness || {};
   const stages = Array.isArray(readiness.stages) ? readiness.stages : [];
   const sensors = (Array.isArray(result?.sensors) ? result.sensors : [])

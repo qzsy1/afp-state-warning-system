@@ -55,7 +55,7 @@
         </details>
 
         <details id="acquisitionSection" class="control-section hidden">
-          <summary>真实采集与保存</summary>
+          <summary>采集与保存</summary>
           <div class="control-content">
             <div id="localHelperPanel" class="local-helper-panel">
               <div class="local-helper-head"><strong>本机采集辅助程序</strong><span id="helperStatus" class="helper-status">未配对</span></div>
@@ -84,11 +84,11 @@
             </label>
             <label>采集来源
               <select id="acquisitionModeSelect">
-                <option value="real" selected>真实接口采集</option>
-                <option value="simulation">模拟采集</option>
+                <option value="real">真实接口采集</option>
+                <option value="simulation" selected>模拟采集</option>
               </select>
             </label>
-            <div id="simulationSettings" class="simulation-settings hidden">
+            <div id="simulationSettings" class="simulation-settings">
               <label id="simulationExecutionHostLabel">模拟执行位置
                 <select id="simulationExecutionHostSelect">
                   <option value="helper_local" selected>访问电脑辅助程序（默认，低延迟）</option>
@@ -261,17 +261,17 @@
                 <span aria-hidden="true">•••</span>
               </div>
               <p class="control-note sensor-prediction-note">“仅采集”表示不运行预测，不等于“模拟采集”；当前数据来源以上方“采集来源”为准。预测模式要求输入通道与模型元数据一致，输出通道决定预测曲线及健康指标数据。</p>
-              <div id="acquisitionSourceIndicator" class="control-note" data-mode="real">当前采集来源：真实物理接口；检查会验证接口、协议和传感器通道。</div>
+              <div id="acquisitionSourceIndicator" class="control-note" data-mode="simulation">当前采集来源：模拟数据源；检查不会访问物理接口。</div>
               <label class="hardware-auto-toggle">
               <input id="autoHardwareCheckInput" type="checkbox" checked>
               启动时自动检查接口与传感器通道（仅一次）
               </label>
               <div class="transport hardware-check-actions">
-              <button id="testSensorsButton" class="secondary-button" type="button">立即检查真实接口</button>
-              <button id="resetSensorCheckButton" class="secondary-button" type="button">重置并重新检查真实接口</button>
+              <button id="testSensorsButton" class="secondary-button" type="button">立即检查模拟数据源</button>
+              <button id="resetSensorCheckButton" class="secondary-button" type="button">重置并重新检查模拟数据源</button>
               </div>
               <div id="hardwareCheckStatus" class="hardware-check-status checking">
-              等待自动检查；检查会逐项确认接口、通道和有效数据。
+              等待模拟数据源自动检查；不会探测物理接口。
               </div>
               </div>
             </details>
@@ -326,7 +326,7 @@
               <button id="startAcquisitionButton" class="primary-button">开始采集</button>
             </div>
             <button id="stopAcquisitionButton" class="secondary-button full-button">停止并保存</button>
-            <div id="acquisitionStatus" class="acquisition-status">尚未启动真实采集</div>
+            <div id="acquisitionStatus" class="acquisition-status">尚未启动采集</div>
           </div>
         </details>
 
@@ -525,6 +525,6 @@
   <script src="/mysql_visibility.js?v=20260909-mysql-toggle-2"></script>
   <script src="/process_parameters.js?v=20260916-auto-process-1"></script>
   <script src="/public_demo.js?v=20261001-stable-public-demo-v2"></script>
-  <script src="/app.js?v=20261007-interface-check-v7"></script>
+  <script src="/app.js?v=20261008-safe-simulation-v8"></script>
 </body>
 </html>

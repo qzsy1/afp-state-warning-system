@@ -5,7 +5,7 @@
     {"id": "HARNESS-001", "title": "质量门禁配置、执行、报告和退出码可靠", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "STARTUP-001", "title": "软件启动、服务探测和前端加载保持可用", "mandatory": true, "profiles": ["full", "release"]},
     {"id": "SIMULATION-001", "title": "模拟采集导入、运行和结果链路保持可用", "mandatory": true, "profiles": ["full", "release"]},
-    {"id": "MODE_ISOLATION-001", "title": "模拟和真实采集状态相互隔离，模拟逻辑接口默认正常", "mandatory": true, "profiles": ["quick", "full", "release"]},
+    {"id": "MODE_ISOLATION-001", "title": "入口安全默认模拟，模拟和真实采集状态隔离且模拟逻辑接口默认正常", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "INTERFACES-001", "title": "SMRF、PLC、UVC、ABB和M3232接口映射保持完整", "mandatory": true, "profiles": ["full", "release"]},
     {"id": "USB_TOPOLOGY-001", "title": "USB拓展坞物理端口识别、同类型接口展示和设备验证边界正确", "mandatory": true, "profiles": ["full", "release"]},
     {"id": "EDGE_HELPER-001", "title": "边缘辅助程序传输、确认、重连和会话隔离正确", "mandatory": true, "profiles": ["full", "release"]},
@@ -212,7 +212,7 @@
       "blocking": true,
       "evidence_tier": "protocol_simulation",
       "requirements": ["REAL_ACQUISITION-001", "PHYSICAL_READINESS-001", "MODE_ISOLATION-001", "DIAGNOSIS-001", "LIVE_PREDICTION_SAFETY-001", "CAPTURE_PERSISTENCE-001"],
-      "change_patterns": ["delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/ui/**", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/legacy/static/**", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/legacy/acquisition.py", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/legacy/real_acquisition.py", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/verification/test_real_acquisition_pipeline.py", "openspec/changes/harden-real-acquisition-pipeline/**"]
+      "change_patterns": ["delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/ui/**", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/legacy/static/**", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/legacy/app.py", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/legacy/acquisition.py", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/legacy/real_acquisition.py", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/verification/test_real_acquisition_pipeline.py", "openspec/changes/harden-real-acquisition-pipeline/**"]
     },
     {
       "id": "release-module-status",

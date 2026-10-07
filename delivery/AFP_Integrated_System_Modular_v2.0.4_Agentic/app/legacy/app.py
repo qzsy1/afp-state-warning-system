@@ -148,12 +148,14 @@ def encode_static_file_response(
     accept_encoding: str = "",
     static_root: Path | None = None,
 ) -> tuple[bytes, dict[str, str]]:
-    """Return static bytes and delivery headers without changing ordinary assets.
+    """Return static bytes and delivery headers with explicit cache semantics.
 
     Only the generated public-demo directory gets explicit cache semantics.
     Content-addressed bundles are immutable and gzip-compressed when useful;
     the stable manifest is short-lived so a deployment can point browsers at a
-    new hash without stale data.
+    new hash without stale data.  All mutable application-shell assets are
+    served with ``no-store`` so a restarted delivery cannot combine an old
+    entry page with newly deployed JavaScript or backend behavior.
     """
 
     resolved_path = Path(path).resolve()
@@ -163,8 +165,10 @@ def encode_static_file_response(
     try:
         relative = resolved_path.relative_to(resolved_root)
     except ValueError:
+        headers["Cache-Control"] = "no-store"
         return raw, headers
     if not relative.parts or relative.parts[0] != "demo":
+        headers["Cache-Control"] = "no-store"
         return raw, headers
     headers["ETag"] = f'"{hashlib.sha256(raw).hexdigest()}"'
     if relative.name == "manifest-v1.json":

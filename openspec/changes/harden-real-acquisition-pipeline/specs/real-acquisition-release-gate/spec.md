@@ -93,7 +93,7 @@ G5 MUST 使用独立真实工件、盲态质量结果和批准的标签流程评
 ### Requirement: Harness必须纳入真实采集门禁
 每项本变更需求 MUST 映射到自动检查、协议仿真或人工现场项。quick SHALL 运行受影响单元和契约测试，full SHALL 运行无硬件完整回归及确定性耐久测试，release SHALL 检查G0–G5证据状态并对必需缺口失败关闭。
 
-Quick中的模式与诊断合同 MUST 直接读取并执行当前delivery目录的生产`app.js`，不得只测试`visualization_app`中的开发副本或只搜索源码关键字。测试 SHALL 至少执行模拟/真实双向模式分支、模拟接口默认状态、残留物理映射旁路、真实失败事件构造以及LangChain任务提交边界。
+Quick中的模式与诊断合同 MUST 直接读取并执行当前delivery目录的生产`app.js`，不得只测试`visualization_app`中的开发副本或只搜索源码关键字。测试 SHALL 至少执行本机入口安全默认模拟、可变入口资源禁用旧缓存、模拟/真实双向模式分支、模拟接口默认状态、残留物理映射旁路、真实失败事件构造以及LangChain任务提交边界。
 
 #### Scenario: 发布环境缺少第二台电脑或五类实物证据
 - **WHEN** release harness 找不到当前交付修订对应的G2、G3或要求的G4现场证据
