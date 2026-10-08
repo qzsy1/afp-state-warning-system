@@ -18,6 +18,8 @@ sys.path.insert(0, str(LEGACY_APP))
 
 import acquisition  # noqa: E402
 import app as delivery_app  # noqa: E402
+import interface_agent  # noqa: E402
+import local_capture_agent  # noqa: E402
 import public_status  # noqa: E402
 
 
@@ -88,6 +90,24 @@ class _PayloadDriver:
         return None
 
 
+class _IndependentInterfaceProbe:
+    def __init__(self, _interfaces, _schema, _source, assignments) -> None:
+        self.channels = [
+            name for names in assignments.values() for name in names
+        ]
+        self.sequence = 0
+
+    def open(self) -> None:
+        return None
+
+    def read_sample(self):
+        self.sequence += 1
+        return {name: float(self.sequence) for name in self.channels}
+
+    def close(self) -> None:
+        return None
+
+
 class _ManagedFakeMultiInterface(acquisition.MultiInterfaceDriver):
     def __init__(self) -> None:
         self.cache = acquisition.ChannelSampleCache()
@@ -109,6 +129,105 @@ class _ManagedFakeMultiInterface(acquisition.MultiInterfaceDriver):
 
 
 class RealAcquisitionRegressionTests(unittest.TestCase):
+    def test_simulation_five_interface_defaults_materialize_distinct_channel_assignments(self) -> None:
+        config = acquisition.AcquisitionConfig(
+            acquisition_mode="simulation",
+            dataset_schema="new_collection_v11_3",
+            simulation_source_type="single_csv",
+            simulation_source_path="simulation.csv",
+            interfaces=acquisition.default_capture_interfaces(),
+            selected_sensors=acquisition.NEW_COLLECTION_SENSOR_COLUMNS.copy(),
+        )
+
+        self.assertEqual(
+            config.interface_channel_assignments,
+            {
+                "thermocouple_8ch": [f"温度{index}" for index in range(1, 9)],
+                "plc_process": ["温度", "压力", "张力"],
+                "uvc_temperature": ["ROI平均温度"],
+                "abb_motion": ["线速度", "ABB_X", "ABB_Y", "ABB_Z"],
+                "m3232_pressure": ["薄膜压力"],
+            },
+        )
+
+    def test_simulation_five_interface_routes_still_build_one_simulation_driver(self) -> None:
+        config = acquisition.AcquisitionConfig(
+            acquisition_mode="simulation",
+            dataset_schema="new_collection_v11_3",
+            simulation_source_type="single_csv",
+            simulation_source_path="simulation.csv",
+            interfaces=acquisition.default_capture_interfaces(),
+            selected_sensors=acquisition.NEW_COLLECTION_SENSOR_COLUMNS.copy(),
+        )
+
+        with patch.object(acquisition, "SimulatorDriver", wraps=acquisition.SimulatorDriver) as driver:
+            built = acquisition.build_driver(config)
+
+        self.assertIsInstance(built, acquisition.SimulatorDriver)
+        self.assertNotIsInstance(built, acquisition.MultiInterfaceDriver)
+        driver.assert_called_once_with(
+            Path("simulation.csv"),
+            acquisition.NEW_COLLECTION_SENSOR_COLUMNS,
+        )
+
+    def test_diagnostic_config_reports_duplicate_binding_after_probing_every_interface(self) -> None:
+        payload = {
+            "acquisition_mode": "real",
+            "dataset_schema": "new_collection_v11_3",
+            "selected_sensors": ["压力", "温度"],
+            "interfaces": [
+                {
+                    "id": "first", "enabled": True, "role": "custom",
+                    "driver": "json_socket", "endpoint": "127.0.0.1:9101",
+                    "physical_interface_id": "serial:COM8",
+                    "physical_port_id": "usbport:shared",
+                    "physical_verified": True,
+                },
+                {
+                    "id": "second", "enabled": True, "role": "custom",
+                    "driver": "json_socket", "endpoint": "127.0.0.1:9102",
+                    "physical_interface_id": "serial:COM9",
+                    "physical_port_id": "usbport:shared",
+                    "physical_verified": True,
+                },
+            ],
+            "interface_channel_assignments": {
+                "first": ["压力"], "second": ["温度"],
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "重复绑定"):
+            acquisition.acquisition_config_from_payload(payload)
+
+        config = acquisition.acquisition_diagnostic_config_from_payload(payload)
+        with patch.object(acquisition, "MultiInterfaceDriver", _IndependentInterfaceProbe):
+            result = acquisition.AcquisitionManager().test_connection(
+                config, timeout_seconds=0.01
+            )
+
+        self.assertEqual(["first", "second"], [item["id"] for item in result["interfaces"]])
+        self.assertTrue(all(item["state"] == "configuration_invalid" for item in result["interfaces"]))
+        self.assertTrue(all(item.get("probe_state") for item in result["interfaces"]))
+        self.assertEqual("duplicate_physical_binding", result["configuration_issues"][0]["code"])
+        self.assertFalse(result["ok"])
+
+    def test_helper_auto_assignment_reserves_parent_usb_port(self) -> None:
+        physical = [
+            {
+                "id": "hid:first", "parent_port_id": "usbport:shared",
+                "kind": "usb_hid", "protocol": "smrf_hid",
+                "auto_bind_eligible": True, "detected": True,
+            },
+            {
+                "id": "hid:second", "parent_port_id": "usbport:other",
+                "kind": "usb_hid", "protocol": "smrf_hid",
+                "auto_bind_eligible": True, "detected": True,
+            },
+        ]
+        chosen = local_capture_agent.LocalCaptureAgent._choose_candidate(
+            physical, "usb_hid", ("smrf_hid",), used={"usbport:shared"}
+        )
+        self.assertEqual("hid:second", chosen["id"])
+
     def test_simulation_readiness_is_isolated_from_cached_real_failure(self) -> None:
         manager = acquisition.AcquisitionManager()
         real_failure = {
@@ -172,6 +291,35 @@ class RealAcquisitionRegressionTests(unittest.TestCase):
         self.assertIn("模拟数据", message)
         for physical_word in ("USB", "串口", "PLC", "ABB", "UVC"):
             self.assertNotIn(physical_word, message)
+
+    def test_standard_simulation_package_passes_all_shared_sensor_selections(self) -> None:
+        source = (
+            DELIVERY_ROOT / "app" / "legacy" / "simulation_packages"
+            / "afp_synthetic_quick_240.csv"
+        )
+        selected = list(
+            acquisition.ACQUISITION_SCHEMAS["new_collection_v11_3"]["sensors"]
+        )
+        config = acquisition.AcquisitionConfig(
+            acquisition_mode="simulation",
+            dataset_schema="new_collection_v11_3",
+            source_file=str(source),
+            simulation_source_path=str(source),
+            selected_sensors=selected,
+            interfaces=acquisition.default_capture_interfaces(),
+        )
+
+        result = acquisition.AcquisitionManager().test_connection(
+            config, timeout_seconds=0.2
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["simulation_readiness"]["replay_ready"])
+        self.assertEqual([], result["simulation_readiness"]["missing_channels"])
+        self.assertEqual(
+            selected,
+            [item["name"] for item in result["sensors"] if item["selected"] and item["ok"]],
+        )
 
     def test_discovery_evidence_never_auto_binds_placeholders_or_generic_serial(self) -> None:
         candidates = acquisition.annotate_discovery_evidence([
@@ -396,7 +544,7 @@ if (!resetButton.textContent.includes("真实接口")) process.exit(8);
             self.assertNotRegex(body, r'<option value="real" selected>')
             self.assertIn('data-mode="simulation"', source)
             self.assertIn("立即检查模拟数据源", source)
-            self.assertIn("20261008-safe-simulation-v8", source)
+            self.assertIn("20261008-manual-sim-routing-v1", source)
 
     def test_mutable_delivery_shell_disables_browser_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -436,6 +584,151 @@ markSimulationInterfacesNormal();
 if (interfaceRows.some((row) => !row.added.includes("check-ok"))) process.exit(1);
 if (interfaceRows.some((row) => row.dataset.checkState !== "模拟接口正常")) process.exit(2);
 if (interfaceRows.some((row) => !row.removed.includes("check-error"))) process.exit(3);
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_delivery_role_transition_recomputes_simulation_start_button(self) -> None:
+        source = (DELIVERY_ROOT / "app" / "ui" / "app.js").read_text(encoding="utf-8")
+        start = source.index("function synchronizeAcquisitionButtons()")
+        end = source.index("\nfunction updateIntegrationSource", start)
+        functions = source[start:end]
+        script = r'''
+const state = {
+  accessRole: "guest", publicDemoReady: false, publicDemoPlayback: null,
+  acquisitionStatus: null, acquisitionStartBusy: false, stopBusy: false,
+  interfaceModeRendered: "", interfaceCatalog: [], simulationInterfaceCatalog: null,
+};
+const toggle = {toggle() {}};
+const controls = {
+  acquisitionMode: {value: "simulation"},
+  simulationSettings: {classList: toggle},
+  simulationExecutionHostLabel: {classList: toggle},
+  simulationExecutionHost: {value: "helper_local", disabled: false},
+  interfaceDiscoveryStatus: {textContent: ""},
+  simulationSourceType: {value: "single_csv", closest() { return {classList: toggle}; }},
+  simulationMysqlSettings: {classList: toggle},
+  simulationSourcePathLabel: {classList: toggle},
+  simulationPackagePanel: {classList: toggle},
+  simulationSourcePath: {placeholder: ""},
+};
+const nodes = {
+  startAcquisitionButton: {textContent: "", disabled: false},
+  stopAcquisitionButton: {textContent: "", disabled: false},
+  localHelperPanel: {classList: toggle},
+};
+const $ = (id) => nodes[id] || null;
+const document = {
+  body: {classList: toggle},
+  querySelector() { return null; },
+  querySelectorAll() { return []; },
+};
+const updateReadinessModePresentation = () => {};
+const updateRealAcquisitionVisibility = () => {};
+const setPublicDemoControlVisibility = () => {};
+const simulationPackageControlsVisible = () => false;
+const buildSimulationInterfaceCatalog = () => [{id: "logical"}];
+const renderInterfacePanel = (items) => {
+  state.interfaceCatalog = items;
+  state.interfaceModeRendered = controls.acquisitionMode.value;
+};
+const markSimulationInterfacesNormal = () => {};
+const rememberRealInterfaceSnapshot = () => {};
+const interfaceConfigs = () => ({interfaces: state.interfaceCatalog});
+const restoreCachedRealInterfaceSnapshot = () => {};
+const loadHelperStatus = async () => {};
+const discoverInterfaces = async () => {};
+const isPublicPrecomputedSimulationMode = () =>
+  (state.accessRole === "guest" || state.accessRole === "authorized")
+  && controls.acquisitionMode.value === "simulation";
+''' + functions + r'''
+updateSimulationSettings();
+if (!nodes.startAcquisitionButton.disabled) process.exit(1);
+state.accessRole = "local_admin";
+updateSimulationSettings();
+if (nodes.startAcquisitionButton.disabled) process.exit(2);
+if (!nodes.stopAcquisitionButton.disabled) process.exit(3);
+state.acquisitionStatus = {running: true};
+updateSimulationSettings();
+if (!nodes.startAcquisitionButton.disabled) process.exit(4);
+if (nodes.stopAcquisitionButton.disabled) process.exit(5);
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_delivery_local_admin_simulation_click_checks_source_and_starts_once(self) -> None:
+        source = (DELIVERY_ROOT / "app" / "ui" / "app.js").read_text(encoding="utf-8")
+        start = source.index("async function startAcquisition()")
+        end = source.index("\nasync function waitForHelperFlushComplete", start)
+        function = source[start:end]
+        script = r'''
+const controls = {
+  acquisitionMode: {value: "simulation"}, simulationExecutionHost: {value: "server"},
+  mysqlLocalEnabled: {checked: false}, autoProcessParameters: {checked: false},
+  processingMode: {value: "prediction"}, dataMode: {value: "live"},
+};
+const statusNode = {textContent: "", classList: {add() {}, remove() {}}};
+const $ = (id) => id === "acquisitionStatus" ? statusNode : null;
+const state = {
+  accessRole: "local_admin", helperStatus: {}, acquisitionStatus: null,
+  acquisitionStartBusy: false, hardwareCheckInProgress: false,
+  simulationSourceCheck: null, simulationSourceCheckFingerprint: "",
+  liveScopeKey: null, payload: null,
+};
+let readinessCalls = 0;
+let startCalls = 0;
+let physicalCalls = 0;
+let allowSource = true;
+const simulationExecutionSelection = () => ({execution_host: "server", error: ""});
+const isPublicPrecomputedSimulationMode = () => false;
+const supportsHelperSimulationReplay = () => false;
+const validateEnabledMysqlBeforeStart = async () => {};
+const acquireRealControl = async () => { physicalCalls += 1; };
+const hardwareConfigFingerprint = () => "simulation-fingerprint";
+const testSensorConnection = async () => {
+  readinessCalls += 1;
+  const result = {ok: allowSource, readiness_namespace: "simulation_source"};
+  state.simulationSourceCheck = result;
+  state.simulationSourceCheckFingerprint = "simulation-fingerprint";
+  return result;
+};
+const liveEvidenceScopeKey = () => "scope";
+const resetLiveEvidenceDisplay = () => {};
+const usesLocalCaptureHelper = () => false;
+const acquisitionConfig = () => ({acquisition_mode: "simulation"});
+const requestLocalHelper = async () => { throw new Error("helper must not run"); };
+const postJson = async (url) => {
+  if (url !== "/api/acquisition/start") throw new Error(`unexpected ${url}`);
+  startCalls += 1;
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  return {running: true, capture_uuid: "sim-1", prediction_model: {}};
+};
+const validateHelperStartResult = () => {};
+const applyPredictionModelProfile = () => {};
+const waitForEdgeFirstSample = async (value) => value;
+const renderAcquisitionStatus = (value) => { state.acquisitionStatus = value; };
+const configureDataMode = () => {};
+const loadRealtime = async () => {};
+const readProcessParameters = async () => {};
+const synchronizeAcquisitionButtons = () => {};
+const toast = () => {};
+''' + function + r'''
+(async () => {
+  await Promise.all([startAcquisition(), startAcquisition()]);
+  if (readinessCalls !== 1) process.exit(1);
+  if (startCalls !== 1) process.exit(2);
+  if (physicalCalls !== 0) process.exit(3);
+  if (!state.acquisitionStatus?.running) process.exit(4);
+
+  state.acquisitionStatus = null;
+  state.simulationSourceCheck = null;
+  state.simulationSourceCheckFingerprint = "";
+  allowSource = false;
+  await startAcquisition();
+  if (readinessCalls !== 2) process.exit(5);
+  if (startCalls !== 1) process.exit(6);
+  if (!statusNode.textContent.includes("模拟数据源检查未通过")) process.exit(7);
+})().catch((error) => { console.error(error); process.exit(8); });
 '''
         completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
         self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -487,9 +780,105 @@ if (interfaceRows.some((row) => row.added.includes("check-error"))) process.exit
         completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
+    def test_delivery_real_mode_allows_manual_empty_port_selection(self) -> None:
+        source = (DELIVERY_ROOT / "app" / "ui" / "app.js").read_text(encoding="utf-8")
+        start = source.index("const USB_SENSOR_ROLES")
+        end = source.index("function itemEnabledForSimulation", start)
+        functions = source[start:end]
+        script = r'''
+const profiles = {thermocouple:{label:"八通道热电偶", physical_kind:"usb_hid", protocol:"smrf_hid"}};
+const state = {
+  physicalInterfaces: [],
+  usbTopology: {usb_ports:[{id:"dock:empty", owner_kind:"dock", dock_id:"d1", label:"拓展坞 1 · USB3-1", state:"empty", endpoint_present:false, user_connectable:true}], devices:[]},
+};
+const controls = {acquisitionMode:{value:"real"}};
+function sensorTypeProfile(role) { return profiles[role] || {}; }
+function option(value, textContent) { return {value, textContent, dataset:{}, disabled:false}; }
+function groupOptions(nodes) { return nodes.flatMap((node) => node.children || [node]); }
+const document = {createElement(tag) {
+  if (tag === "optgroup") return {label:"", children:[], append(node){this.children.push(node);}};
+  return {className:"", textContent:"", classList:{toggle(){},remove(){} }};
+}};
+const select = {
+  children:[], disabled:false, title:"", _value:"",
+  replaceChildren(...nodes){this.children=[...nodes]; this._value="";},
+  append(node){this.children.push(node);},
+  set value(value){this._value=String(value);}, get value(){return this._value;},
+  get selectedOptions(){return groupOptions(this.children).filter((node) => String(node.value) === this._value);},
+};
+const enabled = {checked:true, disabled:false};
+const warning = {textContent:"", classList:{toggle(){},remove(){}}};
+const row = {
+  dataset:{physicalPortId:"", physicalKind:"", endpoint:""},
+  querySelector(selector) {
+    if (selector === ".interface-physical") return select;
+    if (selector === ".interface-role") return {value:"thermocouple"};
+    if (selector === ".interface-enabled") return enabled;
+    if (selector === ".interface-physical-warning") return warning;
+    return null;
+  },
+  append(){},
+};
+''' + functions + r'''
+refreshPhysicalInterfaceOptions(row, "dock:empty");
+const selected = select.selectedOptions[0];
+if (!selected || selected.disabled || select.disabled || enabled.disabled) process.exit(1);
+if (selected.dataset.endpointPresent !== "false") process.exit(2);
+if (!warning.textContent.includes("尚未检测到兼容设备")) process.exit(3);
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_delivery_simulation_cards_identify_distinct_logical_interfaces(self) -> None:
+        source = (DELIVERY_ROOT / "app" / "ui" / "app.js").read_text(encoding="utf-8")
+        start = source.index("function refreshPhysicalInterfaceOptions")
+        end = source.index("function itemEnabledForSimulation", start)
+        function = source[start:end]
+        script = r'''
+const controls = {acquisitionMode:{value:"simulation"}};
+const profiles = {
+  thermocouple:{label:"八通道热电偶"},
+  plc:{label:"松下PLC过程传感器"},
+};
+const sensorTypeProfile = (role) => profiles[role];
+const physicalCandidatesForRole = () => { throw new Error("simulation must not discover physical ports"); };
+const option = (value, textContent) => ({value, textContent, dataset:{}});
+const document = {createElement(){return {className:"", textContent:"", classList:{remove(){},toggle(){}}};}};
+function makeRow(role) {
+  const select = {value:"", disabled:false, items:[], replaceChildren(...items){this.items=items;}, selectedOptions:[]};
+  const enabled = {checked:true, disabled:false};
+  const warning = {textContent:"", classList:{remove(){},toggle(){}}};
+  const labelText = {nodeValue:"实际物理接口"};
+  const label = {firstChild:labelText};
+  select.closest = () => label;
+  const row = {
+    dataset:{interfaceId:role},
+    querySelector(selector) {
+      if (selector === ".interface-physical") return select;
+      if (selector === ".interface-role") return {value:role};
+      if (selector === ".interface-enabled") return enabled;
+      if (selector === ".interface-physical-warning") return warning;
+      return null;
+    },
+    append(){},
+  };
+  return {row, select, labelText};
+}
+''' + function + r'''
+const thermocouple = makeRow("thermocouple");
+const plc = makeRow("plc");
+refreshPhysicalInterfaceOptions(thermocouple.row);
+refreshPhysicalInterfaceOptions(plc.row);
+if (thermocouple.labelText.nodeValue !== "模拟逻辑接口") process.exit(1);
+if (plc.labelText.nodeValue !== "模拟逻辑接口") process.exit(2);
+if (thermocouple.select.items[0].textContent === plc.select.items[0].textContent) process.exit(3);
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_simulation_mode_ignores_stale_physical_kind_mismatch(self) -> None:
         source = (DELIVERY_ROOT / "app" / "ui" / "app.js").read_text(encoding="utf-8")
-        start = source.index("function validatePhysicalInterfaceBindings(")
+        start = source.index("function physicalInterfaceBindingIssues(")
         end = source.index("\ncontrols.acquisitionMode?.addEventListener", start)
         function = source[start:end]
         script = r'''
@@ -559,6 +948,217 @@ const postJson = async (url, payload) => {
 '''
         completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
         self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_langchain_failure_keeps_local_diagnosis_and_complete_hardware_result(self) -> None:
+        source = (DELIVERY_ROOT / "app" / "ui" / "app.js").read_text(encoding="utf-8")
+        poll_start = source.index("async function pollAgentDiagnosisJob(")
+        run_end = source.index("\nasync function testSensorConnection", poll_start)
+        functions = source[poll_start:run_end]
+        script = r'''
+const hardwareResult = {ok: false, interfaces: [{id: "one", enabled: true, ok: false}], sensors: []};
+const localResult = {execution_mode: "local_rules", diagnoses: [{interface_id: "one"}]};
+const calls = [];
+const state = {
+  agentEvents: [{interface_id: "one"}], agentRequestId: 0, agentBusy: false,
+  agentJobId: "", agentResult: null, hardwareCheck: hardwareResult,
+  accessRole: "local_admin",
+};
+const agentApiKeyInput = {value: "test-key"};
+const agentModelNameInput = {value: "test-model"};
+const autoStatus = {textContent: ""};
+const $ = (id) => id === "agentAutoStatus" ? autoStatus : null;
+const renderAgentGate = () => true;
+const renderHardwareCheckResult = () => {};
+const postJson = async (url, payload) => {
+  calls.push({url, payload});
+  return {job_id: "job-1", local_result: localResult};
+};
+const fetch = async () => ({
+  ok: true,
+  json: async () => ({state: "failed", error: "model unavailable", local_result: localResult}),
+});
+''' + functions + r'''
+(async () => {
+  await runAgentDiagnosis({automatic: true});
+  if (calls.length !== 1 || calls[0].url !== "/api/agent/diagnose/start") process.exit(1);
+  if (calls[0].payload.hardware_result !== hardwareResult) process.exit(2);
+  if (state.agentResult !== localResult) process.exit(3);
+  if (!autoStatus.textContent.includes("model unavailable")) process.exit(4);
+  if (state.agentBusy || state.agentJobId) process.exit(5);
+})().catch((error) => { console.error(error); process.exit(6); });
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_real_check_error_envelope_still_uses_structured_diagnosis_pipeline(self) -> None:
+        source = (DELIVERY_ROOT / "app" / "ui" / "app.js").read_text(encoding="utf-8")
+        start = source.rindex("async function testSensorConnection(")
+        end = source.index("\nasync function resetAndCheckHardware", start)
+        check_function = source[start:end]
+        self.assertGreaterEqual(check_function.count("diagnosticValidation: true"), 2)
+        self.assertGreaterEqual(check_function.count("updateAgentFromHardwareResult(failedCheck"), 2)
+        self.assertNotIn("node.textContent = `真实接口检查失败", check_function)
+        self.assertIn("return failedCheck", check_function)
+
+    def test_delivery_langchain_keeps_legacy_diagnosis_shape_with_configuration_evidence(self) -> None:
+        event = {
+            "interface_id": "m3232_pressure",
+            "interface_label": "M3232 薄膜压力",
+            "role": "pressure",
+            "driver": "m3232_pressure",
+            "endpoint": "COM8",
+            "sensor_name": "薄膜压力",
+            "channels": ["薄膜压力"],
+            "state": "configuration_invalid",
+            "message": "物理接口重复绑定",
+            "evidence": {
+                "expected_channels": ["薄膜压力"],
+                "configuration_issues": [{
+                    "code": "duplicate_physical_binding",
+                    "message": "物理接口重复绑定",
+                }],
+                "probe_state": "no_valid_frame",
+                "probe_ok": False,
+                "probe_message": "驱动已打开但没有有效帧",
+            },
+            "simulated": False,
+        }
+        validated = interface_agent.validate_agent_payload({
+            "api_key": "sk-test-only",
+            "model_name": "local-demo-model",
+            "events": [event],
+            "hardware_result": {
+                "ok": False,
+                "interfaces": [{
+                    "id": "m3232_pressure",
+                    "state": "configuration_invalid",
+                    "message": "物理接口重复绑定",
+                    "ok": False,
+                    "configuration_issues": event["evidence"]["configuration_issues"],
+                    "probe_state": "no_valid_frame",
+                    "probe_ok": False,
+                    "probe_message": "驱动已打开但没有有效帧",
+                }],
+                "sensors": [],
+            },
+        })
+        rebuilt = interface_agent.build_agent_event(validated["hardware_result"])
+
+        diagnosis = interface_agent.run_interface_diagnosis(
+            validated["events"][0],
+            api_key_present=True,
+            model_name="local-demo-model",
+        )["diagnosis"]
+
+        self.assertEqual(
+            [
+                "interface_id", "interface_label", "sensor_name", "channels",
+                "fault_type", "summary", "error_message", "evidence",
+                "possible_causes", "recommended_actions", "evidence_boundary",
+                "simulated",
+            ],
+            list(diagnosis),
+        )
+        self.assertEqual(
+            "no_valid_frame",
+            validated["hardware_result"]["interfaces"][0]["probe_state"],
+        )
+        self.assertEqual(
+            "duplicate_physical_binding",
+            rebuilt["evidence"]["configuration_issues"][0]["code"],
+        )
+        self.assertEqual("no_valid_frame", rebuilt["evidence"]["probe_state"])
+
+    def test_delivery_simulation_selection_is_shared_and_server_check_opens_source(self) -> None:
+        source = (DELIVERY_ROOT / "app" / "ui" / "app.js").read_text(encoding="utf-8")
+        helper_start = source.index("function autoEnableSimulationChannels")
+        helper_end = source.index("function isTemperatureChannel", helper_start)
+        helper = source[helper_start:helper_end]
+        self.assertNotIn("collect.checked = present", helper)
+        check_start = source.index("async function checkSimulationSourceReadiness(")
+        check_end = source.index("\nasync function testSensorConnection", check_start)
+        check = source[check_start:check_end]
+        self.assertIn('postJson("/api/acquisition/test"', check)
+        self.assertIn("acquisitionConfig()", check)
+
+    def test_delivery_browser_simulation_fallback_requires_validated_source(self) -> None:
+        source = (DELIVERY_ROOT / "app" / "ui" / "app.js").read_text(encoding="utf-8")
+        start = source.index("function simulationReadinessFromAvailableChannels()")
+        end = source.index("\nasync function checkSimulationSourceReadiness", start)
+        function = source[start:end]
+        script = r'''
+const state = {
+  simulationSourceChannels: ["温度", "压力"], simulationSourceId: "stale-source",
+  simulationSourceReady: null, publicDemoReady: false,
+  publicDemoBundle: {package_id: "quick_240"}, simulationDatasetCache: null,
+};
+const controls = {
+  interfacePanel: {querySelectorAll() { return []; }},
+  simulationSourcePath: {value: ""},
+  simulationPackage: {value: "quick_240"},
+};
+const selectedAcquisitionChannelsForInterfaces = () => ["温度", "压力"];
+const sensorTypeProfile = () => ({channels: []});
+const isPublicPrecomputedSimulationMode = () => true;
+''' + function + r'''
+const unvalidated = simulationReadinessFromAvailableChannels();
+if (unvalidated.ok || unvalidated.simulation_readiness.replay_ready) process.exit(1);
+const invalidValues = unvalidated.simulation_readiness.stages.find((item) => item.name === "values_valid");
+if (invalidValues?.state !== "failed") process.exit(2);
+state.publicDemoReady = true;
+const staleValidated = simulationReadinessFromAvailableChannels();
+if (staleValidated.ok || staleValidated.simulation_readiness.replay_ready) process.exit(3);
+state.simulationSourceId = "";
+const validatedPublic = simulationReadinessFromAvailableChannels();
+if (!validatedPublic.ok || !validatedPublic.simulation_readiness.replay_ready) process.exit(4);
+state.publicDemoReady = false;
+state.publicDemoBundle = null;
+state.simulationSourceId = "upload-2";
+state.simulationDatasetCache = {
+  simulation_source_id: "upload-2",
+  rows: [{"温度": 20, "压力": null}, {"温度": 21, "压力": "bad"}],
+};
+const invalidUpload = simulationReadinessFromAvailableChannels();
+if (invalidUpload.ok) process.exit(5);
+state.simulationDatasetCache.rows[1]["压力"] = 1.5;
+const validUpload = simulationReadinessFromAvailableChannels();
+if (!validUpload.ok) process.exit(6);
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_delivery_simulation_fingerprint_tracks_source_identity_and_validation(self) -> None:
+        source = (DELIVERY_ROOT / "app" / "ui" / "app.js").read_text(encoding="utf-8")
+        start = source.index("function hardwareConfigFingerprint()")
+        end = source.index("\nfunction hardwareStateLabel", start)
+        body = source[start:end]
+        for field in (
+            "simulation_source_type", "simulation_source_path", "simulation_source_id",
+            "simulation_source_package_id", "simulation_source_revision",
+            "simulation_source_validated",
+        ):
+            self.assertIn(field, body)
+
+    def test_delivery_native_source_selection_invalidates_previous_readiness(self) -> None:
+        source = (DELIVERY_ROOT / "app" / "ui" / "app.js").read_text(encoding="utf-8")
+        start = source.index("async function selectSimulationSource()")
+        end = source.index("\nfunction readSimulationFile", start)
+        body = source[start:end]
+        self.assertIn('markHardwareCheckStale("模拟数据源已替换")', body)
+
+    def test_delivery_legacy_agent_card_keeps_labels_and_order(self) -> None:
+        source = (DELIVERY_ROOT / "app" / "ui" / "app.js").read_text(encoding="utf-8")
+        start = source.index("function appendAgentDiagnostics(node)")
+        end = source.index("\nfunction handleAgentInputChange", start)
+        body = source[start:end]
+        self.assertIn('className = "hardware-agent-results"', body)
+        self.assertIn('className = "hardware-agent-item"', body)
+        labels = [
+            "原始报错：", "接口/通道：", "已观察事实", "原因判断",
+            "建议操作", "仍待确认", "证据来源：", "evidence_boundary",
+        ]
+        positions = [body.index(label) for label in labels]
+        self.assertEqual(positions, sorted(positions))
 
     def test_m3232_uses_canonical_thin_film_pressure_channel(self) -> None:
         driver = acquisition.M3232PressureDriver("COM8")

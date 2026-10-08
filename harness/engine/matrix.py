@@ -11,7 +11,14 @@ from .models import CheckSpec, GateConfigError, RegressionMatrix, RequirementSpe
 
 VALID_PROFILES = ("quick", "full", "release")
 VALID_ENVIRONMENTS = ("local", "ci")
-VALID_EVIDENCE_TIERS = ("automated", "local_integration", "field", "unverified")
+VALID_EVIDENCE_TIERS = (
+    "automated",
+    "protocol_simulation",
+    "local_integration",
+    "remote_integration",
+    "field",
+    "unverified",
+)
 VALID_KINDS = ("command", "field")
 TOP_LEVEL_FIELDS = {"schema_version", "requirements", "profiles", "checks"}
 REQUIREMENT_FIELDS = {"id", "title", "mandatory", "profiles"}

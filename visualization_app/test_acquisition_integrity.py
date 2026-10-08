@@ -27,6 +27,48 @@ from training_data import read_excel_or_folder  # noqa: E402
 
 
 class AcquisitionIntegrityTests(unittest.TestCase):
+    def test_simulation_five_interface_defaults_materialize_distinct_channel_assignments(self) -> None:
+        interfaces = acquisition.default_capture_interfaces()
+        config = acquisition.AcquisitionConfig(
+            acquisition_mode="simulation",
+            dataset_schema="new_collection_v11_3",
+            simulation_source_type="single_csv",
+            simulation_source_path="simulation.csv",
+            interfaces=interfaces,
+            selected_sensors=acquisition.NEW_COLLECTION_SENSOR_COLUMNS.copy(),
+        )
+
+        self.assertEqual(
+            config.interface_channel_assignments,
+            {
+                "thermocouple_8ch": [f"温度{index}" for index in range(1, 9)],
+                "plc_process": ["温度", "压力", "张力"],
+                "uvc_temperature": ["ROI平均温度"],
+                "abb_motion": ["线速度", "ABB_X", "ABB_Y", "ABB_Z"],
+                "m3232_pressure": ["薄膜压力"],
+            },
+        )
+
+    def test_simulation_five_interface_routes_still_build_one_simulation_driver(self) -> None:
+        config = acquisition.AcquisitionConfig(
+            acquisition_mode="simulation",
+            dataset_schema="new_collection_v11_3",
+            simulation_source_type="single_csv",
+            simulation_source_path="simulation.csv",
+            interfaces=acquisition.default_capture_interfaces(),
+            selected_sensors=acquisition.NEW_COLLECTION_SENSOR_COLUMNS.copy(),
+        )
+
+        with patch.object(acquisition, "SimulatorDriver", wraps=acquisition.SimulatorDriver) as driver:
+            built = acquisition.build_driver(config)
+
+        self.assertIsInstance(built, acquisition.SimulatorDriver)
+        self.assertNotIsInstance(built, acquisition.MultiInterfaceDriver)
+        driver.assert_called_once_with(
+            Path("simulation.csv"),
+            acquisition.NEW_COLLECTION_SENSOR_COLUMNS,
+        )
+
     def test_default_simulation_basename_resolves_to_configured_absolute_path(self) -> None:
         resolver = getattr(acquisition, "resolve_default_simulation_source", None)
         self.assertTrue(callable(resolver), "authorized simulation needs a canonical source resolver")

@@ -654,6 +654,61 @@ class InterfaceAgentTests(unittest.TestCase):
         self.assertEqual(len(validated["events"]), 2)
         self.assertEqual(len(validated["hardware_result"]["interfaces"]), 2)
 
+    def test_configuration_probe_evidence_preserves_legacy_diagnosis_contract(self) -> None:
+        event = interface_agent.build_agent_event(m3232_result())
+        event["evidence"].update({
+            "configuration_issues": [{
+                "code": "duplicate_physical_binding",
+                "message": "物理接口重复绑定",
+            }],
+            "probe_state": "no_valid_frame",
+            "probe_ok": False,
+            "probe_message": "驱动已打开但没有有效帧",
+        })
+        hardware_result = m3232_result()
+        hardware_result["interfaces"][0].update({
+            "configuration_issues": event["evidence"]["configuration_issues"],
+            "probe_state": "no_valid_frame",
+            "probe_ok": False,
+            "probe_message": "驱动已打开但没有有效帧",
+        })
+
+        validated = validate_agent_payload({
+            "api_key": "sk-test-only",
+            "model_name": "local-demo-model",
+            "events": [event],
+            "hardware_result": hardware_result,
+        })
+        rebuilt = interface_agent.build_agent_event(validated["hardware_result"])
+        diagnosis = run_interface_diagnosis(
+            validated["events"][0],
+            api_key_present=True,
+            model_name="local-demo-model",
+        )["diagnosis"]
+
+        self.assertEqual(
+            [
+                "interface_id", "interface_label", "sensor_name", "channels",
+                "fault_type", "summary", "error_message", "evidence",
+                "possible_causes", "recommended_actions", "evidence_boundary",
+                "simulated",
+            ],
+            list(diagnosis),
+        )
+        self.assertEqual(
+            "duplicate_physical_binding",
+            validated["events"][0]["evidence"]["configuration_issues"][0]["code"],
+        )
+        self.assertEqual(
+            "no_valid_frame",
+            validated["hardware_result"]["interfaces"][0]["probe_state"],
+        )
+        self.assertEqual(
+            "duplicate_physical_binding",
+            rebuilt["evidence"]["configuration_issues"][0]["code"],
+        )
+        self.assertEqual("no_valid_frame", rebuilt["evidence"]["probe_state"])
+
     def test_app_payload_rejects_oversized_hardware_result(self) -> None:
         payload = {
             "api_key": "",

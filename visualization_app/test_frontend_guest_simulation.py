@@ -4,6 +4,42 @@ import unittest
 
 
 class GuestSimulationFrontendContractTests(unittest.TestCase):
+    def test_interface_check_allows_unverified_port_without_weakening_start_gate(self):
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        start = text.index("function physicalInterfaceBindingIssues(")
+        end = text.index("controls.acquisitionMode?.addEventListener", start)
+        function = text[start:end]
+        script = r'''
+const sensorTypeProfile = () => ({physical_kind: "usb_hid"});
+''' + function + r'''
+const unverified = [{
+  id: "thermocouple_8ch", enabled: true, role: "thermocouple",
+  physical_port_id: "usbport:dock:1", physical_interface_id: "",
+  physical_interface_kind: "usb_hid", physical_fallback: false,
+}];
+validatePhysicalInterfaceBindings(unverified, true, {allowUnverifiedPhysical: true});
+let strictBlocked = false;
+try { validatePhysicalInterfaceBindings(unverified, true); }
+catch (error) { strictBlocked = error.message.includes("未检测到兼容设备"); }
+if (!strictBlocked) process.exit(1);
+let missingBlocked = false;
+try {
+  validatePhysicalInterfaceBindings([
+    {...unverified[0], physical_port_id: "", physical_interface_id: ""},
+  ], true, {allowUnverifiedPhysical: true});
+} catch (error) { missingBlocked = error.message.includes("未选择实际物理接口"); }
+if (!missingBlocked) process.exit(2);
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+        check_start = text.rindex("async function testSensorConnection(")
+        check_body = text[check_start:]
+        self.assertGreaterEqual(
+            check_body.count("acquisitionConfig({allowUnverifiedPhysical: true, diagnosticValidation: true})"),
+            2,
+        )
+
     def test_lan_status_prefers_the_current_private_origin_then_server_recommendation(self):
         text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
         start = text.index("function isPrivateNetworkHost(")
@@ -105,7 +141,7 @@ const fetch = async () => { requests += 1; return {ok: true, json: async () => (
     def test_failed_server_target_mysql_has_a_session_bound_retry_control(self):
         html = (Path(__file__).with_name("static") / "index.html").read_text(encoding="utf-8")
         self.assertIn('id="retryTargetMysqlButton"', html)
-        self.assertIn('/app.js?v=20261007-interface-check-v3', html)
+        self.assertIn('/app.js?v=20261008-manual-sim-routing-v1', html)
         text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
         start = text.index("async function retryServerTargetMysql()")
         end = text.index("async function stopAcquisition()", start)
@@ -278,11 +314,15 @@ if (plc.enabled.checked || abb.enabled.checked) process.exit(3);
 
     def test_simulation_connection_result_reports_each_original_protocol(self):
         text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
-        start = text.rindex("async function testSensorConnection(")
-        end = text.index("async function ", start + 1)
-        body = text[start:end]
-        self.assertIn('driver: row.querySelector(".interface-driver")?.value', body)
-        self.assertNotIn('driver: "simulator",', body)
+        config_start = text.index("function interfaceConfigs()")
+        config_end = text.index("function ensureFirstInterfaceRole", config_start)
+        config_body = text[config_start:config_end]
+        self.assertIn('driver: row.querySelector(".interface-driver")?.value', config_body)
+        readiness_start = text.index("async function checkSimulationSourceReadiness(")
+        readiness_end = text.index("\nasync function testSensorConnection", readiness_start)
+        readiness_body = text[readiness_start:readiness_end]
+        self.assertIn("acquisitionConfig()", readiness_body)
+        self.assertNotIn('driver: "simulator",', readiness_body)
 
     def test_changing_simulation_source_keeps_five_interface_card_choices(self):
         text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
@@ -312,6 +352,7 @@ const discoverInterfaces = async () => {};
 const updateRealAcquisitionVisibility = () => {};
 const isPublicPrecomputedSimulationMode = () => false;
 const setPublicDemoControlVisibility = () => {};
+const synchronizeAcquisitionButtons = () => {};
 const $ = () => null;
 """ + function + """
 controls.acquisitionMode.value = "simulation";
@@ -352,7 +393,7 @@ const postJson = async (url) => {
   return {running: false, capture_saved: true, mysql: {}, completed_layers: []};
 };
 const requestLocalHelper = async () => {throw Error("unexpected helper");};
-const renderAcquisitionStatus = () => {};
+const renderAcquisitionStatus = (value) => {state.acquisitionStatus = value;};
 const renderMysqlStatus = () => {};
 const saveFinishedCaptureLocally = async (mode) => {if (mode !== "simulation") throw Error("wrong mode");};
 const loadRealtime = async () => {};
@@ -360,13 +401,16 @@ const toast = () => {};
 const window = {setTimeout};
 const isPublicPrecomputedSimulationMode = () => false;
 const stopPublicDemo = () => {};
+const synchronizeAcquisitionButtons = () => {
+  button.disabled = state.stopBusy || !state.acquisitionStatus?.running;
+};
 """ + function + """
 (async () => {
   const first = stopAcquisition();
   if (!button.disabled || !status.textContent.includes("正在停止")) process.exit(1);
   const second = stopAcquisition();
   await Promise.all([first, second]);
-  if (count !== 1 || button.disabled || state.stopBusy) process.exit(2);
+  if (count !== 1 || !button.disabled || state.stopBusy) process.exit(2);
 })().catch(() => process.exit(3));
 """
         completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
@@ -498,6 +542,41 @@ const stopPublicDemo = () => {};
         check_end = text.index("updateAgentFromHardwareResult", check_start)
         self.assertIn("state.hardwareCheck = result", text[check_start:check_end])
 
+    def test_helper_partial_sensor_response_fails_closed(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("function normalizeHardwareCheckResult")
+        end = text.index("async function checkSimulationSourceReadiness", start)
+        function = text[start:end]
+        script = r'''
+const selectedAcquisitionChannelsForInterfaces = () => ["温度", "压力"];
+const sensorTypeProfile = () => ({channels: ["温度", "压力"], driver: "modbus_tcp", physical_kind: "ethernet"});
+const row = {
+  dataset: {interfaceId: "plc"},
+  querySelector(selector) {
+    if (selector === ".interface-role") return {value: "plc"};
+    if (selector === ".interface-driver") return {value: "modbus_tcp"};
+    if (selector === ".interface-endpoint") return {value: "192.168.125.5:502"};
+    if (selector === ".interface-enabled") return {checked: true};
+    if (selector === ".interface-physical") return {value: "ethernet:test", selectedOptions: []};
+    return null;
+  },
+};
+const controls = {interfacePanel: {querySelectorAll() { return [row]; }}};
+''' + function + r'''
+const result = normalizeHardwareCheckResult({
+  ok: true,
+  interfaces: [{id: "plc", enabled: true, state: "ready", ok: true}],
+  sensors: [{name: "温度", selected: true, state: "ready", ok: true}],
+  errors: [],
+});
+if (result.ok) process.exit(1);
+if (result.sensors.length !== 2) process.exit(2);
+if (result.sensors.find((item) => item.name === "压力")?.ok !== false) process.exit(3);
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_start_preflights_every_enabled_mysql_destination(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
@@ -528,7 +607,9 @@ const stopPublicDemo = () => {};
         real_gate = start_body.index("if (!simulation) {")
         next_scope = start_body.index("const nextScope", real_gate)
         self.assertIn("state.hardwareCheckInProgress", start_body[real_gate:next_scope])
-        self.assertNotIn("state.hardwareCheckInProgress", start_body[:real_gate])
+        self.assertIn("模拟数据源检查正在进行", start_body[:real_gate])
+        self.assertIn("await testSensorConnection({automatic: false})", start_body[:real_gate])
+        self.assertNotIn("await acquireRealControl();", start_body[:real_gate])
         self.assertIn("await acquireRealControl();", start_body[real_gate:next_scope])
 
         check_start = text.index("async function testSensorConnection({automatic = false} = {})", 5000)
@@ -704,23 +785,45 @@ const stopPublicDemo = () => {};
         self.assertIn("保留${profile.label || role}的独立协议和通道映射", body)
         self.assertIn('select.value = "";', body)
 
-    def test_simulation_channels_present_in_source_are_auto_enabled_for_collection(self):
+    def test_simulation_source_channels_do_not_mutate_shared_collection_selection(self):
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
-        self.assertIn(
-            "function autoEnableSimulationChannels",
-            text,
-            "simulation source channels must drive the sensor collection checkboxes",
-        )
-        start = text.index("async function uploadSimulationSource()")
-        end = text.index("function acquisitionConfig()", start)
-        body = text[start:end]
-        self.assertIn("autoEnableSimulationChannels(state.simulationSourceChannels);", body)
         helper_start = text.index("function autoEnableSimulationChannels")
         helper_end = text.index("function isTemperatureChannel", helper_start)
         helper = text[helper_start:helper_end]
-        self.assertIn("save-sensor-checkbox", helper)
-        self.assertIn("available.has", helper)
+        script = r'''
+const first = {value: "温度", checked: true, disabled: false, dataset: {}};
+const second = {value: "压力", checked: false, disabled: false, dataset: {}};
+const makeRow = (collect) => ({
+  dataset: {},
+  querySelector(selector) {
+    if (selector === ".save-sensor-checkbox") return collect;
+    if (selector === ".model-input-sensor-checkbox") return {checked: true, disabled: false};
+    if (selector === ".predict-sensor-checkbox") return {checked: true, disabled: false};
+    return null;
+  },
+});
+const rows = [makeRow(first), makeRow(second)];
+const controls = {acquisitionMode: {value: "simulation"}, processingMode: {value: "prediction"}};
+const document = {querySelectorAll() { return rows; }};
+const refreshInterfaceCardsForSelection = () => {};
+''' + helper + r'''
+autoEnableSimulationChannels(["压力"]);
+if (first.checked !== true) process.exit(1);
+if (second.checked !== false) process.exit(2);
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_server_simulation_readiness_uses_actual_acquisition_check(self):
+        source = Path(__file__).with_name("static") / "app.js"
+        text = source.read_text(encoding="utf-8")
+        start = text.index("async function checkSimulationSourceReadiness(")
+        end = text.index("\nasync function testSensorConnection", start)
+        body = text[start:end]
+        self.assertIn('postJson("/api/acquisition/test"', body)
+        self.assertIn("acquisitionConfig()", body)
+        self.assertIn("renderHardwareCheckResult", body)
 
     def test_guest_simulation_keeps_server_physical_mapping_read_only(self):
         source = Path(__file__).with_name("static") / "app.js"

@@ -30,7 +30,7 @@ class HelperTransportTests(unittest.TestCase):
         self.assertGreaterEqual(capabilities["protocol_version"], 2)
         self.assertEqual(
             capabilities["build_id"],
-            "20260930-helper-public-bdp-stop-v2",
+            "20261008-helper-full-diagnosis-v1",
         )
         self.assertEqual(capabilities["command_lifecycle"], "isolated_hardware_check")
         self.assertTrue(capabilities["simulation_replay_v1"])

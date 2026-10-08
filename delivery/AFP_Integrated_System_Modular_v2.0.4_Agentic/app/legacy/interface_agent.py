@@ -80,6 +80,7 @@ _EVENT_FIELDS = {
     "simulated",
 }
 _EVIDENCE_FIELDS = {
+    "configuration_issues",
     "expected_channels",
     "detected_channels",
     "missing_channels",
@@ -89,10 +90,14 @@ _EVIDENCE_FIELDS = {
     "received_samples",
     "invalid_samples",
     "last_sample_age_seconds",
+    "probe_message",
+    "probe_ok",
+    "probe_state",
     "sensor_states",
 }
 
 _HARDWARE_INTERFACE_FIELDS = {
+    "configuration_issues",
     "id",
     "label",
     "role",
@@ -116,6 +121,9 @@ _HARDWARE_INTERFACE_FIELDS = {
     "message",
     "ok",
     "protocol_evidence",
+    "probe_message",
+    "probe_ok",
+    "probe_state",
     "raw_frame_summary",
 }
 
@@ -287,6 +295,7 @@ def build_agent_event(hardware_result: dict[str, Any]) -> dict[str, Any] | None:
     message = str(interface.get("message") or sensor.get("message") or "接口或通道未返回有效数据")
     channels = expected or ([sensor_name] if sensor_name != "接口" else [])
     evidence = {
+        "configuration_issues": deepcopy(interface.get("configuration_issues") or []),
         "expected_channels": expected,
         "detected_channels": list(interface.get("detected_channels") or []),
         "missing_channels": list(interface.get("missing_channels") or []),
@@ -296,6 +305,9 @@ def build_agent_event(hardware_result: dict[str, Any]) -> dict[str, Any] | None:
         "received_samples": sensor.get("received_samples"),
         "invalid_samples": sensor.get("invalid_samples"),
         "last_sample_age_seconds": sensor.get("last_sample_age_seconds"),
+        "probe_message": interface.get("probe_message"),
+        "probe_ok": interface.get("probe_ok"),
+        "probe_state": interface.get("probe_state"),
         "sensor_states": sensor_states,
     }
     return _clean_event(

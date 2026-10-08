@@ -10,6 +10,13 @@ from typing import Sequence
 from .models import CheckSpec
 
 
+NODE_REQUIRED_CHECKS = {
+    "frontend-behavior-contracts",
+    "frontend-public-contracts",
+    "usb-dock-topology-contracts",
+}
+
+
 @dataclass(frozen=True)
 class PreflightIssue:
     category: str
@@ -63,7 +70,7 @@ def run_preflight(
                 "environment", "working directory", f"working directory does not exist: {cwd}",
                 (check.id,), f"Restore the directory declared by check {check.id}.",
             ))
-    node_checks = tuple(check.id for check in checks if check.id == "frontend-public-contracts")
+    node_checks = tuple(check.id for check in checks if check.id in NODE_REQUIRED_CHECKS)
     if node_checks:
         node_major, detail = _node_version()
         if node_major is None or node_major < 22:

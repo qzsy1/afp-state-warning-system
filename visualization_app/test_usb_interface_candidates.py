@@ -37,7 +37,91 @@ function sensorTypeProfile(role) {{ return profiles[role] || {{}}; }}
     return json.loads(result.stdout)
 
 
+def run_logical_interface_script(assertions: str) -> dict:
+    source = APP_JS.read_text(encoding="utf-8")
+    start = source.index("function uniqueLogicalInterfaceConfigs")
+    end = source.index("function renderInterfacePanel", start)
+    result = subprocess.run(
+        ["node", "-e", f"{source[start:end]}\n{assertions}"],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return json.loads(result.stdout)
+
+
 class UsbInterfaceCandidateTests(unittest.TestCase):
+    def test_empty_operator_port_remains_manually_selectable(self) -> None:
+        source = APP_JS.read_text(encoding="utf-8")
+        start = source.index("const USB_SENSOR_ROLES")
+        end = source.index("function itemEnabledForSimulation", start)
+        body = source[start:end]
+        script = r'''
+const profiles = {thermocouple:{label:"八通道热电偶", physical_kind:"usb_hid", protocol:"smrf_hid"}};
+const state = {
+  physicalInterfaces: [],
+  usbTopology: {usb_ports:[{id:"dock:empty", owner_kind:"dock", dock_id:"d1", label:"拓展坞 1 · USB3-1", state:"empty", user_connectable:true}], devices:[]},
+};
+const controls = {acquisitionMode:{value:"real"}};
+function sensorTypeProfile(role) { return profiles[role] || {}; }
+function option(value, textContent) { return {value, textContent, dataset:{}, disabled:false}; }
+function groupOptions(nodes) { return nodes.flatMap((node) => node.children || [node]); }
+const document = {createElement(tag) {
+  if (tag === "optgroup") return {label:"", children:[], append(node){this.children.push(node);}};
+  return {className:"", textContent:"", classList:{toggle(){},remove(){} }};
+}};
+const select = {
+  children:[], disabled:false, title:"", _value:"",
+  replaceChildren(...nodes){this.children=[...nodes]; this._value="";},
+  append(node){this.children.push(node);},
+  set value(value){this._value=String(value);}, get value(){return this._value;},
+  get selectedOptions(){return groupOptions(this.children).filter((node) => String(node.value) === this._value);},
+};
+const enabled = {checked:true, disabled:false};
+const warning = {textContent:"", classList:{toggle(){},remove(){}}};
+const row = {
+  dataset:{physicalPortId:"", physicalKind:"", endpoint:""},
+  querySelector(selector) {
+    if (selector === ".interface-physical") return select;
+    if (selector === ".interface-role") return {value:"thermocouple"};
+    if (selector === ".interface-enabled") return enabled;
+    if (selector === ".interface-physical-warning") return warning;
+    return null;
+  },
+  append(){},
+};
+''' + body + r'''
+refreshPhysicalInterfaceOptions(row, "dock:empty");
+const selected = select.selectedOptions[0];
+if (!selected || selected.disabled || select.disabled || enabled.disabled) process.exit(1);
+if (selected.dataset.endpointPresent !== "false") process.exit(2);
+if (!warning.textContent.includes("尚未检测到兼容设备")) process.exit(3);
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_shared_ethernet_endpoint_keeps_plc_and_abb_logical_interfaces(self) -> None:
+        result = run_logical_interface_script(
+            r"""
+const sharedEndpoint = "ethernet:asix";
+const configs = [
+  {id:"thermocouple_8ch", role:"thermocouple", endpoint:"SMRFCT08B"},
+  {id:"plc_process", role:"plc", endpoint:sharedEndpoint},
+  {id:"uvc_temperature", role:"thermal_uvc", endpoint:"BSV UVC"},
+  {id:"abb_motion", role:"robot", endpoint:sharedEndpoint},
+  {id:"m3232_pressure", role:"pressure", endpoint:"COM8"},
+];
+const normalized = uniqueLogicalInterfaceConfigs(configs);
+console.log(JSON.stringify({
+  ids: normalized.map((item) => item.id),
+  shared: normalized.filter((item) => item.endpoint === sharedEndpoint).map((item) => item.id),
+}));
+"""
+        )
+        self.assertEqual(len(result["ids"]), 5)
+        self.assertEqual(result["shared"], ["plc_process", "abb_motion"])
+
     def test_type_c_and_dock_upstream_are_excluded_from_usb_a_sensor_pool(self) -> None:
         result = run_candidate_script(
             r"""

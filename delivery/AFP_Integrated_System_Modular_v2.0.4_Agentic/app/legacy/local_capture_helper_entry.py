@@ -26,7 +26,7 @@ from local_capture_agent import HelperTransport, LocalCaptureAgent
 
 
 HELPER_PROTOCOL_VERSION = 2
-HELPER_BUILD_ID = "20260930-helper-public-bdp-stop-v2"
+HELPER_BUILD_ID = "20261008-helper-full-diagnosis-v1"
 HARDWARE_CHECK_TIMEOUT_SECONDS = 60.0
 
 
@@ -450,7 +450,9 @@ def release_single_instance_lock(handle: int | None) -> None:
     ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(handle))
 
 
-def _config_from_payload(payload: dict[str, Any]) -> AcquisitionConfig:
+def _config_from_payload(
+    payload: dict[str, Any], *, diagnostic: bool = False
+) -> AcquisitionConfig:
     # A target profile ID belongs to the server-side credential resolver.  It
     # is non-secret, but it has no meaning on the visiting computer and must
     # never become part of helper-local configuration after future rebuilds.
@@ -459,7 +461,8 @@ def _config_from_payload(payload: dict[str, Any]) -> AcquisitionConfig:
         field.name for field in fields(AcquisitionConfig)
         if field.name not in server_only
     }
-    return AcquisitionConfig(**{key: value for key, value in payload.items() if key in allowed})
+    values = {key: value for key, value in payload.items() if key in allowed}
+    return AcquisitionConfig(diagnostic_validation=diagnostic, **values)
 
 
 def _paired_route(server_url: str) -> tuple[str, str]:
@@ -508,7 +511,9 @@ def _hardware_check_worker(message: dict[str, Any], result_queue: Any) -> None:
     try:
         command = HelperTransport.decode_command(json.dumps(message, ensure_ascii=False))
         payload = _inject_saved_local_mysql(command["payload"])
-        result = LocalCaptureAgent().check_capture(_config_from_payload(payload))
+        result = LocalCaptureAgent().check_capture(
+            _config_from_payload(payload, diagnostic=True)
+        )
         response = {
             "type": "result",
             "request_id": command["request_id"],
@@ -828,7 +833,9 @@ def dispatch_command(agent: LocalCaptureAgent, raw: str | bytes) -> dict[str, An
             result = local_mysql_profile_metadata()
         elif name == "check_capture":
             result = agent.check_capture(
-                _config_from_payload(_inject_saved_local_mysql(payload))
+                _config_from_payload(
+                    _inject_saved_local_mysql(payload), diagnostic=True
+                )
             )
         elif name == "read_process_parameters":
             result = agent.read_process_parameters(_config_from_payload(payload))

@@ -43,6 +43,7 @@ from acquisition import (
     ACQUISITION_SCHEMAS,
     AcquisitionConfig,
     AcquisitionManager,
+    acquisition_diagnostic_config_from_payload,
     acquisition_config_from_payload,
     NEW_COLLECTION_SENSOR_COLUMNS,
     SENSOR_COLUMNS,
@@ -5839,7 +5840,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     payload["simulation_mysql_query"] = validate_read_only_mysql_query(
                         str(payload.get("simulation_mysql_query", ""))
                     )
-                config = acquisition_config_from_payload(payload)
+                config = acquisition_diagnostic_config_from_payload(payload)
                 model_validation = self.dashboard.validate_prediction_setup(
                     config, load_model=False
                 )

@@ -88,7 +88,10 @@ class LocalCaptureAgent:
             if str(item.get("kind") or "") == kind
             and str(item.get("protocol") or "") in protocols
             and bool(item.get("auto_bind_eligible"))
-            and (allow_used or str(item.get("id") or "") not in used)
+            and (
+                allow_used
+                or str(item.get("parent_port_id") or item.get("id") or "") not in used
+            )
         ]
         candidates.sort(
             key=lambda item: (
@@ -113,7 +116,9 @@ class LocalCaptureAgent:
             )
             physical_id = str(candidate.get("id") or "") if candidate else ""
             if candidate and not allow_used:
-                used.add(physical_id)
+                # Multiple live endpoints can represent one USB parent port.
+                # Reserve the physical resource, not merely the endpoint ID.
+                used.add(str(candidate.get("parent_port_id") or physical_id))
             detected = bool(candidate and candidate.get("detected"))
             driver_available = bool(candidate and candidate.get("driver_available"))
             identity_verified = bool(candidate and candidate.get("identity_verified"))

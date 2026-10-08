@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import subprocess
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -18,6 +20,12 @@ PORT_STATES = {
     "error",
     "unknown",
 }
+FRONTEND_BEHAVIOR_TESTS = (
+    "test_usb_interface_candidates.UsbInterfaceCandidateTests."
+    "test_shared_ethernet_endpoint_keeps_plc_and_abb_logical_interfaces",
+    "test_frontend_guest_simulation.GuestSimulationFrontendContractTests."
+    "test_interface_check_allows_unverified_port_without_weakening_start_gate",
+)
 
 
 def _records(value: object, field: str, issues: list[str]) -> list[Mapping[str, Any]]:
@@ -158,11 +166,31 @@ def validate_frontend_source(source: str) -> tuple[str, ...]:
             "dock_upstream",
         ),
         "default selections must track their origin": ("selection_origin", "manual", "auto"),
+        "logical interfaces sharing one physical endpoint must remain distinct": (
+            "uniqueLogicalInterfaceConfigs",
+            "usedIds",
+        ),
     }
     issues: list[str] = []
     for message, tokens in requirements.items():
         if not all(token in source for token in tokens):
             issues.append(message)
+    render_start = source.find("function renderInterfacePanel")
+    render_end = source.find("function mergeRememberedInterfaceSelections", render_start)
+    render_source = source[render_start:render_end] if render_start >= 0 else ""
+    if "usedEndpoints" in render_source:
+        issues.append(
+            "logical interface rendering must not deduplicate PLC and ABB by shared endpoint"
+        )
+    check_start = source.rfind("async function testSensorConnection")
+    check_source = source[check_start:] if check_start >= 0 else ""
+    if not re.search(
+        r"acquisitionConfig\(\{[^}]*allowUnverifiedPhysical\s*:\s*true[^}]*\}\)",
+        check_source,
+    ):
+        issues.append(
+            "interface checks must submit unverified physical ports to the configured driver"
+        )
     return tuple(issues)
 
 
@@ -188,6 +216,34 @@ def validate_acquisition_source(source: str) -> tuple[str, ...]:
         if not all(token in source for token in tokens):
             issues.append(message)
     return tuple(issues)
+
+
+def validate_frontend_behavior(app_dir: Path) -> tuple[str, ...]:
+    """Execute production JavaScript behavior scenarios, not source-token proxies."""
+    if not app_dir.is_dir():
+        return (f"front-end application directory does not exist: {app_dir}",)
+    command = [sys.executable, "-m", "unittest", *FRONTEND_BEHAVIOR_TESTS, "-v"]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=app_dir,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=180,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return ("production front-end behavior scenarios timed out after 180 seconds",)
+    except OSError as exc:
+        return (f"production front-end behavior scenarios could not start: {exc}",)
+    if completed.returncode == 0:
+        return ()
+    detail = (completed.stderr or completed.stdout or "no test output").strip()
+    if len(detail) > 4000:
+        detail = detail[-4000:]
+    return (f"production front-end behavior scenarios failed:\n{detail}",)
 
 
 def run_repo_contract(repo_root: Path) -> tuple[str, ...]:
@@ -218,6 +274,7 @@ def run_repo_contract(repo_root: Path) -> tuple[str, ...]:
         issues.append(f"acquisition source does not exist: {acquisition_path}")
     else:
         issues.extend(validate_acquisition_source(acquisition_path.read_text(encoding="utf-8")))
+    issues.extend(validate_frontend_behavior(app_dir))
     return tuple(issues)
 
 

@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from harness.engine.usb_dock_contract import (
+    FRONTEND_BEHAVIOR_TESTS,
     validate_acquisition_source,
     validate_discovery_payload,
+    validate_frontend_behavior,
     validate_frontend_source,
 )
 
@@ -131,6 +137,29 @@ def compliant_discovery() -> dict:
 
 
 class UsbDockContractValidatorTests(unittest.TestCase):
+    def test_frontend_behavior_contract_executes_the_two_production_regressions(self) -> None:
+        with tempfile.TemporaryDirectory() as folder, patch(
+            "harness.engine.usb_dock_contract.subprocess.run"
+        ) as run:
+            run.return_value = subprocess.CompletedProcess([], 0, "", "")
+
+            self.assertEqual(validate_frontend_behavior(Path(folder)), ())
+
+        command = run.call_args.args[0]
+        self.assertTrue(all(name in command for name in FRONTEND_BEHAVIOR_TESTS))
+        self.assertEqual(run.call_args.kwargs["cwd"], Path(folder))
+
+    def test_frontend_behavior_contract_reports_runtime_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as folder, patch(
+            "harness.engine.usb_dock_contract.subprocess.run"
+        ) as run:
+            run.return_value = subprocess.CompletedProcess([], 1, "", "ABB row missing")
+
+            issues = validate_frontend_behavior(Path(folder))
+
+        self.assertIn("production front-end behavior scenarios failed", issues[0])
+        self.assertIn("ABB row missing", issues[0])
+
     def test_accepts_versioned_topology_and_dock_network_projection(self) -> None:
         self.assertEqual(validate_discovery_payload(compliant_discovery()), ())
 
@@ -175,11 +204,67 @@ class UsbDockContractValidatorTests(unittest.TestCase):
         const usbA = item.connector_form_factor !== "type_c" && item.internal_function !== "dock_upstream";
         item.selection_origin = item.selection_origin || "auto";
         item.selection_origin = "manual";
+        function uniqueLogicalInterfaceConfigs(configs) {
+            const usedIds = new Set();
+            return configs.filter((item) => !usedIds.has(item.id) && usedIds.add(item.id));
+        }
+        async function testSensorConnection() {
+            return acquisitionConfig({allowUnverifiedPhysical: true});
+        }
         """
         self.assertEqual(validate_frontend_source(source), ())
 
         issues = validate_frontend_source("const physical_interface_id = '';")
         self.assertGreaterEqual(len(issues), 4)
+
+    def test_frontend_contract_rejects_endpoint_based_logical_interface_deduplication(self) -> None:
+        source = """
+        function renderInterfacePanel(configs) {
+            const usedEndpoints = new Set();
+        }
+        function mergeRememberedInterfaceSelections(defaults) { return defaults; }
+        """
+
+        issues = "\n".join(validate_frontend_source(source))
+
+        self.assertIn("must not deduplicate PLC and ABB by shared endpoint", issues)
+
+    def test_frontend_contract_requires_unverified_ports_to_reach_interface_check(self) -> None:
+        source = """
+        async function testSensorConnection() {
+            return acquisitionConfig();
+        }
+        """
+
+        issues = "\n".join(validate_frontend_source(source))
+
+        self.assertIn("must submit unverified physical ports", issues)
+
+    def test_frontend_contract_accepts_diagnostic_options_with_unverified_port_probe(self) -> None:
+        source = """
+        const physical_interface_id = selected.value;
+        const physical_port_id = selected.port;
+        const group = document.createElement("optgroup");
+        group.label = "拓展坞 USB 端口";
+        const host = "电脑本机 USB-A";
+        const nativeSerial = "主机原生串口";
+        const ethernet = "拓展坞网口";
+        status.textContent = "端口存在，未检测到兼容设备";
+        const USB_SENSOR_ROLES = new Set(["thermocouple"]);
+        const interfaceTransportFamily = () => "usb";
+        const connector_form_factor = "type_c";
+        const usbA = item.connector_form_factor !== "type_c" && item.internal_function !== "dock_upstream";
+        item.selection_origin = "manual";
+        function uniqueLogicalInterfaceConfigs(configs) { const usedIds = new Set(); return configs; }
+        async function testSensorConnection() {
+            return acquisitionConfig({allowUnverifiedPhysical: true, diagnosticValidation: true});
+        }
+        """
+
+        self.assertNotIn(
+            "interface checks must submit unverified physical ports to the configured driver",
+            validate_frontend_source(source),
+        )
 
     def test_requires_host_owner_and_usb_serial_transport_parentage(self) -> None:
         payload = compliant_discovery()

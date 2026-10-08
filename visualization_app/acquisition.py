@@ -20,7 +20,7 @@ import urllib.parse
 import uuid
 from collections import deque
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import InitVar, asdict, dataclass
 from datetime import datetime
 from itertools import islice
 from pathlib import Path
@@ -503,9 +503,9 @@ def _associate_usb_topology(
     return enrich_interface_transports(topology, physical_interfaces)
 
 
-def _validate_physical_interface_bindings(
+def _physical_interface_binding_issues(
     interfaces: list[dict[str, Any]], acquisition_mode: str
-) -> None:
+) -> list[dict[str, Any]]:
     """Validate role/protocol and physical endpoint ownership.
 
     PLC and ABB intentionally share the same Ethernet adapter.  Every other
@@ -517,7 +517,8 @@ def _validate_physical_interface_bindings(
     not a physical adapter collision and must not be checked as one.
     """
     if acquisition_mode != "real":
-        return
+        return []
+    issues: list[dict[str, Any]] = []
     seen: dict[str, dict[str, Any]] = {}
     for item in interfaces:
         if not item.get("enabled", True):
@@ -527,24 +528,25 @@ def _validate_physical_interface_bindings(
         expected_driver = str(profile.get("driver") or "")
         actual_driver = str(item.get("driver") or "")
         if not profile.get("editable_driver") and actual_driver != expected_driver:
-            raise ValueError(
+            message = (
                 f"接口“{item.get('id', role)}”的协议/驱动与传感器类型不匹配："
                 f"{actual_driver or '未填写'}，应为{expected_driver}"
             )
+            issues.append({"code": "driver_mismatch", "message": message, "interface_ids": [str(item.get("id") or role)]})
         expected_kind = str(profile.get("physical_kind") or "")
         actual_kind = str(item.get("physical_interface_kind") or "")
         fallback_binding = bool(item.get("physical_fallback", False))
         if actual_kind and expected_kind and actual_kind != expected_kind and not fallback_binding:
-            raise ValueError(
+            message = (
                 f"接口“{item.get('id', role)}”的物理接口类型与协议不匹配："
                 f"{actual_kind}，应为{expected_kind}"
             )
+            issues.append({"code": "physical_kind_mismatch", "message": message, "interface_ids": [str(item.get("id") or role)]})
         physical_id = _physical_interface_key(item.get("physical_interface_id"))
         physical_port_id = _physical_interface_key(item.get("physical_port_id"))
         if acquisition_mode == "real" and not physical_id and not physical_port_id:
-            raise ValueError(
-                f"真实接口“{item.get('id', role)}”尚未绑定实际物理接口"
-            )
+            message = f"真实接口“{item.get('id', role)}”尚未绑定实际物理接口"
+            issues.append({"code": "missing_physical_binding", "message": message, "interface_ids": [str(item.get("id") or role)]})
         resource_id = physical_port_id or physical_id
         if not resource_id:
             continue
@@ -559,11 +561,25 @@ def _validate_physical_interface_bindings(
         }
         if shared_roles == {"plc", "robot"} and shared_kinds == {"ethernet"}:
             continue
-        raise ValueError(
+        message = (
             f"物理接口“{item.get('physical_port_id') or item.get('physical_interface_id')}”重复绑定："
             f"{previous.get('id', '前一接口')}与{item.get('id', role)}；"
             "仅允许PLC与ABB共享同一网卡"
         )
+        issues.append({
+            "code": "duplicate_physical_binding", "message": message,
+            "resource_id": str(resource_id),
+            "interface_ids": [str(previous.get("id") or ""), str(item.get("id") or role)],
+        })
+    return issues
+
+
+def _validate_physical_interface_bindings(
+    interfaces: list[dict[str, Any]], acquisition_mode: str
+) -> None:
+    issues = _physical_interface_binding_issues(interfaces, acquisition_mode)
+    if issues:
+        raise ValueError(str(issues[0]["message"]))
 
 
 def _resolve_interface_channel_assignments(
@@ -684,6 +700,7 @@ def _normalize_interface_sample(
 
 @dataclass
 class AcquisitionConfig:
+    diagnostic_validation: InitVar[bool] = False
     processing_mode: str = "prediction_warning"
     dataset_schema: str = "legacy_original"
     use_best_prediction_override: bool = False
@@ -758,7 +775,8 @@ class AcquisitionConfig:
     mysql_charset: str = "utf8mb4"
     mysql_connect_timeout: int = 5
 
-    def __post_init__(self) -> None:
+    def __post_init__(self, diagnostic_validation: bool = False) -> None:
+        self.configuration_issues: list[dict[str, Any]] = []
         requested_mode = str(self.acquisition_mode or "").lower()
         if not requested_mode:
             requested_mode = "simulation" if self.driver == "simulator" else "real"
@@ -802,10 +820,14 @@ class AcquisitionConfig:
             if requested_driver and not profile_hint.get("editable_driver"):
                 expected_driver = str(profile_hint.get("driver") or "")
                 if requested_driver != expected_driver:
-                    raise ValueError(
+                    message = (
                         f"接口“{interface['id']}”的协议/驱动与传感器类型不匹配："
                         f"{requested_driver}，应为{expected_driver}"
                     )
+                    if diagnostic_validation:
+                        self.configuration_issues.append({"code": "driver_mismatch", "message": message, "interface_ids": [interface["id"]]})
+                    else:
+                        raise ValueError(message)
             interface["driver"] = requested_driver or (
                 str(profile_hint.get("driver") or self.driver)
                 if role_hint != "custom" else self.driver
@@ -852,7 +874,10 @@ class AcquisitionConfig:
         if not normalized_interfaces:
             raise ValueError("至少配置一个采集接口")
         self.interfaces = normalized_interfaces
-        _validate_physical_interface_bindings(normalized_interfaces, self.acquisition_mode)
+        binding_issues = _physical_interface_binding_issues(normalized_interfaces, self.acquisition_mode)
+        self.configuration_issues.extend(binding_issues)
+        if binding_issues and not diagnostic_validation:
+            raise ValueError(str(binding_issues[0]["message"]))
         raw_assignments = self.interface_channel_assignments or {}
         requested_assignments = {
             str(key): [str(name) for name in (value or [])]
@@ -869,7 +894,14 @@ class AcquisitionConfig:
             if not enabled:
                 raise ValueError("真实接口采集模式至少要启用一个传感器接口")
             if any(item.get("driver") == "simulator" for item in normalized_interfaces if item.get("enabled", True)):
-                raise ValueError("真实接口采集模式不能使用本地模拟驱动")
+                message = "真实接口采集模式不能使用本地模拟驱动"
+                if diagnostic_validation:
+                    self.configuration_issues.append({
+                        "code": "simulation_driver_in_real_mode", "message": message,
+                        "interface_ids": [str(item.get("id") or "") for item in normalized_interfaces if item.get("enabled", True) and item.get("driver") == "simulator"],
+                    })
+                else:
+                    raise ValueError(message)
             self.source_file = ""
             self.simulation_source_path = ""
         else:
@@ -915,42 +947,34 @@ class AcquisitionConfig:
                 for item in normalized_interfaces
                 if item.get("enabled", True)
             }
-            explicit = {
+            if not requested_assignments and (
+                len(enabled_ids) == 1
+                and next(
+                    item for item in normalized_interfaces
+                    if item.get("enabled", True)
+                ).get("driver") == "simulator"
+            ):
+                # Backward-compatible single-file replay: without an explicit
+                # map, the one simulator supplies every channel the operator
+                # selected.  The browser sends an explicit map whenever more
+                # than one logical interface is configured.
+                interface_id = next(iter(enabled_ids))
+                self.interface_channel_assignments = {
+                    interface_id: list(self.selected_sensors)
+                }
+            else:
+                self.interface_channel_assignments = _resolve_interface_channel_assignments(
+                    normalized_interfaces,
+                    requested_assignments,
+                    list(self.selected_sensors),
+                )
+            routed = {
                 str(channel)
                 for interface_id, channels in self.interface_channel_assignments.items()
                 if str(interface_id) in enabled_ids
                 for channel in channels
                 if str(channel) in allowed_sensors
             }
-            if self.interface_channel_assignments:
-                routed = explicit
-            elif (
-                len(enabled_ids) == 1
-                and normalized_interfaces[0].get("driver") == "simulator"
-            ):
-                # Backward-compatible single-file replay: without an explicit
-                # map, the one simulator supplies every channel the operator
-                # selected.  The browser sends an explicit map whenever more
-                # than one logical interface is configured.
-                routed = set(self.selected_sensors)
-            else:
-                routed: set[str] = set()
-                for item in normalized_interfaces:
-                    if not item.get("enabled", True):
-                        continue
-                    role = str(item.get("role") or "other").lower()
-                    if role == "thermocouple":
-                        routed.update(
-                            name for name in allowed_sensors
-                            if re.fullmatch(r"温度[1-8]", name)
-                        )
-                    elif role == "other":
-                        routed.update(
-                            name for name in allowed_sensors
-                            if not re.fullmatch(r"温度[1-8]", name)
-                        )
-                    else:
-                        routed.update(allowed_sensors)
             self.selected_sensors = [
                 name for name in self.selected_sensors if name in routed
             ]
@@ -1076,6 +1100,14 @@ def acquisition_config_from_payload(payload: dict[str, Any] | None) -> Acquisiti
     for field_name in ACQUISITION_TRANSPORT_METADATA_FIELDS:
         values.pop(field_name, None)
     return AcquisitionConfig(**values)
+
+
+def acquisition_diagnostic_config_from_payload(payload: dict[str, Any] | None) -> AcquisitionConfig:
+    values = dict(payload or {})
+    for field_name in ACQUISITION_TRANSPORT_METADATA_FIELDS:
+        values.pop(field_name, None)
+    values.pop("diagnostic_validation", None)
+    return AcquisitionConfig(diagnostic_validation=True, **values)
 
 
 def _safe_component(value: Any, max_length: int = 40) -> str:
@@ -3034,6 +3066,28 @@ class AcquisitionManager:
                 "auxiliary_only": auxiliary_only, "state": state,
                 "message": message, "ok": state == "ok",
             })
+        configuration_issues = list(getattr(config, "configuration_issues", []) or [])
+        issues_by_interface: dict[str, list[dict[str, Any]]] = {}
+        for issue in configuration_issues:
+            message = str(issue.get("message") or "采集配置无效")
+            if message and message not in errors:
+                errors.append(message)
+            for interface_id in issue.get("interface_ids") or []:
+                issues_by_interface.setdefault(str(interface_id), []).append(issue)
+        for interface_result in interface_results:
+            interface_issues = issues_by_interface.get(str(interface_result.get("id") or ""), [])
+            if not interface_issues:
+                continue
+            interface_result["probe_state"] = interface_result.get("state")
+            interface_result["probe_ok"] = bool(interface_result.get("ok"))
+            interface_result["probe_message"] = str(interface_result.get("message") or "")
+            interface_result["configuration_issues"] = interface_issues
+            interface_result["state"] = "configuration_invalid"
+            interface_result["ok"] = False
+            issue_text = "；".join(str(issue.get("message") or "采集配置无效") for issue in interface_issues)
+            probe_text = str(interface_result.get("probe_message") or "")
+            interface_result["message"] = f"配置问题：{issue_text}" + (f"；探测结果：{probe_text}" if probe_text else "")
+
         sensors = []
         for name in config.schema_sensors:
             is_selected = name in selected
@@ -3064,6 +3118,7 @@ class AcquisitionManager:
             "ok": ok, "driver": config.driver, "endpoint": config.endpoint,
             "elapsed_seconds": time.time() - check_started, "errors": errors,
             "sensors": sensors, "interfaces": interface_results,
+            "configuration_issues": configuration_issues,
         }
         result["checked_at"] = time.time()
         with self.lock:

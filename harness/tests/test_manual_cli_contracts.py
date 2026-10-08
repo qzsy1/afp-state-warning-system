@@ -26,10 +26,18 @@ class ProfileAndCmdContractTests(unittest.TestCase):
         cls.profiles = load_profiles(cls.repo / "harness/config/profiles.json")
 
     def test_stable_profile_composition_and_single_selection(self) -> None:
-        self.assertEqual(len(self.profiles["quick"]), 2)
-        self.assertEqual(len(self.profiles["full"]), 12)
-        self.assertEqual(len(self.profiles["release"]), 20)
-        self.assertEqual(self.profiles["release"][:12], self.profiles["full"])
+        self.assertEqual(len(self.profiles["quick"]), 4)
+        self.assertEqual(len(self.profiles["full"]), 14)
+        self.assertEqual(len(self.profiles["release"]), 22)
+        self.assertEqual(self.profiles["release"][:14], self.profiles["full"])
+        for profile in ("quick", "full", "release"):
+            with self.subTest(profile=profile, check="runtime"):
+                self.assertIn("modular-runtime-contracts", self.profiles[profile])
+            with self.subTest(profile=profile, check="frontend-behavior"):
+                self.assertIn("frontend-behavior-contracts", self.profiles[profile])
+        for profile in ("full", "release"):
+            with self.subTest(profile=profile, check="lan-public"):
+                self.assertIn("frontend-public-contracts", self.profiles[profile])
         selected = select_profile_checks(self.matrix, self.profiles, "quick", "local")
         self.assertEqual(tuple(item.id for item in selected), self.profiles["quick"])
         self.assertEqual(select_single_check(self.matrix, "harness-contracts", "local").id, "harness-contracts")
@@ -76,13 +84,23 @@ class PreflightAndSettingsTests(unittest.TestCase):
     def test_preflight_reports_python_venv_workdir_node_and_exe_with_fix(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            checks = (self.check(cwd="missing"), self.check("frontend-public-contracts"), self.check("release-self-test"))
+            checks = (
+                self.check(cwd="missing"),
+                self.check("frontend-behavior-contracts"),
+                self.check("frontend-public-contracts"),
+                self.check("release-self-test"),
+            )
             with patch("harness.engine.preflight._node_version", return_value=(None, "not found")):
                 issues = run_preflight(root, checks, baseline_exe=None, python_version=(3, 10))
             joined = " ".join(issue.message + issue.suggestion for issue in issues)
             for phrase in ("Python 3.10", ".venv", "working directory", "Node.js 22", "baseline EXE"):
                 self.assertIn(phrase, joined)
             self.assertTrue(all(issue.affected_checks and issue.suggestion for issue in issues))
+            node_issue = next(issue for issue in issues if issue.item == "Node.js 22")
+            self.assertEqual(
+                node_issue.affected_checks,
+                ("frontend-behavior-contracts", "frontend-public-contracts"),
+            )
 
     def test_local_settings_only_allow_nonsecret_paths_and_hash(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

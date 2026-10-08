@@ -87,7 +87,10 @@ class LocalCaptureAgent:
             for item in physical
             if str(item.get("kind") or "") == kind
             and str(item.get("protocol") or "") in protocols
-            and (allow_used or str(item.get("id") or "") not in used)
+            and (
+                allow_used
+                or str(item.get("parent_port_id") or item.get("id") or "") not in used
+            )
         ]
         # A driver placeholder is a valid protocol binding, but is clearly
         # marked as not yet sensor-verified in the returned state.
@@ -114,7 +117,7 @@ class LocalCaptureAgent:
             )
             physical_id = str(candidate.get("id") or "") if candidate else ""
             if candidate and not allow_used:
-                used.add(physical_id)
+                used.add(str(candidate.get("parent_port_id") or physical_id))
             detected = bool(candidate and candidate.get("detected"))
             driver_available = bool(candidate and candidate.get("driver_available"))
             bindings.append(

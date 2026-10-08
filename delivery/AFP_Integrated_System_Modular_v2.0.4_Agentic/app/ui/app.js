@@ -26,6 +26,7 @@ const state = {
   sensorTypeProfiles: [],
   acquisitionStatus: null,
   acquisitionExecutionHost: "",
+  acquisitionStartBusy: false,
   simulationSourceCheck: null,
   simulationSourceCheckFingerprint: "",
   realHardwareCheck: null,
@@ -1176,6 +1177,7 @@ function renderAcquisitionStatus(status) {
     `${status.layer_file ? ` · 分层文件：${status.layer_file}` : ""}` +
     `${status.full_specimen_file ? ` · 完整试样：${status.full_specimen_file}` : ""}` +
     `${status.last_error ? ` · 错误：${status.last_error}` : ""}`;
+  synchronizeAcquisitionButtons();
 }
 
 function describeFirstSampleFailure(helperConnection, helperCaptureStatus) {
@@ -1973,6 +1975,10 @@ function buildAgentEvents(hardwareResult) {
       state: String(interfaceItem.state || sensor.state || "no_data"),
       message: String(interfaceItem.message || sensor.message || "接口或通道未返回有效数据"),
       evidence: {
+        configuration_issues: interfaceItem.configuration_issues || [],
+        probe_state: interfaceItem.probe_state,
+        probe_ok: interfaceItem.probe_ok,
+        probe_message: interfaceItem.probe_message,
         expected_channels: expected,
         detected_channels: (interfaceItem.detected_channels || []).map(String),
         missing_channels: (interfaceItem.missing_channels || []).map(String),
@@ -2256,7 +2262,7 @@ async function testSensorConnection({automatic = false} = {}) {
   try {
     const result = await postJson(
       "/api/acquisition/test",
-      acquisitionConfig({allowUnverifiedPhysical: true}),
+      acquisitionConfig({allowUnverifiedPhysical: true, diagnosticValidation: true}),
       {timeoutMs: 20000},
     );
     if (controls.processingMode.value !== "capture_only") {
@@ -2383,6 +2389,9 @@ function stopPublicDemo() {
 }
 
 async function startAcquisition() {
+  if (state.acquisitionStartBusy || state.acquisitionStatus?.running) return;
+  state.acquisitionStartBusy = true;
+  synchronizeAcquisitionButtons();
   try {
     const simulation = controls.acquisitionMode?.value === "simulation";
     const simulationSelection = simulation
@@ -2436,6 +2445,23 @@ async function startAcquisition() {
       return;
     }
     await validateEnabledMysqlBeforeStart();
+    if (simulation) {
+      if (state.hardwareCheckInProgress) {
+        throw new Error("模拟数据源检查正在进行，请等待检查完成");
+      }
+      const fingerprint = hardwareConfigFingerprint();
+      let sourceCheck = state.simulationSourceCheck;
+      if (
+        !sourceCheck
+        || state.simulationSourceCheckFingerprint !== fingerprint
+        || !sourceCheck.ok
+      ) {
+        sourceCheck = await testSensorConnection({automatic: false});
+      }
+      if (!sourceCheck?.ok) {
+        throw new Error("模拟数据源检查未通过，已阻止开始采集；请按上方数据源或通道映射明细处理后重检");
+      }
+    }
     if (!simulation) {
       if (usesLocalCaptureHelper() && state.helperStatus?.protocol_compatible === false) {
         throw new Error("本地采集辅助程序版本不兼容，请重新下载并运行最新版后再开始真实采集");
@@ -2496,6 +2522,9 @@ async function startAcquisition() {
       status.textContent = `采集启动失败：${error.message}`;
     }
     toast(error.message);
+  } finally {
+    state.acquisitionStartBusy = false;
+    synchronizeAcquisitionButtons();
   }
 }
 
@@ -2681,10 +2710,7 @@ async function stopAcquisition() {
     toast(error.message);
   } finally {
     state.stopBusy = false;
-    if (stopButton) {
-      stopButton.disabled = false;
-      stopButton.textContent = "停止并保存";
-    }
+    synchronizeAcquisitionButtons();
   }
 }
 
@@ -3071,6 +3097,7 @@ async function loadSimulationDatasetOnce({force = false} = {}) {
   if (!isGuestSimulationMode()) return null;
   if (!force && state.simulationDatasetCache) return state.simulationDatasetCache;
   if (!force && state.simulationDatasetPromise) return state.simulationDatasetPromise;
+  const requestedSourceId = String(state.simulationSourceId || "");
   state.simulationDatasetPromise = (async () => {
     const response = await fetch("/api/simulation/dataset", {
       cache: "no-store",
@@ -3082,9 +3109,13 @@ async function loadSimulationDatasetOnce({force = false} = {}) {
     }
     const rows = Array.isArray(payload.rows) ? payload.rows : [];
     if (!rows.length) throw new Error("默认模拟数据没有有效数据行");
+    if (requestedSourceId !== String(state.simulationSourceId || "")) {
+      throw new Error("模拟数据源已变化，请重新加载并检查");
+    }
     state.simulationDatasetCache = {
       ...payload,
       rows,
+      simulation_source_id: requestedSourceId,
       total_rows: Number(payload.total_rows || rows.length),
       cache_start: 0,
       cache_rows: rows.slice(0, SIMULATION_PLAYBACK_CACHE_ROWS),
@@ -5103,10 +5134,11 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
   const select = row.querySelector(".interface-physical");
   const role = row.querySelector(".interface-role")?.value || "custom";
   if (!select) return;
-  const candidates = physicalCandidatesForRole(role);
   const current = preferredId || select.value || row.dataset.physicalPortId || "";
   const profile = sensorTypeProfile(role);
   if (controls.acquisitionMode?.value === "simulation") {
+    const label = select.closest?.("label");
+    if (label?.firstChild) label.firstChild.nodeValue = "模拟逻辑接口";
     select.replaceChildren(option("", `${profile.label || role}：模拟源供数（不占用物理接口）`));
     select.value = "";
     select.disabled = true;
@@ -5126,6 +5158,9 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
     warning.classList.remove("hidden");
     return;
   }
+  const label = select.closest?.("label");
+  if (label?.firstChild) label.firstChild.nodeValue = "实际物理接口";
+  const candidates = physicalCandidatesForRole(role);
   const kindLabels = {usb_hid: "USB HID", usb_uvc: "USB/UVC", ethernet: "网卡", serial: "串口"};
   const emptyText = candidates.length
     ? "请选择已识别的实际接口"
@@ -5160,7 +5195,10 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
     node.dataset.liveId = item.physical_interface_id || "";
     node.dataset.compatible = String(item.compatible !== false);
     node.dataset.transportFamily = interfaceTransportFamily(item);
-    node.disabled = item.endpoint_present === false;
+    // Empty operator-connectable ports remain selectable.  Selecting one is a
+    // manual binding for diagnosis only; strict start validation still
+    // requires a compatible identity and protocol-ready data.
+    node.disabled = false;
     const addresses = Array.isArray(item.addresses) ? item.addresses : [];
     const targetHost = String(profile.endpoint || "").replace(/^https?:\/\//, "").split(/[/:]/)[0];
     const targetPrefix = targetHost.split(".").slice(0, 3).join(".");
@@ -5196,8 +5234,8 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
   const selected = select.selectedOptions?.[0];
   select.disabled = !candidates.length;
   select.title = selected?.value
-    ? `${selected.textContent}；协议类型：${sensorTypeProfile(role).protocol || "自定义"}`
-    : "必须选择自动识别到的实际接口后才能启用";
+    ? `${selected.textContent}；协议类型：${sensorTypeProfile(role).protocol || "自定义"}；可人工选择，正式启动仍需通过设备与数据检查`
+    : "请选择实际接口；允许先选择空端口，正式启动仍需通过设备与数据检查";
   const enabled = row.querySelector(".interface-enabled");
   if (enabled) {
     enabled.disabled = !selected?.value;
@@ -5211,10 +5249,11 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
   }
   warning.textContent = selected?.dataset?.fallback === "true"
     ? "警告：当前未识别到匹配协议，临时分配串口，仅用于测试"
-    : selected?.dataset?.portId && selected?.dataset?.detected !== "true"
-    ? "端口存在，未检测到兼容设备；连接设备后重新识别接口"
+    : selected?.value && (selected?.dataset?.endpointPresent === "false" || selected?.dataset?.detected !== "true")
+    ? "已人工选择端口，但尚未检测到兼容设备；可执行立即检查，正式采集仍会失败关闭"
     : "";
-  warning.classList.toggle("hidden", !selected?.dataset?.fallback && !(selected?.dataset?.portId && selected?.dataset?.detected !== "true"));
+  warning.classList.toggle("hidden", !selected?.dataset?.fallback
+    && !(selected?.value && (selected?.dataset?.endpointPresent === "false" || selected?.dataset?.detected !== "true")));
 }
 
 function itemEnabledForSimulation(row) {
@@ -5442,10 +5481,27 @@ async function discoverInterfaces() {
         mergeRememberedInterfaceSelections(defaults),
         {allowSerialFallback: true},
       );
+      const helperAssignedResources = new Map();
+      allocated.forEach((item) => {
+        const resourceId = item.physical_port_id || item.physical_interface_id || "";
+        if (resourceId) helperAssignedResources.set(String(resourceId), String(item.role || ""));
+      });
       state.interfaceCatalog = allocated.map((item) => {
         const binding = bindings.get(String(item.role || ""));
-        const physicalId = item.physical_interface_id || binding?.physical_interface_id || "";
-        const physicalPortId = item.physical_port_id || binding?.physical_port_id || "";
+        let physicalId = item.physical_interface_id || binding?.physical_interface_id || "";
+        let physicalPortId = item.physical_port_id || binding?.physical_port_id || "";
+        const fallbackResource = String(physicalPortId || physicalId || "");
+        if (!item.physical_interface_id && !item.physical_port_id && fallbackResource) {
+          const previousRole = helperAssignedResources.get(fallbackResource);
+          const roles = new Set([previousRole, String(item.role || "")]);
+          const sharedEthernet = roles.has("plc") && roles.has("robot") && roles.size === 2;
+          if (previousRole && !sharedEthernet) {
+            physicalId = "";
+            physicalPortId = "";
+          } else {
+            helperAssignedResources.set(fallbackResource, String(item.role || ""));
+          }
+        }
         return {
           ...item,
           physical_interface_id: physicalId,
@@ -5733,6 +5789,26 @@ function setPublicDemoControlVisibility(publicDemo) {
   controls.downloadSimulationPackage?.classList.toggle("hidden", publicDemo);
 }
 
+function synchronizeAcquisitionButtons() {
+  const publicDemo = isPublicPrecomputedSimulationMode();
+  const publicDemoRunning = Boolean(state.publicDemoPlayback?.snapshot()?.running);
+  const acquisitionRunning = Boolean(state.acquisitionStatus?.running);
+  const startButton = $("startAcquisitionButton");
+  const stopButton = $("stopAcquisitionButton");
+  if (startButton) {
+    startButton.textContent = publicDemo ? "开始演示" : "开始采集";
+    startButton.disabled = publicDemo
+      ? (!state.publicDemoReady || publicDemoRunning)
+      : (state.acquisitionStartBusy || acquisitionRunning);
+  }
+  if (stopButton) {
+    stopButton.textContent = publicDemo ? "停止演示" : "停止并保存";
+    stopButton.disabled = publicDemo
+      ? !publicDemoRunning
+      : (state.stopBusy || !acquisitionRunning);
+  }
+}
+
 function updateSimulationSettings() {
   const simulation = controls.acquisitionMode?.value === "simulation";
   const publicDemo = isPublicPrecomputedSimulationMode();
@@ -5789,17 +5865,7 @@ function updateSimulationSettings() {
   updateRealAcquisitionVisibility();
   setPublicDemoControlVisibility(publicDemo);
   $("localHelperPanel")?.classList.toggle("hidden", publicDemo);
-  const startButton = $("startAcquisitionButton");
-  const stopButton = $("stopAcquisitionButton");
-  if (startButton) {
-    startButton.textContent = publicDemo ? "开始演示" : "开始采集";
-    if (publicDemo) startButton.disabled = !state.publicDemoReady;
-  }
-  if (stopButton) {
-    stopButton.textContent = publicDemo ? "停止演示" : "停止并保存";
-    if (publicDemo && !state.publicDemoPlayback?.snapshot()?.running) stopButton.disabled = true;
-    else if (!publicDemo) stopButton.disabled = false;
-  }
+  synchronizeAcquisitionButtons();
   if (simulation) {
     if (state.interfaceModeRendered !== "simulation") {
       if (state.interfaceModeRendered === "real") rememberRealInterfaceSnapshot();
@@ -5996,6 +6062,7 @@ async function prepareSelectedSimulationSource() {
   const button = controls.prepareSimulationPackage;
   if (button) button.disabled = true;
   state.simulationSourceReady = null;
+  markHardwareCheckStale("模拟数据源准备状态已变化");
   try {
     if (controls.simulationPackageStatus) controls.simulationPackageStatus.textContent = "正在将合成数据准备到当前会话……";
     let selected = null;
@@ -6089,7 +6156,11 @@ async function selectSimulationSource() {
       state.simulationSourceId = "";
       state.simulationSourceReady = null;
       state.simulationSourcePackageId = "";
+      state.publicDemoPlayback?.stop();
+      state.publicDemoBundle = null;
+      state.publicDemoReady = false;
       controls.simulationSourcePath.value = result.path || result.name || "";
+      markHardwareCheckStale("模拟数据源已替换");
       if (controls.autoProcessParameters?.checked) {
         await readProcessParameters({automatic: true});
       }
@@ -6149,6 +6220,10 @@ async function uploadSimulationSource() {
     state.simulationSourceReady = null;
     state.simulationSourcePackageId = "";
     state.simulationSourceChannels = Array.isArray(result.channels) ? result.channels : [];
+    state.publicDemoPlayback?.stop();
+    state.publicDemoBundle = null;
+    state.publicDemoReady = false;
+    markHardwareCheckStale("模拟数据源已替换");
     if (controls.simulationSourceNote) controls.simulationSourceNote.textContent = state.accessRole === "guest"
       ? `已导入 ${result.name || "模拟数据"}；请点击“开始采集”后才开始读取，预测、预警和保存均基于该数据。`
       : `已导入 ${result.name || "模拟数据"}；请先点击“下载到本机辅助程序并校验”，确认就绪后再开始采集。`;
@@ -6176,13 +6251,16 @@ async function uploadSimulationSource() {
 
 function acquisitionConfig() {
   const allowUnverifiedPhysical = arguments[0]?.allowUnverifiedPhysical === true;
+  const diagnosticValidation = arguments[0]?.diagnosticValidation === true;
   const newSchema = controls.datasetSchema.value === "new_collection_v11_3";
   const interfaceState = interfaceConfigs();
-  validatePhysicalInterfaceBindings(
-    interfaceState.interfaces,
-    controls.acquisitionMode?.value !== "simulation",
-    {allowUnverifiedPhysical},
-  );
+  if (!diagnosticValidation) {
+    validatePhysicalInterfaceBindings(
+      interfaceState.interfaces,
+      controls.acquisitionMode?.value !== "simulation",
+      {allowUnverifiedPhysical},
+    );
+  }
   const first = interfaceState.interfaces[0] || {};
   const simulation = controls.acquisitionMode?.value === "simulation";
   const remoteSimulation = simulation && state.accessRole !== "local_admin";
@@ -6327,33 +6405,46 @@ async function readProcessParameters({automatic = false} = {}) {
   }
 }
 
-function validatePhysicalInterfaceBindings(
+function physicalInterfaceBindingIssues(
   items,
   realMode,
   {allowUnverifiedPhysical = false} = {},
 ) {
-  if (!realMode) return;
+  if (!realMode) return [];
+  const issues = [];
   const seen = new Map();
   for (const item of items.filter((entry) => entry.enabled)) {
     const profile = sensorTypeProfile(item.role);
     const resourceId = item.physical_port_id || item.physical_interface_id;
     if (!resourceId) {
-      throw new Error(`接口“${item.id}”未选择实际物理接口，不能启用`);
+      issues.push({code: "missing_physical_binding", interface_ids: [item.id], message: `接口“${item.id}”未选择实际物理接口，不能启用`});
+      continue;
     }
     if (item.physical_port_id && !item.physical_interface_id && !allowUnverifiedPhysical) {
-      throw new Error(`接口“${item.id}”：端口存在，未检测到兼容设备；连接设备后重新识别接口`);
+      issues.push({code: "physical_device_unverified", interface_ids: [item.id], resource_id: resourceId, message: `接口“${item.id}”：端口存在，未检测到兼容设备；连接设备后重新识别接口`});
     }
     const expectedKind = profile.physical_kind || "";
     if (item.physical_interface_kind && expectedKind && item.physical_interface_kind !== expectedKind && !item.physical_fallback) {
-      throw new Error(`接口“${item.id}”的物理接口类型与协议不匹配`);
+      issues.push({code: "physical_kind_mismatch", interface_ids: [item.id], resource_id: resourceId, message: `接口“${item.id}”的物理接口类型与协议不匹配`});
     }
     const previous = seen.get(resourceId);
     if (!previous) { seen.set(resourceId, item); continue; }
     const shared = new Set([previous.role, item.role]);
     if (!(shared.has("plc") && shared.has("robot") && shared.size === 2 && expectedKind === "ethernet" && previous.physical_interface_kind === "ethernet")) {
-      throw new Error(`物理接口“${resourceId}”重复绑定；仅允许PLC与ABB共享同一网卡`);
+      issues.push({code: "duplicate_physical_binding", interface_ids: [previous.id, item.id], resource_id: resourceId, message: `物理接口“${resourceId}”重复绑定；仅允许PLC与ABB共享同一网卡`});
     }
   }
+  return issues;
+}
+
+function validatePhysicalInterfaceBindings(
+  items,
+  realMode,
+  options = {},
+) {
+  const issues = physicalInterfaceBindingIssues(items, realMode, options);
+  if (issues.length) throw new Error(issues[0].message);
+  return issues;
 }
 
 controls.acquisitionMode?.addEventListener("change", () => {
@@ -6377,8 +6468,15 @@ controls.capturePolicy?.addEventListener("change", () => {
 controls.degradedConfirmation?.addEventListener("change", () => {
   markHardwareCheckStale("降级采集确认状态已变化");
 });
-controls.simulationExecutionHost?.addEventListener("change", updateSimulationSettings);
-controls.simulationSourceType?.addEventListener("change", updateSimulationSettings);
+const updateSimulationSettingsAndInvalidateReadiness = () => {
+  if (controls.acquisitionMode?.value === "simulation") {
+    state.simulationSourceReady = null;
+    markHardwareCheckStale("模拟数据源或执行端已变化");
+  }
+  updateSimulationSettings();
+};
+controls.simulationExecutionHost?.addEventListener("change", updateSimulationSettingsAndInvalidateReadiness);
+controls.simulationSourceType?.addEventListener("change", updateSimulationSettingsAndInvalidateReadiness);
 controls.selectSimulationSource?.addEventListener("click", selectSimulationSource);
 controls.simulationSourceFile?.addEventListener("change", uploadSimulationSource);
 controls.prepareSimulationPackage?.addEventListener("click", () => {
@@ -6388,6 +6486,7 @@ controls.prepareSimulationPackage?.addEventListener("click", () => {
   });
 });
 controls.simulationPackage?.addEventListener("change", () => {
+  markHardwareCheckStale("模拟数据包已变化");
   if (!isPublicPrecomputedSimulationMode()) {
     state.simulationSourceReady = null;
     return;
@@ -6418,10 +6517,9 @@ function selectedAcquisitionChannelsForInterfaces() {
   return checks.filter((node) => node.checked).map((node) => node.value);
 }
 
-// In simulation mode the imported file is the source of truth for which
-// sensor channels are available.  Match those channels to the collection
-// checklist once a source is loaded; users can still manually uncheck any
-// channel afterwards.
+// Simulation discovery describes availability only.  The acquisition
+// checklist is the operator's single selection shared by real and simulation
+// modes, so loading a source must never rewrite those checkboxes.
 function autoEnableSimulationChannels(sourceChannels = []) {
   if (controls.acquisitionMode?.value !== "simulation") return;
   const available = new Set((Array.isArray(sourceChannels) ? sourceChannels : [])
@@ -6433,16 +6531,13 @@ function autoEnableSimulationChannels(sourceChannels = []) {
     const collect = row.querySelector(".save-sensor-checkbox");
     if (!collect) return;
     const present = available.has(String(collect.value || "").trim());
-    collect.checked = present;
+    collect.dataset.simulationAvailable = present ? "true" : "false";
+    row.dataset.simulationChannelAvailable = present ? "true" : "false";
     const modelInput = row.querySelector(".model-input-sensor-checkbox");
     const outputInput = row.querySelector(".predict-sensor-checkbox");
-    if (!present) {
-      if (modelInput) modelInput.checked = false;
-      if (outputInput) outputInput.checked = false;
-    }
     const captureOnly = controls.processingMode?.value === "capture_only";
-    if (modelInput) modelInput.disabled = !present || captureOnly;
-    if (outputInput) outputInput.disabled = !present || captureOnly;
+    if (modelInput) modelInput.disabled = !collect.checked || captureOnly;
+    if (outputInput) outputInput.disabled = !collect.checked || captureOnly;
   });
   refreshInterfaceCardsForSelection();
 }
@@ -6594,6 +6689,13 @@ controls.interfacePanel?.addEventListener("change", (event) => {
 function hardwareConfigFingerprint() {
   try {
     const config = acquisitionConfig({allowUnverifiedPhysical: true});
+    const packageId = String(state.simulationSourcePackageId || (
+      state.simulationSourceId ? "" : (
+        state.publicDemoBundle?.package_id || controls.simulationPackage?.value || ""
+      )
+    ));
+    const packageEntry = (state.simulationPackages || [])
+      .find((item) => String(item?.package_id || "") === packageId);
     return JSON.stringify({
       acquisition_mode: config.acquisition_mode,
       execution_host: config.execution_host,
@@ -6613,6 +6715,21 @@ function hardwareConfigFingerprint() {
       })),
       assignments: config.interface_channel_assignments || {},
       source_file: config.source_file || "",
+      simulation_source_type: config.simulation_source_type || "",
+      simulation_source_path: config.simulation_source_path || "",
+      simulation_source_id: config.simulation_source_id || state.simulationSourceId || "",
+      simulation_source_package_id: packageId,
+      simulation_source_revision: state.simulationSourceReady?.content_sha256
+        || packageEntry?.sha256 || "",
+      simulation_source_validated: Boolean(
+        (!state.simulationSourceId && state.publicDemoReady
+          && state.publicDemoBundle?.package_id === packageId)
+        || (state.simulationSourceId
+          && state.simulationSourceReady?.state === "ready"
+          && state.simulationSourceReady?.source_id === state.simulationSourceId)
+        || (state.simulationSourceId
+          && state.simulationDatasetCache?.simulation_source_id === state.simulationSourceId),
+      ),
     });
   } catch (_error) {
     return "";
@@ -6800,6 +6917,11 @@ function renderHardwareCheckResult(result, {automatic = false, live = false} = {
     const physical = item.physical_interface_id ? ` · 实际${item.physical_interface_id}` : "";
     return `${profile.label || item.role || "接口"} ${item.endpoint || item.id || "未填写地址"}${physical}（${item.message || hardwareStateLabel(item.state)}）`;
   });
+  appendDetails(
+    "配置问题",
+    Array.isArray(result?.configuration_issues) ? result.configuration_issues : [],
+    (item) => String(item?.message || item),
+  );
   appendDetails("接口绑定警告", fallbackInterfaces, (item) => `${item.id || "接口"}：${item.physical_warning}`);
   const failedStages = interfaces.flatMap((item) => (Array.isArray(item.stages) ? item.stages : [])
     .filter((stage) => stage.state === "failed")
@@ -6895,12 +7017,9 @@ function normalizeHardwareCheckResult(result) {
   const current = result && typeof result === "object" ? result : {};
   const interfaces = Array.isArray(current.interfaces) ? current.interfaces : [];
   const sensors = Array.isArray(current.sensors) ? current.sensors : [];
-  if (interfaces.length && sensors.length) return current;
-
-  // A terminated helper check can only return an error envelope.  Keep the
-  // operator's current five-interface/selected-channel configuration visible
-  // so the same failure becomes a real diagnostic event instead of a
-  // misleading 0/0 summary and an empty LangChain gate.
+  // A terminated or partially completed check may omit rows.  Keep every
+  // configured interface and selected channel visible so one broken probe
+  // cannot hide the rest of the evidence from local rules or LangChain.
   const reason = String(
     current.error || current.message || "本地辅助程序未返回完整接口检查结果",
   );
@@ -6942,15 +7061,130 @@ function normalizeHardwareCheckResult(result) {
     blocking: true,
     ok: false,
   }));
+  const returnedInterfaces = new Map(
+    interfaces.map((item) => [String(item?.id || ""), item]),
+  );
+  const configuredIds = new Set(fallbackInterfaces.map((item) => String(item.id || "")));
+  const completeInterfaces = fallbackInterfaces.map((fallback) => (
+    returnedInterfaces.get(String(fallback.id || "")) || fallback
+  ));
+  interfaces.forEach((item) => {
+    if (!configuredIds.has(String(item?.id || ""))) completeInterfaces.push(item);
+  });
+  const returnedSensors = new Map(
+    sensors.map((item) => [String(item?.name || ""), item]),
+  );
+  const selectedNames = new Set(fallbackSensors.map((item) => String(item.name || "")));
+  const completeSensors = fallbackSensors.map((fallback) => (
+    returnedSensors.get(String(fallback.name || "")) || fallback
+  ));
+  sensors.forEach((item) => {
+    if (!selectedNames.has(String(item?.name || ""))) completeSensors.push(item);
+  });
+  const errors = Array.isArray(current.errors) ? [...current.errors] : [];
+  if ((!interfaces.length || !sensors.length || current.error) && !errors.includes(reason)) {
+    errors.push(reason);
+  }
   return {
     ...current,
-    ok: false,
-    interfaces: interfaces.length ? interfaces : fallbackInterfaces,
-    sensors: sensors.length ? sensors : fallbackSensors,
-    errors: [...(Array.isArray(current.errors) ? current.errors : []), reason],
+    ok: Boolean(current.ok)
+      && !current.error
+      && errors.length === 0
+      && selected.length > 0
+      && completeInterfaces.every((item) => item.enabled === false || item.ok)
+      && completeSensors.every((item) => item.selected !== true || item.ok),
+    interfaces: completeInterfaces,
+    sensors: completeSensors,
+    errors,
     hardware_check_timed_out: current.error === "hardware_check_timed_out"
       || /超时|timed.?out/i.test(reason),
   };
+}
+
+function simulationReadinessFromAvailableChannels() {
+  const sourceChannels = new Set((state.simulationSourceChannels || [])
+    .map((name) => String(name || "").trim()).filter(Boolean));
+  const selected = selectedAcquisitionChannelsForInterfaces();
+  const sensors = selected.map((name) => ({
+    name, selected: true,
+    state: sourceChannels.has(name) ? "ready" : "source_channel_missing",
+    message: sourceChannels.has(name) ? "模拟数据已匹配" : "模拟数据未包含该通道",
+    observed_samples: 0, received_samples: 0,
+    ok: sourceChannels.has(name), blocking: true,
+  }));
+  const channelGroups = [...(controls.interfacePanel?.querySelectorAll(".interface-config-row") || [])].map((row) => {
+    const role = row.querySelector(".interface-role")?.value || "custom";
+    const expected = (sensorTypeProfile(role).channels || []).filter((name) => selected.includes(name));
+    const matched = expected.filter((name) => sourceChannels.has(name));
+    return {
+      id: row.dataset.interfaceId, role, label: "模拟通道覆盖",
+      expected_channels: expected, matched_channels: matched,
+      missing_channels: expected.filter((name) => !sourceChannels.has(name)),
+      ok: expected.every((name) => sourceChannels.has(name)),
+    };
+  });
+  const selectedPackageId = String(controls.simulationPackage?.value || "");
+  const publicSourceReady = Boolean(
+    !state.simulationSourceId && state.publicDemoReady && state.publicDemoBundle
+    && state.publicDemoBundle.package_id === selectedPackageId,
+  );
+  const helperSourceReady = Boolean(
+    state.simulationSourceId && state.simulationSourceReady?.state === "ready"
+    && state.simulationSourceReady?.source_id === state.simulationSourceId,
+  );
+  const dataset = state.simulationDatasetCache;
+  const uploadedSourceReady = Boolean(
+    state.simulationSourceId && dataset?.simulation_source_id === state.simulationSourceId
+    && Array.isArray(dataset?.rows) && dataset.rows.length,
+  );
+  const datasetValuesValid = uploadedSourceReady && selected.every((name) => (
+    dataset.rows.some((row) => {
+      const value = row?.[name];
+      return value !== null && value !== "" && Number.isFinite(Number(value));
+    })
+  ));
+  const sourceOpen = publicSourceReady || helperSourceReady || uploadedSourceReady;
+  const complete = selected.length > 0 && sensors.every((item) => item.ok);
+  const valuesValid = complete && (publicSourceReady || helperSourceReady || datasetValuesValid);
+  const replayReady = valuesValid;
+  const stageFacts = [
+    ["source_open", sourceOpen, "请选择并打开模拟数据源"],
+    ["schema_compatible", sourceOpen && sourceChannels.size > 0, "模拟数据源结构无法解析"],
+    ["channels_complete", complete, "补齐模拟数据源通道或调整通道映射"],
+    ["values_valid", valuesValid, "修复模拟数据中的无效数值"],
+    ["replay_ready", replayReady, "修复模拟数据源后重新检查"],
+  ];
+  return {
+    ok: replayReady, acquisition_mode: "simulation", readiness_namespace: "simulation_source",
+    sensors, interfaces: [], channel_groups: channelGroups,
+    errors: replayReady ? [] : ["模拟数据源或通道映射未就绪"],
+    simulation_readiness: {
+      state: replayReady ? "replay_ready" : "source_not_ready", replay_ready: replayReady,
+      stages: stageFacts.map(([name, passed, remediation]) => ({
+        name, state: passed ? "passed" : "failed", remediation: passed ? "" : remediation,
+      })),
+    },
+  };
+}
+
+async function checkSimulationSourceReadiness({automatic = false} = {}) {
+  const execution = simulationExecutionSelection(
+    state.accessRole,
+    controls.simulationExecutionHost?.value || "helper_local",
+    state.helperStatus,
+  );
+  if (execution.error) throw new Error(execution.error);
+  let result;
+  if (execution.execution_host === "helper_local") {
+    result = await requestLocalHelper("check_capture", acquisitionConfig(), {timeoutMs: 120000});
+  } else if (execution.execution_host === "server") {
+    result = await postJson("/api/acquisition/test", acquisitionConfig(), {timeoutMs: 20000});
+  } else {
+    result = simulationReadinessFromAvailableChannels();
+  }
+  storeReadinessResult("simulation", result);
+  renderSimulationSourceCheckResult(result, {automatic});
+  return result;
 }
 
 async function testSensorConnection({automatic = false} = {}) {
@@ -6960,67 +7194,28 @@ async function testSensorConnection({automatic = false} = {}) {
     return null;
   }
   if (controls.acquisitionMode?.value === "simulation") {
-    const sourceChannels = new Set(state.simulationSourceChannels || []);
-    const selected = selectedAcquisitionChannelsForInterfaces();
-    const sensors = selected.map((name) => ({
-      name,
-      selected: true,
-      state: sourceChannels.has(name) ? "ready" : "source_channel_missing",
-      message: sourceChannels.has(name) ? "模拟数据已匹配" : "模拟数据未包含该通道",
-      observed_samples: 0,
-      received_samples: 0,
-      ok: sourceChannels.has(name),
-      blocking: true,
-    }));
-    const channelGroups = [...(controls.interfacePanel?.querySelectorAll(".interface-config-row") || [])].map((row) => {
-      const role = row.querySelector(".interface-role")?.value || "custom";
-      const profile = sensorTypeProfile(role);
-      const expected = (profile.channels || []).filter((name) => selected.includes(name));
-      const matched = expected.filter((name) => sourceChannels.has(name));
-      return {
-        id: row.dataset.interfaceId,
-        role,
-        label: "模拟通道覆盖",
-        expected_channels: expected,
-        matched_channels: matched,
-        missing_channels: expected.filter((name) => !sourceChannels.has(name)),
-        ok: Boolean(matched.length || !expected.length),
+    state.hardwareCheckInProgress = true;
+    const button = $("testSensorsButton");
+    if (button) button.disabled = true;
+    try {
+      return await checkSimulationSourceReadiness({automatic});
+    } catch (error) {
+      const failedCheck = simulationReadinessFromAvailableChannels();
+      failedCheck.ok = false;
+      failedCheck.errors = [String(error.message || error)];
+      failedCheck.simulation_readiness = {
+        ...failedCheck.simulation_readiness,
+        state: "source_check_failed",
+        replay_ready: false,
       };
-    });
-    const sourceOpen = Boolean(
-      state.simulationSourceId
-      || controls.simulationSourcePath?.value?.trim()
-      || sourceChannels.size
-      || isPublicPrecomputedSimulationMode()
-    );
-    const complete = sensors.every((item) => item.ok);
-    const stageFacts = [
-      ["source_open", sourceOpen, "请选择并打开模拟数据源"],
-      ["schema_compatible", sourceOpen && sourceChannels.size > 0, "模拟数据源结构无法解析"],
-      ["channels_complete", complete, "补齐模拟数据源通道或调整通道映射"],
-      ["values_valid", complete, "修复模拟数据中的无效数值"],
-      ["replay_ready", sourceOpen && complete, "修复模拟数据源后重新检查"],
-    ];
-    const replayReady = sourceOpen && complete;
-    const result = {
-      ok: replayReady,
-      acquisition_mode: "simulation",
-      readiness_namespace: "simulation_source",
-      sensors,
-      interfaces: [],
-      channel_groups: channelGroups,
-      errors: replayReady ? [] : ["模拟数据源或通道映射未就绪"],
-      simulation_readiness: {
-        state: replayReady ? "replay_ready" : "source_not_ready",
-        replay_ready: replayReady,
-        stages: stageFacts.map(([name, passed, remediation]) => ({
-          name, state: passed ? "passed" : "failed", remediation: passed ? "" : remediation,
-        })),
-      },
-    };
-    storeReadinessResult("simulation", result);
-    renderSimulationSourceCheckResult(result, {automatic});
-    return result;
+      storeReadinessResult("simulation", failedCheck);
+      renderSimulationSourceCheckResult(failedCheck, {automatic});
+      if (!automatic) toast(error.message);
+      return failedCheck;
+    } finally {
+      state.hardwareCheckInProgress = false;
+      if (button) button.disabled = false;
+    }
   }
   if (usesLocalCaptureHelper() && controls.acquisitionMode?.value !== "simulation") {
     state.hardwareCheckInProgress = true;
@@ -7038,7 +7233,7 @@ async function testSensorConnection({automatic = false} = {}) {
       // of reporting a client-side timeout while the check is still running.
       const result = normalizeHardwareCheckResult(
         await requestLocalHelper("check_capture",
-          acquisitionConfig({allowUnverifiedPhysical: true}),
+          acquisitionConfig({allowUnverifiedPhysical: true, diagnosticValidation: true}),
           {timeoutMs: 120000},
         ),
       );
@@ -7055,12 +7250,8 @@ async function testSensorConnection({automatic = false} = {}) {
       storeReadinessResult("real", failedCheck);
       renderHardwareCheckResult(failedCheck, {automatic});
       updateAgentFromHardwareResult(failedCheck, {automatic});
-      if (node) {
-        node.className = "hardware-check-status error";
-        node.textContent = `真实接口检查失败：${error.message}；如需使用模拟数据，请在“采集来源”选择“模拟采集”。`;
-      }
       if (!automatic) toast(error.message);
-      return null;
+      return failedCheck;
     } finally {
       state.hardwareCheckInProgress = false;
       if (button) button.disabled = false;
@@ -7083,7 +7274,7 @@ async function testSensorConnection({automatic = false} = {}) {
   try {
     const result = await postJson(
       state.accessRole === "guest" ? "/api/simulation/start" : "/api/acquisition/test",
-      acquisitionConfig({allowUnverifiedPhysical: true}),
+      acquisitionConfig({allowUnverifiedPhysical: true, diagnosticValidation: true}),
       {timeoutMs: 20000, controller},
     );
     if (state.accessRole === "guest") {
@@ -7099,16 +7290,15 @@ async function testSensorConnection({automatic = false} = {}) {
     if (!result.ok && !automatic) toast("检查发现接口或传感器通道异常，详情已列出");
     return result;
   } catch (error) {
-    state.realHardwareCheck = null;
-    state.realHardwareCheckFingerprint = "";
-    state.hardwareCheck = null;
-    state.hardwareCheckFingerprint = "";
-    if (node) {
-      node.className = "hardware-check-status error";
-      node.textContent = `真实接口检查失败：${error.message}；如需使用模拟数据，请在“采集来源”选择“模拟采集”。`;
-    }
+    const failedCheck = normalizeHardwareCheckResult({
+      ok: false,
+      error: error.message || "hardware_check_failed",
+    });
+    storeReadinessResult("real", failedCheck);
+    renderHardwareCheckResult(failedCheck, {automatic});
+    updateAgentFromHardwareResult(failedCheck, {automatic});
     if (!automatic) toast(error.message);
-    return null;
+    return failedCheck;
   } finally {
     state.hardwareCheckInProgress = false;
     if (state.hardwareCheckController === controller) state.hardwareCheckController = null;
