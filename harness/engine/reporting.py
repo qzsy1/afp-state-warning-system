@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .evidence import GitEvidence
-from .models import RequirementSpec
+from .models import PreSensorResult, RequirementSpec
 from .runner import CheckResult
 
 
@@ -64,6 +64,48 @@ class GateReport:
     outcome: str
 
 
+@dataclass(frozen=True)
+class PreSensorSummary:
+    total: int
+    passed: int
+    failed: int
+    blocked: int
+    physical_sensor_pending: int
+    outcome: str
+
+
+def aggregate_pre_sensor_results(
+    results: Sequence[PreSensorResult],
+) -> PreSensorSummary:
+    counts = Counter(item.status for item in results)
+    if counts["failed"]:
+        outcome = "failed"
+    elif counts["blocked"]:
+        outcome = "blocked"
+    elif counts["physical_sensor_pending"]:
+        outcome = "physical_sensor_pending"
+    else:
+        outcome = "passed"
+    return PreSensorSummary(
+        total=len(results),
+        passed=counts["passed"],
+        failed=counts["failed"],
+        blocked=counts["blocked"],
+        physical_sensor_pending=counts["physical_sensor_pending"],
+        outcome=outcome,
+    )
+
+
+def pre_sensor_payload(results: Sequence[PreSensorResult]) -> dict[str, Any]:
+    """Return the canonical machine-readable pre-sensor report fragment."""
+
+    return {
+        "schema_version": 1,
+        "summary": _plain(aggregate_pre_sensor_results(results)),
+        "checks": [_plain(item) for item in results],
+    }
+
+
 def redact_text(text: str, environment: Mapping[str, str]) -> str:
     result = text
     secret_values = {
@@ -103,10 +145,17 @@ def aggregate_requirements(
         warnings = tuple(
             check for check in related if not check.blocking and check.status in failure_statuses
         )
+        blocking_environment = tuple(
+            check for check in related if check.blocking and check.status == "blocked"
+        )
         if blocking_failures:
             status = "failed"
+        elif blocking_environment:
+            status = "blocked"
         elif any(check.status == "passed" for check in related):
             status = "passed_with_warnings" if warnings else "passed"
+        elif any(check.status == "physical_sensor_pending" for check in related):
+            status = "physical_sensor_pending"
         elif any(check.status == "pending_field" for check in related):
             status = "pending_field"
         else:
@@ -119,7 +168,9 @@ def aggregate_requirements(
                 status=status,
                 check_ids=tuple(check.check_id for check in related),
                 failed_check_ids=tuple(
-                    check.check_id for check in related if check.status in failure_statuses
+                    check.check_id
+                    for check in related
+                    if check.status in failure_statuses or check.status == "blocked"
                 ),
                 evidence_tiers=tuple(sorted({check.evidence_tier for check in related})),
             )
@@ -157,9 +208,15 @@ def report_payload(report: GateReport, environment: Mapping[str, str]) -> dict[s
         "failed": check_counts["failed"] + check_counts["timed_out"] + check_counts["not_started"],
         "skipped": check_counts["skipped_environment"],
         "pending_field": check_counts["pending_field"],
+        "blocked": check_counts["blocked"],
+        "physical_sensor_pending": check_counts["physical_sensor_pending"],
         "requirements_total": len(report.requirements),
         "requirements_passed": requirement_counts["passed"] + requirement_counts["passed_with_warnings"],
         "requirements_failed": requirement_counts["failed"],
+        "requirements_blocked": requirement_counts["blocked"],
+        "requirements_physical_sensor_pending": requirement_counts[
+            "physical_sensor_pending"
+        ],
         "requirements_unverified": requirement_counts["unverified"],
     }
     return _redact_value(payload, environment)

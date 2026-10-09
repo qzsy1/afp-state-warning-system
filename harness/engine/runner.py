@@ -31,6 +31,8 @@ class CheckResult:
     blocking: bool
     evidence_tier: str
     requirements: tuple[str, ...]
+    external_environment: bool = False
+    remediation: str = ""
 
 
 def _now() -> str:

@@ -23,10 +23,13 @@ from typing import Any
 from acquisition import AcquisitionConfig, MySQLSettings
 from helper_relay import normalize_pairing_code
 from local_capture_agent import HelperTransport, LocalCaptureAgent
+from release_contract import load_release_contract
 
 
-HELPER_PROTOCOL_VERSION = 2
-HELPER_BUILD_ID = "20261008-helper-full-diagnosis-v1"
+RELEASE_CONTRACT = load_release_contract(start=__file__)
+HELPER_PROTOCOL_VERSION = RELEASE_CONTRACT.helper_protocol_version
+HELPER_VERSION = RELEASE_CONTRACT.helper_version
+HELPER_BUILD_ID = RELEASE_CONTRACT.release_revision
 HARDWARE_CHECK_TIMEOUT_SECONDS = 60.0
 
 
@@ -486,7 +489,10 @@ def helper_capabilities(server_url: str = "") -> dict[str, Any]:
     paired_server_url, paired_route_type = _paired_route(server_url)
     result = {
         "protocol_version": HELPER_PROTOCOL_VERSION,
+        "helper_version": HELPER_VERSION,
         "build_id": HELPER_BUILD_ID,
+        "configuration_schema_version": RELEASE_CONTRACT.configuration_schema_version,
+        "readiness_schema_version": RELEASE_CONTRACT.readiness_schema_version,
         "command_lifecycle": "isolated_hardware_check",
         "hardware_check_timeout_seconds": HARDWARE_CHECK_TIMEOUT_SECONDS,
         "hardware_discovery": True,
@@ -497,7 +503,7 @@ def helper_capabilities(server_url: str = "") -> dict[str, Any]:
         "simulation_replay_v1": True,
         "simulation_prefetch_v1": True,
         "unified_frame_v1": True,
-        "unified_frame_contract": "unified_frame_v1",
+        "unified_frame_contract": RELEASE_CONTRACT.unified_frame_contract,
         "local_mysql_profile": local_mysql_profile_metadata(),
     }
     if paired_server_url:

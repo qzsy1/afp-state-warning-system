@@ -31,6 +31,7 @@ from mysql_storage import MySQLCaptureStore
 from json_safety import json_safe_value
 from remote_mysql_setup import classify_mysql_error
 from real_acquisition import ReadinessSnapshot
+from release_contract import assert_helper_contract, load_release_contract
 from simulation_source_transfer import SimulationSourceCache, inspect_csv_source
 
 
@@ -41,6 +42,7 @@ _ROLE_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("abb_motion", "ethernet", ("ethernet",)),
     ("m3232_pressure", "serial", ("serial",)),
 )
+RELEASE_CONTRACT = load_release_contract(start=__file__)
 
 
 class LocalCaptureAgent:
@@ -344,6 +346,7 @@ class LocalCaptureAgent:
             and str(getattr(config, "real_acquisition_mode", "")) == "remote_helper"
         ):
             capabilities = getattr(config, "helper_capabilities", None) or {}
+            assert_helper_contract(capabilities, RELEASE_CONTRACT)
             if not capabilities.get("unified_frame_v1"):
                 raise RuntimeError("helper_capability_missing: unified_frame_v1")
             contract = str(

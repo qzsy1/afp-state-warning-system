@@ -15,9 +15,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from release_contract import (
+    helper_capability_mismatches,
+    load_release_contract,
+)
+
 
 MINIMUM_HELPER_PROTOCOL_VERSION = 2
 REQUIRED_COMMAND_LIFECYCLE = "isolated_hardware_check"
+RELEASE_CONTRACT = load_release_contract(start=__file__)
 
 
 ALLOWED_HELPER_COMMANDS = frozenset(
@@ -360,6 +366,17 @@ class HelperRegistry:
                     helper.sender = None
             if not helper.online:
                 return {"ok": False, "queued": False, "error": "helper_offline"}
+            if command == "start_capture":
+                mismatches = helper_capability_mismatches(
+                    RELEASE_CONTRACT, helper.capabilities
+                )
+                if mismatches:
+                    return {
+                        "ok": False,
+                        "queued": False,
+                        "error": "release_contract_mismatch",
+                        "mismatches": list(mismatches),
+                    }
             helper.last_seen = time.time()
             request = {
                 "type": "command",

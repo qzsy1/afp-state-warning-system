@@ -3,6 +3,8 @@
   "profiles": {
     "quick": [
       "harness-contracts",
+      "pre-sensor-readiness-contracts",
+      "delivery-readonly-baseline",
       "real-acquisition-preflight-contracts",
       "real-acquisition-mode-contracts",
       "real-acquisition-local-direct-contracts",
@@ -14,6 +16,11 @@
     ],
     "full": [
       "harness-contracts",
+      "pre-sensor-readiness-contracts",
+      "delivery-readonly-baseline",
+      "pre-sensor-endurance-unit-contracts",
+      "pre-sensor-endurance-contracts",
+      "pre-sensor-field-operations-contracts",
       "real-acquisition-preflight-contracts",
       "real-acquisition-mode-contracts",
       "real-acquisition-local-direct-contracts",
@@ -35,6 +42,11 @@
     ],
     "release": [
       "harness-contracts",
+      "pre-sensor-readiness-contracts",
+      "delivery-readonly-baseline",
+      "pre-sensor-endurance-unit-contracts",
+      "pre-sensor-endurance-contracts",
+      "pre-sensor-field-operations-contracts",
       "real-acquisition-preflight-contracts",
       "real-acquisition-mode-contracts",
       "real-acquisition-local-direct-contracts",
@@ -61,7 +73,9 @@
       "field-usb-dock-topology",
       "field-real-hardware",
       "field-target-mysql",
-      "field-second-windows-helper"
+      "field-second-windows-helper",
+      "environment-second-windows-readiness",
+      "environment-target-mysql-readiness"
     ]
   }
 }

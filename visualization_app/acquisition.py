@@ -42,6 +42,7 @@ from real_acquisition import (
     UnifiedFrame,
 )
 from local_direct_acquisition import LocalDirectAdapter, minimum_poll_interval
+from release_contract import assert_config_contract, load_release_contract
 try:
     from windows_usb_topology import discover_windows_usb_topology
 except ImportError:  # Compatibility with older modular runtimes.
@@ -53,6 +54,7 @@ except ImportError:  # Compatibility with older modular runtimes.
 
 
 APP_DIR = Path(os.environ.get("AFP_LEGACY_APP_DIR") or Path(__file__).resolve().parent).resolve()
+RELEASE_CONTRACT = load_release_contract(start=__file__)
 WORKSPACE_DIR = APP_DIR.parents[1]
 DEFAULT_CAPTURE_ROOT = Path(WORKSPACE_DIR.anchor) / "AFP_Capture"
 _DATA_DIR = Path(os.environ.get("AFP_DATA_DIR") or APP_DIR / "data").resolve()
@@ -807,6 +809,9 @@ def _normalize_interface_sample(
 @dataclass
 class AcquisitionConfig:
     diagnostic_validation: InitVar[bool] = False
+    application_version: str = ""
+    release_revision: str = ""
+    configuration_schema_version: int = 0
     processing_mode: str = "prediction_warning"
     dataset_schema: str = "legacy_original"
     use_best_prediction_override: bool = False
@@ -899,6 +904,16 @@ class AcquisitionConfig:
 
     def __post_init__(self, diagnostic_validation: bool = False) -> None:
         self.configuration_issues: list[dict[str, Any]] = []
+        self.application_version = str(
+            self.application_version or RELEASE_CONTRACT.application_version
+        ).strip()
+        self.release_revision = str(
+            self.release_revision or RELEASE_CONTRACT.release_revision
+        ).strip()
+        self.configuration_schema_version = int(
+            self.configuration_schema_version
+            or RELEASE_CONTRACT.configuration_schema_version
+        )
         requested_mode = str(self.acquisition_mode or "").lower()
         if not requested_mode:
             requested_mode = "simulation" if self.driver == "simulator" else "real"
@@ -3720,6 +3735,7 @@ class AcquisitionManager:
         cannot permanently block local, LAN, or public operation.  A real
         hardware capture is never taken over implicitly.
         """
+        assert_config_contract(config, RELEASE_CONTRACT)
         if config.acquisition_mode == "real":
             for item in config.interfaces or []:
                 if not item.get("enabled", True):

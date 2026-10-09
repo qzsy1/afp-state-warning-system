@@ -109,9 +109,11 @@ from websocket_live import (
     recv_client_frame,
     websocket_handshake_headers,
 )
+from release_contract import load_release_contract
 
 
 APP_DIR = Path(os.environ.get("AFP_LEGACY_APP_DIR") or Path(__file__).resolve().parent).resolve()
+RELEASE_CONTRACT = load_release_contract(start=__file__)
 
 
 def health_payload() -> dict[str, str]:
@@ -342,8 +344,8 @@ def authorized_target_selection(identity: RequestIdentity, profiles: ServerTarge
     if identity.role in REAL_ACCESS_ROLES and identity.role != "local_admin":
         return profiles.for_request(str(identity.session_id or ""), payload)
     return None
-APP_VERSION = "1.12.0"
-BUILD_ID = "20260823-schema-contract-fix"
+APP_VERSION = RELEASE_CONTRACT.application_version
+BUILD_ID = RELEASE_CONTRACT.release_revision
 EXECUTABLE_DIR = (
     Path(sys.executable).resolve().parent
     if getattr(sys, "frozen", False)

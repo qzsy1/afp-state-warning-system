@@ -27,6 +27,8 @@ class RegressionMatrixContractTests(unittest.TestCase):
                 "REAL_PREP_SOURCE", "REAL_PREP_PROTOCOL", "REAL_PREP_TRANSPORT",
                 "REAL_PREP_PERSISTENCE", "REAL_PREP_RECOVERY", "REAL_PREP_MODE",
                 "REAL_PREP_FRAME", "REAL_PREP_EQUIVALENCE",
+                "PRE_SENSOR_RELEASE", "PRE_SENSOR_ENVIRONMENT",
+                "PRE_SENSOR_ENDURANCE", "PRE_SENSOR_FIELD_OPS",
             },
         )
 

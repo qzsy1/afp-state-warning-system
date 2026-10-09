@@ -6,6 +6,9 @@ param(
     [string]$LauncherSourceDir = "",
     [string]$ExistingExecutable = "",
     [string]$LauncherVersion = "",
+    [string]$ReleaseContract = "",
+    [string]$CandidateId = "",
+    [string]$SourceRevision = "",
     [switch]$AllowExistingTarget
 )
 
@@ -145,7 +148,7 @@ $legacyFiles = @(
     "runtime_health_primitives.py", "web_training.py", "web_training_pipeline.py",
     "training_data.py", "training_center.py", "training_center_cli.py",
     "native_integrated_app.py", "fit_new_collection_health.py", "websocket_live.py",
-    "helper_relay.py", "edge_capture.py", "local_capture_agent.py", "local_capture_helper_entry.py", "windows_usb_topology.py", "interface_transport_catalog.py",
+    "helper_relay.py", "edge_capture.py", "local_capture_agent.py", "local_capture_helper_entry.py", "release_contract.py", "windows_usb_topology.py", "interface_transport_catalog.py",
     "simulation_replay.py", "simulation_source_transfer.py",
     "public_demo_bundles.py",
     "remote_mysql_setup.py", "server_target_mysql.py", "server_capture_journal.py", "generate_pressure_simulation.py",
@@ -271,6 +274,43 @@ function Get-Sha256Hex([string]$Path) {
         $algorithm.Dispose()
         $stream.Dispose()
     }
+}
+
+if ($ReleaseContract) {
+    if (-not (Test-Path -LiteralPath $ReleaseContract -PathType Leaf)) {
+        throw "Release contract is missing: $ReleaseContract"
+    }
+    $releaseManifest = Get-Content -LiteralPath $ReleaseContract -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ([int]$releaseManifest.schema_version -ne 1) {
+        throw "Release contract schema_version must be 1."
+    }
+    if ([string]$releaseManifest.identity.application_version -ne $ApplicationVersion -or
+        [string]$releaseManifest.identity.helper_version -ne $ApplicationVersion -or
+        [string]$releaseManifest.identity.launcher_version -ne $resolvedLauncherVersion) {
+        throw "Release contract identity does not match requested application/launcher version."
+    }
+    $staticHashes = [ordered]@{}
+    foreach ($relative in @($releaseManifest.static_assets.required)) {
+        $asset = Join-Path $TargetDir ([string]$relative).Replace('/', '\')
+        if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) {
+            throw "Release contract static asset is missing: $relative"
+        }
+        $staticHashes[[string]$relative] = (Get-Sha256Hex $asset).ToLowerInvariant()
+    }
+    $releaseManifest.static_assets | Add-Member -NotePropertyName sha256 -NotePropertyValue $staticHashes -Force
+    foreach ($component in @($releaseManifest.runtime_requirements.native_components)) {
+        $nativePath = Join-Path $TargetDir ([string]$component.path).Replace('/', '\')
+        if (-not (Test-Path -LiteralPath $nativePath -PathType Leaf)) {
+            throw "Release contract native component is missing: $($component.path)"
+        }
+        $component | Add-Member -NotePropertyName sha256 -NotePropertyValue ((Get-Sha256Hex $nativePath).ToLowerInvariant()) -Force
+    }
+    $releaseManifest | Add-Member -NotePropertyName candidate -NotePropertyValue ([ordered]@{
+        candidate_id = $CandidateId
+        source_revision = $SourceRevision
+        created_at = (Get-Date).ToUniversalTime().ToString("o")
+    }) -Force
+    $releaseManifest | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $TargetDir "RELEASE-MANIFEST.json") -Encoding UTF8
 }
 
 $immutableFiles = Get-ChildItem -LiteralPath $TargetDir -Recurse -File | Where-Object {

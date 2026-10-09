@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "captured_from_commit": "2047f358808c50ba8c5f85a036a100e6f738e6eb",
+  "delivery_path": "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic",
+  "managed_file_count": 6176,
+  "tree_sha256": "8fd1ab9709215101075bdea283b40895d52d107a389eea42e1683d0e0a6cc4d4",
+  "per_file_manifest": "SHA256SUMS.txt",
+  "per_file_manifest_entries": 6175,
+  "per_file_manifest_sha256": "7e050aec030a9945df8ba4fcc5388536f1afc78d435f50f6ccf33d7e9b9681ab"
+}

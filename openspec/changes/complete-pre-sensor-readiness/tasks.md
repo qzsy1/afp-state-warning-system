@@ -2,21 +2,21 @@
 
 ## 1. OpenSpec、基线与Harness优先合同
 
-- [ ] 1.1 记录 `main@2047f35` 包含 `prepare-real-acquisition` 的提交/引用证据、工作树路径、Harness 128/128 与 quick 9/9 基线，并以 `openspec validate complete-pre-sensor-readiness --strict` 验证本变更规划产物
-- [ ] 1.2 [Harness/RED] 在 `harness/tests` 增加候选发行、统一预检、环境阻塞、耐久恢复和现场证据需求族测试，运行后记录因矩阵缺少稳定需求 ID、检查 ID、profile 和证据等级而产生的预期失败
-- [ ] 1.3 [Harness/GREEN] 最小更新 `harness/config/regression-matrix.json`、`profiles.json` 和对应检查入口，使新增需求族进入 quick/full/release 且 `blocked`、`physical_sensor_pending` 不混用；重跑 Harness 合同测试通过
-- [ ] 1.4 [Harness/RED] 增加预检结果 schema 合同，验证只有白名单物理设备检查可返回 `physical_sensor_pending`，第二台电脑、目标 MySQL、权限和网络缺失必须为 `blocked`；记录当前报告模型不支持该语义的失败
-- [ ] 1.5 [Harness/GREEN] 扩展 Harness 模型、聚合和报告层支持四态结果、外部环境标记及修复建议，运行全部 `harness/tests` 并确认原有 field 语义向后兼容
-- [ ] 1.6 捕获正式 `delivery/` 受管文件基线快照（文件数、逐文件摘要和树摘要），把只读断言接入新增 Harness 检查并验证准备入口不会写入正式目录
+- [x] 1.1 记录 `main@2047f35` 包含 `prepare-real-acquisition` 的提交/引用证据、工作树路径、Harness 128/128 与 quick 9/9 基线，并以 `openspec validate complete-pre-sensor-readiness --strict` 验证本变更规划产物
+- [x] 1.2 [Harness/RED] 在 `harness/tests` 增加候选发行、统一预检、环境阻塞、耐久恢复和现场证据需求族测试，运行后记录因矩阵缺少稳定需求 ID、检查 ID、profile 和证据等级而产生的预期失败
+- [x] 1.3 [Harness/GREEN] 最小更新 `harness/config/regression-matrix.json`、`profiles.json` 和对应检查入口，使新增需求族进入 quick/full/release 且 `blocked`、`physical_sensor_pending` 不混用；重跑 Harness 合同测试通过
+- [x] 1.4 [Harness/RED] 增加预检结果 schema 合同，验证只有白名单物理设备检查可返回 `physical_sensor_pending`，第二台电脑、目标 MySQL、权限和网络缺失必须为 `blocked`；记录当前报告模型不支持该语义的失败
+- [x] 1.5 [Harness/GREEN] 扩展 Harness 模型、聚合和报告层支持四态结果、外部环境标记及修复建议，运行全部 `harness/tests` 并确认原有 field 语义向后兼容
+- [x] 1.6 捕获正式 `delivery/` 受管文件基线快照（文件数、逐文件摘要和树摘要），把只读断言接入新增 Harness 检查并验证准备入口不会写入正式目录
 
 ## 2. 统一发行合同与隔离候选
 
-- [ ] 2.1 [RED] 增加发行合同单元/集成测试，证明当前应用、Helper 与启动器硬编码版本无法关联同一修订，并覆盖协议、统一帧、配置 schema、静态资源和受管文件摘要缺失/不一致
-- [ ] 2.2 [GREEN] 增加权威发行合同及共享加载器，让主程序、Helper 和开发态读取同一版本/协议来源；运行版本一致与秘密排除测试通过
-- [ ] 2.3 [RED] 增加启动副作用顺序测试，验证版本、Helper 合同或配置 schema 不一致时当前路径仍可能到达设备打开或远程启动；记录调用顺序失败
-- [ ] 2.4 [GREEN] 在本机设备打开、正式会话创建和 Helper 启动命令之前接入发行/协议/配置门禁，并验证不一致时所有副作用调用次数为零、兼容候选可继续
-- [ ] 2.5 [RED] 扩展候选装配测试，覆盖已存在目标、版本化目录、`RELEASE-MANIFEST.json`、候选内导入、自检、静态资源、DLL/SDK 声明及禁止依赖源工作树；观察当前装配缺失合同的失败
-- [ ] 2.6 [GREEN] 更新 `modular_runtime/assemble_modular_delivery.ps1` 与候选生成入口，在 `artifacts/pre-sensor-candidates/<candidate-id>/` 生成独立候选、发行 manifest 和摘要，不覆盖/合并现有目录
+- [x] 2.1 [RED] 增加发行合同单元/集成测试，证明当前应用、Helper 与启动器硬编码版本无法关联同一修订，并覆盖协议、统一帧、配置 schema、静态资源和受管文件摘要缺失/不一致
+- [x] 2.2 [GREEN] 增加权威发行合同及共享加载器，让主程序、Helper 和开发态读取同一版本/协议来源；运行版本一致与秘密排除测试通过
+- [x] 2.3 [RED] 增加启动副作用顺序测试，验证版本、Helper 合同或配置 schema 不一致时当前路径仍可能到达设备打开或远程启动；记录调用顺序失败
+- [x] 2.4 [GREEN] 在本机设备打开、正式会话创建和 Helper 启动命令之前接入发行/协议/配置门禁，并验证不一致时所有副作用调用次数为零、兼容候选可继续
+- [x] 2.5 [RED] 扩展候选装配测试，覆盖已存在目标、版本化目录、`RELEASE-MANIFEST.json`、候选内导入、自检、静态资源、DLL/SDK 声明及禁止依赖源工作树；观察当前装配缺失合同的失败
+- [x] 2.6 [GREEN] 更新 `modular_runtime/assemble_modular_delivery.ps1` 与候选生成入口，在 `artifacts/pre-sensor-candidates/<candidate-id>/` 生成独立候选、发行 manifest 和摘要，不覆盖/合并现有目录
 - [ ] 2.7 用真实候选执行模块导入、启动器自检、静态资源、manifest 和受管文件验证；重新捕获正式 `delivery/` 摘要并证明与1.6完全相同
 
 ## 3. 双模式配置模板与启动前门禁

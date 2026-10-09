@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -41,6 +42,7 @@ class RealAcquisitionPreflightTests(unittest.TestCase):
             "app/legacy/real_acquisition.py": (
                 b"from enum import Enum\nclass ChannelQuality(str, Enum):\n    OK = 'ok'\n"
             ),
+            "app/legacy/release_contract.py": b"CONTRACT = 1\n",
             "app/legacy/local_direct_acquisition.py": b"MODE = 'local_direct'\n",
             "app/ui/index.html": b"index",
             "app/ui/app.js": b"app",
@@ -50,6 +52,7 @@ class RealAcquisitionPreflightTests(unittest.TestCase):
             "app/ui/public_demo.js": b"public",
             "app/ui/training.html": b"training",
             "app/ui/training.js": b"training-js",
+            "native_dll/BsvUvcNative.dll": b"native",
         }
         for relative, content in contents.items():
             if relative in omitted:
@@ -57,6 +60,60 @@ class RealAcquisitionPreflightTests(unittest.TestCase):
             path = candidate / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(content)
+        static_relative = "app/ui/app.js"
+        native_relative = "native_dll/BsvUvcNative.dll"
+        static_path = candidate / static_relative
+        release_manifest = {
+            "schema_version": 1,
+            "identity": {
+                "application_version": "test",
+                "helper_version": "test",
+                "launcher_version": "test",
+                "release_revision": "test-revision",
+            },
+            "contracts": {
+                "helper_protocol_version": 2,
+                "unified_frame_contract": "unified_frame_v1",
+                "configuration_schema_version": 1,
+                "readiness_schema_version": 1,
+            },
+            "static_assets": {
+                "required": [static_relative],
+                "sha256": {
+                    static_relative: (
+                        __import__("hashlib").sha256(static_path.read_bytes()).hexdigest()
+                        if static_path.is_file()
+                        else ""
+                    )
+                },
+            },
+            "managed_files": {
+                "manifest": "SHA256SUMS.txt",
+                "digest_algorithm": "sha256",
+            },
+            "runtime_requirements": {
+                "native_components": [
+                    {
+                        "id": "bsv_uvc",
+                        "path": native_relative,
+                        "sha256": __import__("hashlib").sha256(
+                            (candidate / native_relative).read_bytes()
+                        ).hexdigest(),
+                    }
+                ],
+                "vendor_sdks": [{"id": "bsv_uvc_sdk"}],
+                "drivers": [{"id": "uvc"}],
+            },
+            "candidate": {
+                "candidate_id": "test-candidate",
+                "source_revision": "test",
+                "created_at": "2026-10-09T00:00:00Z",
+            },
+        }
+        if "RELEASE-MANIFEST.json" not in omitted:
+            (candidate / "RELEASE-MANIFEST.json").write_text(
+                json.dumps(release_manifest), encoding="utf-8"
+            )
         manifest_lines = []
         for path in sorted(candidate.rglob("*")):
             if path.is_file():
