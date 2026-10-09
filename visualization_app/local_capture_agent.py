@@ -30,6 +30,7 @@ from helper_relay import ALLOWED_HELPER_COMMANDS
 from mysql_storage import MySQLCaptureStore
 from json_safety import json_safe_value
 from remote_mysql_setup import classify_mysql_error
+from real_acquisition import ReadinessSnapshot
 from simulation_source_transfer import SimulationSourceCache, inspect_csv_source
 
 
@@ -72,6 +73,7 @@ class LocalCaptureAgent:
         self._local_stopped_at: float | None = None
         self._flush_state = "idle"
         self._source_transfer_status: dict[str, Any] = {"state": "not_required"}
+        self._readiness_snapshot: ReadinessSnapshot | None = None
 
     @staticmethod
     def _choose_candidate(
@@ -337,9 +339,39 @@ class LocalCaptureAgent:
         return result
 
     def start_capture(self, config: Any) -> dict[str, Any]:
+        if (
+            str(getattr(config, "acquisition_mode", "")) == "real"
+            and str(getattr(config, "real_acquisition_mode", "")) == "remote_helper"
+        ):
+            capabilities = getattr(config, "helper_capabilities", None) or {}
+            if not capabilities.get("unified_frame_v1"):
+                raise RuntimeError("helper_capability_missing: unified_frame_v1")
+            contract = str(
+                capabilities.get("unified_frame_contract") or "unified_frame_v1"
+            )
+            if contract != "unified_frame_v1":
+                raise RuntimeError(
+                    f"helper_capability_mismatch: expected unified_frame_v1, got {contract}"
+                )
+            snapshot = self._readiness_snapshot
+            if snapshot is None:
+                raise RuntimeError("remote_readiness_required")
+            try:
+                snapshot.validate(
+                    config,
+                    required_capabilities=("unified_frame_v1",),
+                )
+            except ValueError as exc:
+                raise RuntimeError(f"remote_readiness_required: {exc}") from exc
+        if not str(getattr(config, "capture_uuid", "") or "").strip():
+            config.capture_uuid = uuid.uuid4().hex
         result = self.manager.start(config)
         with self._stream_lock:
-            self._capture_uuid = uuid.uuid4().hex
+            self._capture_uuid = str(
+                (result or {}).get("capture_uuid")
+                if isinstance(result, dict)
+                else ""
+            ).strip() or str(config.capture_uuid)
             self._stream_cursor = 0
             self._stream_sequence = 0
             self._pending_batch = None
@@ -374,6 +406,7 @@ class LocalCaptureAgent:
             if incremental is not None:
                 rows = list(incremental.get("rows") or [])
                 timestamps = list(incremental.get("timestamps") or [])
+                frames = list(incremental.get("frames") or [])
                 end_cursor = int(incremental.get("next_cursor", self._stream_cursor))
                 total_count = int(incremental.get("total_count", end_cursor))
                 if bool(incremental.get("truncated")):
@@ -386,16 +419,19 @@ class LocalCaptureAgent:
                 end_cursor = min(len(all_rows), self._stream_cursor + batch_limit)
                 rows = all_rows[self._stream_cursor:end_cursor]
                 timestamps = all_timestamps[self._stream_cursor:end_cursor]
+                frames = []
                 total_count = len(all_rows)
             if end_cursor <= self._stream_cursor and not self._status_dirty:
                 return None
             pending = {
                 "capture_uuid": self._capture_uuid,
                 "sequence": self._stream_sequence,
+                "frame_contract": "unified_frame_v1",
                 "cursor_start": self._stream_cursor,
                 "cursor_end": end_cursor,
                 "rows": [json_safe_value(dict(row)) for row in rows],
                 "timestamps": [float(value) for value in timestamps],
+                "frames": [json_safe_value(dict(frame)) for frame in frames],
                 "status": json_safe_value(self.status()),
                 "transport": {
                     "helper_batch_created_at": time.time(),
@@ -474,7 +510,11 @@ class LocalCaptureAgent:
                 total_count = int(counts.get("total_count", 0))
             config = current_status.get("config") if isinstance(current_status, dict) else {}
             try:
-                sample_rate = float((config or {}).get("sample_rate") or 10.0)
+                sample_rate = float(
+                    (config or {}).get("sample_rate_hz")
+                    or (config or {}).get("sample_rate")
+                    or 10.0
+                )
             except (TypeError, ValueError):
                 sample_rate = 10.0
             queued_rows = max(0, total_count - self._stream_cursor)
@@ -495,7 +535,23 @@ class LocalCaptureAgent:
             }
 
     def check_capture(self, config: Any) -> dict[str, Any]:
-        return self.manager.test_connection(config)
+        result = self.manager.test_connection(config)
+        response = dict(result) if isinstance(result, dict) else {"ok": False, "result": result}
+        snapshot = ReadinessSnapshot.create(
+            config,
+            response,
+            capabilities={
+                **dict(getattr(config, "helper_capabilities", None) or {}),
+                "unified_frame_v1": True,
+                "unified_frame_contract": "unified_frame_v1",
+            },
+        )
+        self._readiness_snapshot = snapshot
+        response["readiness_snapshot"] = snapshot.to_dict()
+        return response
+
+    def import_readiness_snapshot(self, payload: dict[str, Any]) -> None:
+        self._readiness_snapshot = ReadinessSnapshot.from_dict(payload)
 
     def read_process_parameters(self, config: Any) -> dict[str, Any]:
         return self.manager.read_process_parameters(config)

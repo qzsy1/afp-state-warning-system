@@ -47,6 +47,7 @@ from acquisition import (
     acquisition_config_from_payload,
     NEW_COLLECTION_SENSOR_COLUMNS,
     SENSOR_COLUMNS,
+    SENSOR_CHANNEL_METADATA,
     check_capture_save_root,
     integrate_capture_sources,
     default_capture_interfaces,
@@ -241,7 +242,12 @@ def decorate_server_mysql_result(result: dict) -> dict:
     return payload
 
 
-def helper_real_capture_payload(payload: dict) -> dict:
+def helper_real_capture_payload(
+    payload: dict,
+    *,
+    helper_session_id: str = "",
+    helper_capabilities: dict | None = None,
+) -> dict:
     """Remove server-target credentials before forwarding a real capture to helper."""
     clean = dict(payload or {})
     for key in (
@@ -252,6 +258,10 @@ def helper_real_capture_payload(payload: dict) -> dict:
     ):
         clean.pop(key, None)
     clean["mysql_enabled"] = False
+    clean["real_acquisition_mode"] = "remote_helper"
+    clean["execution_host"] = "helper_local"
+    clean["helper_session_id"] = str(helper_session_id or "")
+    clean["helper_capabilities"] = dict(helper_capabilities or {})
     return clean
 
 
@@ -4407,17 +4417,22 @@ class AppHandler(BaseHTTPRequestHandler):
         ).start()
 
     def _ingest_helper_sample(self, session_id: str, batch: dict[str, Any]) -> dict[str, Any]:
-        capture_uuid = str(batch.get("capture_uuid") or "") if isinstance(batch, dict) else ""
+        trusted_batch = dict(batch) if isinstance(batch, dict) else {}
+        helper_status = self.dashboard.helper_registry.status(session_id)
+        capabilities = dict(helper_status.get("capabilities") or {})
+        if capabilities.get("unified_frame_v1"):
+            trusted_batch["required_frame_contract"] = "unified_frame_v1"
+        capture_uuid = str(trusted_batch.get("capture_uuid") or "")
         if self.target_capture_journal.manages(session_id, capture_uuid):
             accepted = self.target_capture_journal.ingest(
-                session_id, batch if isinstance(batch, dict) else {},
+                session_id, trusted_batch,
                 self.dashboard.remote_acquisitions,
             )
             if accepted.get("ok"):
                 self._schedule_target_save(session_id, capture_uuid)
             return accepted
         return self.dashboard.remote_acquisitions.ingest(
-            session_id, batch if isinstance(batch, dict) else {}
+            session_id, trusted_batch
         )
 
     def _accept_helper_result(
@@ -4425,6 +4440,11 @@ class AppHandler(BaseHTTPRequestHandler):
     ) -> dict[str, Any]:
         session_id = self.dashboard.helper_registry.authenticate(device_id, token)
         if session_id is not None:
+            capture_uuid = str((payload or {}).get("capture_uuid") or "").strip()
+            if capture_uuid:
+                self.dashboard.remote_acquisitions.bind_contract(
+                    session_id, request_id, capture_uuid
+                )
             self.target_capture_journal.bind_start_result(session_id, request_id, payload)
             self.dashboard.remote_acquisitions.for_session(
                 session_id
@@ -5929,6 +5949,17 @@ class AppHandler(BaseHTTPRequestHandler):
                 command_payload = (
                     payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
                 )
+                helper_status = self.dashboard.helper_registry.status(session_id)
+                helper_capabilities = dict(helper_status.get("capabilities") or {})
+                if (
+                    command_name in {"check_capture", "read_process_parameters"}
+                    and str(command_payload.get("acquisition_mode") or "real").lower() == "real"
+                ):
+                    command_payload = helper_real_capture_payload(
+                        command_payload,
+                        helper_session_id=session_id,
+                        helper_capabilities=helper_capabilities,
+                    )
                 if command_name == "prepare_simulation_source":
                     try:
                         helper_payload = prepare_helper_simulation_payload(
@@ -5947,6 +5978,8 @@ class AppHandler(BaseHTTPRequestHandler):
                     self._send_json(result)
                     return
                 if command_name == "start_capture":
+                    contract_channels: list[str] = []
+                    contract_units: dict[str, str] = {}
                     capture_mode = str(
                         command_payload.get("acquisition_mode") or "real"
                     ).lower()
@@ -5980,9 +6013,50 @@ class AppHandler(BaseHTTPRequestHandler):
                             )
                             return
                     else:
-                        helper_payload = helper_real_capture_payload(command_payload)
+                        if not helper_capabilities.get("unified_frame_v1"):
+                            self._send_json(
+                                {"ok": False, "error": "helper_capability_missing: unified_frame_v1"}
+                            )
+                            return
+                        helper_payload = helper_real_capture_payload(
+                            command_payload,
+                            helper_session_id=session_id,
+                            helper_capabilities=helper_capabilities,
+                        )
+                        requested_channels = helper_payload.get("selected_sensors")
+                        if not isinstance(requested_channels, list):
+                            schema_name = str(
+                                helper_payload.get("dataset_schema") or "legacy_original"
+                            )
+                            requested_channels = list(
+                                (ACQUISITION_SCHEMAS.get(schema_name) or {}).get(
+                                    "sensors", []
+                                )
+                            )
+                        contract_channels = [
+                            str(name) for name in requested_channels if str(name)
+                        ]
+                        contract_units = {
+                            name: str(
+                                (SENSOR_CHANNEL_METADATA.get(name) or {}).get("unit")
+                                or ""
+                            )
+                            for name in contract_channels
+                        }
                     if target_enabled:
                         selection = self.target_profiles.for_request(session_id, command_payload)
+                        target_store = self.target_saver.store_factory(selection.settings)
+                        preflight = target_store.preflight(write_test=True)
+                        if not preflight.get("ok"):
+                            self._send_json(
+                                {
+                                    "ok": False,
+                                    "error": "mysql_preflight_failed: "
+                                    + str(preflight.get("error") or preflight.get("stage") or "unknown error"),
+                                    "mysql": decorate_server_mysql_result(preflight),
+                                }
+                            )
+                            return
                         helper_payload["execution_host"] = "helper_local"
                         result = self.dashboard.helper_registry.command(
                             session_id, command_name, helper_payload
@@ -5991,6 +6065,13 @@ class AppHandler(BaseHTTPRequestHandler):
                             with self.remote_simulation_hosts_lock:
                                 self.remote_simulation_hosts[session_id] = "helper_local"
                         if result.get("ok") and result.get("request_id"):
+                            if capture_mode == "real":
+                                self.dashboard.remote_acquisitions.stage_contract(
+                                    session_id,
+                                    str(result["request_id"]),
+                                    contract_channels,
+                                    contract_units,
+                                )
                             self.target_capture_journal.arm_start(
                                 session_id, str(result["request_id"]), selection.config_id,
                                 config=helper_payload, target=selection.public(),
@@ -6003,6 +6084,18 @@ class AppHandler(BaseHTTPRequestHandler):
                 result = self.dashboard.helper_registry.command(
                     session_id, command_name, command_payload
                 )
+                if (
+                    command_name == "start_capture"
+                    and capture_mode == "real"
+                    and result.get("ok")
+                    and result.get("request_id")
+                ):
+                    self.dashboard.remote_acquisitions.stage_contract(
+                        session_id,
+                        str(result["request_id"]),
+                        contract_channels,
+                        contract_units,
+                    )
                 if (
                     command_name == "start_capture"
                     and str(command_payload.get("acquisition_mode") or "").lower()

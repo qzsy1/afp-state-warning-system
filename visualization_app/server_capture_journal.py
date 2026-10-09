@@ -11,7 +11,11 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from acquisition import AcquisitionConfig, acquisition_config_from_payload
+from acquisition import (
+    AcquisitionConfig,
+    SENSOR_CHANNEL_METADATA,
+    acquisition_config_from_payload,
+)
 from mysql_storage import MySQLCaptureStore, MySQLSettings
 from remote_mysql_setup import classify_mysql_error
 
@@ -175,6 +179,77 @@ class ServerCaptureJournal:
     def close(self) -> None:
         pass  # Connections are scoped to each transaction and iterator.
 
+    def _restore_mirror_if_needed(
+        self, session_id: str, capture_uuid: str, mirrors: Any
+    ) -> dict[str, Any]:
+        """Recover volatile mirror sequence state from the durable journal."""
+
+        with self._connection() as connection:
+            capture = connection.execute(
+                "SELECT next_sequence,final_status FROM captures "
+                "WHERE session_id=? AND capture_uuid=?",
+                (session_id, capture_uuid),
+            ).fetchone()
+            if capture is None or int(capture[0]) <= 0:
+                return {"ok": True, "restored": False}
+            durable_next = int(capture[0])
+            mirror_status = mirrors.for_session(session_id).status()
+            if (
+                str(mirror_status.get("capture_uuid") or "") == capture_uuid
+                and int(mirror_status.get("remote_expected_sequence") or 0)
+                == durable_next
+            ):
+                return {"ok": True, "restored": False}
+            stored = connection.execute(
+                "SELECT sequence,body FROM batches "
+                "WHERE session_id=? AND capture_uuid=? ORDER BY sequence",
+                (session_id, capture_uuid),
+            ).fetchall()
+        if len(stored) != durable_next:
+            return {"ok": False, "error": "target_journal_restore_gap"}
+        restored_batches: list[dict[str, Any]] = []
+        final_status = json.loads(capture[1]) if capture[1] else None
+        for index, (sequence, body) in enumerate(stored):
+            payload = json.loads(body)
+            restored = {
+                "capture_uuid": capture_uuid,
+                "sequence": int(sequence),
+                **payload,
+            }
+            if final_status is not None and index == len(stored) - 1:
+                restored["status"] = final_status
+            restored_batches.append(restored)
+        return mirrors.restore(session_id, restored_batches)
+
+    def _configure_mirror_contract(
+        self, session_id: str, capture_uuid: str, mirrors: Any
+    ) -> dict[str, Any]:
+        armed = self._armed.get(session_id)
+        capture_config = dict(armed[1]) if armed is not None else {}
+        if not capture_config:
+            with self._connection() as connection:
+                stored = connection.execute(
+                    "SELECT config_json FROM captures "
+                    "WHERE session_id=? AND capture_uuid=?",
+                    (session_id, capture_uuid),
+                ).fetchone()
+            if stored is not None:
+                capture_config = json.loads(stored[0] or "{}")
+        channels = capture_config.get("selected_sensors") or capture_config.get(
+            "schema_sensors"
+        )
+        if not isinstance(channels, list) or not channels:
+            return {"ok": False, "error": "frame_channel_contract_unbound"}
+        units = {
+            str(name): str(
+                (SENSOR_CHANNEL_METADATA.get(str(name)) or {}).get("unit") or ""
+            )
+            for name in channels
+        }
+        return mirrors.configure_capture_contract(
+            session_id, capture_uuid, channels, units
+        )
+
     def ingest(self, session_id: str, batch: dict[str, Any], mirrors: Any) -> dict[str, Any]:
         capture_uuid = str(batch.get("capture_uuid") or "")
         try:
@@ -192,13 +267,45 @@ class ServerCaptureJournal:
             return {"ok": False, "error": "sample_timestamp_invalid"}
         if any(_without_secrets(row) != row for row in rows):
             return {"ok": False, "error": "sample_row_contains_secret"}
-        body = json.dumps({"rows": rows, "timestamps": timestamps}, ensure_ascii=False, allow_nan=False)
+        frames = batch.get("frames")
+        if frames is not None and _without_secrets(frames) != frames:
+            return {"ok": False, "error": "frame_contains_secret"}
+        journal_payload: dict[str, Any] = {
+            "rows": rows,
+            "timestamps": timestamps,
+        }
+        if frames is not None:
+            journal_payload["frames"] = frames
+        required_frame_contract = str(
+            batch.get("required_frame_contract") or ""
+        ).strip()
+        if required_frame_contract:
+            journal_payload["required_frame_contract"] = required_frame_contract
+        body = json.dumps(
+            journal_payload, ensure_ascii=False, allow_nan=False, sort_keys=True
+        )
         digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
         safe_status = _without_secrets(batch.get("status") or {})
         if not isinstance(safe_status, dict):
             safe_status = {}
         byte_count = len(body.encode("utf-8"))
         with self._lock:
+            if required_frame_contract == "unified_frame_v1":
+                configured = self._configure_mirror_contract(
+                    session_id, capture_uuid, mirrors
+                )
+                if not configured.get("ok"):
+                    return configured
+            restored = self._restore_mirror_if_needed(
+                session_id, capture_uuid, mirrors
+            )
+            if not restored.get("ok"):
+                return restored
+            mirror_validation = mirrors.validate(session_id, batch)
+            if not mirror_validation.get("ok"):
+                rejected = dict(mirror_validation)
+                rejected["journal_state"] = "not_committed"
+                return rejected
             try:
                 with self._connection() as connection:
                     connection.execute("BEGIN IMMEDIATE")
@@ -255,11 +362,17 @@ class ServerCaptureJournal:
                     )
             except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
                 return {"ok": False, "error": "target_journal_write_failed", "detail": str(exc)}
-            # Only after commit may the helper advance its cursor. The mirror is
-            # deliberately bounded and is never the source for MySQL persistence.
+            # The ACK is returned only after the durable transaction commits.
+            # The bounded mirror remains a live projection and is never the
+            # source for MySQL persistence.
             mirror_ack = mirrors.ingest(session_id, batch)
             if not mirror_ack.get("ok"):
-                return {"ok": False, "error": "target_mirror_sync_failed"}
+                return {
+                    **mirror_ack,
+                    "error": "target_mirror_sync_failed",
+                    "mirror_error": mirror_ack.get("error"),
+                    "journal_state": "committed",
+                }
             return mirror_ack
 
     def ready_capture(self, session_id: str, capture_uuid: str) -> CaptureRecord | None:

@@ -27,12 +27,42 @@ def sample(sequence, values, *, final=False, count=None):
     }
 
 
+def unified_frame(sequence, value, *, timestamp=None):
+    frame_time = float(value if timestamp is None else timestamp)
+    return {
+        "contract_version": "unified_frame_v1",
+        "capture_uuid": "transport-capture-a",
+        "frame_sequence": sequence,
+        "frame_time": frame_time,
+        "target_monotonic": frame_time,
+        "assembled_monotonic": frame_time,
+        "deadline_missed": False,
+        "channels": {
+            "温度": {
+                "value": value,
+                "unit": "°C",
+                "quality": "measured_new",
+                "source_timestamp": frame_time,
+                "received_timestamp": frame_time,
+                "age_seconds": 0.0,
+                "is_new": True,
+                "interface_id": "temperature",
+                "source_sequence": sequence,
+                "protocol_ok": True,
+                "error": "",
+            }
+        },
+    }
+
+
 class ServerCaptureJournalTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.journal = ServerCaptureJournal(Path(self.temp.name) / "journal.sqlite3", max_capture_bytes=300000)
         self.mirrors = RemoteAcquisitionRegistry(max_rows=24)
-        self.journal.arm("session-a", "selection-a")
+        self.journal.arm(
+            "session-a", "selection-a", config={"selected_sensors": ["温度"]}
+        )
 
     def tearDown(self):
         self.journal.close()
@@ -50,6 +80,81 @@ class ServerCaptureJournalTests(unittest.TestCase):
         self.assertEqual(record.row_count, 3)
         self.assertEqual([row["温度"] for row in record.rows], [0, 1, 2])
         self.assertEqual(record.target_config_id, "selection-a")
+
+    def test_unified_frame_rejection_never_commits_or_becomes_duplicate_ack(self):
+        invalid = sample(0, [1], final=True, count=1)
+        invalid["required_frame_contract"] = "unified_frame_v1"
+        invalid["frames"] = [unified_frame(0, 999, timestamp=1)]
+
+        first = self.journal.ingest("session-a", invalid, self.mirrors)
+        repeated = self.journal.ingest("session-a", invalid, self.mirrors)
+
+        self.assertFalse(first["ok"])
+        self.assertEqual(first["error"], "frame_projection_mismatch")
+        self.assertFalse(repeated["ok"])
+        self.assertNotIn("duplicate", repeated)
+        self.assertIsNone(
+            self.journal.ready_capture("session-a", "transport-capture-a")
+        )
+
+        corrected = sample(0, [1], final=True, count=1)
+        corrected["required_frame_contract"] = "unified_frame_v1"
+        corrected["frames"] = [unified_frame(0, 1)]
+        accepted = self.journal.ingest("session-a", corrected, self.mirrors)
+
+        self.assertTrue(accepted["ok"], accepted)
+        record = self.journal.ready_capture("session-a", "transport-capture-a")
+        self.assertIsNotNone(record)
+        self.assertEqual([row["温度"] for row in record.rows], [1])
+
+    def test_restart_restores_mirror_before_duplicate_and_next_batch(self):
+        for sequence, value in enumerate((1, 2)):
+            current = sample(sequence, [value])
+            current["required_frame_contract"] = "unified_frame_v1"
+            current["frames"] = [unified_frame(sequence, value)]
+            self.assertTrue(
+                self.journal.ingest("session-a", current, self.mirrors)["ok"]
+            )
+
+        restarted_mirrors = RemoteAcquisitionRegistry(max_rows=24)
+        duplicate = sample(1, [2])
+        duplicate["required_frame_contract"] = "unified_frame_v1"
+        duplicate["frames"] = [unified_frame(1, 2)]
+        replay = self.journal.ingest("session-a", duplicate, restarted_mirrors)
+
+        self.assertTrue(replay["ok"], replay)
+        self.assertTrue(replay["duplicate"])
+        self.assertEqual(
+            restarted_mirrors.for_session("session-a").status()[
+                "remote_expected_sequence"
+            ],
+            2,
+        )
+
+        following = sample(2, [3], final=True, count=3)
+        following["required_frame_contract"] = "unified_frame_v1"
+        following["frames"] = [unified_frame(2, 3)]
+        accepted = self.journal.ingest(
+            "session-a", following, restarted_mirrors
+        )
+        self.assertTrue(accepted["ok"], accepted)
+        record = self.journal.ready_capture("session-a", "transport-capture-a")
+        self.assertEqual([row["温度"] for row in record.rows], [1, 2, 3])
+
+    def test_target_journal_enforces_authoritative_channel_unit(self):
+        wrong_unit = sample(0, [1], final=True, count=1)
+        wrong_unit["required_frame_contract"] = "unified_frame_v1"
+        frame = unified_frame(0, 1)
+        frame["channels"]["温度"]["unit"] = "K"
+        wrong_unit["frames"] = [frame]
+
+        rejected = self.journal.ingest("session-a", wrong_unit, self.mirrors)
+
+        self.assertFalse(rejected["ok"])
+        self.assertEqual(rejected["error"], "frame_unit_contract_mismatch")
+        self.assertIsNone(
+            self.journal.ready_capture("session-a", "transport-capture-a")
+        )
 
     def test_more_than_mirror_capacity_remains_in_full_journal(self):
         for index in range(55):

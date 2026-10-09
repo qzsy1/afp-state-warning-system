@@ -8,6 +8,7 @@ import io
 import json
 import math
 import os
+import queue
 import re
 import socket
 import struct
@@ -31,6 +32,16 @@ import pandas as pd
 from mysql_storage import MySQLCaptureStore, MySQLSettings, validate_database_name
 from smrf_hid import SmrfHidDriver, enumerate_smrf_hid_devices
 from simulation_replay import MonotonicReplayScheduler
+from real_acquisition import (
+    AcquisitionQualityMetrics,
+    ChannelQuality,
+    ChannelSample,
+    ChannelSampleCache,
+    DriverWorker,
+    FrameAssembler,
+    UnifiedFrame,
+)
+from local_direct_acquisition import LocalDirectAdapter, minimum_poll_interval
 try:
     from windows_usb_topology import discover_windows_usb_topology
 except ImportError:  # Compatibility with older modular runtimes.
@@ -266,6 +277,101 @@ def check_capture_save_root(path: str | Path | None) -> dict[str, Any]:
                 probe_path.unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+class BoundedCsvWriter:
+    """Single-owner CSV writer with bounded handoff from the sampling loop."""
+
+    _STOP = object()
+
+    def __init__(
+        self,
+        row_writer: Any,
+        timestamp_writer: Any,
+        *,
+        max_queue_rows: int = 1024,
+        submit_timeout_seconds: float = 0.05,
+    ) -> None:
+        self.row_writer = row_writer
+        self.timestamp_writer = timestamp_writer
+        self.submit_timeout_seconds = max(0.0, float(submit_timeout_seconds))
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, int(max_queue_rows)))
+        self._error: BaseException | None = None
+        self._closed = False
+        self.high_water_rows = 0
+        self._thread = threading.Thread(
+            target=self._run,
+            name="AFP-PersistenceWriter",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            try:
+                if item is self._STOP:
+                    return
+                if self._error is None:
+                    row, timestamp = item
+                    self.row_writer.writerow(row)
+                    self.timestamp_writer.writerow(timestamp)
+            except BaseException as exc:
+                self._error = exc
+            finally:
+                self._queue.task_done()
+
+    def _raise_error(self) -> None:
+        if self._error is not None:
+            raise RuntimeError(f"persistence_write_failed: {self._error}") from self._error
+
+    def submit(self, row: dict[str, Any], timestamp: dict[str, Any]) -> None:
+        if self._closed:
+            raise RuntimeError("persistence_writer_closed")
+        self._raise_error()
+        try:
+            self._queue.put(
+                (dict(row), dict(timestamp)),
+                timeout=self.submit_timeout_seconds,
+            )
+            self.high_water_rows = max(self.high_water_rows, self._queue.qsize())
+        except queue.Full as exc:
+            raise RuntimeError("persistence_queue_overflow") from exc
+        self._raise_error()
+
+    @property
+    def pending_rows(self) -> int:
+        return self._queue.qsize()
+
+    def close(self, *, timeout_seconds: float = 5.0) -> None:
+        if not self._closed:
+            self._closed = True
+            deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("persistence_writer_stop_timeout")
+                try:
+                    self._queue.put(self._STOP, timeout=min(0.05, remaining))
+                    break
+                except queue.Full:
+                    continue
+            self._thread.join(max(0.0, deadline - time.monotonic()))
+            if self._thread.is_alive():
+                raise RuntimeError("persistence_writer_stop_timeout")
+        self._raise_error()
+
+
+class _DiscardTextIO(io.TextIOBase):
+    """Writable zero-retention sink used by bounded engineering previews."""
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, value: str) -> int:
+        return len(value)
+
+
 BSV_UVC_WIDTH = 256
 BSV_UVC_HEIGHT = 192
 BSV_UVC_PIXELS = BSV_UVC_WIDTH * BSV_UVC_HEIGHT
@@ -734,6 +840,15 @@ class AcquisitionConfig:
     root: str = "LIVE"
     source_file: str = ""
     save_root: str = ""
+    # Real acquisition must either prove a durable destination or explicitly
+    # opt into a bounded, non-production engineering preview.
+    persistence_policy: str = "required"
+    writer_queue_rows: int = 1024
+    writer_submit_timeout_seconds: float = 0.05
+    writer_stop_timeout_seconds: float = 5.0
+    stop_sampling_timeout_seconds: float = 5.0
+    stop_force_timeout_seconds: float = 2.0
+    first_sample_timeout_seconds: float = 3.0
     initial_compaction_force_N: float = 400.0
     placement_speed_mm_s: float = 80.0
     pid_angle_deg: float = 5.0
@@ -743,6 +858,13 @@ class AcquisitionConfig:
     # Empty keeps backward compatibility with older callers: a simulator
     # driver implies simulation, while serial/TCP implies real interfaces.
     acquisition_mode: str = ""
+    # Orthogonal to acquisition_mode: real captures explicitly choose where
+    # the physical drivers live.  The dataclass default preserves direct
+    # constructor compatibility; external payload builders enforce presence.
+    real_acquisition_mode: str = "local_direct"
+    execution_host: str = ""
+    helper_session_id: str = ""
+    helper_capabilities: dict[str, Any] | None = None
     simulation_source_type: str = "single_csv"
     simulation_source_path: str = ""
     simulation_mysql_query: str = ""
@@ -783,6 +905,57 @@ class AcquisitionConfig:
         self.acquisition_mode = requested_mode
         if self.acquisition_mode not in {"real", "simulation"}:
             raise ValueError("acquisition_mode must be real or simulation")
+        self.real_acquisition_mode = str(self.real_acquisition_mode or "").strip().lower()
+        self.execution_host = str(self.execution_host or "").strip().lower()
+        self.helper_session_id = str(self.helper_session_id or "").strip()
+        self.helper_capabilities = dict(self.helper_capabilities or {})
+        self.persistence_policy = str(self.persistence_policy or "required").strip().lower()
+        self.writer_queue_rows = max(1, min(int(self.writer_queue_rows or 1024), 200000))
+        self.writer_submit_timeout_seconds = max(
+            0.0, min(float(self.writer_submit_timeout_seconds or 0.0), 5.0)
+        )
+        self.writer_stop_timeout_seconds = max(
+            0.001, min(float(self.writer_stop_timeout_seconds or 5.0), 60.0)
+        )
+        self.stop_sampling_timeout_seconds = max(
+            0.001, min(float(self.stop_sampling_timeout_seconds or 5.0), 60.0)
+        )
+        self.stop_force_timeout_seconds = max(
+            0.001, min(float(self.stop_force_timeout_seconds or 2.0), 30.0)
+        )
+        self.first_sample_timeout_seconds = max(
+            0.01, min(float(self.first_sample_timeout_seconds or 3.0), 30.0)
+        )
+        if self.acquisition_mode == "simulation":
+            self.real_acquisition_mode = ""
+            if self.persistence_policy == "required":
+                self.persistence_policy = "optional"
+        else:
+            if self.persistence_policy not in {"required", "engineering_preview"}:
+                raise ValueError(
+                    "persistence_policy must be required or engineering_preview for real capture"
+                )
+            if self.real_acquisition_mode not in {"local_direct", "remote_helper"}:
+                raise ValueError(
+                    "real_acquisition_mode must be local_direct or remote_helper"
+                )
+            remote_fields_present = bool(
+                self.helper_session_id
+                or self.helper_capabilities
+                or self.execution_host == "helper_local"
+            )
+            if self.real_acquisition_mode == "local_direct" and remote_fields_present:
+                raise ValueError(
+                    "mode_field_conflict: local_direct cannot use Helper session, "
+                    "capability, or helper_local execution fields"
+                )
+            if (
+                self.real_acquisition_mode == "remote_helper"
+                and self.execution_host != "helper_local"
+            ):
+                raise ValueError(
+                    "mode_field_conflict: remote_helper requires execution_host=helper_local"
+                )
         self.simulation_source_type = str(self.simulation_source_type or "single_csv").lower()
         if self.simulation_source_type not in {"single_csv", "folder_csv", "mysql"}:
             raise ValueError("simulation_source_type must be single_csv, folder_csv or mysql")
@@ -1081,7 +1254,6 @@ class AcquisitionConfig:
 
 ACQUISITION_TRANSPORT_METADATA_FIELDS = frozenset(
     {
-        "execution_host",
         "simulation_execution_choice",
         "simulation_source_id",
         "simulation_source_ready",
@@ -1097,6 +1269,14 @@ def acquisition_config_from_payload(payload: dict[str, Any] | None) -> Acquisiti
     dataclass raises instead of silently accepting a misspelled configuration.
     """
     values = dict(payload or {})
+    requested_mode = str(values.get("acquisition_mode") or "").strip().lower()
+    requested_driver = str(values.get("driver") or "simulator").strip().lower()
+    if (requested_mode == "real" or (not requested_mode and requested_driver != "simulator")) and not str(
+        values.get("real_acquisition_mode") or ""
+    ).strip():
+        raise ValueError(
+            "real_acquisition_mode is required for external real acquisition configuration"
+        )
     for field_name in ACQUISITION_TRANSPORT_METADATA_FIELDS:
         values.pop(field_name, None)
     return AcquisitionConfig(**values)
@@ -1104,6 +1284,14 @@ def acquisition_config_from_payload(payload: dict[str, Any] | None) -> Acquisiti
 
 def acquisition_diagnostic_config_from_payload(payload: dict[str, Any] | None) -> AcquisitionConfig:
     values = dict(payload or {})
+    requested_mode = str(values.get("acquisition_mode") or "").strip().lower()
+    requested_driver = str(values.get("driver") or "simulator").strip().lower()
+    if (requested_mode == "real" or (not requested_mode and requested_driver != "simulator")) and not str(
+        values.get("real_acquisition_mode") or ""
+    ).strip():
+        raise ValueError(
+            "real_acquisition_mode is required for external real acquisition configuration"
+        )
     for field_name in ACQUISITION_TRANSPORT_METADATA_FIELDS:
         values.pop(field_name, None)
     values.pop("diagnostic_validation", None)
@@ -1674,10 +1862,27 @@ class ModbusTcpDriver(SampleDriver):
         )
         self.sock.sendall(request)
         header = self._recv_exact(7)
-        if len(header) < 7:
+        if len(header) != 7:
             raise IOError("Modbus TCP 响应头不完整")
-        _, _, length, _unit = struct.unpack(">HHHB", header)
-        pdu = self._recv_exact(length)
+        transaction_id, protocol_id, length, unit_id = struct.unpack(">HHHB", header)
+        if transaction_id != self._transaction_id:
+            raise IOError(
+                f"Modbus TCP 事务ID不匹配：期望{self._transaction_id}，收到{transaction_id}"
+            )
+        if protocol_id != 0:
+            raise IOError(f"Modbus TCP 协议ID无效：{protocol_id}")
+        if unit_id != self.slave_id:
+            raise IOError(
+                f"Modbus TCP Unit ID不匹配：期望{self.slave_id}，收到{unit_id}"
+            )
+        if length < 2:
+            raise IOError(f"Modbus TCP MBAP长度无效：{length}")
+        pdu_length = length - 1
+        pdu = self._recv_exact(pdu_length)
+        if len(pdu) != pdu_length:
+            raise IOError(
+                f"Modbus TCP 响应PDU不完整：期望{pdu_length}字节，收到{len(pdu)}字节"
+            )
         if len(pdu) < 2:
             raise IOError("Modbus TCP 响应PDU不完整")
         function_code = pdu[0]
@@ -1687,13 +1892,33 @@ class ModbusTcpDriver(SampleDriver):
                 f"Modbus 异常响应: 功能码={function_code:#x}, "
                 f"异常码={exception_code:#x}"
             )
+        if function_code != 3:
+            raise IOError(
+                f"Modbus TCP 功能码不匹配：期望0x03，收到{function_code:#x}"
+            )
         byte_count = pdu[1]
-        register_data = pdu[2:2 + byte_count]
-        return [
+        if byte_count % 2:
+            raise IOError(f"Modbus TCP 字节数必须为偶数：{byte_count}")
+        expected_byte_count = int(quantity) * 2
+        if byte_count != expected_byte_count:
+            raise IOError(
+                f"Modbus TCP 寄存器数量不匹配：期望{quantity}个，收到{byte_count // 2}个"
+            )
+        if len(pdu) != 2 + byte_count:
+            raise IOError(
+                f"Modbus TCP PDU长度不匹配：声明{byte_count}数据字节，"
+                f"实际{max(0, len(pdu) - 2)}字节"
+            )
+        register_data = pdu[2:]
+        registers = [
             struct.unpack(">H", register_data[index:index + 2])[0]
             for index in range(0, len(register_data), 2)
-            if len(register_data[index:index + 2]) == 2
         ]
+        if len(registers) != int(quantity):
+            raise IOError(
+                f"Modbus TCP 寄存器数量不匹配：期望{quantity}个，收到{len(registers)}个"
+            )
+        return registers
 
     @staticmethod
     def _registers_to_float(low_word: int, high_word: int) -> float:
@@ -2188,13 +2413,15 @@ class M3232PressureDriver(SampleDriver):
 
 
 class MultiInterfaceDriver(SampleDriver):
-    """Read several physical interfaces and merge one time slice."""
+    """Run physical interfaces independently and expose their latest samples."""
     def __init__(self, configs: list[dict[str, Any]], selected_sensors: list[str], source_file: str = "", assignments: dict[str, list[str]] | None = None) -> None:
         self.configs = [item for item in configs if item.get("enabled", True)]
         self.selected_sensors = selected_sensors
         self.source_file = source_file
         self.assignments = assignments or {}
         self.drivers: list[SampleDriver] = []
+        self.cache = ChannelSampleCache(max_events=max(128, len(selected_sensors) * 64))
+        self.workers: list[LocalDirectAdapter] = []
 
     def open(self) -> None:
         self.drivers = []
@@ -2252,30 +2479,69 @@ class MultiInterfaceDriver(SampleDriver):
                     driver = SimulatorDriver(Path(self.source_file or DEFAULT_SIMULATOR_FILE), self.selected_sensors)
                 else:
                     raise ValueError(f"unsupported interface driver: {driver_name}")
-                driver.open()
                 self.drivers.append(driver)
+                interface_id = str(item.get("id") or f"interface_{len(self.drivers)}")
+                allowed = self.assignments.get(interface_id)
+                if allowed is None:
+                    allowed = list(self.selected_sensors)
+                requested_poll = float(item.get("poll_interval_seconds") or 0.002)
+                worker = LocalDirectAdapter(
+                    interface_id,
+                    driver,
+                    allowed,
+                    self.cache,
+                    poll_interval_seconds=requested_poll,
+                    minimum_poll_seconds=minimum_poll_interval(driver_name),
+                    reconnect_backoff_seconds=float(
+                        item.get("reconnect_backoff_seconds") or 0.05
+                    ),
+                    max_reconnect_backoff_seconds=float(
+                        item.get("max_reconnect_backoff_seconds") or 1.0
+                    ),
+                    max_reconnect_attempts=int(item.get("max_reconnect_attempts") or 5),
+                )
+                self.workers.append(worker)
+                worker.start()
+            for worker in self.workers:
+                open_deadline = time.monotonic() + 2.5
+                while (
+                    not worker.opened.is_set()
+                    and worker.thread is not None
+                    and worker.thread.is_alive()
+                    and time.monotonic() < open_deadline
+                ):
+                    worker.opened.wait(0.02)
+                if not worker.opened.is_set():
+                    if worker.last_error:
+                        raise RuntimeError(
+                            f"接口{worker.interface_id}打开失败：{worker.last_error}"
+                        )
+                    raise TimeoutError(f"接口{worker.interface_id}在2.5秒内未完成打开")
+                if worker.state == "failed" or (
+                    worker.thread is not None and not worker.thread.is_alive()
+                ):
+                    raise RuntimeError(
+                        f"接口{worker.interface_id}打开失败：{worker.last_error}"
+                    )
         except Exception:
             self.close()
             raise
 
     def read_sample(self) -> dict[str, float] | None:
-        merged: dict[str, float] = {}
-        for index, driver in enumerate(self.drivers):
-            sample = driver.read_sample()
-            if sample:
-                interface_id = self.configs[index].get("id") if index < len(self.configs) else None
-                allowed = self.assignments.get(str(interface_id))
-                if allowed is not None:
-                    sample = {name: value for name, value in sample.items() if name in allowed}
-                merged.update(sample)
+        merged = {
+            name: sample.value
+            for name, sample in self.cache.snapshot().items()
+            if sample.value is not None and name in self.selected_sensors
+        }
         return merged or None
 
+    def worker_status(self) -> list[dict[str, Any]]:
+        return [worker.status() for worker in self.workers]
+
     def close(self) -> None:
-        for driver in self.drivers:
-            try:
-                driver.close()
-            except Exception:
-                pass
+        for worker in self.workers:
+            worker.stop(timeout_seconds=0.5)
+        self.workers = []
         self.drivers = []
 
 
@@ -2334,6 +2600,22 @@ def build_driver(config: AcquisitionConfig) -> SampleDriver:
             int(getattr(config, "matrix_cols", 0) or 0),
         )
     raise ValueError(f"不支持的采集驱动：{config.driver}")
+
+
+def _freshness_by_channel(config: AcquisitionConfig) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for item in config.interfaces or []:
+        if not item.get("enabled", True):
+            continue
+        interface_id = str(item.get("id") or "")
+        freshness = max(
+            0.0,
+            float(item.get("freshness_seconds") or (2.5 / config.sample_rate_hz)),
+        )
+        for channel in config.interface_channel_assignments.get(interface_id, []):
+            if channel in (config.selected_sensors or []):
+                result[channel] = freshness
+    return result
 
 
 def _parameter_result_template() -> list[dict[str, Any]]:
@@ -2515,6 +2797,9 @@ class AcquisitionManager:
         self.config: AcquisitionConfig | None = None
         self.rows: deque[dict[str, Any]] = deque(maxlen=200000)
         self.timestamps: deque[float] = deque(maxlen=200000)
+        self.frame_quality: deque[dict[str, str]] = deque(maxlen=200000)
+        self.frame_envelopes: deque[dict[str, Any]] = deque(maxlen=200000)
+        self.quality_metrics: AcquisitionQualityMetrics | None = None
         self.total_sample_count = 0
         self.sensor_received = {name: 0 for name in ALL_SENSOR_COLUMNS}
         self.sensor_last_time = {name: None for name in ALL_SENSOR_COLUMNS}
@@ -2544,6 +2829,10 @@ class AcquisitionManager:
         self.specimen_folder_name = ""
         self.capture_saved = False
         self.save_enabled = False
+        self.capture_phase = "idle"
+        self.persistence_failed = False
+        self.persistence_queue_depth = 0
+        self.persistence_queue_high_water_rows = 0
         self.save_status: dict[str, Any] = check_capture_save_root(self.capture_root)
         self.finalization_complete = False
         self.last_data_quality: dict[str, Any] | None = None
@@ -3280,6 +3569,8 @@ class AcquisitionManager:
                 or str(config.capture_uuid or "").strip()
             )
         if not capture_uuid:
+            capture_uuid = str(config.capture_uuid or "").strip()
+        if not capture_uuid:
             capture_uuid = (
                 f"AFP-{datetime.now().strftime('%Y%m%dT%H%M%S')}-"
                 f"{uuid.uuid4().hex[:8]}"
@@ -3466,6 +3757,14 @@ class AcquisitionManager:
             if self.thread is not None and self.thread.is_alive():
                 raise RuntimeError("采集已经在运行")
             if (
+                not self.finalization_complete
+                and self.capture_phase in {"database_pending_retry", "finalization_failed"}
+            ):
+                raise RuntimeError(
+                    f"previous_capture_{self.capture_phase}: "
+                    "上一采集仍有未完成的持久化收尾，必须先处理后再开始新采集"
+                )
+            if (
                 self.thread is not None
                 and self.config is not None
                 and not self.finalization_complete
@@ -3486,6 +3785,11 @@ class AcquisitionManager:
             }
             self.rows.clear()
             self.timestamps.clear()
+            self.frame_quality.clear()
+            self.frame_envelopes.clear()
+            self.quality_metrics = AcquisitionQualityMetrics(
+                config.selected_sensors or [], config.sample_rate_hz
+            )
             self.total_sample_count = 0
             self.sensor_received = {
                 name: 0 for name in ALL_SENSOR_COLUMNS
@@ -3509,7 +3813,73 @@ class AcquisitionManager:
             self.specimen_folder_name = ""
             self.capture_saved = False
             self.save_enabled = False
+            self.capture_phase = "starting"
+            self.persistence_failed = False
+            self.persistence_queue_depth = 0
+            self.persistence_queue_high_water_rows = 0
             self.save_status = check_capture_save_root(config.save_root)
+            mysql_preflight: dict[str, Any] = {}
+            preflight_destinations = (
+                self._mysql_destinations(config)
+                if config.acquisition_mode == "real"
+                else []
+            )
+            for destination_name, settings in preflight_destinations:
+                result = MySQLCaptureStore(settings).preflight(write_test=True)
+                mysql_preflight[destination_name] = result
+                if not result.get("ok"):
+                    self.last_error = (
+                        f"mysql_preflight_failed: {destination_name}: "
+                        f"{result.get('error') or result.get('stage') or 'unknown error'}"
+                    )
+                    self.mysql_status = {
+                        "enabled": True,
+                        "ok": False,
+                        "state": "preflight_failed",
+                        "preflight": mysql_preflight,
+                        "error": self.last_error,
+                        "saved_rows": 0,
+                    }
+                    self.finalization_complete = True
+                    raise RuntimeError(self.last_error)
+            if mysql_preflight:
+                self.mysql_status["preflight"] = mysql_preflight
+            if preflight_destinations and not self.save_status["ok"]:
+                # A database can disappear after preflight.  Real MySQL-only
+                # captures therefore stream to the manager's local durable
+                # root so the complete layer remains retryable instead of
+                # depending on the bounded live deque.
+                requested_save_status = dict(self.save_status)
+                retry_spool = check_capture_save_root(self.capture_root)
+                if not retry_spool.get("ok"):
+                    self.last_error = (
+                        "persistence_retry_spool_unavailable: "
+                        + str(retry_spool.get("message") or "unknown error")
+                    )
+                    self.finalization_complete = True
+                    raise RuntimeError(self.last_error)
+                self.save_status = {
+                    **retry_spool,
+                    "retry_spool": True,
+                    "requested_save_status": requested_save_status,
+                    "message": "MySQL正式采集使用本机耐久重试暂存目录",
+                }
+            durable_destination = bool(
+                self.save_status["ok"]
+                or config.mysql_enabled
+                or config.mysql_local_enabled
+            )
+            if (
+                config.acquisition_mode == "real"
+                and config.persistence_policy == "required"
+                and not durable_destination
+            ):
+                self.last_error = (
+                    "persistence_required: real capture requires a writable save root "
+                    "or an enabled durable MySQL destination"
+                )
+                self.finalization_complete = True
+                raise RuntimeError(self.last_error)
             self.finalization_complete = False
             self.full_specimen_path = None
             self.completed_layers = []
@@ -3538,6 +3908,14 @@ class AcquisitionManager:
                 self.session_dir = selected_root / specimen_folder_name
                 self.capture_record_dir = self.session_dir / "采集记录"
                 self.capture_record_dir.mkdir(parents=True, exist_ok=True)
+                probe_path = self.capture_record_dir / f".{stamp}.write-probe"
+                try:
+                    with probe_path.open("xb") as probe:
+                        probe.write(b"afp-persistence-probe")
+                        probe.flush()
+                        os.fsync(probe.fileno())
+                finally:
+                    probe_path.unlink(missing_ok=True)
                 self.timestamp_path = self.capture_record_dir / (
                     f"{specimen_folder_name}_第{config.layer + 1}层_"
                     f"{stamp}_时间戳.csv"
@@ -3560,6 +3938,11 @@ class AcquisitionManager:
                 # Keep the acquisition stream and predictions usable while
                 # routing all file output to memory for this run.
                 self.raw_path = None
+                self.capture_uuid = str(config.capture_uuid or "").strip() or (
+                    f"AFP-{datetime.now().strftime('%Y%m%dT%H%M%S')}-"
+                    f"{uuid.uuid4().hex[:8]}"
+                )
+                config.capture_uuid = self.capture_uuid
             self.driver = build_driver(config)
             try:
                 self.driver.open()
@@ -3611,6 +3994,39 @@ class AcquisitionManager:
                 daemon=True,
             )
             self.thread.start()
+            self.capture_phase = (
+                "waiting_first_sample"
+                if config.acquisition_mode == "real"
+                else "running"
+            )
+        if config.acquisition_mode == "real":
+            required_channels = set(config.selected_sensors or [])
+            observed: set[str] = set()
+            deadline = time.monotonic() + config.first_sample_timeout_seconds
+            while time.monotonic() < deadline:
+                with self.lock:
+                    observed = {
+                        name for name in required_channels
+                        if self.channel_observed.get(name, 0) > 0
+                    }
+                    alive = self.thread is not None and self.thread.is_alive()
+                if observed == required_channels:
+                    self.capture_phase = "running"
+                    break
+                if not alive:
+                    break
+                self.wait_for_stream_activity(min(0.05, max(0.0, deadline - time.monotonic())))
+            if required_channels and observed != required_channels:
+                missing = sorted(required_channels - observed)
+                self.last_error = "first_sample_timeout: " + ", ".join(missing)
+                self.capture_phase = "start_failed"
+                self.stop_event.set()
+                if self.driver is not None:
+                    self.driver.close()
+                if self.thread is not None:
+                    self.thread.join(timeout=config.stop_force_timeout_seconds)
+                self.finalization_complete = False
+                raise RuntimeError(self.last_error)
         return self.status()
 
     def _archive_existing(self, path: Path, category: str) -> Path | None:
@@ -3683,17 +4099,24 @@ class AcquisitionManager:
 
     def _run(self) -> None:
         config = self.config
+        if not str(self.capture_uuid or "").strip():
+            self.capture_uuid = str(config.capture_uuid or "").strip() or (
+                f"AFP-{datetime.now().strftime('%Y%m%dT%H%M%S')}-"
+                f"{uuid.uuid4().hex[:8]}"
+            )
+            config.capture_uuid = self.capture_uuid
         selected = set(config.selected_sensors or [])
         raw_target = (
             self.raw_work_path
             if self.save_enabled and self.raw_work_path is not None
-            else io.StringIO()
+            else _DiscardTextIO()
         )
         timestamp_target = (
             self.timestamp_work_path
             if self.save_enabled and self.timestamp_work_path is not None
-            else io.StringIO()
+            else _DiscardTextIO()
         )
+        capture_writer: BoundedCsvWriter | None = None
         try:
             raw_context = (
                 raw_target.open("w", encoding="gb18030", newline="")
@@ -3713,12 +4136,24 @@ class AcquisitionManager:
                     time_file,
                     fieldnames=[
                         "row_index",
+                        "frame_sequence",
                         "timestamp_iso",
                         "timestamp_unix",
+                        "target_monotonic",
+                        "deadline_missed",
+                        "channel_quality_json",
+                        "channel_source_time_json",
+                        "channel_age_seconds_json",
                     ],
                 )
                 writer.writeheader()
                 timestamp_writer.writeheader()
+                capture_writer = BoundedCsvWriter(
+                    writer,
+                    timestamp_writer,
+                    max_queue_rows=config.writer_queue_rows,
+                    submit_timeout_seconds=config.writer_submit_timeout_seconds,
+                )
                 replay_scheduler = (
                     MonotonicReplayScheduler(
                         config.sample_rate_hz,
@@ -3728,26 +4163,85 @@ class AcquisitionManager:
                     if config.driver == "simulator" or config.acquisition_mode == "simulation"
                     else None
                 )
-                empty_since: float | None = None
+                frame_assembler = (
+                    FrameAssembler(
+                        config.selected_sensors or [],
+                        config.sample_rate_hz,
+                        _freshness_by_channel(config),
+                        clock=time.monotonic,
+                        wall_clock=time.time,
+                        wait=self.stop_event.wait,
+                    )
+                    if config.acquisition_mode == "real"
+                    else None
+                )
                 while not self.stop_event.is_set():
-                    try:
-                        sample = self.driver.read_sample()
-                    except Exception as exc:
-                        self.last_error = str(exc)
-                        break
-                    observed_now = time.time()
-                    if sample:
+                    frame: UnifiedFrame | None = None
+                    quality: dict[str, str] = {}
+                    source_times: dict[str, float | None] = {}
+                    ages: dict[str, float | None] = {}
+                    if frame_assembler is not None:
+                        deadline = frame_assembler.wait_next_deadline(self.stop_event)
+                        if self.stop_event.is_set():
+                            break
+                        if not isinstance(self.driver, MultiInterfaceDriver):
+                            raise RuntimeError("真实采集必须使用独立DriverWorker内核")
+                        frame = frame_assembler.assemble(self.driver.cache, deadline)
+                        sample = {
+                            name: channel.value
+                            for name, channel in frame.channels.items()
+                            if channel.value is not None
+                            and channel.quality
+                            not in {ChannelQuality.MISSING, ChannelQuality.INVALID}
+                        }
+                        quality = frame.quality()
+                        source_times = {
+                            name: channel.received_wall_time
+                            if channel.interface_id
+                            else None
+                            for name, channel in frame.channels.items()
+                        }
+                        ages = {
+                            name: _finite(channel.metadata.get("age_seconds"))
+                            for name, channel in frame.channels.items()
+                        }
+                        now = frame.target_wall_time
+                        if self.quality_metrics is not None:
+                            self.quality_metrics.observe(frame)
                         with self.lock:
-                            for name, value in sample.items():
-                                if name in self.channel_observed and _finite(value) is not None:
+                            for name, channel in frame.channels.items():
+                                if channel.quality == ChannelQuality.MEASURED_NEW:
                                     self.channel_observed[name] += 1
-                                    self.channel_last_observed[name] = observed_now
+                                    self.channel_last_observed[name] = channel.received_wall_time
+                    else:
+                        try:
+                            sample = self.driver.read_sample()
+                        except Exception as exc:
+                            self.last_error = str(exc)
+                            break
+                        now = time.time()
+                        if sample:
+                            with self.lock:
+                                for name, value in sample.items():
+                                    if name in self.channel_observed and _finite(value) is not None:
+                                        self.channel_observed[name] += 1
+                                        self.channel_last_observed[name] = now
+                        quality = {
+                            name: (
+                                ChannelQuality.MEASURED_NEW.value
+                                if _finite(sample.get(name)) is not None
+                                else ChannelQuality.MISSING.value
+                            )
+                            for name in selected
+                        }
                     valid_sample = bool(sample) and any(
                         _finite(sample.get(name)) is not None for name in selected
                     )
-                    if valid_sample:
-                        empty_since = None
-                        now = time.time()
+                    # A real unified frame is persisted even when every channel
+                    # is missing; dropping it would hide timing and continuity
+                    # failures.  Simulation retains the legacy end-of-source
+                    # behavior.
+                    if valid_sample or frame is not None:
                         row_index = int(self.total_sample_count)
                         row = {
                             name: sample.get(name, "")
@@ -3793,38 +4287,99 @@ class AcquisitionManager:
                                     "试件": config.specimen_id,
                                 }
                             )
-                        writer.writerow(row)
-                        timestamp_writer.writerow(
-                            {
-                                "row_index": row_index,
-                                "timestamp_iso": datetime.fromtimestamp(now).isoformat(
-                                    timespec="milliseconds"
-                                ),
-                                "timestamp_unix": f"{now:.6f}",
-                            }
+                        timestamp_row = {
+                            "row_index": row_index,
+                            "frame_sequence": (
+                                frame.capture_sequence if frame is not None else row_index
+                            ),
+                            "timestamp_iso": datetime.fromtimestamp(now).isoformat(
+                                timespec="milliseconds"
+                            ),
+                            "timestamp_unix": f"{now:.6f}",
+                            "target_monotonic": (
+                                f"{frame.target_monotonic:.9f}" if frame is not None else ""
+                            ),
+                            "deadline_missed": bool(
+                                frame.deadline_missed if frame is not None else False
+                            ),
+                            "channel_quality_json": json.dumps(
+                                quality, ensure_ascii=False, separators=(",", ":")
+                            ),
+                            "channel_source_time_json": json.dumps(
+                                source_times, ensure_ascii=False, separators=(",", ":")
+                            ),
+                            "channel_age_seconds_json": json.dumps(
+                                ages, ensure_ascii=False, separators=(",", ":")
+                            ),
+                        }
+                        capture_writer.submit(row, timestamp_row)
+                        self.persistence_queue_depth = capture_writer.pending_rows
+                        self.persistence_queue_high_water_rows = max(
+                            self.persistence_queue_high_water_rows,
+                            capture_writer.high_water_rows,
                         )
-                        raw_file.flush()
-                        time_file.flush()
+                        if frame is None:
+                            target_monotonic = time.monotonic()
+                            frame = UnifiedFrame(
+                                capture_sequence=row_index,
+                                target_monotonic=target_monotonic,
+                                target_wall_time=now,
+                                channels={
+                                    name: ChannelSample(
+                                        interface_id="simulation",
+                                        channel_name=name,
+                                        value=row.get(name),
+                                        quality=ChannelQuality(
+                                            quality.get(name, ChannelQuality.MISSING.value)
+                                        ),
+                                        received_wall_time=now,
+                                        received_monotonic=target_monotonic,
+                                        source_sequence=row_index,
+                                        metadata={"age_seconds": 0.0},
+                                    )
+                                    for name in config.selected_sensors
+                                },
+                                assembled_monotonic=target_monotonic,
+                            )
+                        envelope = frame.to_envelope(
+                            self.capture_uuid or config.capture_uuid,
+                            {
+                                name: str(
+                                    (SENSOR_CHANNEL_METADATA.get(name) or {}).get("unit")
+                                    or ""
+                                )
+                                for name in config.selected_sensors
+                            },
+                        )
                         with self.lock:
                             self.total_sample_count += 1
                             self.rows.append(row)
                             self.timestamps.append(now)
+                            self.frame_quality.append(quality)
+                            self.frame_envelopes.append(envelope)
                             for name in selected:
                                 if _finite(row.get(name)) is not None:
                                     self.sensor_received[name] += 1
                                     self.sensor_last_time[name] = now
                             self._stream_activity.notify_all()
-                    elif config.acquisition_mode == "real":
-                        if empty_since is None:
-                            empty_since = time.monotonic()
-                        elif time.monotonic() - empty_since >= 3.0:
-                            self.last_error = "没有连接到传感器，3秒内没有检测到有效采集数据；请检查接口、串口和数据格式"
-                            break
-                        time.sleep(0.005)
                     if replay_scheduler is not None:
                         replay_scheduler.wait_next()
+                capture_writer.close(timeout_seconds=config.writer_stop_timeout_seconds)
+                self.persistence_queue_depth = 0
+                raw_file.flush()
+                time_file.flush()
+                if self.save_enabled:
+                    os.fsync(raw_file.fileno())
+                    os.fsync(time_file.fileno())
         except Exception as exc:
             self.last_error = str(exc)
+            self.persistence_failed = bool(self.save_enabled)
+            if capture_writer is not None:
+                try:
+                    capture_writer.close(timeout_seconds=config.writer_stop_timeout_seconds)
+                except Exception as close_exc:
+                    if str(close_exc) not in self.last_error:
+                        self.last_error = f"{self.last_error}; {close_exc}".strip("; ")
         finally:
             try:
                 if self.driver is not None:
@@ -3997,18 +4552,41 @@ class AcquisitionManager:
                     "enabled": True,
                 }
             )
-        retry_root = Path(
-            root
-            or (active_config.save_root if active_config is not None else "")
-            or self.capture_root
-        ).expanduser()
+        if root is not None:
+            retry_root = Path(root).expanduser()
+        elif self.save_status.get("retry_spool") and self.save_status.get("path"):
+            retry_root = Path(str(self.save_status["path"])).expanduser()
+        else:
+            retry_root = Path(
+                (active_config.save_root if active_config is not None else "")
+                or self.capture_root
+            ).expanduser()
         result = self._retry_pending_mysql(
             settings, retry_root, limit=max(1, min(int(limit), 1000))
+        )
+        current_pending = False
+        if self.capture_uuid:
+            for pending_path in retry_root.rglob("*_mysql*_pending.json"):
+                payload = self._read_json(pending_path)
+                summary = payload.get("summary")
+                if (
+                    isinstance(summary, dict)
+                    and str(summary.get("capture_uuid") or "") == self.capture_uuid
+                ):
+                    current_pending = True
+                    break
+        current_capture_synced = bool(
+            self.capture_phase == "database_pending_retry"
+            and int(result.get("attempted", 0)) > 0
+            and int(result.get("failed", 0)) == 0
+            and not result.get("connection_error")
+            and not current_pending
         )
         with self.lock:
             self.mysql_status = {
                 **self.mysql_status,
                 "enabled": True,
+                "ok": True if current_capture_synced else self.mysql_status.get("ok"),
                 "database": settings.database,
                 "host": settings.host,
                 "pending_retry": result,
@@ -4019,6 +4597,11 @@ class AcquisitionManager:
                     else "pending"
                 ),
             }
+            if current_capture_synced:
+                self.finalization_complete = True
+                self.capture_phase = "completed"
+                if "database" in self.last_error.lower() or "mysql" in self.last_error.lower():
+                    self.last_error = ""
         return result
 
     @staticmethod
@@ -4066,39 +4649,73 @@ class AcquisitionManager:
             return self._stop_active()
 
     def _stop_active(self) -> dict:
+        if (
+            not self.finalization_complete
+            and self.capture_phase in {"database_pending_retry", "finalization_failed"}
+        ):
+            return self.status()
+        self.capture_phase = "stopping_sampling"
         self.stop_event.set()
         thread = self.thread
         if thread is not None:
-            thread.join(timeout=5.0)
+            sampling_timeout = (
+                self.config.stop_sampling_timeout_seconds if self.config else 5.0
+            )
+            force_timeout = (
+                self.config.stop_force_timeout_seconds if self.config else 2.0
+            )
+            thread.join(timeout=sampling_timeout)
             if thread.is_alive() and self.driver is not None:
                 try:
                     self.driver.close()
                 except Exception:
                     pass
-                thread.join(timeout=2.0)
+                thread.join(timeout=force_timeout)
             if thread.is_alive():
                 self.last_error = (
                     self.last_error
-                    or "采集接口未能及时停止，工作文件已保留，尚未生成最终层文件"
+                    or "stop_timeout: 采集接口未能及时停止，工作文件已保留，尚未生成最终层文件"
                 )
+                self.capture_phase = "stop_timed_out"
                 return self.status()
+        self.capture_phase = "finalizing"
         with self.lock:
             if self.finalization_complete:
+                self.capture_phase = "completed"
                 return self.status()
             if self.config is None:
                 self.capture_saved = False
                 self.finalization_complete = True
+                self.capture_phase = "completed"
                 return self.status()
             mysql_destinations = self._mysql_destinations(self.config)
             if not self.save_enabled and not mysql_destinations:
                 self.capture_saved = False
                 self.finalization_complete = True
+                self.capture_phase = "completed"
                 return self.status()
             # CSV output is optional.  When its directory is empty or
             # unavailable, still finalize an enabled MySQL destination from
             # the in-memory rows collected during this run.
             if not self.save_enabled and self.session_dir is None:
                 rows = list(self.rows)
+                if self.total_sample_count != len(rows):
+                    self.last_error = (
+                        "buffer_reconciliation_failed: in-memory row count "
+                        f"{len(rows)} does not match captured sample count "
+                        f"{self.total_sample_count}; database save was not attempted"
+                    )
+                    self.mysql_status = {
+                        "enabled": True,
+                        "ok": False,
+                        "state": "incomplete_buffer",
+                        "saved_rows": 0,
+                        "error": self.last_error,
+                    }
+                    self.capture_saved = False
+                    self.finalization_complete = False
+                    self.capture_phase = "finalization_failed"
+                    return self.status()
                 destination_results: dict[str, Any] = {}
                 for destination_name, settings in mysql_destinations:
                     saved = MySQLCaptureStore(settings).save_layer(
@@ -4135,7 +4752,13 @@ class AcquisitionManager:
                     ),
                 }
                 self.capture_saved = False
-                self.finalization_complete = True
+                database_pending_retry = bool(failed)
+                self.finalization_complete = not database_pending_retry
+                self.capture_phase = (
+                    "database_pending_retry"
+                    if database_pending_retry
+                    else "completed"
+                )
                 return self.status()
             if self.session_dir is not None and self.config is not None:
                 intended_raw_path = self.raw_path
@@ -4144,6 +4767,7 @@ class AcquisitionManager:
                 )
                 has_valid_data = bool(
                     self.total_sample_count > 0
+                    and not self.persistence_failed
                     and self.raw_work_path is not None
                     and self.raw_work_path.is_file()
                 )
@@ -4388,7 +5012,18 @@ class AcquisitionManager:
                         "ok": False,
                         "saved_rows": 0,
                     }
-                self.finalization_complete = True
+                database_pending_retry = bool(
+                    mysql_destinations and not self.mysql_status.get("ok")
+                )
+                self.finalization_complete = not (
+                    self.persistence_failed or database_pending_retry
+                )
+                if self.persistence_failed:
+                    self.capture_phase = "finalization_failed"
+                elif database_pending_retry:
+                    self.capture_phase = "database_pending_retry"
+                else:
+                    self.capture_phase = "completed"
         return self.status()
 
     def status(self) -> dict:
@@ -4430,6 +5065,17 @@ class AcquisitionManager:
                 })
             sensor_by_name = {item["name"]: item for item in sensors}
             interfaces: list[dict[str, Any]] = []
+            worker_by_interface: dict[str, dict[str, Any]] = {}
+            worker_status = getattr(self.driver, "worker_status", None)
+            if callable(worker_status):
+                try:
+                    worker_by_interface = {
+                        str(item.get("interface_id") or ""): dict(item)
+                        for item in (worker_status() or [])
+                        if isinstance(item, dict) and item.get("interface_id")
+                    }
+                except Exception:
+                    worker_by_interface = {}
             if self.config is not None and self.config.acquisition_mode == "real":
                 for item in self.config.interfaces or []:
                     interface_id = str(item.get("id") or "")
@@ -4476,6 +5122,11 @@ class AcquisitionManager:
                         name for name in expected
                         if sensor_by_name.get(name, {}).get("observed_samples", 0) > 0
                     ]
+                    adapter_status = worker_by_interface.get(interface_id, {})
+                    adapter_state = str(adapter_status.get("state") or "")
+                    if adapter_state in {"failed", "stop_timed_out"}:
+                        state = adapter_state
+                        message = str(adapter_status.get("last_error") or adapter_state)
                     interfaces.append({
                         "id": interface_id, "role": item.get("role", "custom"),
                         "driver": item.get("driver", ""), "endpoint": item.get("endpoint", ""),
@@ -4484,6 +5135,11 @@ class AcquisitionManager:
                         "stale_channels": stale, "auxiliary_only": auxiliary_only,
                         "state": state, "message": message,
                         "ok": state in {"disabled", "video_only", "no_channels", "ok"},
+                        "fault_domain": adapter_status.get("fault_domain"),
+                        "adapter_state": adapter_state or None,
+                        "reconnect_attempts": int(adapter_status.get("reconnect_attempts") or 0),
+                        "last_error": str(adapter_status.get("last_error") or ""),
+                        "poll_interval_seconds": adapter_status.get("actual_poll_interval_seconds"),
                     })
             model_inputs = (
                 self.config.model_input_sensors
@@ -4502,8 +5158,28 @@ class AcquisitionManager:
                 "online_buffer_rows": len(self.rows),
                 "capture_uuid": self.capture_uuid or None,
                 "capture_saved": self.capture_saved,
+                "capture_phase": self.capture_phase,
+                "finalization_complete": self.finalization_complete,
+                "persistence_failed": self.persistence_failed,
+                "persistence_queue_depth": self.persistence_queue_depth,
+                "persistence_queue_high_water_rows": self.persistence_queue_high_water_rows,
+                "database_pending_retry": bool(
+                    self.mysql_status.get("enabled")
+                    and not self.mysql_status.get("ok")
+                    and self.mysql_status.get("state") in {
+                        "pending", "not_saved", "preflight_failed"
+                    }
+                ),
                 "save_enabled": self.save_enabled,
                 "save_status": dict(self.save_status),
+                "persistence_policy": (
+                    self.config.persistence_policy if self.config else None
+                ),
+                "production_conclusion_enabled": bool(
+                    self.config is not None
+                    and self.config.persistence_policy != "engineering_preview"
+                ),
+                "memory_buffer_limit_rows": self.rows.maxlen,
                 "started_at": self.started_at,
                 "stopped_at": self.stopped_at,
                 "last_error": self.last_error,
@@ -4642,9 +5318,13 @@ class AcquisitionManager:
             relative_end = end - base
             row_values = list(islice(rows, relative_start, relative_end))
             timestamp_values = list(islice(timestamps, relative_start, relative_end))
+            frame_values = list(
+                islice(self.frame_envelopes, relative_start, relative_end)
+            )
             return {
                 "rows": row_values,
                 "timestamps": timestamp_values,
+                "frames": frame_values,
                 "next_cursor": end,
                 "total_count": total,
                 "buffer_base": base,

@@ -10,7 +10,7 @@
 系统 SHALL 将真实采集业务实现维护在权威源目录中，delivery MUST 仅由受控装配生成。产品修复、测试和配置变更 MUST NOT 只存在于 delivery 中。
 
 #### Scenario: 修复真实采集缺陷
-- **WHEN** 开发者修复采集、helper、预测、前端或保存链路
+- **WHEN** 开发者修复采集、helper、前端或保存链路
 - **THEN** 修复 MUST 位于权威源及其测试中，重新装配后 delivery SHALL 获得等价行为
 
 #### Scenario: delivery存在独有实现
@@ -45,4 +45,3 @@
 #### Scenario: 运行既有核心回归
 - **WHEN** 权威源、装配脚本或真实采集模块发生变化
 - **THEN** 既有模拟采集、接口映射、helper、CSV、MySQL、诊断、前端和模型合同测试 MUST 继续通过
-

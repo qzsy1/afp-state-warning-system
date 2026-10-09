@@ -520,6 +520,7 @@ class PublicWebHttpTests(unittest.TestCase):
         self.assertEqual(acquired, 200)
         request = {
             "acquisition_mode": "real",
+            "real_acquisition_mode": "local_direct",
             "mysql_target_config_id": "opaque-id",
             "interfaces": [{
                 "id": "plc_process",
@@ -668,7 +669,7 @@ class PublicWebHttpTests(unittest.TestCase):
         _, challenge, _ = self.request_json("POST", "/api/helper/pair/start", {})
         _, paired, _ = self.request_json("POST", "/api/helper/pair/complete", {
             "challenge": challenge["challenge"], "device_id": "visitor-pc",
-            "capabilities": {"real_capture": True},
+            "capabilities": {"real_capture": True, "unified_frame_v1": True},
         })
         handler = self.server.RequestHandlerClass
         handler.target_profiles._profile_loader = lambda: {"target": {
@@ -676,10 +677,15 @@ class PublicWebHttpTests(unittest.TestCase):
             "database": "afp", "password": "server-only-secret",
         }}
         saved = []
+        preflights = []
 
         class Store:
             def __init__(self, settings):
                 self.settings = settings
+
+            def preflight(self, *, write_test=False):
+                preflights.append((self.settings.host, write_test))
+                return {"ok": True, "write_test": write_test}
 
             def save_layer(self, _config, **kwargs):
                 saved.append((self.settings.password, list(kwargs["rows"])))
@@ -701,6 +707,7 @@ class PublicWebHttpTests(unittest.TestCase):
             "command": "start_capture", "payload": start_payload,
         })
         self.assertTrue(command["ok"])
+        self.assertEqual(preflights, [("db.test", True)])
         _, polled, _ = self.request_json("POST", "/api/helper/poll", {"device_id": "visitor-pc"},
                                          headers={"Authorization": f"Bearer {paired['pairing_token']}"}, csrf=False)
         self.assertNotIn("server-only-secret", json.dumps(polled))
@@ -714,6 +721,22 @@ class PublicWebHttpTests(unittest.TestCase):
             "device_id": "visitor-pc", "batch": {
                 "capture_uuid": "capture-target-a", "sequence": 0,
                 "rows": [{"薄膜压力": 10.0}], "timestamps": [10.0],
+                "frames": [{
+                    "contract_version": "unified_frame_v1",
+                    "capture_uuid": "capture-target-a",
+                    "frame_sequence": 0,
+                    "frame_time": 10.0,
+                    "target_monotonic": 10.0,
+                    "assembled_monotonic": 10.0,
+                    "deadline_missed": False,
+                    "channels": {"薄膜压力": {
+                        "value": 10.0, "unit": "N", "quality": "measured_new",
+                        "source_timestamp": 10.0, "received_timestamp": 10.0,
+                        "age_seconds": 0.0, "is_new": True,
+                        "interface_id": "m3232_pressure", "source_sequence": 0,
+                        "protocol_ok": True, "error": "",
+                    }},
+                }],
                 "status": {"running": False, "finalization_complete": True, "sample_count": 1},
             },
         }, headers={"Authorization": f"Bearer {paired['pairing_token']}"}, csrf=False)

@@ -139,7 +139,7 @@ foreach ($name in $operationalFiles) {
 }
 
 $legacyFiles = @(
-    "app.py", "interface_agent.py", "agentic_diagnosis.py", "diagnostic_tools.py", "acquisition.py", "smrf_hid.py", "mysql_storage.py",
+    "app.py", "interface_agent.py", "agentic_diagnosis.py", "diagnostic_tools.py", "acquisition.py", "real_acquisition.py", "local_direct_acquisition.py", "smrf_hid.py", "mysql_storage.py",
     "online_inference.py", "atavn.py", "online_health_features.py",
     "causal_online_runtime.py", "runtime_scaler.py", "new_collection_health.py",
     "runtime_health_primitives.py", "web_training.py", "web_training_pipeline.py",
@@ -191,7 +191,7 @@ if (Test-Path -LiteralPath (Join-Path $referenceData "new_collection_demo_v11_3"
 } elseif (Test-Path -LiteralPath (Join-Path $referenceLegacy "new_collection_demo_v11_3")) {
     New-Item -ItemType Directory -Force -Path (Join-Path $legacyTarget "new_collection_demo_v11_3") | Out-Null
     Copy-Item -Path (Join-Path $referenceLegacy "new_collection_demo_v11_3\*") -Destination (Join-Path $legacyTarget "new_collection_demo_v11_3") -Recurse -Force
-} else {
+} elseif (Test-Path -LiteralPath (Join-Path $LegacySource "new_collection_demo_v11_3")) {
     New-Item -ItemType Directory -Force -Path (Join-Path $legacyTarget "new_collection_demo_v11_3") | Out-Null
     Copy-Item -Path (Join-Path $LegacySource "new_collection_demo_v11_3\*") -Destination (Join-Path $legacyTarget "new_collection_demo_v11_3") -Recurse -Force
 }

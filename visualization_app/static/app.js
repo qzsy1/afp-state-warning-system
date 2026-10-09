@@ -6182,6 +6182,7 @@ function acquisitionConfig() {
   return {
     processing_mode: controls.processingMode.value,
     acquisition_mode: simulation ? "simulation" : "real",
+    real_acquisition_mode: simulation ? "" : (usesLocalCaptureHelper() ? "remote_helper" : "local_direct"),
     simulation_source_type: controls.simulationSourceType?.value || "single_csv",
     simulation_source_path: simulation && !remoteSimulation ? (controls.simulationSourcePath?.value.trim() || "") : "",
     ...(remoteSimulation ? {simulation_source_id: state.simulationSourceId || ""} : {}),

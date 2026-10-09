@@ -827,7 +827,8 @@ class AcquisitionPanel(ttk.Frame):
         if not settings_list:
             self.mysql_status_text.set("请先勾选“保存到本机”或“保存到目标电脑”。")
             return
-        root = Path(str(self.vars["save_root"].get()) or r"F:\AFP_Capture")
+        save_root = str(self.vars["save_root"].get() or "").strip()
+        root = Path(save_root) if save_root else None
 
         def work() -> dict[str, Any]:
             results = {

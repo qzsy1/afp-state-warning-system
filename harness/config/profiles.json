@@ -3,12 +3,22 @@
   "profiles": {
     "quick": [
       "harness-contracts",
+      "real-acquisition-preflight-contracts",
+      "real-acquisition-mode-contracts",
+      "real-acquisition-local-direct-contracts",
+      "real-acquisition-remote-helper-contracts",
+      "real-acquisition-mode-equivalence-contracts",
       "modular-runtime-contracts",
       "frontend-behavior-contracts",
       "real-acquisition-protocol-contracts"
     ],
     "full": [
       "harness-contracts",
+      "real-acquisition-preflight-contracts",
+      "real-acquisition-mode-contracts",
+      "real-acquisition-local-direct-contracts",
+      "real-acquisition-remote-helper-contracts",
+      "real-acquisition-mode-equivalence-contracts",
       "modular-runtime-contracts",
       "interface-monitor-contracts",
       "usb-dock-topology-contracts",
@@ -25,6 +35,11 @@
     ],
     "release": [
       "harness-contracts",
+      "real-acquisition-preflight-contracts",
+      "real-acquisition-mode-contracts",
+      "real-acquisition-local-direct-contracts",
+      "real-acquisition-remote-helper-contracts",
+      "real-acquisition-mode-equivalence-contracts",
       "modular-runtime-contracts",
       "interface-monitor-contracts",
       "usb-dock-topology-contracts",
@@ -45,7 +60,8 @@
       "release-functional-smoke",
       "field-usb-dock-topology",
       "field-real-hardware",
-      "field-target-mysql"
+      "field-target-mysql",
+      "field-second-windows-helper"
     ]
   }
 }

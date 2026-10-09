@@ -82,6 +82,14 @@ class BuildScriptContractTests(unittest.TestCase):
         self.assertIn('"simulation_packages.py"', self.assembly)
         self.assertIn('Join-Path $LegacySource "simulation_packages"', self.assembly)
 
+    def test_build_copies_real_acquisition_from_authoritative_source(self) -> None:
+        self.assertIn('"real_acquisition.py"', self.assembly)
+        self.assertTrue((RUNTIME_ROOT.parent / "visualization_app" / "real_acquisition.py").is_file())
+        self.assertNotIn(
+            'Join-Path $referenceLegacy "real_acquisition.py"',
+            self.assembly,
+        )
+
     def test_build_stamps_requested_version_into_runtime_config(self) -> None:
         self.assertIn("$runtimeConfig.application_version = $ApplicationVersion", self.assembly)
 

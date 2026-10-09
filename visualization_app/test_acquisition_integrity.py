@@ -621,6 +621,16 @@ class AcquisitionIntegrityTests(unittest.TestCase):
             self.assertTrue((root / "x_mysql_synced.json").is_file())
 
     def test_empty_capture_does_not_replace_last_valid_specimen(self) -> None:
+        class FakeStore:
+            def __init__(self, settings):
+                self.settings = settings
+
+            def preflight(self, *, write_test=False):
+                return {"ok": True, "write_test": write_test}
+
+            def save_layer(self, config, **kwargs):
+                raise AssertionError("empty capture must not be uploaded")
+
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = self._source(root)
@@ -653,9 +663,10 @@ class AcquisitionIntegrityTests(unittest.TestCase):
                 mysql_enabled=True,
                 mysql_database="unused",
             )
-            manager.start(config)
-            time.sleep(0.05)
-            failed = manager.stop()
+            with patch("acquisition.MySQLCaptureStore", FakeStore):
+                manager.start(config)
+                time.sleep(0.05)
+                failed = manager.stop()
 
             self.assertFalse(failed["capture_saved"])
             self.assertIsNone(failed["raw_file"])
@@ -699,6 +710,9 @@ class AcquisitionIntegrityTests(unittest.TestCase):
 
             def test_connection(self):
                 return {"ok": True}
+
+            def preflight(self, *, write_test=False):
+                return {"ok": True, "write_test": write_test}
 
             def save_layer(self, config, **kwargs):
                 return {"ok": True, "saved_rows": len(kwargs["rows"])}
@@ -753,6 +767,9 @@ class AcquisitionIntegrityTests(unittest.TestCase):
 
             def test_connection(self):
                 return {"ok": True}
+
+            def preflight(self, *, write_test=False):
+                return {"ok": True, "write_test": write_test}
 
             def save_layer(self, config, **kwargs):
                 return {
@@ -810,6 +827,9 @@ class AcquisitionIntegrityTests(unittest.TestCase):
             def test_connection(self):
                 return {"ok": True}
 
+            def preflight(self, *, write_test=False):
+                return {"ok": True, "write_test": write_test}
+
             def save_layer(self, config, **kwargs):
                 type(self).save_calls += 1
                 return {
@@ -860,6 +880,9 @@ class AcquisitionIntegrityTests(unittest.TestCase):
             def test_connection(self):
                 return {"ok": True}
 
+            def preflight(self, *, write_test=False):
+                return {"ok": True, "write_test": write_test}
+
             def save_layer(self, config, **kwargs):
                 type(self).calls.append(self.settings.host)
                 return {
@@ -908,6 +931,9 @@ class AcquisitionIntegrityTests(unittest.TestCase):
 
             def test_connection(self):
                 return {"ok": True}
+
+            def preflight(self, *, write_test=False):
+                return {"ok": True, "write_test": write_test}
 
             def save_layer(self, config, **kwargs):
                 type(self).calls.append(len(kwargs["rows"]))

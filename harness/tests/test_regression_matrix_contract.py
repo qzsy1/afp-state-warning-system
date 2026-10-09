@@ -24,6 +24,9 @@ class RegressionMatrixContractTests(unittest.TestCase):
                 "REAL_ACQUISITION", "PHYSICAL_READINESS",
                 "LIVE_PREDICTION_SAFETY", "CAPTURE_PERSISTENCE",
                 "REAL_RELEASE_GATE",
+                "REAL_PREP_SOURCE", "REAL_PREP_PROTOCOL", "REAL_PREP_TRANSPORT",
+                "REAL_PREP_PERSISTENCE", "REAL_PREP_RECOVERY", "REAL_PREP_MODE",
+                "REAL_PREP_FRAME", "REAL_PREP_EQUIVALENCE",
             },
         )
 
@@ -202,6 +205,96 @@ class RegressionMatrixContractTests(unittest.TestCase):
         field = next(item for item in self.matrix.checks if item.id == "field-real-hardware")
         self.assertEqual("field", field.evidence_tier)
         self.assertIn("REAL_RELEASE_GATE-001", field.requirements)
+
+    def test_prepare_real_acquisition_requirements_have_blocking_checks(self) -> None:
+        expected_requirements = {
+            "REAL_PREP_MODE-001": ("quick", "full", "release"),
+            "REAL_PREP_FRAME-001": ("quick", "full", "release"),
+            "REAL_PREP_EQUIVALENCE-001": ("quick", "full", "release"),
+            "REAL_PREP_SOURCE-001": ("quick", "full", "release"),
+            "REAL_PREP_PROTOCOL-001": ("quick", "full", "release"),
+            "REAL_PREP_TRANSPORT-001": ("full", "release"),
+            "REAL_PREP_PERSISTENCE-001": ("full", "release"),
+            "REAL_PREP_RECOVERY-001": ("full", "release"),
+        }
+        expected_checks = {
+            "REAL_PREP_MODE-001": ("real-acquisition-mode-contracts", "automated"),
+            "REAL_PREP_FRAME-001": ("real-acquisition-mode-equivalence-contracts", "automated"),
+            "REAL_PREP_EQUIVALENCE-001": ("real-acquisition-mode-equivalence-contracts", "automated"),
+            "REAL_PREP_SOURCE-001": ("real-acquisition-preflight-contracts", "automated"),
+            "REAL_PREP_PROTOCOL-001": ("real-acquisition-protocol-contracts", "protocol_simulation"),
+            "REAL_PREP_TRANSPORT-001": ("edge-helper-websocket-contracts", "automated"),
+            "REAL_PREP_PERSISTENCE-001": ("acquisition-storage-contracts", "automated"),
+            "REAL_PREP_RECOVERY-001": ("edge-helper-websocket-contracts", "automated"),
+        }
+        requirements = {item.id: item for item in self.matrix.requirements}
+        checks = {item.id: item for item in self.matrix.checks}
+
+        for requirement_id, profiles in expected_requirements.items():
+            with self.subTest(requirement=requirement_id):
+                self.assertIn(requirement_id, requirements)
+                requirement = requirements.get(requirement_id)
+                if requirement is None:
+                    continue
+                self.assertEqual(requirement.profiles, profiles)
+                check_id, evidence_tier = expected_checks[requirement_id]
+                self.assertIn(check_id, checks)
+                check = checks.get(check_id)
+                if check is None:
+                    continue
+                self.assertTrue(check.blocking)
+                self.assertEqual(check.evidence_tier, evidence_tier)
+                self.assertTrue(set(profiles).issubset(check.profiles))
+                self.assertIn(requirement_id, check.requirements)
+
+    def test_real_acquisition_modes_have_isolated_executable_contracts(self) -> None:
+        checks = {item.id: item for item in self.matrix.checks}
+        expected = {
+            "real-acquisition-local-direct-contracts": (
+                "LocalDirectNoHardwareIntegrationTests",
+                {"REAL_PREP_MODE-001", "REAL_PREP_FRAME-001", "REAL_PREP_RECOVERY-001"},
+            ),
+            "real-acquisition-remote-helper-contracts": (
+                "RemoteHelperNoHardwareIntegrationTests",
+                {"REAL_PREP_MODE-001", "REAL_PREP_FRAME-001", "REAL_PREP_TRANSPORT-001"},
+            ),
+            "real-acquisition-mode-equivalence-contracts": (
+                "AcquisitionModeEquivalenceTests",
+                {"REAL_PREP_FRAME-001", "REAL_PREP_EQUIVALENCE-001"},
+            ),
+        }
+
+        for check_id, (test_class, requirements) in expected.items():
+            with self.subTest(check=check_id):
+                self.assertIn(check_id, checks)
+                check = checks.get(check_id)
+                if check is None:
+                    continue
+                self.assertTrue(check.blocking)
+                self.assertEqual(check.evidence_tier, "automated")
+                self.assertEqual(check.cwd, "visualization_app")
+                self.assertEqual(check.profiles, ("quick", "full", "release"))
+                self.assertIn(f"test_real_acquisition_modes.{test_class}", check.command)
+                self.assertTrue(requirements.issubset(check.requirements))
+
+        local = checks.get("real-acquisition-local-direct-contracts")
+        remote = checks.get("real-acquisition-remote-helper-contracts")
+        if local is not None and remote is not None:
+            self.assertNotEqual(local.command, remote.command)
+
+    def test_real_acquisition_field_boundaries_remain_mode_specific(self) -> None:
+        checks = {item.id: item for item in self.matrix.checks}
+        hardware = checks["field-real-hardware"]
+        second_windows = checks["field-second-windows-helper"]
+
+        self.assertIn("REAL_PREP_MODE-001", hardware.requirements)
+        self.assertIn("REAL_PREP_MODE-001", second_windows.requirements)
+        self.assertIn("REAL_PREP_TRANSPORT-001", second_windows.requirements)
+        self.assertNotIn("REAL_PREP_EQUIVALENCE-001", second_windows.requirements)
+        self.assertEqual(hardware.kind, "field")
+        self.assertEqual(second_windows.kind, "field")
+        self.assertFalse(hardware.blocking)
+        self.assertFalse(second_windows.blocking)
 
     def test_manual_interface_and_simulation_routing_are_blocking_requirements(self) -> None:
         requirement_ids = {item.id for item in self.matrix.requirements}

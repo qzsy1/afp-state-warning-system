@@ -25,9 +25,87 @@
     {"id": "PHYSICAL_READINESS-001", "title": "五类物理传感器按协议身份和全部必需通道失败关闭", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "LIVE_PREDICTION_SAFETY-001", "title": "实时预测只使用兼容频率下最近连续完整模型窗口", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "CAPTURE_PERSISTENCE-001", "title": "统一帧、质量侧车、数据库和停止终结可对账恢复", "mandatory": true, "profiles": ["full", "release"]},
-    {"id": "REAL_RELEASE_GATE-001", "title": "G0至G5证据按交付修订分级且不可由低等级越级替代", "mandatory": true, "profiles": ["release"]}
+    {"id": "REAL_RELEASE_GATE-001", "title": "G0至G5证据按交付修订分级且不可由低等级越级替代", "mandatory": true, "profiles": ["release"]},
+    {"id": "REAL_PREP_MODE-001", "title": "local_direct与remote_helper显式并列且模式专属逻辑不可混用", "mandatory": true, "profiles": ["quick", "full", "release"]},
+    {"id": "REAL_PREP_FRAME-001", "title": "两种真实采集模式共享统一帧包络和逐通道质量合同", "mandatory": true, "profiles": ["quick", "full", "release"]},
+    {"id": "REAL_PREP_EQUIVALENCE-001", "title": "相同输入经两种模式产生等价规范化帧", "mandatory": true, "profiles": ["quick", "full", "release"]},
+    {"id": "REAL_PREP_SOURCE-001", "title": "真实采集权威源、隔离装配和正式delivery只读边界可验证", "mandatory": true, "profiles": ["quick", "full", "release"]},
+    {"id": "REAL_PREP_PROTOCOL-001", "title": "真实采集协议和数据合同使用生产路径失败关闭", "mandatory": true, "profiles": ["quick", "full", "release"]},
+    {"id": "REAL_PREP_TRANSPORT-001", "title": "真实采集跨进程命令、传输和逐帧身份可对账", "mandatory": true, "profiles": ["full", "release"]},
+    {"id": "REAL_PREP_PERSISTENCE-001", "title": "正式采集持久化门禁和本地远程保存完整", "mandatory": true, "profiles": ["full", "release"]},
+    {"id": "REAL_PREP_RECOVERY-001", "title": "设备异常、写入背压和停止终结可恢复可观察", "mandatory": true, "profiles": ["full", "release"]}
   ],
   "checks": [
+    {
+      "id": "real-acquisition-preflight-contracts",
+      "title": "真实采集权威源、四层Harness与delivery只读合同",
+      "kind": "command",
+      "command": ["{python}", "-m", "unittest", "harness.tests.test_real_acquisition_preflight", "-v"],
+      "cwd": ".",
+      "timeout_seconds": 120,
+      "profiles": ["quick", "full", "release"],
+      "environments": ["local", "ci"],
+      "blocking": true,
+      "evidence_tier": "automated",
+      "requirements": ["REAL_PREP_SOURCE-001", "REAL_PREP_PROTOCOL-001", "REAL_PREP_TRANSPORT-001", "REAL_PREP_PERSISTENCE-001", "REAL_PREP_RECOVERY-001"],
+      "change_patterns": ["harness/**", "modular_runtime/**", "visualization_app/**", "openspec/changes/prepare-real-acquisition/**"]
+    },
+    {
+      "id": "real-acquisition-mode-contracts",
+      "title": "真实采集显式双模式与专属字段互斥合同",
+      "kind": "command",
+      "command": ["{python}", "-m", "unittest", "test_real_acquisition_modes.AcquisitionModeConfigurationTests", "test_real_acquisition_modes.SharedAcquisitionCoreTests", "-v"],
+      "cwd": "visualization_app",
+      "timeout_seconds": 120,
+      "profiles": ["quick", "full", "release"],
+      "environments": ["local", "ci"],
+      "blocking": true,
+      "evidence_tier": "automated",
+      "requirements": ["REAL_PREP_MODE-001", "REAL_PREP_FRAME-001", "REAL_PREP_PERSISTENCE-001", "REAL_PREP_RECOVERY-001"],
+      "change_patterns": ["visualization_app/acquisition.py", "visualization_app/real_acquisition.py", "visualization_app/*capture*", "visualization_app/test_real_acquisition_modes.py", "harness/**", "openspec/changes/prepare-real-acquisition/**"]
+    },
+    {
+      "id": "real-acquisition-local-direct-contracts",
+      "title": "local_direct本机设备生命周期与故障隔离无硬件合同",
+      "kind": "command",
+      "command": ["{python}", "-m", "unittest", "test_real_acquisition_modes.LocalDirectNoHardwareIntegrationTests", "-v"],
+      "cwd": "visualization_app",
+      "timeout_seconds": 180,
+      "profiles": ["quick", "full", "release"],
+      "environments": ["local", "ci"],
+      "blocking": true,
+      "evidence_tier": "automated",
+      "requirements": ["REAL_PREP_MODE-001", "REAL_PREP_FRAME-001", "REAL_PREP_RECOVERY-001"],
+      "change_patterns": ["visualization_app/acquisition.py", "visualization_app/real_acquisition.py", "visualization_app/*capture*", "visualization_app/test_real_acquisition_modes.py", "harness/**", "openspec/changes/prepare-real-acquisition/**"]
+    },
+    {
+      "id": "real-acquisition-remote-helper-contracts",
+      "title": "remote_helper跨进程readiness能力协商与传输无硬件合同",
+      "kind": "command",
+      "command": ["{python}", "-m", "unittest", "test_real_acquisition_modes.RemoteHelperNoHardwareIntegrationTests", "-v"],
+      "cwd": "visualization_app",
+      "timeout_seconds": 240,
+      "profiles": ["quick", "full", "release"],
+      "environments": ["local", "ci"],
+      "blocking": true,
+      "evidence_tier": "automated",
+      "requirements": ["REAL_PREP_MODE-001", "REAL_PREP_FRAME-001", "REAL_PREP_TRANSPORT-001"],
+      "change_patterns": ["visualization_app/acquisition.py", "visualization_app/real_acquisition.py", "visualization_app/local_capture_agent.py", "visualization_app/helper_relay.py", "visualization_app/edge_capture.py", "visualization_app/*websocket*", "visualization_app/test_real_acquisition_modes.py", "harness/**", "openspec/changes/prepare-real-acquisition/**"]
+    },
+    {
+      "id": "real-acquisition-mode-equivalence-contracts",
+      "title": "local_direct与remote_helper统一帧输出等价合同",
+      "kind": "command",
+      "command": ["{python}", "-m", "unittest", "test_real_acquisition_modes.AcquisitionModeEquivalenceTests", "-v"],
+      "cwd": "visualization_app",
+      "timeout_seconds": 180,
+      "profiles": ["quick", "full", "release"],
+      "environments": ["local", "ci"],
+      "blocking": true,
+      "evidence_tier": "automated",
+      "requirements": ["REAL_PREP_FRAME-001", "REAL_PREP_EQUIVALENCE-001"],
+      "change_patterns": ["visualization_app/acquisition.py", "visualization_app/real_acquisition.py", "visualization_app/local_capture_agent.py", "visualization_app/edge_capture.py", "visualization_app/test_real_acquisition_modes.py", "harness/**", "openspec/changes/prepare-real-acquisition/**"]
+    },
     {
       "id": "harness-contracts",
       "title": "Harness单元与契约测试",
@@ -135,7 +213,7 @@
       "environments": ["local", "ci"],
       "blocking": true,
       "evidence_tier": "automated",
-      "requirements": ["SIMULATION-001", "MODE_ISOLATION-001", "CSV-001", "MYSQL-001", "PREDICTION_WARNING-001", "REAL_ACQUISITION-001", "CAPTURE_PERSISTENCE-001"]
+      "requirements": ["SIMULATION-001", "MODE_ISOLATION-001", "CSV-001", "MYSQL-001", "PREDICTION_WARNING-001", "REAL_ACQUISITION-001", "CAPTURE_PERSISTENCE-001", "REAL_PREP_PERSISTENCE-001"]
     },
     {
       "id": "dashboard-runtime-contracts",
@@ -187,7 +265,7 @@
       "environments": ["local", "ci"],
       "blocking": true,
       "evidence_tier": "automated",
-      "requirements": ["EDGE_HELPER-001", "WEBSOCKET-001", "SIMULATION-001"]
+      "requirements": ["EDGE_HELPER-001", "WEBSOCKET-001", "SIMULATION-001", "REAL_PREP_TRANSPORT-001", "REAL_PREP_RECOVERY-001"]
     },
     {
       "id": "model-prediction-contracts",
@@ -213,7 +291,7 @@
       "environments": ["local"],
       "blocking": true,
       "evidence_tier": "protocol_simulation",
-      "requirements": ["STARTUP-001", "SIMULATION-001", "SIMULATION-002", "INTERFACES-002", "REAL_ACQUISITION-001", "PHYSICAL_READINESS-001", "MODE_ISOLATION-001", "DIAGNOSIS-001", "LIVE_PREDICTION_SAFETY-001", "CAPTURE_PERSISTENCE-001"],
+      "requirements": ["STARTUP-001", "SIMULATION-001", "SIMULATION-002", "INTERFACES-002", "REAL_ACQUISITION-001", "PHYSICAL_READINESS-001", "MODE_ISOLATION-001", "DIAGNOSIS-001", "LIVE_PREDICTION_SAFETY-001", "CAPTURE_PERSISTENCE-001", "REAL_PREP_PROTOCOL-001"],
       "change_patterns": ["delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/ui/**", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/legacy/static/**", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/legacy/app.py", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/legacy/acquisition.py", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/legacy/real_acquisition.py", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/verification/test_real_acquisition_pipeline.py", "openspec/changes/harden-real-acquisition-pipeline/**"]
     },
     {
@@ -305,7 +383,7 @@
       "environments": ["local"],
       "blocking": false,
       "evidence_tier": "field",
-      "requirements": ["INTERFACES-001", "FIELD_BOUNDARY-001", "REAL_ACQUISITION-001", "PHYSICAL_READINESS-001", "REAL_RELEASE_GATE-001"]
+      "requirements": ["INTERFACES-001", "FIELD_BOUNDARY-001", "REAL_ACQUISITION-001", "PHYSICAL_READINESS-001", "REAL_RELEASE_GATE-001", "REAL_PREP_MODE-001", "REAL_PREP_PROTOCOL-001", "REAL_PREP_RECOVERY-001"]
     },
     {
       "id": "field-target-mysql",
@@ -318,7 +396,20 @@
       "environments": ["local"],
       "blocking": false,
       "evidence_tier": "field",
-      "requirements": ["MYSQL-001", "FIELD_BOUNDARY-001"]
+      "requirements": ["MYSQL-001", "FIELD_BOUNDARY-001", "REAL_PREP_PERSISTENCE-001", "REAL_PREP_RECOVERY-001"]
+    },
+    {
+      "id": "field-second-windows-helper",
+      "title": "第二台Windows电脑上的真实Helper、公网与断线恢复现场验收",
+      "kind": "field",
+      "command": [],
+      "cwd": ".",
+      "timeout_seconds": 1,
+      "profiles": ["release"],
+      "environments": ["local"],
+      "blocking": false,
+      "evidence_tier": "field",
+      "requirements": ["FIELD_BOUNDARY-001", "REAL_RELEASE_GATE-001", "REAL_PREP_MODE-001", "REAL_PREP_TRANSPORT-001"]
     }
   ]
 }

@@ -496,6 +496,8 @@ def helper_capabilities(server_url: str = "") -> dict[str, Any]:
         "local_mysql_save": True,
         "simulation_replay_v1": True,
         "simulation_prefetch_v1": True,
+        "unified_frame_v1": True,
+        "unified_frame_contract": "unified_frame_v1",
         "local_mysql_profile": local_mysql_profile_metadata(),
     }
     if paired_server_url:
@@ -676,7 +678,34 @@ class HelperCommandDispatcher:
         command = HelperTransport.decode_command(json.dumps(message, ensure_ascii=False))
         name = command["command"]
         if name == "check_capture":
-            self.check_runner.start(dict(message), callback)
+            def import_then_callback(response: dict[str, Any]) -> None:
+                payload = response.get("payload") if isinstance(response, dict) else None
+                if isinstance(payload, dict) and payload.get("ok"):
+                    snapshot = payload.get("readiness_snapshot")
+                    if not isinstance(snapshot, dict):
+                        response = {
+                            "type": "result",
+                            "request_id": command["request_id"],
+                            "payload": {
+                                "ok": False,
+                                "error": "remote_readiness_snapshot_missing",
+                            },
+                        }
+                    else:
+                        try:
+                            self.agent.import_readiness_snapshot(snapshot)
+                        except Exception as exc:
+                            response = {
+                                "type": "result",
+                                "request_id": command["request_id"],
+                                "payload": {
+                                    "ok": False,
+                                    "error": f"remote_readiness_snapshot_invalid: {exc}",
+                                },
+                            }
+                callback(response)
+
+            self.check_runner.start(dict(message), import_then_callback)
             return
         if name in {"start_capture", "stop_capture"}:
             self.check_runner.cancel(reason="hardware_check_cancelled_for_capture")
