@@ -136,3 +136,5 @@
 
 - RED：候选统一预检的 `runtime.candidate_dependencies` 发现发行合同要求 `pymysql`，但实际冻结运行时只打包并使用首选 `mysql.connector`；该候选因此正确失败，未把自检通过冒充完整依赖通过。
 - GREEN：发行合同 `required_modules` 改为生产构建明确收集且存储实现优先使用的 `mysql.connector`；新增合同断言禁止再次把可选 fallback `pymysql` 写成必需模块。目标 MySQL 环境验证仍独立要求真实实例，并未因驱动声明修正而降级。
+- RED：修正 MySQL 声明后审查默认驱动探针，发现 SMRF 实现通过 `ctypes` 使用 Windows `hid.dll`，探针却错误要求第三方 Python `hid` 包，会造成候选假失败。
+- GREEN：新增 Windows HID 检测合同并改为实际加载系统 `hid.dll`；同时继续独立验证串口平台、以太网、UVC native DLL 和厂商 SDK。运行时探针 5/5 通过，未把物理传感器存在性混入驱动检测。

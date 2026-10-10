@@ -6,7 +6,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from visualization_app.pre_sensor_preflight import probe_candidate_runtime
+from visualization_app.pre_sensor_preflight import (
+    detect_runtime_driver_statuses,
+    probe_candidate_runtime,
+)
 
 
 def _pe(machine: int = 0x8664) -> bytes:
@@ -19,6 +22,21 @@ def _pe(machine: int = 0x8664) -> bytes:
 
 
 class CandidateRuntimeProbeTests(unittest.TestCase):
+    def test_windows_hid_uses_the_built_in_driver_dll_not_a_python_hid_package(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "native_dll").mkdir()
+            (root / "native_dll" / "BsvUvcNative.dll").write_bytes(b"dll")
+            loaded: list[str] = []
+            statuses = detect_runtime_driver_statuses(
+                root,
+                platform_name="nt",
+                hid_loader=lambda name: loaded.append(name) or object(),
+            )
+        self.assertTrue(statuses["smrf_hid"])
+        self.assertEqual(loaded, ["hid.dll"])
+        self.assertTrue(statuses["serial_port"])
+        self.assertTrue(statuses["uvc"])
     def _candidate(self, root: Path, *, native: bytes | None = None) -> dict:
         runtime = root / "_internal" / "python311.dll"
         runtime.parent.mkdir(parents=True)

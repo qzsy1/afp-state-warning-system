@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import ctypes
 import hashlib
 import importlib.util
 import struct
@@ -459,6 +460,35 @@ def _native_machine(path: Path) -> int:
         raise ValueError(f"native component is unreadable: {exc}") from exc
 
 
+def detect_runtime_driver_statuses(
+    root: str | Path,
+    *,
+    platform_name: str | None = None,
+    hid_loader: Callable[[str], Any] | None = None,
+) -> dict[str, bool]:
+    """Detect runtime driver prerequisites without requiring attached devices."""
+
+    candidate_root = Path(root)
+    platform = str(platform_name or os.name)
+    hid_available = False
+    if platform == "nt":
+        loader = hid_loader or getattr(ctypes, "WinDLL", None)
+        if callable(loader):
+            try:
+                loader("hid.dll")
+                hid_available = True
+            except (OSError, AttributeError):
+                hid_available = False
+    return {
+        "serial_port": platform == "nt",
+        "ethernet": True,
+        "uvc": (candidate_root / "native_dll" / "BsvUvcNative.dll").is_file(),
+        # SMRF uses the Windows HID API through ctypes; it does not import the
+        # unrelated third-party Python package named ``hid``.
+        "smrf_hid": hid_available,
+    }
+
+
 def probe_candidate_runtime(context: Mapping[str, Any]) -> ProbeOutcome:
     """Verify candidate-local runtime, modules, native files, SDKs and drivers."""
 
@@ -539,12 +569,7 @@ def probe_candidate_runtime(context: Mapping[str, Any]) -> ProbeOutcome:
     if not isinstance(drivers, list) or not drivers:
         raise ValueError("driver declarations are missing")
     if not isinstance(statuses, Mapping):
-        statuses = {
-            "serial_port": os.name == "nt",
-            "ethernet": True,
-            "uvc": (root / "native_dll" / "BsvUvcNative.dll").is_file(),
-            "smrf_hid": importlib.util.find_spec("hid") is not None,
-        }
+        statuses = detect_runtime_driver_statuses(root)
     for item in drivers:
         if not isinstance(item, Mapping) or not item.get("id"):
             raise ValueError("driver declaration is invalid")
@@ -1311,4 +1336,3 @@ def run_candidate_preflight(
     output = Path(output_directory or candidate_root / "verification" / "pre-sensor")
     json_path, markdown_path = write_preflight_report(report, output)
     return report, json_path, markdown_path
-
