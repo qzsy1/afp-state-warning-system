@@ -43,7 +43,11 @@ class RealAcquisitionPreflightTests(unittest.TestCase):
                 b"from enum import Enum\nclass ChannelQuality(str, Enum):\n    OK = 'ok'\n"
             ),
             "app/legacy/release_contract.py": b"CONTRACT = 1\n",
+            "app/legacy/pre_sensor_config.py": b"CONFIG = 1\n",
             "app/legacy/local_direct_acquisition.py": b"MODE = 'local_direct'\n",
+            "config/pre_sensor/schema.json": b"{}",
+            "config/pre_sensor/local_direct.json": b"{}",
+            "config/pre_sensor/remote_helper.json": b"{}",
             "app/ui/index.html": b"index",
             "app/ui/app.js": b"app",
             "app/ui/styles.css": b"styles",
@@ -62,6 +66,11 @@ class RealAcquisitionPreflightTests(unittest.TestCase):
             path.write_bytes(content)
         static_relative = "app/ui/app.js"
         native_relative = "native_dll/BsvUvcNative.dll"
+        configuration_relatives = [
+            "config/pre_sensor/schema.json",
+            "config/pre_sensor/local_direct.json",
+            "config/pre_sensor/remote_helper.json",
+        ]
         static_path = candidate / static_relative
         release_manifest = {
             "schema_version": 1,
@@ -85,6 +94,17 @@ class RealAcquisitionPreflightTests(unittest.TestCase):
                         if static_path.is_file()
                         else ""
                     )
+                },
+            },
+            "configuration_templates": {
+                "required": configuration_relatives,
+                "sha256": {
+                    relative: __import__("hashlib").sha256(
+                        (candidate / relative).read_bytes()
+                    ).hexdigest()
+                    if (candidate / relative).is_file()
+                    else ""
+                    for relative in configuration_relatives
                 },
             },
             "managed_files": {

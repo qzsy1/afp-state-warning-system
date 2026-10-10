@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "afp-pre-sensor-config-v1",
+  "title": "AFP pre-sensor acquisition configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "release_revision", "mode", "channels", "interfaces",
+    "storage", "timeouts", "reconnect", "queues", "logging", "capacity"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "release_revision": {"type": "string", "minLength": 1},
+    "mode": {"enum": ["local_direct", "remote_helper"]},
+    "channels": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "unit", "interface_id"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "unit": {"type": "string", "minLength": 1},
+          "interface_id": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "interfaces": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "role", "driver", "location", "endpoint_ref"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "role": {"type": "string", "minLength": 1},
+          "driver": {"type": "string", "minLength": 1},
+          "location": {"enum": ["local", "remote_helper"]},
+          "endpoint_ref": {"type": "string", "pattern": "^AFP_[A-Z0-9_]+$"}
+        }
+      }
+    },
+    "helper": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["server_url_ref", "pairing_profile_ref", "health_timeout_seconds", "command_timeout_seconds", "required_capabilities"],
+      "properties": {
+        "server_url_ref": {"type": "string", "pattern": "^AFP_[A-Z0-9_]+$"},
+        "pairing_profile_ref": {"type": "string", "pattern": "^AFP_[A-Z0-9_]+$"},
+        "health_timeout_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "command_timeout_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "required_capabilities": {"type": "array", "minItems": 1, "items": {"type": "string"}}
+      }
+    },
+    "storage": {"type": "object", "minProperties": 1},
+    "timeouts": {"type": "object", "minProperties": 1},
+    "reconnect": {"type": "object", "minProperties": 1},
+    "queues": {"type": "object", "minProperties": 1},
+    "logging": {"type": "object", "minProperties": 1},
+    "capacity": {"type": "object", "minProperties": 1}
+  },
+  "oneOf": [
+    {
+      "properties": {"mode": {"const": "local_direct"}},
+      "not": {"required": ["helper"]}
+    },
+    {
+      "properties": {"mode": {"const": "remote_helper"}},
+      "required": ["helper"]
+    }
+  ]
+}

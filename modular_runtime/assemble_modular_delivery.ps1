@@ -106,9 +106,10 @@ $legacyTarget = Join-Path $appTarget "legacy"
 $legacyStaticTarget = Join-Path $legacyTarget "static"
 $uiTarget = Join-Path $appTarget "ui"
 $configTarget = Join-Path $TargetDir "config"
+$preSensorConfigTarget = Join-Path $configTarget "pre_sensor"
 $nativeTarget = Join-Path $TargetDir "native_dll"
 $docsTarget = Join-Path $TargetDir "docs"
-foreach ($path in @($appTarget, $legacyTarget, $legacyStaticTarget, $uiTarget, $configTarget, $nativeTarget, $docsTarget)) {
+foreach ($path in @($appTarget, $legacyTarget, $legacyStaticTarget, $uiTarget, $configTarget, $preSensorConfigTarget, $nativeTarget, $docsTarget)) {
     New-Item -ItemType Directory -Force -Path $path | Out-Null
 }
 
@@ -121,6 +122,14 @@ Copy-Item -LiteralPath (Join-Path $ScriptDir "config\runtime.delivery.json") -De
 $runtimeConfig = Get-Content -LiteralPath $runtimeConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $runtimeConfig.application_version = $ApplicationVersion
 $runtimeConfig | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $runtimeConfigPath -Encoding UTF8
+$preSensorConfigSource = Join-Path $RepoRoot "pre_sensor\config"
+foreach ($name in @("schema.json", "local_direct.json", "remote_helper.json")) {
+    $source = Join-Path $preSensorConfigSource $name
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+        throw "Pre-sensor configuration template is missing: $source"
+    }
+    Copy-Item -LiteralPath $source -Destination $preSensorConfigTarget -Force
+}
 $documentation = Get-ChildItem -LiteralPath (Join-Path $RepoRoot "docs") -Filter "*.md" -File
 if (-not $documentation) {
     throw "Modular documentation directory does not contain Markdown files."
@@ -148,7 +157,7 @@ $legacyFiles = @(
     "runtime_health_primitives.py", "web_training.py", "web_training_pipeline.py",
     "training_data.py", "training_center.py", "training_center_cli.py",
     "native_integrated_app.py", "fit_new_collection_health.py", "websocket_live.py",
-    "helper_relay.py", "edge_capture.py", "local_capture_agent.py", "local_capture_helper_entry.py", "release_contract.py", "windows_usb_topology.py", "interface_transport_catalog.py",
+    "helper_relay.py", "edge_capture.py", "local_capture_agent.py", "local_capture_helper_entry.py", "release_contract.py", "pre_sensor_config.py", "windows_usb_topology.py", "interface_transport_catalog.py",
     "simulation_replay.py", "simulation_source_transfer.py",
     "public_demo_bundles.py",
     "remote_mysql_setup.py", "server_target_mysql.py", "server_capture_journal.py", "generate_pressure_simulation.py",
@@ -298,6 +307,15 @@ if ($ReleaseContract) {
         $staticHashes[[string]$relative] = (Get-Sha256Hex $asset).ToLowerInvariant()
     }
     $releaseManifest.static_assets | Add-Member -NotePropertyName sha256 -NotePropertyValue $staticHashes -Force
+    $configurationHashes = [ordered]@{}
+    foreach ($relative in @($releaseManifest.configuration_templates.required)) {
+        $template = Join-Path $TargetDir ([string]$relative).Replace('/', '\')
+        if (-not (Test-Path -LiteralPath $template -PathType Leaf)) {
+            throw "Release contract configuration template is missing: $relative"
+        }
+        $configurationHashes[[string]$relative] = (Get-Sha256Hex $template).ToLowerInvariant()
+    }
+    $releaseManifest.configuration_templates | Add-Member -NotePropertyName sha256 -NotePropertyValue $configurationHashes -Force
     foreach ($component in @($releaseManifest.runtime_requirements.native_components)) {
         $nativePath = Join-Path $TargetDir ([string]$component.path).Replace('/', '\')
         if (-not (Test-Path -LiteralPath $nativePath -PathType Leaf)) {

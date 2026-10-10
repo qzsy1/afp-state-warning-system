@@ -40,6 +40,14 @@ class CandidateReleaseContractTests(unittest.TestCase):
             native = candidate / "native_dll" / "BsvUvcNative.dll"
             native.parent.mkdir()
             native.write_bytes(b"dll")
+            template_hashes = {}
+            for relative in source_contract["configuration_templates"]["required"]:
+                template = candidate / relative
+                template.parent.mkdir(parents=True, exist_ok=True)
+                template.write_bytes(relative.encode("utf-8"))
+                template_hashes[relative] = hashlib.sha256(
+                    relative.encode("utf-8")
+                ).hexdigest()
             manifest = {
                 **source_contract,
                 "candidate": {
@@ -50,6 +58,10 @@ class CandidateReleaseContractTests(unittest.TestCase):
                 "static_assets": {
                     "required": ["app/ui/app.js"],
                     "sha256": {"app/ui/app.js": hashlib.sha256(b"asset").hexdigest()},
+                },
+                "configuration_templates": {
+                    **source_contract["configuration_templates"],
+                    "sha256": template_hashes,
                 },
                 "runtime_requirements": {
                     **source_contract["runtime_requirements"],
@@ -74,6 +86,59 @@ class CandidateReleaseContractTests(unittest.TestCase):
             asset.write_bytes(b"tampered")
             self.assertIn(
                 "release static hash mismatch: app/ui/app.js",
+                validate_candidate_release_contract(candidate),
+            )
+
+    def test_release_manifest_binds_both_mode_templates_and_schema(self) -> None:
+        source_contract = json.loads(
+            (ROOT / "pre_sensor" / "release-contract.json").read_text(encoding="utf-8")
+        )
+        expected = {
+            "config/pre_sensor/schema.json",
+            "config/pre_sensor/local_direct.json",
+            "config/pre_sensor/remote_helper.json",
+        }
+        declared = set(source_contract["configuration_templates"]["required"])
+        self.assertEqual(declared, expected)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate = Path(temporary)
+            digests = {}
+            for relative in expected:
+                path = candidate / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                content = relative.encode("utf-8")
+                path.write_bytes(content)
+                digests[relative] = hashlib.sha256(content).hexdigest()
+            manifest = {
+                **source_contract,
+                "candidate": {
+                    "candidate_id": "2.0.5-rc.1-test",
+                    "source_revision": "abc123",
+                    "created_at": "2026-10-09T00:00:00Z",
+                },
+                "configuration_templates": {
+                    "required": sorted(expected),
+                    "sha256": digests,
+                },
+                "static_assets": {"required": [], "sha256": {}},
+                "runtime_requirements": {
+                    **source_contract["runtime_requirements"],
+                    "native_components": [],
+                },
+            }
+            (candidate / "RELEASE-MANIFEST.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            # This focused test ignores unrelated fixture declarations and
+            # asserts that configuration tampering is independently detected.
+            issues = validate_candidate_release_contract(candidate)
+            self.assertFalse(any("configuration template" in item for item in issues))
+            changed = candidate / "config" / "pre_sensor" / "local_direct.json"
+            changed.write_bytes(b"tampered")
+            self.assertIn(
+                "release configuration template hash mismatch: "
+                "config/pre_sensor/local_direct.json",
                 validate_candidate_release_contract(candidate),
             )
 

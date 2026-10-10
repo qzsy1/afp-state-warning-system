@@ -194,7 +194,11 @@ _CANDIDATE_REQUIRED_FILES = (
     "app/legacy/acquisition.py",
     "app/legacy/real_acquisition.py",
     "app/legacy/release_contract.py",
+    "app/legacy/pre_sensor_config.py",
     "app/legacy/local_direct_acquisition.py",
+    "config/pre_sensor/schema.json",
+    "config/pre_sensor/local_direct.json",
+    "config/pre_sensor/remote_helper.json",
     "app/ui/index.html",
     "app/ui/app.js",
     "app/ui/styles.css",
@@ -329,6 +333,7 @@ def validate_candidate_release_contract(candidate_root: Path) -> tuple[str, ...]
     identity = payload.get("identity")
     contracts = payload.get("contracts")
     static = payload.get("static_assets")
+    configuration = payload.get("configuration_templates")
     managed = payload.get("managed_files")
     runtime = payload.get("runtime_requirements")
     candidate = payload.get("candidate")
@@ -336,6 +341,7 @@ def validate_candidate_release_contract(candidate_root: Path) -> tuple[str, ...]
         ("identity", identity),
         ("contracts", contracts),
         ("static_assets", static),
+        ("configuration_templates", configuration),
         ("managed_files", managed),
         ("runtime_requirements", runtime),
         ("candidate", candidate),
@@ -373,6 +379,29 @@ def validate_candidate_release_contract(candidate_root: Path) -> tuple[str, ...]
                 issues.append(f"release static file missing: {relative}")
             elif _sha256_file(asset_path) != str(asset_hashes.get(relative) or "").lower():
                 issues.append(f"release static hash mismatch: {relative}")
+
+    required_templates = configuration.get("required")
+    template_hashes = configuration.get("sha256")
+    if not isinstance(required_templates, list) or not isinstance(template_hashes, dict):
+        issues.append(
+            "release configuration templates require a path list and sha256 map"
+        )
+    else:
+        for relative_value in required_templates:
+            relative = str(relative_value)
+            template_path = (root / relative).resolve()
+            if root not in template_path.parents:
+                issues.append(
+                    f"release configuration template path escapes candidate: {relative}"
+                )
+            elif not template_path.is_file():
+                issues.append(f"release configuration template missing: {relative}")
+            elif _sha256_file(template_path) != str(
+                template_hashes.get(relative) or ""
+            ).lower():
+                issues.append(
+                    f"release configuration template hash mismatch: {relative}"
+                )
 
     native_components = runtime.get("native_components")
     if not isinstance(native_components, list) or not native_components:

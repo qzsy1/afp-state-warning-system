@@ -35,4 +35,23 @@
 - GREEN：同一命令 2/2 通过；候选入口拒绝既有目标并固定在 `artifacts/pre-sensor-candidates/<candidate-id>/`，清单绑定静态资源和 native DLL 摘要，声明 SDK/驱动要求。
 - 装配兼容：现有启动器复用装配测试 1/1 通过；候选与既有真实采集预检 17/17 通过。
 - 阶段全量：Harness 140/140、modular runtime 34/34、`git diff --check` 通过。
+- 干净提交候选：`2.0.5-rc.1-9ee31829532f-20261009T112336Z`，`source_revision=9ee31829532f`，6175 项 `SHA256SUMS.txt`。
+- 候选实测：候选内导入、发行清单/静态/native 验证无问题；`--self-test`、`--module-status`、`--verify-files` 返回码均为 0。
+- 正式目录复验：仍为 6176 个受管文件，树摘要检查通过；正式 `delivery` 未修改。
+
+## 双模式配置模板
+
+- RED：`python -m unittest harness.tests.test_pre_sensor_config.PreSensorConfigurationTemplateTests -v`，2/2 因 `pre_sensor/config/local_direct.json` 与 `remote_helper.json` 不存在而报错。
+- GREEN：同一命令 2/2 通过；两套完整模板显式互斥，覆盖 17 个通道/单位、5 类接口、保存、超时、重连、队列、日志和容量，所有端点使用 `AFP_*` 引用且无敏感字段或机器绝对路径。
+
+## 双模式配置启动前门禁
+
+- RED：`python -m unittest harness.tests.test_pre_sensor_config.PreSensorConfigurationValidationTests -v` 首次因 `visualization_app.pre_sensor_config` 不存在而导入失败；补充远程 Helper 合同用例后，错误 Helper 版本仍会触发启动回调，1/1 失败。
+- GREEN：配置测试 7/7 通过；缺失/混用模式、接口位置、通道、单位、引用、容量、超时、重连、队列和日志边界均在启动回调前失败，远程 Helper 发行合同不一致时发送次数为零。
+- 复用与兼容：验证器映射到既有 `AcquisitionConfig`，双模式/共享采集核心和发行门禁 45/45 通过，前端合同 84/84 通过。`test_app.DashboardTests` 仍因仓库既有 dashboard/model 历史数据缺失无法初始化，未生成任何伪数据；与本配置变更无关。
+
+## 候选配置资产合同
+
+- RED：`python -m unittest harness.tests.test_candidate_release_contract.CandidateReleaseContractTests.test_release_manifest_binds_both_mode_templates_and_schema -v` 因发行合同缺少 `configuration_templates` 报错。
+- GREEN：候选发行合同 3/3、候选真实采集预检 15/15 通过；两套模板和 schema 具有发行清单 SHA-256，任一篡改会被候选验证器拒绝。
 

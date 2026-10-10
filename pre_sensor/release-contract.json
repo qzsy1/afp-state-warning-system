@@ -24,6 +24,13 @@
       "app/ui/training.js"
     ]
   },
+  "configuration_templates": {
+    "required": [
+      "config/pre_sensor/schema.json",
+      "config/pre_sensor/local_direct.json",
+      "config/pre_sensor/remote_helper.json"
+    ]
+  },
   "managed_files": {
     "manifest": "SHA256SUMS.txt",
     "digest_algorithm": "sha256"
