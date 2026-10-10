@@ -108,6 +108,8 @@ class PreSensorEnduranceTests(unittest.TestCase):
         self.assertIn("--pre-sensor-endurance", bootstrap)
         self.assertIn("default=1800.0", bootstrap)
         self.assertIn("--pre-sensor-endurance", wrapper)
+        self.assertIn("Start-Process", wrapper)
+        self.assertIn(".ExitCode", wrapper)
 
 
 if __name__ == "__main__":

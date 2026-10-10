@@ -93,6 +93,11 @@ class RemainingPhysicalChecklistTests(unittest.TestCase):
             "pre_sensor_evidence.py",
         ):
             self.assertIn(name, assembly)
+        exporter = (ROOT / "pre_sensor" / "export-pre-sensor-evidence.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Start-Process", exporter)
+        self.assertIn(".ExitCode", exporter)
 
 
 if __name__ == "__main__":

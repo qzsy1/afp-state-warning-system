@@ -815,9 +815,7 @@ def main(root: Path, arguments: list[str] | None = None) -> None:
         }
         _emit_command_result(context, "pre-sensor-preflight", result)
         if report.summary.outcome in {"failed", "blocked"}:
-            raise RuntimeError(
-                "pre-sensor readiness did not pass; inspect the generated report"
-            )
+            raise SystemExit(1)
         return
     if args.pre_sensor_endurance:
         endurance = _legacy_module("pre_sensor_endurance", context)
@@ -847,7 +845,7 @@ def main(root: Path, arguments: list[str] | None = None) -> None:
         }
         _emit_command_result(context, "pre-sensor-endurance", result)
         if not result.get("ok"):
-            raise RuntimeError("pre-sensor endurance did not reconcile")
+            raise SystemExit(1)
         return
     if args.pre_sensor_export_evidence:
         evidence = _legacy_module("pre_sensor_evidence", context)

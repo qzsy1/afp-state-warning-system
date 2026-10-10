@@ -16,5 +16,8 @@ $arguments = @("--pre-sensor-export-evidence", "--pre-sensor-output", $Output)
 foreach ($item in $Source) {
     $arguments += @("--pre-sensor-evidence-source", $item)
 }
-& $launcher @arguments
-exit $LASTEXITCODE
+$quotedArguments = $arguments | ForEach-Object {
+    '"' + ([string]$_).Replace('"', '\"') + '"'
+}
+$process = Start-Process -FilePath $launcher -ArgumentList $quotedArguments -Wait -PassThru -WindowStyle Hidden
+exit $process.ExitCode

@@ -125,3 +125,9 @@
 - GREEN：同一命令 4/4 通过。证据导出器按结构脱敏密码/Token/授权/Cookie、URL 用户信息与敏感 query、环境变量和 Windows 用户私有路径；已知秘密仍存在或二进制无法安全脱敏时失败关闭，并为每个源保留 SHA-256/字节数清单。
 - 现场手册按安装、预检、模式选择、修复、启动、观察、停止、数据库重试/对账、导出证据的固定顺序编排；所有高影响 Windows 设置仅检查，不自动修改。
 - `real-device-only-checklist.json` 恰含 9 个实物验证 ID；版本、配置、网络、存储、MySQL、Helper 或 Windows 项注入会被验证器拒绝。
+
+## 候选窗口化命令失败关闭
+
+- RED：首次候选短跑把输出放在深层候选目录，已有 235 字符路径保护正确拒绝，但窗口化启动器的未捕获 `RuntimeError` 留下错误对话框；同时 PowerShell 直接调用 GUI EXE 不等待，无法可靠取得 `$LASTEXITCODE`。新增三个静态合同测试均失败。
+- GREEN：预检/耐久的已知不通过结论现在写完报告后使用 `SystemExit(1)`；预检、耐久和证据导出 wrapper 统一以 `Start-Process -Wait -PassThru` 等待并返回 `.ExitCode`。3/3 合同通过，所有脚本 PowerShell AST 语法检查通过。
+- 候选短路径复测：在 `D:\AFP-Drill-11d304a` 分别执行 local_direct 与 remote_helper 1 秒候选短跑，均返回 0；各 11 帧且 CSV/质量/绝对序号/时间戳对账，远程 journal 11/11。深路径失败不被写成采集缺陷，现场手册已明确要求短安装路径。

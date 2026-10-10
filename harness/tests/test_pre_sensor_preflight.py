@@ -158,11 +158,17 @@ class PreSensorPreflightOrchestrationTests(unittest.TestCase):
             "--pre-sensor-output",
         ):
             self.assertIn(argument, source)
+        self.assertIn("raise SystemExit(1)", source)
+        self.assertNotIn(
+            "pre-sensor readiness did not pass; inspect the generated report",
+            source,
+        )
         wrapper = ROOT / "pre_sensor" / "run-preflight.ps1"
         self.assertTrue(wrapper.is_file())
         wrapper_source = wrapper.read_text(encoding="utf-8")
         self.assertIn("--pre-sensor-preflight", wrapper_source)
-        self.assertIn("$LASTEXITCODE", wrapper_source)
+        self.assertIn("Start-Process", wrapper_source)
+        self.assertIn(".ExitCode", wrapper_source)
 
 
 if __name__ == "__main__":

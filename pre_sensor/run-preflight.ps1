@@ -21,5 +21,8 @@ if ($Output) {
     $launcherArguments += @("--pre-sensor-output", $Output)
 }
 
-& $launcher @launcherArguments
-exit $LASTEXITCODE
+$quotedArguments = $launcherArguments | ForEach-Object {
+    '"' + ([string]$_).Replace('"', '\"') + '"'
+}
+$process = Start-Process -FilePath $launcher -ArgumentList $quotedArguments -Wait -PassThru -WindowStyle Hidden
+exit $process.ExitCode

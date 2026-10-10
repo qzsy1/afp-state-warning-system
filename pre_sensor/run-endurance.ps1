@@ -27,5 +27,8 @@ if ($Output) {
 if ($FaultDrill) {
     $arguments += "--pre-sensor-fault-drill"
 }
-& $launcher @arguments
-exit $LASTEXITCODE
+$quotedArguments = $arguments | ForEach-Object {
+    '"' + ([string]$_).Replace('"', '\"') + '"'
+}
+$process = Start-Process -FilePath $launcher -ArgumentList $quotedArguments -Wait -PassThru -WindowStyle Hidden
+exit $process.ExitCode
