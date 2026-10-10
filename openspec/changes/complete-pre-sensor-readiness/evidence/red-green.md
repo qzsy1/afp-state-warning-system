@@ -131,3 +131,8 @@
 - RED：首次候选短跑把输出放在深层候选目录，已有 235 字符路径保护正确拒绝，但窗口化启动器的未捕获 `RuntimeError` 留下错误对话框；同时 PowerShell 直接调用 GUI EXE 不等待，无法可靠取得 `$LASTEXITCODE`。新增三个静态合同测试均失败。
 - GREEN：预检/耐久的已知不通过结论现在写完报告后使用 `SystemExit(1)`；预检、耐久和证据导出 wrapper 统一以 `Start-Process -Wait -PassThru` 等待并返回 `.ExitCode`。3/3 合同通过，所有脚本 PowerShell AST 语法检查通过。
 - 候选短路径复测：在 `D:\AFP-Drill-11d304a` 分别执行 local_direct 与 remote_helper 1 秒候选短跑，均返回 0；各 11 帧且 CSV/质量/绝对序号/时间戳对账，远程 journal 11/11。深路径失败不被写成采集缺陷，现场手册已明确要求短安装路径。
+
+## 候选MySQL驱动声明一致性
+
+- RED：候选统一预检的 `runtime.candidate_dependencies` 发现发行合同要求 `pymysql`，但实际冻结运行时只打包并使用首选 `mysql.connector`；该候选因此正确失败，未把自检通过冒充完整依赖通过。
+- GREEN：发行合同 `required_modules` 改为生产构建明确收集且存储实现优先使用的 `mysql.connector`；新增合同断言禁止再次把可选 fallback `pymysql` 写成必需模块。目标 MySQL 环境验证仍独立要求真实实例，并未因驱动声明修正而降级。

@@ -27,6 +27,12 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertEqual(contract.helper_protocol_version, 2)
         self.assertEqual(contract.unified_frame_contract, "unified_frame_v1")
         self.assertEqual(contract.configuration_schema_version, 1)
+        payload = json.loads(
+            (ROOT / "pre_sensor" / "release-contract.json").read_text(encoding="utf-8")
+        )
+        required_modules = payload["runtime_requirements"]["required_modules"]
+        self.assertIn("mysql.connector", required_modules)
+        self.assertNotIn("pymysql", required_modules)
         self.assertEqual(contract.readiness_schema_version, 1)
         self.assertIn("app/ui/app.js", contract.required_static_assets)
         self.assertEqual(contract.managed_file_manifest, "SHA256SUMS.txt")

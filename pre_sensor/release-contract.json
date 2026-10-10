@@ -37,7 +37,7 @@
   },
   "runtime_requirements": {
     "python_runtime": "bundled",
-    "required_modules": ["numpy", "pandas", "joblib", "pymysql"],
+    "required_modules": ["numpy", "pandas", "joblib", "mysql.connector"],
     "native_components": [
       {"id": "bsv_uvc", "path": "native_dll/BsvUvcNative.dll"},
       {"id": "libusb", "path": "native_dll/libusb-1.0.dll"}
