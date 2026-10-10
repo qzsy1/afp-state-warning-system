@@ -977,7 +977,11 @@ class DashboardData:
             coherence_floor=online_artifact["coherence_floor"],
             transformers=online_artifact["transformers"],
         )
-        self.acquisition = AcquisitionManager()
+        # The production application must discover durable MySQL retry and
+        # incomplete-finalization records left by a prior process.  Direct
+        # library callers keep the legacy constructor behavior unless they
+        # explicitly opt in or provide a dedicated capture root.
+        self.acquisition = AcquisitionManager(recovery_scan=True)
         self.local_capture_agent = LocalCaptureAgent(manager=self.acquisition)
         self.helper_registry = HelperRegistry()
         self.remote_acquisitions = RemoteAcquisitionRegistry()

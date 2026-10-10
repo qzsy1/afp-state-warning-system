@@ -62,7 +62,7 @@ class MySQLDiagnosticsTests(unittest.TestCase):
         connection = Mock()
         cursor = Mock()
         connection.cursor.return_value = cursor
-        cursor.fetchone.return_value = (1,)
+        cursor.fetchone.side_effect = [(1,), (0,)]
         cursor.fetchall.return_value = []
         store = MySQLCaptureStore(_settings())
         store._connect = lambda database=None: ("pymysql", connection)  # type: ignore[method-assign]
@@ -71,6 +71,7 @@ class MySQLDiagnosticsTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertTrue(result["write_test"])
+        self.assertTrue(result["rollback_verified"])
         connection.rollback.assert_called_once_with()
         self.assertTrue(
             any("afp_mysql_upload_log" in str(call.args[0]) for call in cursor.execute.call_args_list)

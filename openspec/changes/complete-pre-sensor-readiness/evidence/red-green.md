@@ -84,3 +84,44 @@
 - RED：`python -m unittest harness.tests.test_pre_sensor_capacity -v` 因缺少 `CapacityPolicy` 导入失败。
 - GREEN：3/3 通过；writer/transport 队列、日志总量/保留天数、journal、retry spool、最小剩余空间均要求有限正值；软阈值投影为明确警告，硬阈值和队列溢出失败关闭。
 
+## MySQL分阶段事务预检
+
+- RED：`python -m unittest harness.tests.test_pre_sensor_mysql_probe -v` 首次因缺少 `probe_mysql_readiness` 导入失败；既有写探针仅调用 rollback，未查询并证明探针行已消失。
+- GREEN：3/3 通过；使用唯一探针身份依次证明 connect、schema、INSERT 权限、rollback 和零残留，报告只保留脱敏目标字段。缺少目标 profile 返回外部 `blocked`，`simulation` 证据明确拒绝升级为目标实例通过。
+
+## 持久化身份、重试与恢复
+
+- RED：质量侧车合同因摘要中缺少 `quality_sidecar` 失败；`python -m unittest harness.tests.test_pre_sensor_recovery_gate -v` 因缺少持久恢复扫描和预检探针导入失败。
+- GREEN：质量侧车携带与 CSV/时间戳逐通道质量相同的 `capture_uuid`、样本数和绝对序号范围；启动恢复扫描识别 `*_mysql*_pending.json` 与 `.partial`，证据仅含文件名/相对路径摘要，不泄露机器根路径；待重试或未完成收尾会阻止下一正式采集。
+- 相关回归：MySQL、采集完整性、双模式持久化、server journal 共 104/104 通过，包含运行中断开、耐久 retry spool、重复 retry/stop、journal 重启、重复 ACK、配额和目标保存身份覆盖。
+
+## 当前目标MySQL与历史待重试实测
+
+- 目标 MySQL：未设置 `AFP_MYSQL_PROFILE`，报告 `artifacts/pre-sensor-evidence/current-target-mysql/target-mysql-readiness.{json,md}` 为 `blocked`；本机 3306 端口可连接不能替代目标实例身份、schema 和权限证据。
+- 持久恢复：`D:\AFP_Capture` 检出 1 个既有 target MySQL 待重试记录，报告 `artifacts/pre-sensor-evidence/current-persistence-recovery/persistence-recovery.{json,md}` 为 `failed`；在获得目标实例凭据并完成重试/对账前，正式采集门禁保持关闭。
+
+## Helper预检、协议故障演练与第二台Windows
+
+- RED：`python -m unittest harness.tests.test_pre_sensor_helper_probe -v` 因缺少 `probe_helper_readiness` 导入失败；版本/合同、安装、进程、端口、健康、配对、readiness、HTTP、WebSocket 和代理任一阶段都要求失败关闭。
+- GREEN：Helper 预检 4/4 通过；本机模式明确不适用，远程模式缺少第二台电脑返回外部 `blocked`，协议模拟与真实双机只允许两个独立证据等级。
+- RED：`python -m unittest harness.tests.test_pre_sensor_helper_drill -v` 因缺少协议演练器导入失败；报告写入合同随后因 writer 不存在失败。
+- GREEN：协议演练 3/3 通过；实际生成 300 帧、10 Hz、绝对序号 0–299，覆盖 ACK/批量、缺口拒绝、重复幂等、断线重放、Helper 重启重放、server journal 重启恢复和最终 300/300 对账。证据位于 `artifacts/pre-sensor-evidence/local-helper-protocol/`，固定标记 `protocol_simulation` 且 `two_machine_verified=false`。
+- RED→GREEN：第二台 Windows 脚本合同先因文件不存在 2/2 报错，候选装配断言再因缺失文件名失败；实现后 3/3 通过。脚本提供 install/start/stop/restart/check/export，不接受或输出凭据，不自动修改防火墙、电源、网卡、USB 或时钟策略，检查失败/阻塞分别返回非零退出码。
+- 既有回归：Helper transport/relay、HTTP fallback、WebSocket、live protocol、server journal、remote mirror、local agent 共 107/107 通过。
+- 外部环境：当前未提供可访问的第二台 Windows 主机，`artifacts/pre-sensor-evidence/second-windows-blocked/` 明确为 `blocked`；未把本机协议模拟冒充真实跨机、睡眠恢复或网络切换证据。
+
+## 双模式耐久、故障边界与统一对账
+
+- RED：`python -m unittest harness.tests.test_pre_sensor_endurance -v` 首次 3/3 因 `pre_sensor_endurance` 不存在而导入失败；候选一键入口合同随后因 wrapper 不存在失败。
+- GREEN：耐久合同 5/5 通过；默认计划固定每种模式 1800 秒/10 Hz，低于 1800 秒只能标记 `short_test`。运行器复用 `AcquisitionManager`、`LocalCaptureAgent`、`HelperSamplePump`、`RemoteAcquisitionRegistry` 和 `ServerCaptureJournal`，不另造采集核心。
+- 双模式短跑：各 5 秒实跑通过；local_direct 51 帧/CSV 51/质量 51，remote_helper 51 帧/CSV 51/质量 51/journal 51，绝对序号 0–50、逐通道质量与单调时间戳对账，频率分别约 9.988 Hz 和 9.980 Hz。证据固定标记 `short_test`。
+- 故障边界：`fault_injection_simulation` 报告通过慢写背压、队列溢出失败关闭、停止超时、容量软告警/硬拒绝、数据库中断 spool、停止时数据库不可用和恢复对账；writer 队列峰值 2，最终 spool 为 0。
+- 差异注入：CSV、质量侧车或 journal 任一计数变化均使统一对账失败并定位字段；MySQL 目标实例不可用时保留 `mysql_rows=null`，不会把模拟恢复写成目标 MySQL 通过。
+- 30 分钟墙钟：`local_direct` 与 `remote_helper` 已并行启动，完成并核验前 7.7 保持未完成。
+
+## 现场手册、脱敏证据与真实设备白名单
+
+- RED：`python -m unittest harness.tests.test_pre_sensor_field_ops -v` 首次 4/4 因导出器、手册和白名单文件不存在而报错。
+- GREEN：同一命令 4/4 通过。证据导出器按结构脱敏密码/Token/授权/Cookie、URL 用户信息与敏感 query、环境变量和 Windows 用户私有路径；已知秘密仍存在或二进制无法安全脱敏时失败关闭，并为每个源保留 SHA-256/字节数清单。
+- 现场手册按安装、预检、模式选择、修复、启动、观察、停止、数据库重试/对账、导出证据的固定顺序编排；所有高影响 Windows 设置仅检查，不自动修改。
+- `real-device-only-checklist.json` 恰含 9 个实物验证 ID；版本、配置、网络、存储、MySQL、Helper 或 Windows 项注入会被验证器拒绝。

@@ -18,6 +18,7 @@ import socket
 import subprocess
 import re
 import locale
+import sys
 import threading
 import time
 from collections import Counter
@@ -25,6 +26,11 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
 from pathlib import Path
+
+
+_APP_DIR = Path(__file__).resolve().parent
+if str(_APP_DIR) not in sys.path:
+    sys.path.insert(0, str(_APP_DIR))
 
 
 READINESS_STATUSES = frozenset(
@@ -765,6 +771,171 @@ def probe_capacity_readiness(context: Mapping[str, Any]) -> ProbeOutcome:
     )
 
 
+def probe_mysql_readiness(context: Mapping[str, Any]) -> ProbeOutcome:
+    profile = context.get("mysql_profile")
+    if not isinstance(profile, Mapping) or not profile:
+        raise ExternalEnvironmentBlocked(
+            "target MySQL profile is not available",
+            "Provide AFP_MYSQL_PROFILE for the real target instance with connect, "
+            "schema, INSERT, SELECT and ROLLBACK permissions, then rerun",
+        )
+    if context.get("mysql_evidence_tier") != "target_environment":
+        raise ValueError(
+            "MySQL readiness requires target environment evidence; simulation is insufficient"
+        )
+    try:
+        from mysql_storage import MySQLCaptureStore, MySQLSettings
+    except ImportError:
+        from .mysql_storage import MySQLCaptureStore, MySQLSettings
+    settings = MySQLSettings.from_mapping(
+        {
+            **dict(profile),
+            "mysql_enabled": True,
+        }
+    )
+    factory = context.get("mysql_store_factory")
+    store = factory(settings) if callable(factory) else MySQLCaptureStore(settings)
+    result = store.preflight(require_schema=True, write_test=True)
+    if not isinstance(result, Mapping):
+        raise ValueError("target MySQL preflight returned an invalid result")
+    stage = str(result.get("stage") or "unknown")
+    required_flags = (
+        bool(result.get("ok")),
+        bool(result.get("schema_ready")),
+        bool(result.get("write_test")),
+        bool(result.get("rollback_verified")),
+    )
+    if not all(required_flags):
+        category = ""
+        error_detail = result.get("error_detail")
+        if isinstance(error_detail, Mapping):
+            category = str(error_detail.get("category") or "")
+        suffix = f" ({category})" if category else ""
+        raise ValueError(f"target MySQL preflight failed at stage {stage}{suffix}")
+    stages = result.get("stages")
+    expected_stages = {"connect", "schema", "write", "rollback"}
+    if not isinstance(stages, Mapping) or any(
+        stages.get(name) is not True for name in expected_stages
+    ):
+        raise ValueError("target MySQL preflight did not prove every required stage")
+    details = {
+        "host": settings.host,
+        "port": settings.port,
+        "database": settings.database,
+        "user": settings.user,
+        "tls_requested": bool(result.get("tls_requested", settings.ssl_enabled)),
+        "driver": str(result.get("driver") or ""),
+        "stages": {name: True for name in sorted(expected_stages)},
+        "rollback_verified": True,
+        "evidence_tier": "target_environment",
+    }
+    return ProbeOutcome(
+        "passed",
+        "target MySQL connect/schema/write/rollback probe passed without residue",
+        details=details,
+    )
+
+
+def probe_persistence_recovery(context: Mapping[str, Any]) -> ProbeOutcome:
+    raw_path = str(context.get("save_path") or "").strip()
+    if not raw_path:
+        raise ValueError("save path is empty; persistence recovery cannot be scanned")
+    try:
+        from acquisition import scan_persistence_recovery
+    except ImportError:
+        from .acquisition import scan_persistence_recovery
+    recovery = scan_persistence_recovery(Path(raw_path))
+    if recovery["database_pending_retry"]:
+        raise ValueError(
+            "database_pending_retry: complete MySQL retry and reconciliation before "
+            "the next formal capture"
+        )
+    if recovery["incomplete_files"]:
+        raise ValueError(
+            "finalization_failed: incomplete capture files require recovery or "
+            "operator-reviewed archival before the next formal capture"
+        )
+    return ProbeOutcome(
+        "passed",
+        "no database retry or incomplete finalization remains from a prior capture",
+        details=dict(recovery),
+    )
+
+
+def probe_helper_readiness(context: Mapping[str, Any]) -> ProbeOutcome:
+    mode = str(context.get("mode") or "")
+    if mode == "local_direct":
+        return ProbeOutcome(
+            "passed",
+            "Helper is not applicable to local_direct mode",
+            details={"not_applicable": True, "evidence_tier": "local_environment"},
+        )
+    if mode != "remote_helper":
+        raise ValueError("Helper readiness requires an explicit acquisition mode")
+    provider = context.get("helper_status_provider")
+    if not callable(provider):
+        raise ExternalEnvironmentBlocked(
+            "a second Windows Helper environment is not available to this preflight",
+            "Provide the second Windows computer, install the same candidate Helper, "
+            "pair it, and rerun the two-machine preflight",
+        )
+    state = provider()
+    if not isinstance(state, Mapping):
+        raise ValueError("Helper status provider returned an invalid result")
+    required = (
+        "installed",
+        "process_running",
+        "port_open",
+        "health_ok",
+        "paired",
+        "readiness_imported",
+        "http_ok",
+        "websocket_ok",
+        "proxy_ok",
+    )
+    failed = [field_name for field_name in required if state.get(field_name) is not True]
+    if failed:
+        raise ValueError("Helper readiness checks failed: " + ", ".join(failed))
+    capabilities = state.get("capabilities")
+    if not isinstance(capabilities, Mapping):
+        raise ValueError("Helper capabilities are missing")
+    try:
+        from release_contract import (
+            ReleaseContractError,
+            assert_helper_contract,
+            load_release_contract,
+        )
+    except ImportError:
+        from .release_contract import (
+            ReleaseContractError,
+            assert_helper_contract,
+            load_release_contract,
+        )
+    contract = load_release_contract(start=Path(__file__))
+    try:
+        assert_helper_contract(capabilities, contract)
+    except ReleaseContractError as exc:
+        raise ValueError(str(exc)) from exc
+    evidence_tier = str(
+        context.get("helper_evidence_tier") or "protocol_simulation"
+    )
+    if evidence_tier not in {"protocol_simulation", "two_machine_environment"}:
+        raise ValueError("Helper evidence tier is invalid")
+    evidence = "Helper installation, health, pairing, readiness and transports passed"
+    if evidence_tier == "protocol_simulation":
+        evidence += "; protocol simulation only, not a two-machine acceptance"
+    return ProbeOutcome(
+        "passed",
+        evidence,
+        details={
+            **{field_name: True for field_name in required},
+            "evidence_tier": evidence_tier,
+            "version": contract.helper_version,
+            "release_revision": contract.release_revision,
+        },
+    )
+
+
 def generate_windows_remediation_script(_findings: Sequence[str]) -> str:
     return _WINDOWS_REMEDIATION_SCRIPT
 
@@ -1034,6 +1205,16 @@ def run_candidate_preflight(
         config_path = next((path for path in candidates if path.is_file()), candidates[0])
     payload = json.loads(Path(config_path).read_text(encoding="utf-8-sig"))
     references = _references_from_environment(payload)
+    mysql_profile: Mapping[str, Any] | None = None
+    raw_mysql_profile = os.environ.get("AFP_MYSQL_PROFILE")
+    if raw_mysql_profile:
+        try:
+            parsed_profile = json.loads(raw_mysql_profile)
+        except json.JSONDecodeError as exc:
+            raise ValueError("AFP_MYSQL_PROFILE must contain a JSON object") from exc
+        if not isinstance(parsed_profile, Mapping):
+            raise ValueError("AFP_MYSQL_PROFILE must contain a JSON object")
+        mysql_profile = parsed_profile
     storage = payload.get("storage") if isinstance(payload, Mapping) else None
     logging_config = payload.get("logging") if isinstance(payload, Mapping) else None
     capacity = payload.get("capacity") if isinstance(payload, Mapping) else None
@@ -1075,6 +1256,26 @@ def run_candidate_preflight(
             30,
         ),
         Probe(
+            "environment.target_mysql",
+            "目标 MySQL 连接、schema、权限、写入与回滚",
+            probe_mysql_readiness,
+            60,
+            external_environment=True,
+        ),
+        Probe(
+            "storage.persistence_recovery",
+            "上一采集数据库重试与收尾恢复",
+            probe_persistence_recovery,
+            30,
+        ),
+        Probe(
+            "environment.second_windows",
+            "Helper 安装、健康、配对、能力与 HTTP/WebSocket",
+            probe_helper_readiness,
+            60,
+            external_environment=True,
+        ),
+        Probe(
             "environment.windows_policy_access",
             "Windows 防火墙、代理、电源与时间同步",
             probe_windows_readiness,
@@ -1098,6 +1299,11 @@ def run_candidate_preflight(
             "minimum_free_bytes": minimum_free_bytes,
             "configuration": payload,
             "capacity_directories": capacity_directories,
+            "mysql_profile": mysql_profile,
+            "mysql_evidence_tier": (
+                "target_environment" if mysql_profile is not None else "unavailable"
+            ),
+            "mode": mode,
         },
         candidate_identity=candidate_identity,
         mode=mode,

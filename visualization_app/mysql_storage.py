@@ -12,6 +12,7 @@ import csv
 import json
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -744,6 +745,13 @@ class MySQLCaptureStore:
             "schema_ready": False,
             "missing_objects": [],
             "write_test": False,
+            "rollback_verified": False,
+            "stages": {
+                "connect": False,
+                "schema": False,
+                "write": False,
+                "rollback": False,
+            },
             "elapsed_seconds": 0.0,
         }
         if not self.settings.enabled:
@@ -757,7 +765,10 @@ class MySQLCaptureStore:
 
         # Keep error wording consistent with the existing web diagnostics
         # without importing the HTTP application module (which would cycle).
-        from remote_mysql_setup import classify_mysql_error
+        try:
+            from remote_mysql_setup import classify_mysql_error
+        except ImportError:
+            from .remote_mysql_setup import classify_mysql_error
 
         connection = None
         cursor = None
@@ -768,6 +779,7 @@ class MySQLCaptureStore:
             cursor = self._cursor(connection)
             cursor.execute("SELECT 1")
             cursor.fetchone()
+            base["stages"]["connect"] = True
 
             base["stage"] = "schema"
             missing: list[str] = []
@@ -791,16 +803,30 @@ class MySQLCaptureStore:
                     "message": "数据库已连接，但缺少AFP关系表",
                 }
                 return base | {"elapsed_seconds": round(time.time() - started, 3)}
+            base["stages"]["schema"] = True
 
             if write_test:
                 base["stage"] = "write"
+                probe_key = f"__afp_preflight__:{uuid.uuid4().hex}"
                 cursor.execute(
                     "INSERT INTO afp_mysql_upload_log "
                     "(specimen_key, layer_no, success, row_count, created_at) "
                     "VALUES (%s, %s, %s, %s, NOW(3))",
-                    ("__afp_preflight__", 0, 0, 0),
+                    (probe_key, 0, 0, 0),
                 )
+                base["stages"]["write"] = True
+                base["stage"] = "rollback"
                 connection.rollback()
+                cursor.execute(
+                    "SELECT COUNT(*) FROM afp_mysql_upload_log "
+                    "WHERE specimen_key=%s AND layer_no=%s",
+                    (probe_key, 0),
+                )
+                residue = int((cursor.fetchone() or (0,))[0] or 0)
+                if residue:
+                    raise RuntimeError("MySQL preflight rollback left a probe row")
+                base["rollback_verified"] = True
+                base["stages"]["rollback"] = True
                 base["write_test"] = True
 
             base["stage"] = "ready"

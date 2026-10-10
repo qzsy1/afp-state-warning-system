@@ -159,6 +159,28 @@ if (-not (Test-Path -LiteralPath $windowsReview -PathType Leaf)) {
     throw "Windows readiness review script is missing: $windowsReview"
 }
 Copy-Item -LiteralPath $windowsReview -Destination (Join-Path $TargetDir "review-windows-remediation.ps1") -Force
+$secondWindowsHelper = Join-Path $RepoRoot "pre_sensor\second-windows-helper.ps1"
+if (-not (Test-Path -LiteralPath $secondWindowsHelper -PathType Leaf)) {
+    throw "Second-Windows Helper entrypoint is missing: $secondWindowsHelper"
+}
+Copy-Item -LiteralPath $secondWindowsHelper -Destination (Join-Path $TargetDir "second-windows-helper.ps1") -Force
+$enduranceEntrypoint = Join-Path $RepoRoot "pre_sensor\run-endurance.ps1"
+if (-not (Test-Path -LiteralPath $enduranceEntrypoint -PathType Leaf)) {
+    throw "Pre-sensor endurance entrypoint is missing: $enduranceEntrypoint"
+}
+Copy-Item -LiteralPath $enduranceEntrypoint -Destination (Join-Path $TargetDir "run-pre-sensor-endurance.ps1") -Force
+$evidenceEntrypoint = Join-Path $RepoRoot "pre_sensor\export-pre-sensor-evidence.ps1"
+if (-not (Test-Path -LiteralPath $evidenceEntrypoint -PathType Leaf)) {
+    throw "Pre-sensor evidence export entrypoint is missing: $evidenceEntrypoint"
+}
+Copy-Item -LiteralPath $evidenceEntrypoint -Destination (Join-Path $TargetDir "export-pre-sensor-evidence.ps1") -Force
+foreach ($fieldDocument in @("FIELD-OPERATIONS.md", "real-device-only-checklist.json")) {
+    $fieldSource = Join-Path $RepoRoot "pre_sensor\$fieldDocument"
+    if (-not (Test-Path -LiteralPath $fieldSource -PathType Leaf)) {
+        throw "Pre-sensor field document is missing: $fieldSource"
+    }
+    Copy-Item -LiteralPath $fieldSource -Destination (Join-Path $TargetDir $fieldDocument) -Force
+}
 
 $legacyFiles = @(
     "app.py", "interface_agent.py", "agentic_diagnosis.py", "diagnostic_tools.py", "acquisition.py", "real_acquisition.py", "local_direct_acquisition.py", "smrf_hid.py", "mysql_storage.py",
@@ -167,7 +189,7 @@ $legacyFiles = @(
     "runtime_health_primitives.py", "web_training.py", "web_training_pipeline.py",
     "training_data.py", "training_center.py", "training_center_cli.py",
     "native_integrated_app.py", "fit_new_collection_health.py", "websocket_live.py",
-    "helper_relay.py", "edge_capture.py", "local_capture_agent.py", "local_capture_helper_entry.py", "release_contract.py", "pre_sensor_config.py", "pre_sensor_preflight.py", "windows_usb_topology.py", "interface_transport_catalog.py",
+    "helper_relay.py", "edge_capture.py", "local_capture_agent.py", "local_capture_helper_entry.py", "release_contract.py", "pre_sensor_config.py", "pre_sensor_preflight.py", "pre_sensor_drill.py", "pre_sensor_endurance.py", "pre_sensor_evidence.py", "windows_usb_topology.py", "interface_transport_catalog.py",
     "simulation_replay.py", "simulation_source_transfer.py",
     "public_demo_bundles.py",
     "remote_mysql_setup.py", "server_target_mysql.py", "server_capture_journal.py", "generate_pressure_simulation.py",

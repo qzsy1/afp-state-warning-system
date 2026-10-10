@@ -742,6 +742,11 @@ def main(root: Path, arguments: list[str] | None = None) -> None:
     parser.add_argument("--rollback", action="store_true")
     parser.add_argument("--server-only", action="store_true")
     parser.add_argument("--pre-sensor-preflight", action="store_true")
+    parser.add_argument("--pre-sensor-endurance", action="store_true")
+    parser.add_argument("--pre-sensor-fault-drill", action="store_true")
+    parser.add_argument("--pre-sensor-duration", type=float, default=1800.0)
+    parser.add_argument("--pre-sensor-export-evidence", action="store_true")
+    parser.add_argument("--pre-sensor-evidence-source", action="append", default=[])
     parser.add_argument(
         "--pre-sensor-mode",
         choices=("local_direct", "remote_helper"),
@@ -813,5 +818,46 @@ def main(root: Path, arguments: list[str] | None = None) -> None:
             raise RuntimeError(
                 "pre-sensor readiness did not pass; inspect the generated report"
             )
+        return
+    if args.pre_sensor_endurance:
+        endurance = _legacy_module("pre_sensor_endurance", context)
+        output = Path(args.pre_sensor_output) if args.pre_sensor_output else (
+            context.root / "verification" / "pre-sensor" / "endurance"
+        )
+        runtime = output / (
+            "boundary-fault-runtime"
+            if args.pre_sensor_fault_drill
+            else f"{args.pre_sensor_mode}-runtime"
+        )
+        if args.pre_sensor_fault_drill:
+            result = endurance.run_boundary_fault_drill(runtime)
+        else:
+            plan = endurance.EndurancePlan(
+                duration_seconds=args.pre_sensor_duration,
+                sample_rate_hz=10.0,
+                modes=(args.pre_sensor_mode,),
+            )
+            result = endurance.run_endurance_mode(
+                runtime, mode=args.pre_sensor_mode, plan=plan
+            )
+        json_path, markdown_path = endurance.write_endurance_report(result, output)
+        result["report_files"] = {
+            "json": str(json_path),
+            "markdown": str(markdown_path),
+        }
+        _emit_command_result(context, "pre-sensor-endurance", result)
+        if not result.get("ok"):
+            raise RuntimeError("pre-sensor endurance did not reconcile")
+        return
+    if args.pre_sensor_export_evidence:
+        evidence = _legacy_module("pre_sensor_evidence", context)
+        if not args.pre_sensor_output:
+            raise ValueError("--pre-sensor-output is required for evidence export")
+        result = evidence.export_sanitized_evidence(
+            [Path(item) for item in args.pre_sensor_evidence_source],
+            Path(args.pre_sensor_output),
+            secret_values=evidence.secret_values_from_environment(),
+        )
+        _emit_command_result(context, "pre-sensor-export-evidence", result)
         return
     launch(context, manager, server_only=args.server_only)
