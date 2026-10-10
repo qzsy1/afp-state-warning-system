@@ -660,6 +660,9 @@ class PublicWebHttpTests(unittest.TestCase):
         self.assertEqual(remote_status["capture_uuid"], "capture-a")
 
     def test_real_helper_target_mysql_is_server_only_and_finalizes_after_last_batch(self):
+        from release_contract import load_release_contract
+
+        contract = load_release_contract(start=__file__)
         self.request_json("GET", "/api/auth/session")
         login, _, _ = self.request_json(
             "POST", "/api/auth/login", {"password": "Correct-Horse-2026"},
@@ -669,7 +672,16 @@ class PublicWebHttpTests(unittest.TestCase):
         _, challenge, _ = self.request_json("POST", "/api/helper/pair/start", {})
         _, paired, _ = self.request_json("POST", "/api/helper/pair/complete", {
             "challenge": challenge["challenge"], "device_id": "visitor-pc",
-            "capabilities": {"real_capture": True, "unified_frame_v1": True},
+            "capabilities": {
+                "real_capture": True,
+                "unified_frame_v1": True,
+                "protocol_version": contract.helper_protocol_version,
+                "helper_version": contract.helper_version,
+                "build_id": contract.release_revision,
+                "unified_frame_contract": contract.unified_frame_contract,
+                "configuration_schema_version": contract.configuration_schema_version,
+                "readiness_schema_version": contract.readiness_schema_version,
+            },
         })
         handler = self.server.RequestHandlerClass
         handler.target_profiles._profile_loader = lambda: {"target": {

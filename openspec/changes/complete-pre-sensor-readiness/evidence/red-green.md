@@ -138,3 +138,16 @@
 - GREEN：发行合同 `required_modules` 改为生产构建明确收集且存储实现优先使用的 `mysql.connector`；新增合同断言禁止再次把可选 fallback `pymysql` 写成必需模块。目标 MySQL 环境验证仍独立要求真实实例，并未因驱动声明修正而降级。
 - RED：修正 MySQL 声明后审查默认驱动探针，发现 SMRF 实现通过 `ctypes` 使用 Windows `hid.dll`，探针却错误要求第三方 Python `hid` 包，会造成候选假失败。
 - GREEN：新增 Windows HID 检测合同并改为实际加载系统 `hid.dll`；同时继续独立验证串口平台、以太网、UVC native DLL 和厂商 SDK。运行时探针 5/5 通过，未把物理传感器存在性混入驱动检测。
+
+## Helper发行能力测试夹具收口
+
+- RED：最终 Harness full 的 `frontend-public-contracts` 中，`test_real_helper_target_mysql_is_server_only_and_finalizes_after_last_batch` 返回 `release_contract_mismatch`。测试只给 Helper 声明 `real_capture` 与 `unified_frame_v1`，却仍期待生产启动成功，违反本变更的启动前版本/协议门禁。
+- GREEN：测试从权威发行合同填入 helper version、build ID、协议、统一帧及配置/readiness schema；没有放宽生产门禁。目标用例 1/1、`frontend-public-contracts` 单项及最终 full 中该检查均通过。
+
+## 最终墙钟耐久与综合验证
+
+- `local_direct`：1800.156 秒、18001 帧、9.999981 Hz、最大帧间隔 119.534 ms、writer 队列峰值 1；CSV/质量侧车各 18001 行，绝对序号 0–18000 连续，对账通过。
+- `remote_helper`：1800.171 秒、18001 帧、9.999941 Hz、最大帧间隔 112.663 ms、writer 队列峰值 1、journal 20,013,056 bytes/18001 行；CSV/质量侧车/journal 对账通过。
+- 两种模式证据均为 `endurance_30m`、确定性模拟、`physical_sensor_verified=false`；网络重放、Helper 重启重放和停止幂等通过，`mysql_rows=null` 未被写成真实目标数据库通过。
+- 最终：Harness 单元/合同 193/193、quick 11/11、full 21/24、modular runtime 34/34；OpenSpec strict、Python compileall、候选导入/自检/静态/manifest、正式 delivery 6176 文件只读基线及 `git diff --check` 均通过。
+- full 剩余 3 项为仓库既有模型/历史数据缺失：`dashboard-runtime-contracts`、`causal-history-evidence`、`model-prediction-contracts`。按范围限制未生成缺失模型或历史数据。
