@@ -741,6 +741,14 @@ def main(root: Path, arguments: list[str] | None = None) -> None:
     parser.add_argument("--install-patch", default="")
     parser.add_argument("--rollback", action="store_true")
     parser.add_argument("--server-only", action="store_true")
+    parser.add_argument("--pre-sensor-preflight", action="store_true")
+    parser.add_argument(
+        "--pre-sensor-mode",
+        choices=("local_direct", "remote_helper"),
+        default="local_direct",
+    )
+    parser.add_argument("--pre-sensor-config", default="")
+    parser.add_argument("--pre-sensor-output", default="")
     args = parser.parse_args(arguments)
     context, manager = initialize(root)
 
@@ -786,5 +794,24 @@ def main(root: Path, arguments: list[str] | None = None) -> None:
         return
     if args.module_status:
         _emit_command_result(context, "module-status", manager.status())
+        return
+    if args.pre_sensor_preflight:
+        readiness = _legacy_module("pre_sensor_preflight", context)
+        report, json_path, markdown_path = readiness.run_candidate_preflight(
+            context.root,
+            mode=args.pre_sensor_mode,
+            config_path=Path(args.pre_sensor_config) if args.pre_sensor_config else None,
+            output_directory=Path(args.pre_sensor_output) if args.pre_sensor_output else None,
+        )
+        result = readiness.preflight_payload(report)
+        result["report_files"] = {
+            "json": str(json_path),
+            "markdown": str(markdown_path),
+        }
+        _emit_command_result(context, "pre-sensor-preflight", result)
+        if report.summary.outcome in {"failed", "blocked"}:
+            raise RuntimeError(
+                "pre-sensor readiness did not pass; inspect the generated report"
+            )
         return
     launch(context, manager, server_only=args.server_only)

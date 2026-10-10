@@ -191,10 +191,13 @@ _MANIFEST_LINE = re.compile(r"^([0-9A-Fa-f]{64}) [ *](.+)$")
 _CANDIDATE_REQUIRED_FILES = (
     "AFP_Integrated_System_Modular.exe",
     "RELEASE-MANIFEST.json",
+    "run-pre-sensor-preflight.ps1",
+    "review-windows-remediation.ps1",
     "app/legacy/acquisition.py",
     "app/legacy/real_acquisition.py",
     "app/legacy/release_contract.py",
     "app/legacy/pre_sensor_config.py",
+    "app/legacy/pre_sensor_preflight.py",
     "app/legacy/local_direct_acquisition.py",
     "config/pre_sensor/schema.json",
     "config/pre_sensor/local_direct.json",

@@ -37,6 +37,8 @@ class RealAcquisitionPreflightTests(unittest.TestCase):
         omitted = omit or set()
         contents = {
             "AFP_Integrated_System_Modular.exe": b"synthetic-launcher",
+            "run-pre-sensor-preflight.ps1": b"exit 0\n",
+            "review-windows-remediation.ps1": b"Write-Host review\n",
             "_internal/runtime.txt": b"runtime",
             "app/legacy/acquisition.py": b"from real_acquisition import ChannelQuality\n",
             "app/legacy/real_acquisition.py": (
@@ -44,6 +46,7 @@ class RealAcquisitionPreflightTests(unittest.TestCase):
             ),
             "app/legacy/release_contract.py": b"CONTRACT = 1\n",
             "app/legacy/pre_sensor_config.py": b"CONFIG = 1\n",
+            "app/legacy/pre_sensor_preflight.py": b"PREFLIGHT = 1\n",
             "app/legacy/local_direct_acquisition.py": b"MODE = 'local_direct'\n",
             "config/pre_sensor/schema.json": b"{}",
             "config/pre_sensor/local_direct.json": b"{}",

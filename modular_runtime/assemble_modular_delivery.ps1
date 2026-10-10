@@ -149,6 +149,16 @@ foreach ($name in $operationalFiles) {
     }
     Copy-Item -LiteralPath $source -Destination (Join-Path $TargetDir $name) -Force
 }
+$preSensorEntrypoint = Join-Path $RepoRoot "pre_sensor\run-preflight.ps1"
+if (-not (Test-Path -LiteralPath $preSensorEntrypoint -PathType Leaf)) {
+    throw "Pre-sensor one-click entrypoint is missing: $preSensorEntrypoint"
+}
+Copy-Item -LiteralPath $preSensorEntrypoint -Destination (Join-Path $TargetDir "run-pre-sensor-preflight.ps1") -Force
+$windowsReview = Join-Path $RepoRoot "pre_sensor\review-windows-remediation.ps1"
+if (-not (Test-Path -LiteralPath $windowsReview -PathType Leaf)) {
+    throw "Windows readiness review script is missing: $windowsReview"
+}
+Copy-Item -LiteralPath $windowsReview -Destination (Join-Path $TargetDir "review-windows-remediation.ps1") -Force
 
 $legacyFiles = @(
     "app.py", "interface_agent.py", "agentic_diagnosis.py", "diagnostic_tools.py", "acquisition.py", "real_acquisition.py", "local_direct_acquisition.py", "smrf_hid.py", "mysql_storage.py",
@@ -157,7 +167,7 @@ $legacyFiles = @(
     "runtime_health_primitives.py", "web_training.py", "web_training_pipeline.py",
     "training_data.py", "training_center.py", "training_center_cli.py",
     "native_integrated_app.py", "fit_new_collection_health.py", "websocket_live.py",
-    "helper_relay.py", "edge_capture.py", "local_capture_agent.py", "local_capture_helper_entry.py", "release_contract.py", "pre_sensor_config.py", "windows_usb_topology.py", "interface_transport_catalog.py",
+    "helper_relay.py", "edge_capture.py", "local_capture_agent.py", "local_capture_helper_entry.py", "release_contract.py", "pre_sensor_config.py", "pre_sensor_preflight.py", "windows_usb_topology.py", "interface_transport_catalog.py",
     "simulation_replay.py", "simulation_source_transfer.py",
     "public_demo_bundles.py",
     "remote_mysql_setup.py", "server_target_mysql.py", "server_capture_journal.py", "generate_pressure_simulation.py",

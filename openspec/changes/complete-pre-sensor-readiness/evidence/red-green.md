@@ -54,4 +54,33 @@
 
 - RED：`python -m unittest harness.tests.test_candidate_release_contract.CandidateReleaseContractTests.test_release_manifest_binds_both_mode_templates_and_schema -v` 因发行合同缺少 `configuration_templates` 报错。
 - GREEN：候选发行合同 3/3、候选真实采集预检 15/15 通过；两套模板和 schema 具有发行清单 SHA-256，任一篡改会被候选验证器拒绝。
+- 干净提交候选：`2.0.5-rc.1-cc7b43d45893-20261010T063146Z`；候选综合验证问题数为 0，候选内 `pre_sensor_config` 成功解析两种模式各 17 通道，秘密扫描通过，`--self-test`、`--module-status`、`--verify-files` 均返回 0。
+- 正式目录复验：`delivery-readonly: passed (6176 managed files)`，正式发行目录没有被候选装配修改。
+
+## 统一预检编排与一键入口
+
+- RED：`python -m unittest harness.tests.test_pre_sensor_preflight -v` 首次因 `visualization_app.pre_sensor_preflight` 不存在而导入失败；补充报告写入/候选入口合同后又分别因缺少 `write_preflight_report` 和 `pre_sensor/run-preflight.ps1` 失败。
+- GREEN：预检编排 5/5、候选真实采集预检 15/15 通过。每个探针具有稳定 ID 和独立超时，异常不会阻止后续检查；`failed`、`blocked`、`physical_sensor_pending` 分类失败关闭；同一不可变报告对象生成 JSON/Markdown 原子文件对。
+- 候选入口：`run-pre-sensor-preflight.ps1` 转发明确模式、配置和输出目录到候选启动器，启动器调用包内预检模块；失败或外部阻塞返回非成功进程状态，真实设备未连接仅允许白名单物理检查为 `physical_sensor_pending`。
+
+## 候选运行环境探针
+
+- RED：`python -m unittest harness.tests.test_pre_sensor_runtime_probe -v` 因缺少 `probe_candidate_runtime` 导入失败。
+- GREEN：4/4 通过；从候选 manifest 校验包内 Python 运行库、模块、native DLL 摘要/PE 架构、SDK 检测文件和驱动状态。删除包内运行库时，即使提供源工作树路径仍失败，禁止借用开发环境。
+
+## 保存目录与慢写探针
+
+- RED：`python -m unittest harness.tests.test_pre_sensor_storage_probe -v` 因缺少 `probe_save_directory` 导入失败。
+- GREEN：3/3 通过；覆盖空路径、创建权限、路径长度、最小剩余空间、写入/flush/close、慢写、原子重命名、内容复验和清理。成功无残留，失败会尝试清理；清理本身失败时保留残留证据并明确失败阶段。
+
+## Windows只读状态探针
+
+- RED：`python -m unittest harness.tests.test_pre_sensor_windows_probe -v` 因缺少 Windows 探针与修复脚本生成器导入失败。
+- GREEN：4/4 通过；只读覆盖防火墙查询、端口、代理、本机睡眠、活动网卡节能、USB 选择性挂起、W32Time 和同步状态；访问拒绝转换为外部环境 `blocked`，脚本只显示检查/建议，不含设置命令。
+- 当前主机实测：报告写入 `artifacts/pre-sensor-evidence/current-host-windows/windows-readiness.{json,md}`；结果为 `failed`，明确发现 `sleep_disabled_ac`、`adapter_power_saving_disabled`、`usb_selective_suspend_disabled`、`time_synchronized` 未满足。未自动更改这些需要管理员审查的系统策略，也未误标为传感器待验证。
+
+## 统一容量策略
+
+- RED：`python -m unittest harness.tests.test_pre_sensor_capacity -v` 因缺少 `CapacityPolicy` 导入失败。
+- GREEN：3/3 通过；writer/transport 队列、日志总量/保留天数、journal、retry spool、最小剩余空间均要求有限正值；软阈值投影为明确警告，硬阈值和队列溢出失败关闭。
 
