@@ -128,7 +128,7 @@
 - GREEN：同一命令 4/4 通过。证据导出器按结构脱敏密码/Token/授权/Cookie、URL 用户信息与敏感 query、环境变量和 Windows 用户私有路径；已知秘密仍存在或二进制无法安全脱敏时失败关闭，并为每个源保留 SHA-256/字节数清单。
 - 现场手册按安装、预检、模式选择、修复、启动、观察、停止、数据库重试/对账、导出证据的固定顺序编排；所有高影响 Windows 设置仅检查，不自动修改。
 - `real-device-only-checklist.json` 恰含 9 个实物验证 ID；版本、配置、网络、存储、MySQL、Helper 或 Windows 项注入会被验证器拒绝。
-- 最终候选首次从全新短路径运行时，模板的 `save_root_ref` 因操作员未预设环境引用而正确失败；这暴露了“一键预检”仍依赖隐含环境步骤。新增合同测试先因入口缺少保存根目录设置与安全 MySQL 提示而 RED；入口现默认使用候选盘符下的 `AFP_Capture`，支持显式 `-SaveRoot`，并用 `-PromptForMySQL` 的 SecureString 本机提示临时传递目标 profile，子进程退出后恢复环境且不把密码放入命令行/配置/报告。现场操作专项现为 5/5，PowerShell AST 通过。
+- 最终候选首次从全新短路径运行时，模板的保存、日志和物理接口引用因操作员未预设环境而正确失败；这暴露了“一键预检”仍依赖隐含环境步骤。合同测试先后因入口缺少保存根目录/安全 MySQL 提示、日志/接口/Helper 诊断引用而 RED；入口现默认使用候选盘符下的 `AFP_Capture`，建立有限日志目录，为未连接的接口提供只在预检进程内存在的 `physical-sensor-pending` 引用，并按发行 manifest 生成不含秘密的未配对 Helper 诊断合同。它支持显式 `-SaveRoot`，并用 `-PromptForMySQL` 的 SecureString 本机提示临时传递目标 profile；子进程退出后恢复全部环境且不把密码放入命令行/配置/报告。现场操作专项现为 5/5，PowerShell AST 通过。
 
 ## 候选窗口化命令失败关闭
 

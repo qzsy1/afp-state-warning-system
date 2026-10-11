@@ -62,6 +62,10 @@ class RemainingPhysicalChecklistTests(unittest.TestCase):
         self.assertIn("AFP_MYSQL_PROFILE", script)
         self.assertIn("AFP_SAVE_ROOT", script)
         self.assertIn("AFP_HELPER_SAVE_ROOT", script)
+        self.assertIn("AFP_LOG_ROOT", script)
+        self.assertIn("AFP_HELPER_LOG_ROOT", script)
+        self.assertIn("AFP_INTERFACE_THERMOCOUPLE", script)
+        self.assertIn("AFP_HELPER_PAIRING_PROFILE", script)
         self.assertIn("finally", script)
 
     def test_only_physical_device_whitelist_is_accepted(self) -> None:

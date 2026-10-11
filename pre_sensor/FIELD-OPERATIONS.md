@@ -10,7 +10,7 @@
 
 ## 2. 运行传感器前预检
 
-运行 `run-pre-sensor-preflight.ps1 -Mode local_direct` 或 `-Mode remote_helper`。入口默认使用候选所在盘符下的 `AFP_Capture`，也可用 `-SaveRoot <短路径>` 明确指定；它会自动设置当前模式对应的保存目录引用，结束后恢复进程环境。目标 MySQL 可用时增加 `-PromptForMySQL`，在本机安全提示中输入密码；禁止把密码写入命令行、配置或报告。保存 JSON 和 Markdown 报告。除白名单物理设备检查外，任何 `failed` 或 `blocked` 都会禁止正式启动。
+运行 `run-pre-sensor-preflight.ps1 -Mode local_direct` 或 `-Mode remote_helper`。入口默认使用候选所在盘符下的 `AFP_Capture`，也可用 `-SaveRoot <短路径>` 明确指定；它会自动设置当前模式对应的保存/日志引用，并仅为尚未连接的物理接口建立预检占位，结束后恢复进程环境。远程模式的诊断占位不会冒充真实配对，第二台电脑未连接时仍为 `blocked`。目标 MySQL 可用时增加 `-PromptForMySQL`，在本机安全提示中输入密码；禁止把密码写入命令行、配置或报告。保存 JSON 和 Markdown 报告。除白名单物理设备检查外，任何 `failed` 或 `blocked` 都会禁止正式启动。
 
 ## 3. 选择模式
 
