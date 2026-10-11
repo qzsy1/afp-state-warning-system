@@ -31,12 +31,12 @@
 
 ## 最终候选与全新目录演练
 
-- 候选：`2.0.5-rc.1-77ce0b81ae4a-20261011T001544Z`。
-- 源提交：`77ce0b81ae4a`；候选独立位于 `artifacts/pre-sensor-candidates/`，未覆盖正式发行。
-- 候选规模：6222 个文件、1,079,086,779 bytes；`SHA256SUMS.txt` 6190 项。
+- 候选：`2.0.5-rc.1-7ebcc3afa865-20261011T002212Z`。
+- 源提交：`7ebcc3afa865`；候选独立位于 `artifacts/pre-sensor-candidates/`，未覆盖正式发行。
+- 候选规模：6222 个文件、1,079,090,277 bytes；`SHA256SUMS.txt` 6190 项。
 - 发行身份：应用、Helper、启动器均为 `2.0.5-rc.1`；协议 2、统一帧 `unified_frame_v1`、配置/readiness schema 均为 1。
 - 候选验证：包内导入、manifest、8 项静态资源、3 项配置资产、native DLL/SDK/驱动声明均通过；`--self-test`、`--module-status`、`--verify-files` 返回码均为 0。
-- 从全新短路径 `D:\AFP-Drill-77ce0b8` 在不预设保存、日志、接口或 Helper 环境引用的条件下运行双模式统一预检。一键入口自动建立无秘密的诊断引用并在退出后恢复环境，不再依赖隐含准备步骤。
+- 从全新短路径 `D:\AFP-Drill-7ebcc3a` 在不预设保存、日志、接口或 Helper 环境引用的条件下运行统一预检。一键入口自动建立无秘密的诊断引用并在退出后恢复环境，不再依赖隐含准备步骤；`-PromptForMySQL -RetryPendingMySQL` 可用一次安全密码输入顺序执行目标探针、幂等补传和最终预检。
 - 候选预检正确失败关闭：`local_direct` 为 7 passed / 1 failed / 1 blocked / 1 physical pending；`remote_helper` 为 6 passed / 1 failed / 2 blocked / 1 physical pending。唯一失败为历史 MySQL 待重试；阻塞为目标 MySQL 凭据及第二台电脑；唯一 `physical_sensor_pending` 为实物身份/端口。Windows、配置、保存目录和容量均通过。
 
 ## RED→GREEN 与自动验证
@@ -74,7 +74,7 @@
 
 | 阻塞项 | 当前证据 | 解除条件 | 证据等级 |
 |---|---|---|---|
-| 目标 MySQL | `192.168.101.31:3306` TCP 可达；MySQL 实际握手返回 1045，确认空密码不允许。真实凭据未进入聊天、命令行、仓库或报告 | 操作员在候选运行 `run-pre-sensor-preflight.ps1 -Mode local_direct -PromptForMySQL` 并在本机 SecureString 提示输入密码，完成 schema/权限/INSERT/SELECT/ROLLBACK 零残留探针 | `blocked / target_environment` |
+| 目标 MySQL | `192.168.101.31:3306` TCP 可达；MySQL 实际握手返回 1045，确认空密码不允许。真实凭据未进入聊天、命令行、仓库或报告 | 操作员在候选运行 `run-pre-sensor-preflight.ps1 -Mode local_direct -PromptForMySQL -RetryPendingMySQL` 并在本机 SecureString 提示输入一次密码，顺序完成零残留事务探针、历史补传和最终预检 | `blocked / target_environment` |
 | 历史数据库待重试 | `D:\AFP_Capture` 检出 1 个 `*_mysql*_pending.json`；原记录指向旧 F 盘，但已按同一 `capture_uuid` 唯一定位到当前归档 CSV，`missing_retry_sources=0`、`relocated_retry_sources=1` | 目标探针通过后用既有幂等 retry 操作补传并完成最终对账；不得手工删除或伪造记录 | `failed / local_environment` |
 | 第二台 Windows | 当前没有可访问的第二台电脑；本机 300 帧协议演练不能替代跨机 | 在第二台电脑运行候选内 `second-windows-helper.ps1`，完成安装/启停/重启、配对、HTTP/WebSocket、断网、睡眠恢复和网络切换 | `blocked / remote_integration` |
 
