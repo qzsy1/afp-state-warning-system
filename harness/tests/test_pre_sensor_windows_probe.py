@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 
 from visualization_app.pre_sensor_preflight import (
+    _adapter_power_disabled_from_registry,
+    _windows_time_status_synchronized,
     ExternalEnvironmentBlocked,
     generate_windows_remediation_script,
     probe_windows_readiness,
@@ -15,6 +17,37 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class WindowsReadinessProbeTests(unittest.TestCase):
+    def test_active_adapter_registry_fallback_handles_unsupported_driver_cmdlet(self) -> None:
+        registry_key = (
+            "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Class\\"
+            "{4d36e972-e325-11ce-bfc1-08002be10318}\\0001"
+        )
+
+        def disabled(command):
+            if "/f" in command:
+                return registry_key + "\n    NetCfgInstanceId    REG_SZ    {ABC-123}\n"
+            return registry_key + "\n    PnPCapabilities    REG_DWORD    0x20\n"
+
+        def enabled(command):
+            if "/f" in command:
+                return registry_key + "\n    NetCfgInstanceId    REG_SZ    {ABC-123}\n"
+            return registry_key + "\n    PnPCapabilities    REG_DWORD    0x0\n"
+
+        self.assertTrue(_adapter_power_disabled_from_registry("ABC-123", disabled))
+        self.assertFalse(_adapter_power_disabled_from_registry("ABC-123", enabled))
+
+    def test_time_status_rejects_leap_alarm_even_with_non_cmos_source(self) -> None:
+        self.assertFalse(
+            _windows_time_status_synchronized(
+                "Leap Indicator: 3(not synchronized)\nSource: 52.231.114.183,0x8\n"
+            )
+        )
+        self.assertTrue(
+            _windows_time_status_synchronized(
+                "Leap Indicator: 0(no warning)\nSource: 52.231.114.183,0x9\n"
+            )
+        )
+
     def _ready_state(self) -> dict:
         return {
             "firewall_query_ok": True,

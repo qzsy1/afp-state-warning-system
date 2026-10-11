@@ -12,11 +12,44 @@ APP = ROOT / "visualization_app"
 if str(APP) not in sys.path:
     sys.path.insert(0, str(APP))
 
-from acquisition import AcquisitionManager, scan_persistence_recovery
+from acquisition import (
+    AcquisitionManager,
+    _resolve_pending_layer_file,
+    scan_persistence_recovery,
+)
 from visualization_app.pre_sensor_preflight import probe_persistence_recovery
 
 
 class PersistenceRestartRecoveryTests(unittest.TestCase):
+    def test_moved_capture_root_resolves_layer_from_matching_session_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            specimen = root / "specimen"
+            records = specimen / "采集记录"
+            archive = (
+                specimen
+                / "历史版本"
+                / "试样会话_20261001_092655_capture-moved"
+            )
+            records.mkdir(parents=True)
+            archive.mkdir(parents=True)
+            layer = archive / "layer.csv"
+            layer.write_text("capture_uuid,value\ncapture-moved,1\n", encoding="utf-8")
+            pending = records / "layer_mysql_target_pending.json"
+            payload = {
+                "config": {"capture_uuid": "capture-moved"},
+                "layer_file": r"F:\old-root\specimen\layer.csv",
+            }
+            pending.write_text(json.dumps(payload), encoding="utf-8")
+
+            self.assertEqual(
+                _resolve_pending_layer_file(pending, payload, root),
+                layer,
+            )
+            recovery = scan_persistence_recovery(root)
+            self.assertEqual(recovery["missing_retry_sources"], 0)
+            self.assertEqual(recovery["relocated_retry_sources"], 1)
+
     def test_restart_discovers_database_retry_and_blocks_next_real_capture(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

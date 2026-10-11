@@ -281,6 +281,70 @@ def check_capture_save_root(path: str | Path | None) -> dict[str, Any]:
                 pass
 
 
+def _pending_capture_uuid(payload: dict[str, Any]) -> str:
+    config = payload.get("config")
+    summary = payload.get("summary")
+    if isinstance(config, dict):
+        capture_uuid = str(config.get("capture_uuid") or "").strip()
+        if capture_uuid:
+            return capture_uuid
+    if isinstance(summary, dict):
+        return str(summary.get("capture_uuid") or "").strip()
+    return ""
+
+
+def _resolve_pending_layer_file(
+    pending_path: Path,
+    payload: dict[str, Any],
+    capture_root: str | Path,
+) -> Path | None:
+    """Resolve a retry source after a capture root was moved or archived.
+
+    Pending records intentionally retain the original absolute path for audit
+    evidence.  A later specimen can archive that CSV, or the entire capture
+    root can be copied to another drive.  The immutable capture identity in
+    the archive directory lets us recover the exact source without selecting
+    a newer same-named layer.
+    """
+
+    saved = Path(str(payload.get("layer_file") or "")).expanduser()
+    if saved.is_file():
+        return saved
+    if not saved.name:
+        return None
+
+    root = Path(capture_root).expanduser().resolve()
+    capture_uuid = _pending_capture_uuid(payload)
+    if capture_uuid:
+        specimen_root = pending_path.parent.parent
+        search_roots = [specimen_root]
+        if specimen_root.resolve() != root:
+            search_roots.append(root)
+        archive_suffix = f"_{capture_uuid}"
+        matches: list[Path] = []
+        for search_root in search_roots:
+            if not search_root.is_dir():
+                continue
+            for candidate in search_root.rglob(saved.name):
+                if not candidate.is_file():
+                    continue
+                if any(parent.name.endswith(archive_suffix) for parent in candidate.parents):
+                    matches.append(candidate)
+            if matches:
+                break
+        unique = list(dict.fromkeys(path.resolve() for path in matches))
+        if len(unique) == 1:
+            return unique[0]
+
+    # Relative paths from older records were relative to either the record
+    # directory or the selected capture root.
+    if not saved.is_absolute():
+        for candidate in (pending_path.parent / saved, root / saved):
+            if candidate.is_file():
+                return candidate.resolve()
+    return None
+
+
 def scan_persistence_recovery(root: str | Path) -> dict[str, Any]:
     """Discover durable work that survived a prior process.
 
@@ -293,21 +357,27 @@ def scan_persistence_recovery(root: str | Path) -> dict[str, Any]:
     incomplete_files = sorted(capture_root.rglob("*.partial"))
     capture_uuids: set[str] = set()
     unreadable_pending = 0
+    missing_retry_sources = 0
+    relocated_retry_sources = 0
     for path in pending_files:
         try:
             payload = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             unreadable_pending += 1
             continue
-        config = payload.get("config") if isinstance(payload, dict) else None
-        summary = payload.get("summary") if isinstance(payload, dict) else None
-        capture_uuid = ""
-        if isinstance(config, dict):
-            capture_uuid = str(config.get("capture_uuid") or "").strip()
-        if not capture_uuid and isinstance(summary, dict):
-            capture_uuid = str(summary.get("capture_uuid") or "").strip()
+        if not isinstance(payload, dict):
+            unreadable_pending += 1
+            continue
+        capture_uuid = _pending_capture_uuid(payload)
         if capture_uuid:
             capture_uuids.add(capture_uuid)
+        resolved_layer = _resolve_pending_layer_file(path, payload, capture_root)
+        if resolved_layer is None:
+            missing_retry_sources += 1
+        else:
+            saved_layer = Path(str(payload.get("layer_file") or "")).expanduser()
+            if not saved_layer.is_file():
+                relocated_retry_sources += 1
     file_evidence = [
         {
             "name": path.name,
@@ -322,6 +392,8 @@ def scan_persistence_recovery(root: str | Path) -> dict[str, Any]:
         "database_pending_retry": len(pending_files),
         "incomplete_files": len(incomplete_files),
         "unreadable_pending": unreadable_pending,
+        "missing_retry_sources": missing_retry_sources,
+        "relocated_retry_sources": relocated_retry_sources,
         "capture_uuids": sorted(capture_uuids),
         "files": file_evidence,
     }
@@ -2924,6 +2996,8 @@ class AcquisitionManager:
                 "database_pending_retry": 0,
                 "incomplete_files": 0,
                 "unreadable_pending": 0,
+                "missing_retry_sources": 0,
+                "relocated_retry_sources": 0,
                 "capture_uuids": [],
                 "files": [],
                 "scan_deferred": True,
@@ -4507,6 +4581,7 @@ class AcquisitionManager:
             "failed": 0,
             "skipped": 0,
             "errors": [],
+            "relocated_sources": 0,
         }
         pending_files = sorted(
             root.rglob("*_mysql*_pending.json"),
@@ -4544,13 +4619,16 @@ class AcquisitionManager:
         allowed_fields = set(AcquisitionConfig.__dataclass_fields__)
         for pending_path, payload in selected_pending:
             saved_config = payload.get("config")
-            layer_file = Path(str(payload.get("layer_file") or ""))
-            if not layer_file.is_file():
+            saved_layer_file = Path(str(payload.get("layer_file") or ""))
+            layer_file = _resolve_pending_layer_file(pending_path, payload, root)
+            if layer_file is None:
                 result["failed"] += 1
                 result["errors"].append(
-                    f"{pending_path.name}：找不到层文件 {layer_file}"
+                    f"{pending_path.name}：找不到与采集身份匹配的层文件 {saved_layer_file.name}"
                 )
                 continue
+            if not saved_layer_file.is_file():
+                result["relocated_sources"] += 1
             values = {
                 key: value
                 for key, value in saved_config.items()

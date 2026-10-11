@@ -987,6 +987,98 @@ def _run_readonly_command(command: Sequence[str]) -> str:
     return output
 
 
+def _adapter_power_disabled_from_registry(
+    interface_guid: str,
+    runner: Callable[[Sequence[str]], str] = _run_readonly_command,
+) -> bool:
+    """Read the documented adapter opt-out bit when a driver rejects NetAdapter PM."""
+    normalized = str(interface_guid or "").strip().strip("{}")
+    if not normalized:
+        return False
+    class_key = (
+        r"HKLM\SYSTEM\CurrentControlSet\Control\Class"
+        r"\{4d36e972-e325-11ce-bfc1-08002be10318}"
+    )
+    search = runner(
+        (
+            "reg",
+            "query",
+            class_key,
+            "/s",
+            "/f",
+            "{" + normalized + "}",
+            "/d",
+            "/e",
+        )
+    )
+    keys = re.findall(
+        r"(?im)^(HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Class"
+        r"\\\{4d36e972-e325-11ce-bfc1-08002be10318\}\\[0-9]{4})\s*$",
+        search,
+    )
+    if not keys:
+        return False
+    values = runner(("reg", "query", keys[0], "/v", "PnPCapabilities"))
+    matched = re.search(
+        r"(?im)^\s*PnPCapabilities\s+REG_DWORD\s+(0x[0-9A-Fa-f]+)\s*$",
+        values,
+    )
+    return bool(matched) and bool(int(matched.group(1), 16) & 0x20)
+
+
+def _active_physical_adapter_power_saving_disabled() -> bool:
+    inventory = _run_readonly_command(
+        (
+            "powershell",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$items=@(Get-NetAdapter -Physical -ErrorAction Stop | "
+            "Where-Object {$_.Status -eq 'Up'} | "
+            "Select-Object @{n='name';e={$_.Name}},@{n='guid';e={[string]$_.InterfaceGuid}}); "
+            "$items | ConvertTo-Json -Compress",
+        )
+    ).strip()
+    if not inventory:
+        return False
+    parsed = json.loads(inventory)
+    adapters = parsed if isinstance(parsed, list) else [parsed]
+    if not adapters:
+        return False
+    for adapter in adapters:
+        name = str(adapter.get("name") or "").replace("'", "''")
+        guid = str(adapter.get("guid") or "")
+        if not name or not guid:
+            return False
+        try:
+            output = _run_readonly_command(
+                (
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    f"$item=Get-NetAdapterPowerManagement -Name '{name}' -ErrorAction Stop; "
+                    "$item.AllowComputerToTurnOffDevice -ne 'Enabled'",
+                )
+            )
+            if "true" not in output.lower():
+                return False
+        except RuntimeError:
+            if not _adapter_power_disabled_from_registry(guid):
+                return False
+    return True
+
+
+def _windows_time_status_synchronized(output: str) -> bool:
+    text = str(output or "")
+    lowered = text.lower()
+    if not text.strip() or "local cmos clock" in lowered or "free-running system clock" in lowered:
+        return False
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    leap = re.search(r":\s*([0-9]+)\s*(?:\(|$)", first_line)
+    return bool(leap) and int(leap.group(1)) != 3
+
+
 def _power_setting_disabled(subgroup: str, setting: str) -> bool:
     output = _run_readonly_command(
         ("powercfg", "/query", "SCHEME_CURRENT", subgroup, setting)
@@ -1030,19 +1122,10 @@ def _default_windows_state(context: Mapping[str, Any]) -> dict[str, Any]:
     adapter_power_saving_disabled = False
     adapter_power_query_error = ""
     try:
-        adapter_output = _run_readonly_command(
-            (
-                "powershell",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "$items=Get-NetAdapterPowerManagement -ErrorAction Stop; "
-                "$bad=@($items | Where-Object {$_.AllowComputerToTurnOffDevice -eq 'Enabled'}); "
-                "if($bad.Count -gt 0){'False'}else{'True'}",
-            )
+        adapter_power_saving_disabled = (
+            _active_physical_adapter_power_saving_disabled()
         )
-        adapter_power_saving_disabled = "true" in adapter_output.lower()
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
         adapter_power_query_error = str(exc)
     service_output = _run_readonly_command(
         (
@@ -1055,7 +1138,7 @@ def _default_windows_state(context: Mapping[str, Any]) -> dict[str, Any]:
     )
     try:
         time_output = _run_readonly_command(("w32tm", "/query", "/status"))
-        synchronized = "local cmos clock" not in time_output.lower()
+        synchronized = _windows_time_status_synchronized(time_output)
     except RuntimeError:
         synchronized = False
     state = {

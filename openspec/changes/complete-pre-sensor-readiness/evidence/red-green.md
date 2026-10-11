@@ -77,7 +77,9 @@
 
 - RED：`python -m unittest harness.tests.test_pre_sensor_windows_probe -v` 因缺少 Windows 探针与修复脚本生成器导入失败。
 - GREEN：4/4 通过；只读覆盖防火墙查询、端口、代理、本机睡眠、活动网卡节能、USB 选择性挂起、W32Time 和同步状态；访问拒绝转换为外部环境 `blocked`，脚本只显示检查/建议，不含设置命令。
-- 当前主机实测：报告写入 `artifacts/pre-sensor-evidence/current-host-windows/windows-readiness.{json,md}`；结果为 `failed`，明确发现 `sleep_disabled_ac`、`adapter_power_saving_disabled`、`usb_selective_suspend_disabled`、`time_synchronized` 未满足。未自动更改这些需要管理员审查的系统策略，也未误标为传感器待验证。
+- 授权后的 RED→GREEN 1：Intel WLAN 驱动不支持 `Get-NetAdapterPowerManagement`，旧探针无法证明活动物理网卡已禁用系统断电。新增测试先因 `_adapter_power_disabled_from_registry` 不存在而 RED；实现只检查活动物理网卡并以 `PnPCapabilities` 的 `0x20` 位作驱动兼容回退后，目标测试通过。
+- 授权后的 RED→GREEN 2：时间源已离开 Local CMOS 但 `w32tm` 仍报告 Leap Indicator 3 时，旧逻辑会假通过。新增测试先因 `_windows_time_status_synchronized` 不存在而 RED；实现显式拒绝 Leap 3、Local CMOS 和 free-running clock 后通过。Windows 专项现为 6/6。
+- 当前主机实测：经用户明确授权，已生成变更前快照与回滚脚本，然后禁用 AC 睡眠、活动 WLAN 系统断电和 AC USB 选择性挂起；为 W32Time 添加经 WLAN 网关的目标 NTP `/32` 持久路由并完成有效同步。最终报告位于 `artifacts/pre-sensor-evidence/current-host-windows-after/pre-sensor-readiness.{json,md}`，8 项状态全部通过；未更改 Codex 防火墙规则。
 
 ## 统一容量策略
 
@@ -93,12 +95,13 @@
 
 - RED：质量侧车合同因摘要中缺少 `quality_sidecar` 失败；`python -m unittest harness.tests.test_pre_sensor_recovery_gate -v` 因缺少持久恢复扫描和预检探针导入失败。
 - GREEN：质量侧车携带与 CSV/时间戳逐通道质量相同的 `capture_uuid`、样本数和绝对序号范围；启动恢复扫描识别 `*_mysql*_pending.json` 与 `.partial`，证据仅含文件名/相对路径摘要，不泄露机器根路径；待重试或未完成收尾会阻止下一正式采集。
+- 迁移根目录 RED→GREEN：实际旧记录引用已不存在的 `F:\AFP_Capture`，而正确 CSV 已按同一 `capture_uuid` 归档到当前 `D:\AFP_Capture`。新增测试先因 `_resolve_pending_layer_file` 不存在而 RED；实现按不可变采集身份和归档会话唯一匹配，拒绝误选后来同名层文件。恢复专项现为 4/4；实测 `missing_retry_sources=0`、`relocated_retry_sources=1`。
 - 相关回归：MySQL、采集完整性、双模式持久化、server journal 共 104/104 通过，包含运行中断开、耐久 retry spool、重复 retry/stop、journal 重启、重复 ACK、配额和目标保存身份覆盖。
 
 ## 当前目标MySQL与历史待重试实测
 
-- 目标 MySQL：未设置 `AFP_MYSQL_PROFILE`，报告 `artifacts/pre-sensor-evidence/current-target-mysql/target-mysql-readiness.{json,md}` 为 `blocked`；本机 3306 端口可连接不能替代目标实例身份、schema 和权限证据。
-- 持久恢复：`D:\AFP_Capture` 检出 1 个既有 target MySQL 待重试记录，报告 `artifacts/pre-sensor-evidence/current-persistence-recovery/persistence-recovery.{json,md}` 为 `failed`；在获得目标实例凭据并完成重试/对账前，正式采集门禁保持关闭。
+- 目标 MySQL：`192.168.101.31:3306` TCP 已连通；实际 MySQL 握手确认 `afp_app` 空密码被 1045 拒绝，因此当前精确阻塞为“缺少受保护的目标账号凭据”，不是网络或传感器。报告位于 `artifacts/pre-sensor-evidence/current-target-mysql-live/`；模拟数据库证据没有升级为目标实例通过。
+- 持久恢复：`D:\AFP_Capture` 检出 1 个既有 target MySQL 待重试记录；记录中的密码字段是脱敏占位符 `***`，没有可复用秘密。层 CSV 已可从匹配 `capture_uuid` 的归档会话安全定位；在通过本机安全提示取得目标凭据并完成重试/对账前，正式采集门禁保持关闭。
 
 ## Helper预检、协议故障演练与第二台Windows
 
@@ -149,5 +152,5 @@
 - `local_direct`：1800.156 秒、18001 帧、9.999981 Hz、最大帧间隔 119.534 ms、writer 队列峰值 1；CSV/质量侧车各 18001 行，绝对序号 0–18000 连续，对账通过。
 - `remote_helper`：1800.171 秒、18001 帧、9.999941 Hz、最大帧间隔 112.663 ms、writer 队列峰值 1、journal 20,013,056 bytes/18001 行；CSV/质量侧车/journal 对账通过。
 - 两种模式证据均为 `endurance_30m`、确定性模拟、`physical_sensor_verified=false`；网络重放、Helper 重启重放和停止幂等通过，`mysql_rows=null` 未被写成真实目标数据库通过。
-- 最终：Harness 单元/合同 193/193、quick 11/11、full 21/24、modular runtime 34/34；OpenSpec strict、Python compileall、候选导入/自检/静态/manifest、正式 delivery 6176 文件只读基线及 `git diff --check` 均通过。
+- 本轮加固后：Harness 单元/合同 196/196、Windows+恢复专项 10/10、modular runtime 34/34、Python compileall 和 `git diff --check` 通过；候选、quick/full、OpenSpec strict 与正式 delivery 只读基线将在最终候选重建后再次执行并记录。
 - full 剩余 3 项为仓库既有模型/历史数据缺失：`dashboard-runtime-contracts`、`causal-history-evidence`、`model-prediction-contracts`。按范围限制未生成缺失模型或历史数据。
