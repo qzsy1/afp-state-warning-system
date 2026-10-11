@@ -4,7 +4,9 @@
 
 仓库内实现、隔离候选装配、本机协议模拟、双模式 30 分钟墙钟耐久和可在第二台电脑直接执行的操作包已经完成。OpenSpec 任务为 **60/60 完成，剩余 0**。
 
-当前**不得声明全部传感器前准备已经通过**：目标 MySQL、第二台 Windows 电脑及当前主机的管理员级 Windows 设置仍缺少外部环境或授权；`D:\AFP_Capture` 还存在 1 个历史目标 MySQL 待重试记录。上述项目均为传感器无关的环境阻塞，不在“仅剩真实设备验证清单”中。
+当前主机的 AC 睡眠、活动 WLAN 节能、USB 选择性挂起和时间同步已经在用户明确授权后修正并通过统一预检；变更前快照和回滚脚本已保留，Codex 防火墙规则未修改。
+
+当前仍**不得声明全部传感器前准备已经通过**：目标 MySQL 已确认 TCP 可达，但尚未通过本机安全提示取得 `afp_app` 凭据；因此真实 schema/权限/写入/回滚探针和 1 个历史待重试记录的最终对账尚未执行。第二台 Windows 电脑也尚未提供可访问环境。两项均是传感器无关的外部阻塞，不在“仅剩真实设备验证清单”中。
 
 ## OpenSpec实现一致性复核
 
@@ -29,20 +31,20 @@
 
 ## 最终候选与全新目录演练
 
-- 候选：`2.0.5-rc.1-3a56a28d1a2e-20261010T144936Z`。
-- 源提交：`3a56a28d1a2e`；候选独立位于 `artifacts/pre-sensor-candidates/`，未覆盖正式发行。
-- 候选规模：6225 个文件、1,079,078,053 bytes；`SHA256SUMS.txt` 6190 项。
+- 候选：`2.0.5-rc.1-77ce0b81ae4a-20261011T001544Z`。
+- 源提交：`77ce0b81ae4a`；候选独立位于 `artifacts/pre-sensor-candidates/`，未覆盖正式发行。
+- 候选规模：6222 个文件、1,079,086,779 bytes；`SHA256SUMS.txt` 6190 项。
 - 发行身份：应用、Helper、启动器均为 `2.0.5-rc.1`；协议 2、统一帧 `unified_frame_v1`、配置/readiness schema 均为 1。
 - 候选验证：包内导入、manifest、8 项静态资源、3 项配置资产、native DLL/SDK/驱动声明均通过；`--self-test`、`--module-status`、`--verify-files` 返回码均为 0。
-- 从全新短路径 `D:\AFP-Drill-3a56a28` 按操作员顺序执行：双模式预检、双模式 1 秒采集、停止/对账和脱敏证据导出均可运行；两个耐久 wrapper 返回 0，证据导出返回 0 且 `sanitized=true`。
-- 候选预检正确失败关闭：`local_direct` 为 7 passed / 1 failed / 1 blocked / 1 physical pending；`remote_helper` 为 6 passed / 1 failed / 2 blocked / 1 physical pending。失败为当前 Windows 设置，阻塞为目标 MySQL及第二台电脑，唯一 `physical_sensor_pending` 为实物身份/端口。
+- 从全新短路径 `D:\AFP-Drill-77ce0b8` 在不预设保存、日志、接口或 Helper 环境引用的条件下运行双模式统一预检。一键入口自动建立无秘密的诊断引用并在退出后恢复环境，不再依赖隐含准备步骤。
+- 候选预检正确失败关闭：`local_direct` 为 7 passed / 1 failed / 1 blocked / 1 physical pending；`remote_helper` 为 6 passed / 1 failed / 2 blocked / 1 physical pending。唯一失败为历史 MySQL 待重试；阻塞为目标 MySQL 凭据及第二台电脑；唯一 `physical_sensor_pending` 为实物身份/端口。Windows、配置、保存目录和容量均通过。
 
 ## RED→GREEN 与自动验证
 
 逐项首次失败和修复命令记录在 `evidence/red-green.md`。最终结果如下：
 
 - OpenSpec：`openspec validate complete-pre-sensor-readiness --strict` 通过。
-- Harness 单元/合同：193/193 通过。
+- Harness 单元/合同：197/197 通过。
 - 模块化运行时：34/34 通过。
 - Harness quick：11/11 通过。
 - Harness full：21/24 通过。失败的 3 项均为既有、明确超出本变更范围且禁止伪造的模型/历史产物：
@@ -54,6 +56,8 @@
 - MySQL、采集完整性、质量侧车、重试、恢复和 journal：104/104 通过。
 - 双模式配置、发行门禁、候选、预检、存储、容量、Windows、MySQL、Helper、耐久与现场操作专项均通过；两种模式规范化输出等价。
 - Python `compileall` 通过；候选包内导入通过；PowerShell 脚本 AST 检查通过；`git diff --check` 通过。
+
+本轮新增 RED→GREEN 包括：活动物理网卡不支持标准 cmdlet 时的注册表只读回退、拒绝 Leap Indicator 3 的时间同步判定、按 `capture_uuid` 恢复迁移/归档后的待重试 CSV，以及消除一键预检对保存/日志/接口/Helper 环境引用的隐含依赖。Windows+恢复专项 10/10、现场操作专项 5/5 通过。
 
 本轮最后一个 RED→GREEN：旧公网 Helper 测试仅声明 `real_capture`/`unified_frame_v1`，启动被正确拒绝并返回 `release_contract_mismatch`；测试夹具改为携带权威版本、build、协议、统一帧和 schema 能力后，目标用例 1/1、`frontend-public-contracts` 1/1 以及最终 full 中该检查均通过。生产失败关闭语义未放宽。
 
@@ -70,10 +74,11 @@
 
 | 阻塞项 | 当前证据 | 解除条件 | 证据等级 |
 |---|---|---|---|
-| 目标 MySQL | 未提供 `AFP_MYSQL_PROFILE`；未验证目标身份/schema/权限/事务/中断恢复 | 提供目标实例网络访问及受保护的连接 profile，允许执行 INSERT/SELECT/ROLLBACK 与断开恢复演练 | `blocked / remote_integration` |
-| 历史数据库待重试 | `D:\AFP_Capture` 检出 1 个 `*_mysql*_pending.json`，正式采集门禁关闭 | 在目标实例可用后执行重试并完成最终对账，不删除或伪造该记录 | `failed / local_environment` |
+| 目标 MySQL | `192.168.101.31:3306` TCP 可达；MySQL 实际握手返回 1045，确认空密码不允许。真实凭据未进入聊天、命令行、仓库或报告 | 操作员在候选运行 `run-pre-sensor-preflight.ps1 -Mode local_direct -PromptForMySQL` 并在本机 SecureString 提示输入密码，完成 schema/权限/INSERT/SELECT/ROLLBACK 零残留探针 | `blocked / target_environment` |
+| 历史数据库待重试 | `D:\AFP_Capture` 检出 1 个 `*_mysql*_pending.json`；原记录指向旧 F 盘，但已按同一 `capture_uuid` 唯一定位到当前归档 CSV，`missing_retry_sources=0`、`relocated_retry_sources=1` | 目标探针通过后用既有幂等 retry 操作补传并完成最终对账；不得手工删除或伪造记录 | `failed / local_environment` |
 | 第二台 Windows | 当前没有可访问的第二台电脑；本机 300 帧协议演练不能替代跨机 | 在第二台电脑运行候选内 `second-windows-helper.ps1`，完成安装/启停/重启、配对、HTTP/WebSocket、断网、睡眠恢复和网络切换 | `blocked / remote_integration` |
-| Windows 管理员级设置 | 当前主机未满足 AC 睡眠禁用、活动网卡节能禁用、USB 选择性挂起禁用、时间同步 | 管理员审查 `review-windows-remediation.ps1` 后实际调整并重跑预检；代码未自动更改系统策略 | `failed / local_environment` |
+
+已解除的 Windows 环境项：AC 睡眠为从不、活动 Intel WLAN 禁止系统断电、AC USB 选择性挂起禁用、W32Time 为有效 Leap 0 同步。最终统一预检 8/8 Windows 状态通过；证据位于 `artifacts/pre-sensor-evidence/current-host-windows-after/`。
 
 正式发布、防火墙或管理员设置未被自动修改；如需把候选提升为正式 `delivery/`，仍需用户另行授权。
 
