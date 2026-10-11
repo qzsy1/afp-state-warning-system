@@ -100,8 +100,8 @@
 
 ## 当前目标MySQL与历史待重试实测
 
-- 目标 MySQL：`192.168.101.31:3306` TCP 已连通；实际 MySQL 握手确认 `afp_app` 空密码被 1045 拒绝，因此当前精确阻塞为“缺少受保护的目标账号凭据”，不是网络或传感器。报告位于 `artifacts/pre-sensor-evidence/current-target-mysql-live/`；模拟数据库证据没有升级为目标实例通过。
-- 持久恢复：`D:\AFP_Capture` 检出 1 个既有 target MySQL 待重试记录；记录中的密码字段是脱敏占位符 `***`，没有可复用秘密。层 CSV 已可从匹配 `capture_uuid` 的归档会话安全定位；在通过本机安全提示取得目标凭据并完成重试/对账前，正式采集门禁保持关闭。
+- 目标 MySQL：`192.168.101.31:3306` TCP 连通后，操作员通过候选 SecureString 提示输入真实 `afp_app` 凭据；目标实例 connect/schema/write/rollback 全部通过，`rollback_verified=true` 且无探针残留。真实凭据未进入聊天、命令行、仓库或报告。
+- 持久恢复：`D:\AFP_Capture` 的 1 个 target MySQL 待重试记录使用匹配 `capture_uuid` 的迁移归档 CSV 完成补传；`attempted=1`、`succeeded=1`、`failed=0`、`relocated_sources=1`。synced 证据中 `sample_count=192`、`saved_rows=192`、身份一致且无明文密码；最终扫描待重试和 incomplete 均为 0。
 
 ## Helper预检、协议故障演练与第二台Windows
 

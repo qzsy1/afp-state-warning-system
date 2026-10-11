@@ -6,7 +6,9 @@
 
 当前主机的 AC 睡眠、活动 WLAN 节能、USB 选择性挂起和时间同步已经在用户明确授权后修正并通过统一预检；变更前快照和回滚脚本已保留，Codex 防火墙规则未修改。
 
-当前仍**不得声明全部传感器前准备已经通过**：目标 MySQL 已确认 TCP 可达，但尚未通过本机安全提示取得 `afp_app` 凭据；因此真实 schema/权限/写入/回滚探针和 1 个历史待重试记录的最终对账尚未执行。第二台 Windows 电脑也尚未提供可访问环境。两项均是传感器无关的外部阻塞，不在“仅剩真实设备验证清单”中。
+目标 MySQL 已使用真实 `afp_app` 凭据完成连接、schema、权限、写入和回滚零残留探针；历史待重试记录按迁移后的归档 CSV 成功补传 192/192 行，最终恢复扫描为零待处理。本机 `local_direct` 统一预检现为 **9 passed / 0 failed / 0 blocked / 1 physical pending**。
+
+当前仍**不得声明全部传感器前准备已经通过**：第二台 Windows 电脑尚未提供可访问环境，真实双机 Helper 安装/启停/重启、HTTP/WebSocket、断网恢复、睡眠恢复和网络切换仍为传感器无关的外部阻塞。本机协议模拟不能替代该证据。
 
 ## OpenSpec实现一致性复核
 
@@ -37,7 +39,7 @@
 - 发行身份：应用、Helper、启动器均为 `2.0.5-rc.1`；协议 2、统一帧 `unified_frame_v1`、配置/readiness schema 均为 1。
 - 候选验证：包内导入、manifest、8 项静态资源、3 项配置资产、native DLL/SDK/驱动声明均通过；`--self-test`、`--module-status`、`--verify-files` 返回码均为 0。
 - 从全新短路径 `D:\AFP-Drill-7ebcc3a` 在不预设保存、日志、接口或 Helper 环境引用的条件下运行统一预检。一键入口自动建立无秘密的诊断引用并在退出后恢复环境，不再依赖隐含准备步骤；`-PromptForMySQL -RetryPendingMySQL` 可用一次安全密码输入顺序执行目标探针、幂等补传和最终预检。
-- 候选预检正确失败关闭：`local_direct` 为 7 passed / 1 failed / 1 blocked / 1 physical pending；`remote_helper` 为 6 passed / 1 failed / 2 blocked / 1 physical pending。唯一失败为历史 MySQL 待重试；阻塞为目标 MySQL 凭据及第二台电脑；唯一 `physical_sensor_pending` 为实物身份/端口。Windows、配置、保存目录和容量均通过。
+- 候选首次无凭据预检正确失败关闭；操作员随后通过本机 SecureString 输入一次真实凭据，目标探针、历史补传和最终预检依次成功。最终 `local_direct` 为 9 passed / 0 failed / 0 blocked / 1 physical pending；唯一 `physical_sensor_pending` 为实物身份/端口。Windows、配置、保存目录、容量、目标 MySQL 和持久恢复均通过。
 
 ## RED→GREEN 与自动验证
 
@@ -74,11 +76,11 @@
 
 | 阻塞项 | 当前证据 | 解除条件 | 证据等级 |
 |---|---|---|---|
-| 目标 MySQL | `192.168.101.31:3306` TCP 可达；MySQL 实际握手返回 1045，确认空密码不允许。真实凭据未进入聊天、命令行、仓库或报告 | 操作员在候选运行 `run-pre-sensor-preflight.ps1 -Mode local_direct -PromptForMySQL -RetryPendingMySQL` 并在本机 SecureString 提示输入一次密码，顺序完成零残留事务探针、历史补传和最终预检 | `blocked / target_environment` |
-| 历史数据库待重试 | `D:\AFP_Capture` 检出 1 个 `*_mysql*_pending.json`；原记录指向旧 F 盘，但已按同一 `capture_uuid` 唯一定位到当前归档 CSV，`missing_retry_sources=0`、`relocated_retry_sources=1` | 目标探针通过后用既有幂等 retry 操作补传并完成最终对账；不得手工删除或伪造记录 | `failed / local_environment` |
 | 第二台 Windows | 当前没有可访问的第二台电脑；本机 300 帧协议演练不能替代跨机 | 在第二台电脑运行候选内 `second-windows-helper.ps1`，完成安装/启停/重启、配对、HTTP/WebSocket、断网、睡眠恢复和网络切换 | `blocked / remote_integration` |
 
 已解除的 Windows 环境项：AC 睡眠为从不、活动 Intel WLAN 禁止系统断电、AC USB 选择性挂起禁用、W32Time 为有效 Leap 0 同步。最终统一预检 8/8 Windows 状态通过；证据位于 `artifacts/pre-sensor-evidence/current-host-windows-after/`。
+
+已解除的目标 MySQL 与恢复项：真实目标探针 connect/schema/write/rollback 全部通过且 `rollback_verified=true`；补传 `attempted=1`、`succeeded=1`、`failed=0`，迁移源命中 1 个，采集身份 `AFP-20260923T142300-6c1814b0` 的 `sample_count=192` 与 `saved_rows=192` 对账。`D:\AFP_Capture` 最终 `database_pending_retry=0`、`incomplete_files=0`，synced 证据不含明文密码。脱敏导出位于 `D:\AFP-Drill-7ebcc3a\evidence\target-mysql-live-sanitized\evidence.json`，`sanitized=true`、manifest 2 项。
 
 正式发布、防火墙或管理员设置未被自动修改；如需把候选提升为正式 `delivery/`，仍需用户另行授权。
 
