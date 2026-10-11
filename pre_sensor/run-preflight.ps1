@@ -6,6 +6,7 @@ param(
     [string]$Output = "",
     [string]$SaveRoot = "",
     [switch]$PromptForMySQL,
+    [switch]$RetryPendingMySQL,
     [string]$MySQLHost = "192.168.101.31",
     [ValidateRange(1, 65535)]
     [int]$MySQLPort = 3306,
@@ -110,6 +111,37 @@ try {
     }
     $process = Start-Process -FilePath $launcher -ArgumentList $quotedArguments -Wait -PassThru -WindowStyle Hidden
     $exitCode = $process.ExitCode
+    if ($RetryPendingMySQL) {
+        $reportDirectory = if ($Output) {
+            $Output
+        }
+        else {
+            Join-Path $candidateRoot "verification\pre-sensor"
+        }
+        $reportPath = Join-Path $reportDirectory "pre-sensor-readiness.json"
+        if (-not (Test-Path -LiteralPath $reportPath -PathType Leaf)) {
+            throw "Preflight report is missing; MySQL retry was not attempted: $reportPath"
+        }
+        $report = Get-Content -LiteralPath $reportPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $mysqlCheck = @($report.checks | Where-Object {
+            $_.check_id -eq "environment.target_mysql"
+        }) | Select-Object -First 1
+        if ($null -ne $mysqlCheck -and $mysqlCheck.status -eq "passed") {
+            $retryArguments = @(
+                "--pre-sensor-retry-mysql",
+                "--pre-sensor-capture-root",
+                $SaveRoot
+            ) | ForEach-Object {
+                '"' + ([string]$_).Replace('"', '\"') + '"'
+            }
+            $retryProcess = Start-Process -FilePath $launcher -ArgumentList $retryArguments -Wait -PassThru -WindowStyle Hidden
+            $exitCode = $retryProcess.ExitCode
+            if ($exitCode -eq 0) {
+                $finalProcess = Start-Process -FilePath $launcher -ArgumentList $quotedArguments -Wait -PassThru -WindowStyle Hidden
+                $exitCode = $finalProcess.ExitCode
+            }
+        }
+    }
 }
 finally {
     foreach ($name in $previousEnvironment.Keys) {

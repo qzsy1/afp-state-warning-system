@@ -57,6 +57,7 @@ class RemainingPhysicalChecklistTests(unittest.TestCase):
     def test_preflight_entry_sets_save_root_and_prompts_for_mysql_without_cli_secret(self) -> None:
         script = (ROOT / "pre_sensor" / "run-preflight.ps1").read_text(encoding="utf-8")
         self.assertIn("[switch]$PromptForMySQL", script)
+        self.assertIn("[switch]$RetryPendingMySQL", script)
         self.assertIn("Read-Host", script)
         self.assertIn("-AsSecureString", script)
         self.assertIn("AFP_MYSQL_PROFILE", script)
@@ -66,7 +67,13 @@ class RemainingPhysicalChecklistTests(unittest.TestCase):
         self.assertIn("AFP_HELPER_LOG_ROOT", script)
         self.assertIn("AFP_INTERFACE_THERMOCOUPLE", script)
         self.assertIn("AFP_HELPER_PAIRING_PROFILE", script)
+        self.assertIn("--pre-sensor-retry-mysql", script)
         self.assertIn("finally", script)
+        bootstrap = (ROOT / "modular_runtime" / "app" / "bootstrap.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"--pre-sensor-retry-mysql"', bootstrap)
+        self.assertIn("retry_pending_mysql", bootstrap)
 
     def test_only_physical_device_whitelist_is_accepted(self) -> None:
         from visualization_app.pre_sensor_evidence import validate_physical_checklist

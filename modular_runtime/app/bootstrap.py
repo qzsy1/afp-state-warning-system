@@ -742,6 +742,8 @@ def main(root: Path, arguments: list[str] | None = None) -> None:
     parser.add_argument("--rollback", action="store_true")
     parser.add_argument("--server-only", action="store_true")
     parser.add_argument("--pre-sensor-preflight", action="store_true")
+    parser.add_argument("--pre-sensor-retry-mysql", action="store_true")
+    parser.add_argument("--pre-sensor-capture-root", default="")
     parser.add_argument("--pre-sensor-endurance", action="store_true")
     parser.add_argument("--pre-sensor-fault-drill", action="store_true")
     parser.add_argument("--pre-sensor-duration", type=float, default=1800.0)
@@ -815,6 +817,41 @@ def main(root: Path, arguments: list[str] | None = None) -> None:
         }
         _emit_command_result(context, "pre-sensor-preflight", result)
         if report.summary.outcome in {"failed", "blocked"}:
+            raise SystemExit(1)
+        return
+    if args.pre_sensor_retry_mysql:
+        raw_profile = os.environ.get("AFP_MYSQL_PROFILE", "")
+        try:
+            profile = json.loads(raw_profile)
+        except json.JSONDecodeError as exc:
+            raise ValueError("AFP_MYSQL_PROFILE must contain a JSON object") from exc
+        if not isinstance(profile, dict) or not raw_profile:
+            raise ValueError("AFP_MYSQL_PROFILE is required for MySQL retry")
+        capture_root = Path(args.pre_sensor_capture_root or "").expanduser()
+        if not str(args.pre_sensor_capture_root or "").strip():
+            raise ValueError("--pre-sensor-capture-root is required for MySQL retry")
+        acquisition = _legacy_module("acquisition", context)
+        mysql_storage = _legacy_module("mysql_storage", context)
+        settings = mysql_storage.MySQLSettings.from_mapping(
+            {**profile, "enabled": True}
+        )
+        capture_manager = acquisition.AcquisitionManager(capture_root)
+        result = capture_manager.retry_pending_mysql(
+            settings,
+            root=capture_root,
+            limit=1000,
+        )
+        recovery = acquisition.scan_persistence_recovery(capture_root)
+        result["recovery_after"] = recovery
+        ok = bool(
+            not result.get("connection_error")
+            and int(result.get("failed", 0)) == 0
+            and int(recovery.get("database_pending_retry", 0)) == 0
+            and int(recovery.get("incomplete_files", 0)) == 0
+        )
+        result["ok"] = ok
+        _emit_command_result(context, "pre-sensor-retry-mysql", result)
+        if not ok:
             raise SystemExit(1)
         return
     if args.pre_sensor_endurance:

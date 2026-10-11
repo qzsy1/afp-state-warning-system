@@ -34,7 +34,7 @@
 
 ## 8. 数据库重试与最终对账
 
-目标 MySQL 恢复后执行既有 retry 操作，确认待重试文件清零，再核对同一 `capture_uuid` 的帧数、绝对序号、时间戳、CSV、质量侧车、journal 和 MySQL。任一不一致均阻止下一次正式采集。
+目标 MySQL 恢复后运行 `run-pre-sensor-preflight.ps1 -Mode local_direct -PromptForMySQL -RetryPendingMySQL`。入口先执行零残留事务探针；只有目标探针通过才调用既有幂等 retry，随后自动复跑完整预检。密码只输入一次且在子进程结束后从环境清除。确认待重试文件清零，再核对同一 `capture_uuid` 的帧数、绝对序号、时间戳、CSV、质量侧车、journal 和 MySQL。任一不一致均阻止下一次正式采集。
 
 ## 9. 导出脱敏证据
 
