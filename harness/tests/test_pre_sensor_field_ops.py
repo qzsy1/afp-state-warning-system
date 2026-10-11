@@ -54,6 +54,16 @@ class EvidenceExporterTests(unittest.TestCase):
 
 
 class RemainingPhysicalChecklistTests(unittest.TestCase):
+    def test_preflight_entry_sets_save_root_and_prompts_for_mysql_without_cli_secret(self) -> None:
+        script = (ROOT / "pre_sensor" / "run-preflight.ps1").read_text(encoding="utf-8")
+        self.assertIn("[switch]$PromptForMySQL", script)
+        self.assertIn("Read-Host", script)
+        self.assertIn("-AsSecureString", script)
+        self.assertIn("AFP_MYSQL_PROFILE", script)
+        self.assertIn("AFP_SAVE_ROOT", script)
+        self.assertIn("AFP_HELPER_SAVE_ROOT", script)
+        self.assertIn("finally", script)
+
     def test_only_physical_device_whitelist_is_accepted(self) -> None:
         from visualization_app.pre_sensor_evidence import validate_physical_checklist
 
