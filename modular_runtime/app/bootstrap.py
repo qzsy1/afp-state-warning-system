@@ -741,6 +741,21 @@ def main(root: Path, arguments: list[str] | None = None) -> None:
     parser.add_argument("--install-patch", default="")
     parser.add_argument("--rollback", action="store_true")
     parser.add_argument("--server-only", action="store_true")
+    parser.add_argument("--pre-sensor-preflight", action="store_true")
+    parser.add_argument("--pre-sensor-retry-mysql", action="store_true")
+    parser.add_argument("--pre-sensor-capture-root", default="")
+    parser.add_argument("--pre-sensor-endurance", action="store_true")
+    parser.add_argument("--pre-sensor-fault-drill", action="store_true")
+    parser.add_argument("--pre-sensor-duration", type=float, default=1800.0)
+    parser.add_argument("--pre-sensor-export-evidence", action="store_true")
+    parser.add_argument("--pre-sensor-evidence-source", action="append", default=[])
+    parser.add_argument(
+        "--pre-sensor-mode",
+        choices=("local_direct", "remote_helper"),
+        default="local_direct",
+    )
+    parser.add_argument("--pre-sensor-config", default="")
+    parser.add_argument("--pre-sensor-output", default="")
     args = parser.parse_args(arguments)
     context, manager = initialize(root)
 
@@ -786,5 +801,98 @@ def main(root: Path, arguments: list[str] | None = None) -> None:
         return
     if args.module_status:
         _emit_command_result(context, "module-status", manager.status())
+        return
+    if args.pre_sensor_preflight:
+        readiness = _legacy_module("pre_sensor_preflight", context)
+        report, json_path, markdown_path = readiness.run_candidate_preflight(
+            context.root,
+            mode=args.pre_sensor_mode,
+            config_path=Path(args.pre_sensor_config) if args.pre_sensor_config else None,
+            output_directory=Path(args.pre_sensor_output) if args.pre_sensor_output else None,
+        )
+        result = readiness.preflight_payload(report)
+        result["report_files"] = {
+            "json": str(json_path),
+            "markdown": str(markdown_path),
+        }
+        _emit_command_result(context, "pre-sensor-preflight", result)
+        if report.summary.outcome in {"failed", "blocked"}:
+            raise SystemExit(1)
+        return
+    if args.pre_sensor_retry_mysql:
+        raw_profile = os.environ.get("AFP_MYSQL_PROFILE", "")
+        try:
+            profile = json.loads(raw_profile)
+        except json.JSONDecodeError as exc:
+            raise ValueError("AFP_MYSQL_PROFILE must contain a JSON object") from exc
+        if not isinstance(profile, dict) or not raw_profile:
+            raise ValueError("AFP_MYSQL_PROFILE is required for MySQL retry")
+        capture_root = Path(args.pre_sensor_capture_root or "").expanduser()
+        if not str(args.pre_sensor_capture_root or "").strip():
+            raise ValueError("--pre-sensor-capture-root is required for MySQL retry")
+        acquisition = _legacy_module("acquisition", context)
+        mysql_storage = _legacy_module("mysql_storage", context)
+        settings = mysql_storage.MySQLSettings.from_mapping(
+            {**profile, "enabled": True}
+        )
+        capture_manager = acquisition.AcquisitionManager(capture_root)
+        result = capture_manager.retry_pending_mysql(
+            settings,
+            root=capture_root,
+            limit=1000,
+        )
+        recovery = acquisition.scan_persistence_recovery(capture_root)
+        result["recovery_after"] = recovery
+        ok = bool(
+            not result.get("connection_error")
+            and int(result.get("failed", 0)) == 0
+            and int(recovery.get("database_pending_retry", 0)) == 0
+            and int(recovery.get("incomplete_files", 0)) == 0
+        )
+        result["ok"] = ok
+        _emit_command_result(context, "pre-sensor-retry-mysql", result)
+        if not ok:
+            raise SystemExit(1)
+        return
+    if args.pre_sensor_endurance:
+        endurance = _legacy_module("pre_sensor_endurance", context)
+        output = Path(args.pre_sensor_output) if args.pre_sensor_output else (
+            context.root / "verification" / "pre-sensor" / "endurance"
+        )
+        runtime = output / (
+            "boundary-fault-runtime"
+            if args.pre_sensor_fault_drill
+            else f"{args.pre_sensor_mode}-runtime"
+        )
+        if args.pre_sensor_fault_drill:
+            result = endurance.run_boundary_fault_drill(runtime)
+        else:
+            plan = endurance.EndurancePlan(
+                duration_seconds=args.pre_sensor_duration,
+                sample_rate_hz=10.0,
+                modes=(args.pre_sensor_mode,),
+            )
+            result = endurance.run_endurance_mode(
+                runtime, mode=args.pre_sensor_mode, plan=plan
+            )
+        json_path, markdown_path = endurance.write_endurance_report(result, output)
+        result["report_files"] = {
+            "json": str(json_path),
+            "markdown": str(markdown_path),
+        }
+        _emit_command_result(context, "pre-sensor-endurance", result)
+        if not result.get("ok"):
+            raise SystemExit(1)
+        return
+    if args.pre_sensor_export_evidence:
+        evidence = _legacy_module("pre_sensor_evidence", context)
+        if not args.pre_sensor_output:
+            raise ValueError("--pre-sensor-output is required for evidence export")
+        result = evidence.export_sanitized_evidence(
+            [Path(item) for item in args.pre_sensor_evidence_source],
+            Path(args.pre_sensor_output),
+            secret_values=evidence.secret_values_from_environment(),
+        )
+        _emit_command_result(context, "pre-sensor-export-evidence", result)
         return
     launch(context, manager, server_only=args.server_only)

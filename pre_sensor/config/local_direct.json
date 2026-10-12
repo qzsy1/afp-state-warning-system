@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "release_revision": "complete-pre-sensor-readiness-v1",
+  "mode": "local_direct",
+  "channels": [
+    {"name": "温度", "unit": "°C", "interface_id": "plc-process"},
+    {"name": "压力", "unit": "N", "interface_id": "plc-process"},
+    {"name": "薄膜压力", "unit": "N", "interface_id": "m3232-pressure"},
+    {"name": "ROI平均温度", "unit": "°C", "interface_id": "uvc-temperature"},
+    {"name": "张力", "unit": "N", "interface_id": "plc-process"},
+    {"name": "线速度", "unit": "mm/s", "interface_id": "abb-motion"},
+    {"name": "ABB_X", "unit": "mm", "interface_id": "abb-motion"},
+    {"name": "ABB_Y", "unit": "mm", "interface_id": "abb-motion"},
+    {"name": "ABB_Z", "unit": "mm", "interface_id": "abb-motion"},
+    {"name": "温度1", "unit": "°C", "interface_id": "thermocouple-8ch"},
+    {"name": "温度2", "unit": "°C", "interface_id": "thermocouple-8ch"},
+    {"name": "温度3", "unit": "°C", "interface_id": "thermocouple-8ch"},
+    {"name": "温度4", "unit": "°C", "interface_id": "thermocouple-8ch"},
+    {"name": "温度5", "unit": "°C", "interface_id": "thermocouple-8ch"},
+    {"name": "温度6", "unit": "°C", "interface_id": "thermocouple-8ch"},
+    {"name": "温度7", "unit": "°C", "interface_id": "thermocouple-8ch"},
+    {"name": "温度8", "unit": "°C", "interface_id": "thermocouple-8ch"}
+  ],
+  "interfaces": [
+    {"id": "thermocouple-8ch", "role": "thermocouple_8ch", "driver": "smrf_hid", "location": "local", "endpoint_ref": "AFP_INTERFACE_THERMOCOUPLE"},
+    {"id": "plc-process", "role": "plc_process", "driver": "modbus_tcp", "location": "local", "endpoint_ref": "AFP_INTERFACE_PLC"},
+    {"id": "uvc-temperature", "role": "uvc_temperature", "driver": "uvc_thermal", "location": "local", "endpoint_ref": "AFP_INTERFACE_UVC"},
+    {"id": "abb-motion", "role": "abb_motion", "driver": "abb_robot", "location": "local", "endpoint_ref": "AFP_INTERFACE_ABB"},
+    {"id": "m3232-pressure", "role": "m3232_pressure", "driver": "m3232_pressure", "location": "local", "endpoint_ref": "AFP_INTERFACE_M3232"}
+  ],
+  "storage": {
+    "policy": "required",
+    "save_root_ref": "AFP_SAVE_ROOT",
+    "mysql_enabled": false,
+    "mysql_profile_ref": ""
+  },
+  "timeouts": {
+    "first_sample_seconds": 5,
+    "writer_submit_seconds": 0.25,
+    "writer_stop_seconds": 15,
+    "sampling_stop_seconds": 10,
+    "force_stop_seconds": 5
+  },
+  "reconnect": {
+    "enabled": true,
+    "initial_delay_seconds": 0.25,
+    "maximum_delay_seconds": 5,
+    "maximum_attempts": 8
+  },
+  "queues": {
+    "writer_rows": 4096,
+    "transport_rows": 8192,
+    "high_water_ratio": 0.8,
+    "overflow_policy": "fail_closed"
+  },
+  "logging": {
+    "directory_ref": "AFP_LOG_ROOT",
+    "level": "INFO",
+    "max_file_mb": 20,
+    "max_total_mb": 500,
+    "retention_days": 14
+  },
+  "capacity": {
+    "minimum_free_mb": 2048,
+    "journal_max_mb": 512,
+    "retry_spool_max_mb": 2048,
+    "warning_ratio": 0.8,
+    "hard_limit_ratio": 1.0
+  }
+}

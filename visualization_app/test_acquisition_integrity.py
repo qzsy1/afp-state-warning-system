@@ -460,6 +460,23 @@ class AcquisitionIntegrityTests(unittest.TestCase):
             summary = json.loads(summaries[-1].read_text(encoding="utf-8"))
             self.assertEqual(summary["capture_uuid"], second["capture_uuid"])
             self.assertEqual(summary["sample_count"], second["sample_count"])
+            quality_sidecar = Path(summary["quality_sidecar"])
+            self.assertTrue(quality_sidecar.is_file())
+            quality_payload = json.loads(quality_sidecar.read_text(encoding="utf-8"))
+            self.assertEqual(quality_payload["capture_uuid"], second["capture_uuid"])
+            self.assertEqual(quality_payload["sample_count"], second["sample_count"])
+            with Path(second["raw_file"]).open("r", encoding="gb18030", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(
+                {row["specimen_id"] for row in rows}, {second["capture_uuid"]}
+            )
+            with Path(second["timestamp_file"]).open(
+                "r", encoding="utf-8-sig", newline=""
+            ) as handle:
+                timestamp_rows = list(csv.DictReader(handle))
+            self.assertTrue(
+                all(row["channel_quality_json"] for row in timestamp_rows)
+            )
             self.assertEqual(
                 len(summary["file_integrity"]["layer_file"]["sha256"]), 64
             )

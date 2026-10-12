@@ -6,6 +6,9 @@ param(
     [string]$LauncherSourceDir = "",
     [string]$ExistingExecutable = "",
     [string]$LauncherVersion = "",
+    [string]$ReleaseContract = "",
+    [string]$CandidateId = "",
+    [string]$SourceRevision = "",
     [switch]$AllowExistingTarget
 )
 
@@ -103,9 +106,10 @@ $legacyTarget = Join-Path $appTarget "legacy"
 $legacyStaticTarget = Join-Path $legacyTarget "static"
 $uiTarget = Join-Path $appTarget "ui"
 $configTarget = Join-Path $TargetDir "config"
+$preSensorConfigTarget = Join-Path $configTarget "pre_sensor"
 $nativeTarget = Join-Path $TargetDir "native_dll"
 $docsTarget = Join-Path $TargetDir "docs"
-foreach ($path in @($appTarget, $legacyTarget, $legacyStaticTarget, $uiTarget, $configTarget, $nativeTarget, $docsTarget)) {
+foreach ($path in @($appTarget, $legacyTarget, $legacyStaticTarget, $uiTarget, $configTarget, $preSensorConfigTarget, $nativeTarget, $docsTarget)) {
     New-Item -ItemType Directory -Force -Path $path | Out-Null
 }
 
@@ -118,6 +122,14 @@ Copy-Item -LiteralPath (Join-Path $ScriptDir "config\runtime.delivery.json") -De
 $runtimeConfig = Get-Content -LiteralPath $runtimeConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $runtimeConfig.application_version = $ApplicationVersion
 $runtimeConfig | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $runtimeConfigPath -Encoding UTF8
+$preSensorConfigSource = Join-Path $RepoRoot "pre_sensor\config"
+foreach ($name in @("schema.json", "local_direct.json", "remote_helper.json")) {
+    $source = Join-Path $preSensorConfigSource $name
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+        throw "Pre-sensor configuration template is missing: $source"
+    }
+    Copy-Item -LiteralPath $source -Destination $preSensorConfigTarget -Force
+}
 $documentation = Get-ChildItem -LiteralPath (Join-Path $RepoRoot "docs") -Filter "*.md" -File
 if (-not $documentation) {
     throw "Modular documentation directory does not contain Markdown files."
@@ -137,6 +149,38 @@ foreach ($name in $operationalFiles) {
     }
     Copy-Item -LiteralPath $source -Destination (Join-Path $TargetDir $name) -Force
 }
+$preSensorEntrypoint = Join-Path $RepoRoot "pre_sensor\run-preflight.ps1"
+if (-not (Test-Path -LiteralPath $preSensorEntrypoint -PathType Leaf)) {
+    throw "Pre-sensor one-click entrypoint is missing: $preSensorEntrypoint"
+}
+Copy-Item -LiteralPath $preSensorEntrypoint -Destination (Join-Path $TargetDir "run-pre-sensor-preflight.ps1") -Force
+$windowsReview = Join-Path $RepoRoot "pre_sensor\review-windows-remediation.ps1"
+if (-not (Test-Path -LiteralPath $windowsReview -PathType Leaf)) {
+    throw "Windows readiness review script is missing: $windowsReview"
+}
+Copy-Item -LiteralPath $windowsReview -Destination (Join-Path $TargetDir "review-windows-remediation.ps1") -Force
+$secondWindowsHelper = Join-Path $RepoRoot "pre_sensor\second-windows-helper.ps1"
+if (-not (Test-Path -LiteralPath $secondWindowsHelper -PathType Leaf)) {
+    throw "Second-Windows Helper entrypoint is missing: $secondWindowsHelper"
+}
+Copy-Item -LiteralPath $secondWindowsHelper -Destination (Join-Path $TargetDir "second-windows-helper.ps1") -Force
+$enduranceEntrypoint = Join-Path $RepoRoot "pre_sensor\run-endurance.ps1"
+if (-not (Test-Path -LiteralPath $enduranceEntrypoint -PathType Leaf)) {
+    throw "Pre-sensor endurance entrypoint is missing: $enduranceEntrypoint"
+}
+Copy-Item -LiteralPath $enduranceEntrypoint -Destination (Join-Path $TargetDir "run-pre-sensor-endurance.ps1") -Force
+$evidenceEntrypoint = Join-Path $RepoRoot "pre_sensor\export-pre-sensor-evidence.ps1"
+if (-not (Test-Path -LiteralPath $evidenceEntrypoint -PathType Leaf)) {
+    throw "Pre-sensor evidence export entrypoint is missing: $evidenceEntrypoint"
+}
+Copy-Item -LiteralPath $evidenceEntrypoint -Destination (Join-Path $TargetDir "export-pre-sensor-evidence.ps1") -Force
+foreach ($fieldDocument in @("FIELD-OPERATIONS.md", "real-device-only-checklist.json")) {
+    $fieldSource = Join-Path $RepoRoot "pre_sensor\$fieldDocument"
+    if (-not (Test-Path -LiteralPath $fieldSource -PathType Leaf)) {
+        throw "Pre-sensor field document is missing: $fieldSource"
+    }
+    Copy-Item -LiteralPath $fieldSource -Destination (Join-Path $TargetDir $fieldDocument) -Force
+}
 
 $legacyFiles = @(
     "app.py", "interface_agent.py", "agentic_diagnosis.py", "diagnostic_tools.py", "acquisition.py", "real_acquisition.py", "local_direct_acquisition.py", "smrf_hid.py", "mysql_storage.py",
@@ -145,7 +189,7 @@ $legacyFiles = @(
     "runtime_health_primitives.py", "web_training.py", "web_training_pipeline.py",
     "training_data.py", "training_center.py", "training_center_cli.py",
     "native_integrated_app.py", "fit_new_collection_health.py", "websocket_live.py",
-    "helper_relay.py", "edge_capture.py", "local_capture_agent.py", "local_capture_helper_entry.py", "windows_usb_topology.py", "interface_transport_catalog.py",
+    "helper_relay.py", "edge_capture.py", "local_capture_agent.py", "local_capture_helper_entry.py", "release_contract.py", "pre_sensor_config.py", "pre_sensor_preflight.py", "pre_sensor_drill.py", "pre_sensor_endurance.py", "pre_sensor_evidence.py", "windows_usb_topology.py", "interface_transport_catalog.py",
     "simulation_replay.py", "simulation_source_transfer.py",
     "public_demo_bundles.py",
     "remote_mysql_setup.py", "server_target_mysql.py", "server_capture_journal.py", "generate_pressure_simulation.py",
@@ -271,6 +315,52 @@ function Get-Sha256Hex([string]$Path) {
         $algorithm.Dispose()
         $stream.Dispose()
     }
+}
+
+if ($ReleaseContract) {
+    if (-not (Test-Path -LiteralPath $ReleaseContract -PathType Leaf)) {
+        throw "Release contract is missing: $ReleaseContract"
+    }
+    $releaseManifest = Get-Content -LiteralPath $ReleaseContract -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ([int]$releaseManifest.schema_version -ne 1) {
+        throw "Release contract schema_version must be 1."
+    }
+    if ([string]$releaseManifest.identity.application_version -ne $ApplicationVersion -or
+        [string]$releaseManifest.identity.helper_version -ne $ApplicationVersion -or
+        [string]$releaseManifest.identity.launcher_version -ne $resolvedLauncherVersion) {
+        throw "Release contract identity does not match requested application/launcher version."
+    }
+    $staticHashes = [ordered]@{}
+    foreach ($relative in @($releaseManifest.static_assets.required)) {
+        $asset = Join-Path $TargetDir ([string]$relative).Replace('/', '\')
+        if (-not (Test-Path -LiteralPath $asset -PathType Leaf)) {
+            throw "Release contract static asset is missing: $relative"
+        }
+        $staticHashes[[string]$relative] = (Get-Sha256Hex $asset).ToLowerInvariant()
+    }
+    $releaseManifest.static_assets | Add-Member -NotePropertyName sha256 -NotePropertyValue $staticHashes -Force
+    $configurationHashes = [ordered]@{}
+    foreach ($relative in @($releaseManifest.configuration_templates.required)) {
+        $template = Join-Path $TargetDir ([string]$relative).Replace('/', '\')
+        if (-not (Test-Path -LiteralPath $template -PathType Leaf)) {
+            throw "Release contract configuration template is missing: $relative"
+        }
+        $configurationHashes[[string]$relative] = (Get-Sha256Hex $template).ToLowerInvariant()
+    }
+    $releaseManifest.configuration_templates | Add-Member -NotePropertyName sha256 -NotePropertyValue $configurationHashes -Force
+    foreach ($component in @($releaseManifest.runtime_requirements.native_components)) {
+        $nativePath = Join-Path $TargetDir ([string]$component.path).Replace('/', '\')
+        if (-not (Test-Path -LiteralPath $nativePath -PathType Leaf)) {
+            throw "Release contract native component is missing: $($component.path)"
+        }
+        $component | Add-Member -NotePropertyName sha256 -NotePropertyValue ((Get-Sha256Hex $nativePath).ToLowerInvariant()) -Force
+    }
+    $releaseManifest | Add-Member -NotePropertyName candidate -NotePropertyValue ([ordered]@{
+        candidate_id = $CandidateId
+        source_revision = $SourceRevision
+        created_at = (Get-Date).ToUniversalTime().ToString("o")
+    }) -Force
+    $releaseManifest | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $TargetDir "RELEASE-MANIFEST.json") -Encoding UTF8
 }
 
 $immutableFiles = Get-ChildItem -LiteralPath $TargetDir -Recurse -File | Where-Object {

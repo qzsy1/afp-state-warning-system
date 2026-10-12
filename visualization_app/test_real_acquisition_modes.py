@@ -40,10 +40,28 @@ from real_acquisition import (
     UnifiedFrame,
     readiness_config_fingerprint,
 )
+from release_contract import ReleaseContractError, load_release_contract
 try:
     from real_acquisition import ReadinessSnapshot
 except ImportError:
     ReadinessSnapshot = None
+
+
+RELEASE_CONTRACT = load_release_contract(start=__file__)
+
+
+def compatible_helper_capabilities(**overrides):
+    values = {
+        "protocol_version": RELEASE_CONTRACT.helper_protocol_version,
+        "helper_version": RELEASE_CONTRACT.helper_version,
+        "build_id": RELEASE_CONTRACT.release_revision,
+        "configuration_schema_version": RELEASE_CONTRACT.configuration_schema_version,
+        "readiness_schema_version": RELEASE_CONTRACT.readiness_schema_version,
+        "unified_frame_v1": True,
+        "unified_frame_contract": RELEASE_CONTRACT.unified_frame_contract,
+    }
+    values.update(overrides)
+    return values
 
 
 def load_config(payload):
@@ -98,10 +116,7 @@ def _successful_readiness_worker(message, result_queue):
             ],
             "sensors": [{"name": "温度", "state": "ready"}],
         },
-        capabilities={
-            "unified_frame_v1": True,
-            "unified_frame_contract": "unified_frame_v1",
-        },
+        capabilities=compatible_helper_capabilities(),
     )
     result_queue.put(
         {
@@ -1061,7 +1076,7 @@ class RemoteHelperNoHardwareIntegrationTests(unittest.TestCase):
             "real_acquisition_mode": "remote_helper",
             "execution_host": "helper_local",
             "helper_session_id": "session-1",
-            "helper_capabilities": {"unified_frame_v1": True},
+            "helper_capabilities": compatible_helper_capabilities(),
         }
         values.update(overrides)
         payload = real_payload(**values)
@@ -1089,10 +1104,7 @@ class RemoteHelperNoHardwareIntegrationTests(unittest.TestCase):
                 "sensors": [{"name": "温度", "state": "ok"}],
                 "password": "must-not-leak",
             },
-            capabilities={
-                "unified_frame_v1": True,
-                "unified_frame_contract": "unified_frame_v1",
-            },
+            capabilities=compatible_helper_capabilities(),
             now=100.0,
             ttl_seconds=30.0,
         )
@@ -1112,10 +1124,7 @@ class RemoteHelperNoHardwareIntegrationTests(unittest.TestCase):
         incomplete = ReadinessSnapshot.create(
             config,
             {"ok": True, "interfaces": [], "sensors": []},
-            capabilities={
-                "unified_frame_v1": True,
-                "unified_frame_contract": "unified_frame_v1",
-            },
+            capabilities=compatible_helper_capabilities(),
             now=100.0,
         )
         with self.assertRaisesRegex(ValueError, "identity|channel"):
@@ -1130,7 +1139,7 @@ class RemoteHelperNoHardwareIntegrationTests(unittest.TestCase):
         snapshot = ReadinessSnapshot.create(
             config,
             {"ok": True, "checked_at": 100.0, "interfaces": [], "sensors": []},
-            capabilities={"unified_frame_v1": True},
+            capabilities=compatible_helper_capabilities(),
             now=100.0,
         ).to_dict()
         events = []
@@ -1180,10 +1189,7 @@ class RemoteHelperNoHardwareIntegrationTests(unittest.TestCase):
             real_acquisition_mode="remote_helper",
             execution_host="helper_local",
             helper_session_id="session-1",
-            helper_capabilities={
-                "unified_frame_v1": True,
-                "unified_frame_contract": "unified_frame_v1",
-            },
+            helper_capabilities=compatible_helper_capabilities(),
         )
         config = acquisition_config_from_payload(payload)
 
@@ -1253,10 +1259,7 @@ class RemoteHelperNoHardwareIntegrationTests(unittest.TestCase):
                 ],
                 "sensors": [{"name": "温度", "state": "ready"}],
             },
-            capabilities={
-                "unified_frame_v1": True,
-                "unified_frame_contract": "unified_frame_v1",
-            },
+            capabilities=compatible_helper_capabilities(),
         )
         agent.import_readiness_snapshot(snapshot.to_dict())
         started = agent.start_capture(config)
@@ -1264,19 +1267,22 @@ class RemoteHelperNoHardwareIntegrationTests(unittest.TestCase):
         self.assertTrue(started["running"])
         self.assertEqual(manager.starts, 1)
 
-        incompatible = self.remote_config(helper_capabilities={})
+        incompatible_capabilities = compatible_helper_capabilities()
+        incompatible_capabilities.pop("unified_frame_v1")
+        incompatible = self.remote_config(
+            helper_capabilities=incompatible_capabilities
+        )
         agent.import_readiness_snapshot(snapshot.to_dict())
-        with self.assertRaisesRegex(RuntimeError, "helper_capability_missing"):
+        with self.assertRaisesRegex(ReleaseContractError, "unified_frame_v1"):
             agent.start_capture(incompatible)
 
         wrong_revision = self.remote_config(
-            helper_capabilities={
-                "unified_frame_v1": True,
-                "unified_frame_contract": "unified_frame_v2",
-            }
+            helper_capabilities=compatible_helper_capabilities(
+                unified_frame_contract="unified_frame_v2"
+            )
         )
         agent.import_readiness_snapshot(snapshot.to_dict())
-        with self.assertRaisesRegex(RuntimeError, "helper_capability_mismatch"):
+        with self.assertRaisesRegex(ReleaseContractError, "unified_frame_contract"):
             agent.start_capture(wrong_revision)
 
     @staticmethod

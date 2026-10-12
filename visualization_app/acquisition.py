@@ -42,6 +42,7 @@ from real_acquisition import (
     UnifiedFrame,
 )
 from local_direct_acquisition import LocalDirectAdapter, minimum_poll_interval
+from release_contract import assert_config_contract, load_release_contract
 try:
     from windows_usb_topology import discover_windows_usb_topology
 except ImportError:  # Compatibility with older modular runtimes.
@@ -53,6 +54,7 @@ except ImportError:  # Compatibility with older modular runtimes.
 
 
 APP_DIR = Path(os.environ.get("AFP_LEGACY_APP_DIR") or Path(__file__).resolve().parent).resolve()
+RELEASE_CONTRACT = load_release_contract(start=__file__)
 WORKSPACE_DIR = APP_DIR.parents[1]
 DEFAULT_CAPTURE_ROOT = Path(WORKSPACE_DIR.anchor) / "AFP_Capture"
 _DATA_DIR = Path(os.environ.get("AFP_DATA_DIR") or APP_DIR / "data").resolve()
@@ -277,6 +279,124 @@ def check_capture_save_root(path: str | Path | None) -> dict[str, Any]:
                 probe_path.unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+def _pending_capture_uuid(payload: dict[str, Any]) -> str:
+    config = payload.get("config")
+    summary = payload.get("summary")
+    if isinstance(config, dict):
+        capture_uuid = str(config.get("capture_uuid") or "").strip()
+        if capture_uuid:
+            return capture_uuid
+    if isinstance(summary, dict):
+        return str(summary.get("capture_uuid") or "").strip()
+    return ""
+
+
+def _resolve_pending_layer_file(
+    pending_path: Path,
+    payload: dict[str, Any],
+    capture_root: str | Path,
+) -> Path | None:
+    """Resolve a retry source after a capture root was moved or archived.
+
+    Pending records intentionally retain the original absolute path for audit
+    evidence.  A later specimen can archive that CSV, or the entire capture
+    root can be copied to another drive.  The immutable capture identity in
+    the archive directory lets us recover the exact source without selecting
+    a newer same-named layer.
+    """
+
+    saved = Path(str(payload.get("layer_file") or "")).expanduser()
+    if saved.is_file():
+        return saved
+    if not saved.name:
+        return None
+
+    root = Path(capture_root).expanduser().resolve()
+    capture_uuid = _pending_capture_uuid(payload)
+    if capture_uuid:
+        specimen_root = pending_path.parent.parent
+        search_roots = [specimen_root]
+        if specimen_root.resolve() != root:
+            search_roots.append(root)
+        archive_suffix = f"_{capture_uuid}"
+        matches: list[Path] = []
+        for search_root in search_roots:
+            if not search_root.is_dir():
+                continue
+            for candidate in search_root.rglob(saved.name):
+                if not candidate.is_file():
+                    continue
+                if any(parent.name.endswith(archive_suffix) for parent in candidate.parents):
+                    matches.append(candidate)
+            if matches:
+                break
+        unique = list(dict.fromkeys(path.resolve() for path in matches))
+        if len(unique) == 1:
+            return unique[0]
+
+    # Relative paths from older records were relative to either the record
+    # directory or the selected capture root.
+    if not saved.is_absolute():
+        for candidate in (pending_path.parent / saved, root / saved):
+            if candidate.is_file():
+                return candidate.resolve()
+    return None
+
+
+def scan_persistence_recovery(root: str | Path) -> dict[str, Any]:
+    """Discover durable work that survived a prior process.
+
+    Only file names, counts and capture identities are returned so readiness
+    evidence does not disclose the machine's private directory layout.
+    """
+
+    capture_root = Path(root).expanduser().resolve()
+    pending_files = sorted(capture_root.rglob("*_mysql*_pending.json"))
+    incomplete_files = sorted(capture_root.rglob("*.partial"))
+    capture_uuids: set[str] = set()
+    unreadable_pending = 0
+    missing_retry_sources = 0
+    relocated_retry_sources = 0
+    for path in pending_files:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            unreadable_pending += 1
+            continue
+        if not isinstance(payload, dict):
+            unreadable_pending += 1
+            continue
+        capture_uuid = _pending_capture_uuid(payload)
+        if capture_uuid:
+            capture_uuids.add(capture_uuid)
+        resolved_layer = _resolve_pending_layer_file(path, payload, capture_root)
+        if resolved_layer is None:
+            missing_retry_sources += 1
+        else:
+            saved_layer = Path(str(payload.get("layer_file") or "")).expanduser()
+            if not saved_layer.is_file():
+                relocated_retry_sources += 1
+    file_evidence = [
+        {
+            "name": path.name,
+            "path_sha256": hashlib.sha256(
+                path.relative_to(capture_root).as_posix().encode("utf-8")
+            ).hexdigest(),
+        }
+        for path in (*pending_files, *incomplete_files)
+    ]
+    return {
+        "blocked": bool(pending_files or incomplete_files),
+        "database_pending_retry": len(pending_files),
+        "incomplete_files": len(incomplete_files),
+        "unreadable_pending": unreadable_pending,
+        "missing_retry_sources": missing_retry_sources,
+        "relocated_retry_sources": relocated_retry_sources,
+        "capture_uuids": sorted(capture_uuids),
+        "files": file_evidence,
+    }
 
 
 class BoundedCsvWriter:
@@ -807,6 +927,9 @@ def _normalize_interface_sample(
 @dataclass
 class AcquisitionConfig:
     diagnostic_validation: InitVar[bool] = False
+    application_version: str = ""
+    release_revision: str = ""
+    configuration_schema_version: int = 0
     processing_mode: str = "prediction_warning"
     dataset_schema: str = "legacy_original"
     use_best_prediction_override: bool = False
@@ -899,6 +1022,16 @@ class AcquisitionConfig:
 
     def __post_init__(self, diagnostic_validation: bool = False) -> None:
         self.configuration_issues: list[dict[str, Any]] = []
+        self.application_version = str(
+            self.application_version or RELEASE_CONTRACT.application_version
+        ).strip()
+        self.release_revision = str(
+            self.release_revision or RELEASE_CONTRACT.release_revision
+        ).strip()
+        self.configuration_schema_version = int(
+            self.configuration_schema_version
+            or RELEASE_CONTRACT.configuration_schema_version
+        )
         requested_mode = str(self.acquisition_mode or "").lower()
         if not requested_mode:
             requested_mode = "simulation" if self.driver == "simulator" else "real"
@@ -2785,7 +2918,12 @@ def read_real_process_parameters(
 
 
 class AcquisitionManager:
-    def __init__(self, capture_root: Path = DEFAULT_CAPTURE_ROOT) -> None:
+    def __init__(
+        self,
+        capture_root: Path = DEFAULT_CAPTURE_ROOT,
+        *,
+        recovery_scan: bool | None = None,
+    ) -> None:
         self.capture_root = capture_root
         self.capture_root.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
@@ -2813,6 +2951,7 @@ class AcquisitionManager:
         self.raw_work_path: Path | None = None
         self.timestamp_path: Path | None = None
         self.timestamp_work_path: Path | None = None
+        self.quality_sidecar_path: Path | None = None
         self.capture_record_dir: Path | None = None
         self.full_specimen_path: Path | None = None
         self.completed_layers: list[int] = []
@@ -2847,6 +2986,37 @@ class AcquisitionManager:
             "interfaces": [],
             "sensors": [],
         }
+        if recovery_scan is None:
+            recovery_scan = Path(capture_root).resolve() != DEFAULT_CAPTURE_ROOT.resolve()
+        self.recovery_state = (
+            scan_persistence_recovery(self.capture_root)
+            if recovery_scan
+            else {
+                "blocked": False,
+                "database_pending_retry": 0,
+                "incomplete_files": 0,
+                "unreadable_pending": 0,
+                "missing_retry_sources": 0,
+                "relocated_retry_sources": 0,
+                "capture_uuids": [],
+                "files": [],
+                "scan_deferred": True,
+            }
+        )
+        if self.recovery_state["blocked"]:
+            self.finalization_complete = False
+            if self.recovery_state["database_pending_retry"]:
+                self.capture_phase = "database_pending_retry"
+                self.mysql_status = {
+                    "enabled": True,
+                    "ok": False,
+                    "state": "pending",
+                    "saved_rows": 0,
+                    "recovery": dict(self.recovery_state),
+                }
+            else:
+                self.capture_phase = "finalization_failed"
+                self.last_error = "restart_recovery_incomplete_files"
 
     @staticmethod
     def _public_config(config: AcquisitionConfig) -> dict[str, Any]:
@@ -3720,6 +3890,7 @@ class AcquisitionManager:
         cannot permanently block local, LAN, or public operation.  A real
         hardware capture is never taken over implicitly.
         """
+        assert_config_contract(config, RELEASE_CONTRACT)
         if config.acquisition_mode == "real":
             for item in config.interfaces or []:
                 if not item.get("enabled", True):
@@ -3791,6 +3962,7 @@ class AcquisitionManager:
                 config.selected_sensors or [], config.sample_rate_hz
             )
             self.total_sample_count = 0
+            self.quality_sidecar_path = None
             self.sensor_received = {
                 name: 0 for name in ALL_SENSOR_COLUMNS
             }
@@ -4409,6 +4581,7 @@ class AcquisitionManager:
             "failed": 0,
             "skipped": 0,
             "errors": [],
+            "relocated_sources": 0,
         }
         pending_files = sorted(
             root.rglob("*_mysql*_pending.json"),
@@ -4446,13 +4619,16 @@ class AcquisitionManager:
         allowed_fields = set(AcquisitionConfig.__dataclass_fields__)
         for pending_path, payload in selected_pending:
             saved_config = payload.get("config")
-            layer_file = Path(str(payload.get("layer_file") or ""))
-            if not layer_file.is_file():
+            saved_layer_file = Path(str(payload.get("layer_file") or ""))
+            layer_file = _resolve_pending_layer_file(pending_path, payload, root)
+            if layer_file is None:
                 result["failed"] += 1
                 result["errors"].append(
-                    f"{pending_path.name}：找不到层文件 {layer_file}"
+                    f"{pending_path.name}：找不到与采集身份匹配的层文件 {saved_layer_file.name}"
                 )
                 continue
+            if not saved_layer_file.is_file():
+                result["relocated_sources"] += 1
             values = {
                 key: value
                 for key, value in saved_config.items()
@@ -4564,6 +4740,7 @@ class AcquisitionManager:
         result = self._retry_pending_mysql(
             settings, retry_root, limit=max(1, min(int(limit), 1000))
         )
+        recovery_after = scan_persistence_recovery(retry_root)
         current_pending = False
         if self.capture_uuid:
             for pending_path in retry_root.rglob("*_mysql*_pending.json"):
@@ -4582,7 +4759,16 @@ class AcquisitionManager:
             and not result.get("connection_error")
             and not current_pending
         )
+        restart_recovery_synced = bool(
+            self.capture_phase == "database_pending_retry"
+            and int(result.get("attempted", 0)) > 0
+            and int(result.get("failed", 0)) == 0
+            and not result.get("connection_error")
+            and recovery_after["database_pending_retry"] == 0
+            and recovery_after["incomplete_files"] == 0
+        )
         with self.lock:
+            self.recovery_state = recovery_after
             self.mysql_status = {
                 **self.mysql_status,
                 "enabled": True,
@@ -4597,7 +4783,7 @@ class AcquisitionManager:
                     else "pending"
                 ),
             }
-            if current_capture_synced:
+            if current_capture_synced or restart_recovery_synced:
                 self.finalization_complete = True
                 self.capture_phase = "completed"
                 if "database" in self.last_error.lower() or "mysql" in self.last_error.lower():
@@ -4834,6 +5020,39 @@ class AcquisitionManager:
                             if str(layer).isdigit() and int(layer) > 0
                         ]
                 data_quality = self._data_quality_summary()
+                if self.capture_saved and self.capture_record_dir is not None:
+                    quality_stem = (
+                        intended_raw_path.stem
+                        if intended_raw_path is not None
+                        else "未保存"
+                    )
+                    self.quality_sidecar_path = self.capture_record_dir / (
+                        f"{quality_stem}_{self.session_stamp}_质量.json"
+                    )
+                    _atomic_write_json(
+                        self.quality_sidecar_path,
+                        {
+                            "schema_version": 1,
+                            "capture_uuid": self.capture_uuid,
+                            "sample_count": int(self.total_sample_count),
+                            "absolute_sequence_first": (
+                                0 if self.total_sample_count else None
+                            ),
+                            "absolute_sequence_last": (
+                                int(self.total_sample_count) - 1
+                                if self.total_sample_count
+                                else None
+                            ),
+                            "channel_units": {
+                                name: str(
+                                    (SENSOR_CHANNEL_METADATA.get(name) or {}).get("unit")
+                                    or ""
+                                )
+                                for name in (self.config.selected_sensors or [])
+                            },
+                            "data_quality": data_quality,
+                        },
+                    )
                 integrity = {
                     "layer_file": (
                         _file_integrity(self.raw_path)
@@ -4848,6 +5067,12 @@ class AcquisitionManager:
                     "whole_specimen_file": (
                         _file_integrity(full_specimen_path)
                         if self.capture_saved
+                        else None
+                    ),
+                    "quality_sidecar": (
+                        _file_integrity(self.quality_sidecar_path)
+                        if self.quality_sidecar_path is not None
+                        and self.quality_sidecar_path.is_file()
                         else None
                     ),
                 }
@@ -4877,6 +5102,11 @@ class AcquisitionManager:
                         layer + 1 for layer in self.completed_layers
                     ],
                     "timestamp_file": str(self.timestamp_path),
+                    "quality_sidecar": (
+                        str(self.quality_sidecar_path)
+                        if self.quality_sidecar_path is not None
+                        else None
+                    ),
                     "sensor_received": self.sensor_received,
                     "data_quality": data_quality,
                     "file_integrity": integrity,
@@ -5215,6 +5445,11 @@ class AcquisitionManager:
                 "timestamp_file": (
                     str(self.timestamp_path) if self.timestamp_path else None
                 ),
+                "quality_sidecar": (
+                    str(self.quality_sidecar_path)
+                    if self.quality_sidecar_path is not None
+                    else None
+                ),
                 "model_ready": model_ready,
                 "minimum_prediction_points": 24,
                 "minimum_warning_points": 48,
@@ -5224,6 +5459,7 @@ class AcquisitionManager:
                     self._public_config(self.config) if self.config else None
                 ),
                 "mysql": dict(self.mysql_status),
+                "persistence_recovery": dict(self.recovery_state),
             }
 
     def export_manifest(self) -> dict[str, Any]:

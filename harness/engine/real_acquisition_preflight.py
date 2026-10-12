@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -189,9 +190,18 @@ def run_isolated_assembly(
 _MANIFEST_LINE = re.compile(r"^([0-9A-Fa-f]{64}) [ *](.+)$")
 _CANDIDATE_REQUIRED_FILES = (
     "AFP_Integrated_System_Modular.exe",
+    "RELEASE-MANIFEST.json",
+    "run-pre-sensor-preflight.ps1",
+    "review-windows-remediation.ps1",
     "app/legacy/acquisition.py",
     "app/legacy/real_acquisition.py",
+    "app/legacy/release_contract.py",
+    "app/legacy/pre_sensor_config.py",
+    "app/legacy/pre_sensor_preflight.py",
     "app/legacy/local_direct_acquisition.py",
+    "config/pre_sensor/schema.json",
+    "config/pre_sensor/local_direct.json",
+    "config/pre_sensor/remote_helper.json",
     "app/ui/index.html",
     "app/ui/app.js",
     "app/ui/styles.css",
@@ -307,4 +317,115 @@ def validate_candidate_runtime(candidate_root: Path) -> tuple[str, ...]:
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout).strip()
             issues.append(f"candidate acquisition import failed: {detail}")
+    issues.extend(validate_candidate_release_contract(root))
+    return tuple(issues)
+
+
+def validate_candidate_release_contract(candidate_root: Path) -> tuple[str, ...]:
+    root = Path(candidate_root).resolve()
+    path = root / "RELEASE-MANIFEST.json"
+    if not path.is_file():
+        return ("candidate file missing: RELEASE-MANIFEST.json",)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return (f"release manifest unreadable: {exc}",)
+    issues: list[str] = []
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        return ("release manifest schema_version must be 1",)
+    identity = payload.get("identity")
+    contracts = payload.get("contracts")
+    static = payload.get("static_assets")
+    configuration = payload.get("configuration_templates")
+    managed = payload.get("managed_files")
+    runtime = payload.get("runtime_requirements")
+    candidate = payload.get("candidate")
+    for name, value in (
+        ("identity", identity),
+        ("contracts", contracts),
+        ("static_assets", static),
+        ("configuration_templates", configuration),
+        ("managed_files", managed),
+        ("runtime_requirements", runtime),
+        ("candidate", candidate),
+    ):
+        if not isinstance(value, dict):
+            issues.append(f"release manifest {name} must be an object")
+    if issues:
+        return tuple(issues)
+    versions = {
+        str(identity.get(name) or "")
+        for name in ("application_version", "helper_version", "launcher_version")
+    }
+    if "" in versions or len(versions) != 1:
+        issues.append("release identity versions are missing or inconsistent")
+    if not str(identity.get("release_revision") or "").strip():
+        issues.append("release identity revision is missing")
+    if not str(candidate.get("candidate_id") or "").strip():
+        issues.append("candidate identity is missing")
+    if str(managed.get("manifest") or "") != "SHA256SUMS.txt":
+        issues.append("managed file manifest must be SHA256SUMS.txt")
+    if str(managed.get("digest_algorithm") or "").lower() != "sha256":
+        issues.append("managed file digest algorithm must be sha256")
+
+    required_assets = static.get("required")
+    asset_hashes = static.get("sha256")
+    if not isinstance(required_assets, list) or not isinstance(asset_hashes, dict):
+        issues.append("release static assets require a path list and sha256 map")
+    else:
+        for relative_value in required_assets:
+            relative = str(relative_value)
+            asset_path = (root / relative).resolve()
+            if root not in asset_path.parents:
+                issues.append(f"release static path escapes candidate: {relative}")
+            elif not asset_path.is_file():
+                issues.append(f"release static file missing: {relative}")
+            elif _sha256_file(asset_path) != str(asset_hashes.get(relative) or "").lower():
+                issues.append(f"release static hash mismatch: {relative}")
+
+    required_templates = configuration.get("required")
+    template_hashes = configuration.get("sha256")
+    if not isinstance(required_templates, list) or not isinstance(template_hashes, dict):
+        issues.append(
+            "release configuration templates require a path list and sha256 map"
+        )
+    else:
+        for relative_value in required_templates:
+            relative = str(relative_value)
+            template_path = (root / relative).resolve()
+            if root not in template_path.parents:
+                issues.append(
+                    f"release configuration template path escapes candidate: {relative}"
+                )
+            elif not template_path.is_file():
+                issues.append(f"release configuration template missing: {relative}")
+            elif _sha256_file(template_path) != str(
+                template_hashes.get(relative) or ""
+            ).lower():
+                issues.append(
+                    f"release configuration template hash mismatch: {relative}"
+                )
+
+    native_components = runtime.get("native_components")
+    if not isinstance(native_components, list) or not native_components:
+        issues.append("release native component declarations are missing")
+    else:
+        for item in native_components:
+            if not isinstance(item, dict):
+                issues.append("release native component declaration is invalid")
+                continue
+            relative = str(item.get("path") or "")
+            component_path = (root / relative).resolve()
+            if not item.get("id") or not relative:
+                issues.append("release native component id/path is missing")
+            elif root not in component_path.parents:
+                issues.append(f"release native path escapes candidate: {relative}")
+            elif not component_path.is_file():
+                issues.append(f"release native component missing: {relative}")
+            elif _sha256_file(component_path) != str(item.get("sha256") or "").lower():
+                issues.append(f"release native hash mismatch: {relative}")
+    if not isinstance(runtime.get("vendor_sdks"), list) or not runtime.get("vendor_sdks"):
+        issues.append("release vendor SDK declarations are missing")
+    if not isinstance(runtime.get("drivers"), list) or not runtime.get("drivers"):
+        issues.append("release driver declarations are missing")
     return tuple(issues)

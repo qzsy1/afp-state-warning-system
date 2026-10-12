@@ -109,9 +109,11 @@ from websocket_live import (
     recv_client_frame,
     websocket_handshake_headers,
 )
+from release_contract import load_release_contract
 
 
 APP_DIR = Path(os.environ.get("AFP_LEGACY_APP_DIR") or Path(__file__).resolve().parent).resolve()
+RELEASE_CONTRACT = load_release_contract(start=__file__)
 
 
 def health_payload() -> dict[str, str]:
@@ -342,8 +344,8 @@ def authorized_target_selection(identity: RequestIdentity, profiles: ServerTarge
     if identity.role in REAL_ACCESS_ROLES and identity.role != "local_admin":
         return profiles.for_request(str(identity.session_id or ""), payload)
     return None
-APP_VERSION = "1.12.0"
-BUILD_ID = "20260823-schema-contract-fix"
+APP_VERSION = RELEASE_CONTRACT.application_version
+BUILD_ID = RELEASE_CONTRACT.release_revision
 EXECUTABLE_DIR = (
     Path(sys.executable).resolve().parent
     if getattr(sys, "frozen", False)
@@ -975,7 +977,11 @@ class DashboardData:
             coherence_floor=online_artifact["coherence_floor"],
             transformers=online_artifact["transformers"],
         )
-        self.acquisition = AcquisitionManager()
+        # The production application must discover durable MySQL retry and
+        # incomplete-finalization records left by a prior process.  Direct
+        # library callers keep the legacy constructor behavior unless they
+        # explicitly opt in or provide a dedicated capture root.
+        self.acquisition = AcquisitionManager(recovery_scan=True)
         self.local_capture_agent = LocalCaptureAgent(manager=self.acquisition)
         self.helper_registry = HelperRegistry()
         self.remote_acquisitions = RemoteAcquisitionRegistry()

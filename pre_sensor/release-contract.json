@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "identity": {
+    "application_version": "2.0.5-rc.1",
+    "helper_version": "2.0.5-rc.1",
+    "launcher_version": "2.0.5-rc.1",
+    "release_revision": "complete-pre-sensor-readiness-v1"
+  },
+  "contracts": {
+    "helper_protocol_version": 2,
+    "unified_frame_contract": "unified_frame_v1",
+    "configuration_schema_version": 1,
+    "readiness_schema_version": 1
+  },
+  "static_assets": {
+    "required": [
+      "app/ui/index.html",
+      "app/ui/app.js",
+      "app/ui/styles.css",
+      "app/ui/mysql_visibility.js",
+      "app/ui/process_parameters.js",
+      "app/ui/public_demo.js",
+      "app/ui/training.html",
+      "app/ui/training.js"
+    ]
+  },
+  "configuration_templates": {
+    "required": [
+      "config/pre_sensor/schema.json",
+      "config/pre_sensor/local_direct.json",
+      "config/pre_sensor/remote_helper.json"
+    ]
+  },
+  "managed_files": {
+    "manifest": "SHA256SUMS.txt",
+    "digest_algorithm": "sha256"
+  },
+  "runtime_requirements": {
+    "python_runtime": "bundled",
+    "required_modules": ["numpy", "pandas", "joblib", "mysql.connector"],
+    "native_components": [
+      {"id": "bsv_uvc", "path": "native_dll/BsvUvcNative.dll"},
+      {"id": "libusb", "path": "native_dll/libusb-1.0.dll"}
+    ],
+    "vendor_sdks": [
+      {
+        "id": "bsv_uvc_sdk",
+        "required_for": "uvc_temperature",
+        "detection": "native_dll/BsvUvcNative.dll"
+      }
+    ],
+    "drivers": [
+      {"id": "smrf_hid", "required_for": "thermocouple_8ch"},
+      {"id": "serial_port", "required_for": "m3232_pressure"},
+      {"id": "ethernet", "required_for": "plc_process_and_abb_motion"},
+      {"id": "uvc", "required_for": "uvc_temperature"}
+    ]
+  }
+}

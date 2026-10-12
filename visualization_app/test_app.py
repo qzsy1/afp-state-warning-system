@@ -80,7 +80,10 @@ class DashboardTests(unittest.TestCase):
 
     def test_bootstrap_and_view(self) -> None:
         bootstrap = self.dashboard.bootstrap()
-        self.assertEqual(bootstrap["application"]["version"], "1.12.0")
+        self.assertEqual(
+            bootstrap["application"]["version"],
+            app_module.RELEASE_CONTRACT.application_version,
+        )
         prediction_models = bootstrap["acquisition"]["prediction_models"]
         self.assertEqual(len(prediction_models), 11)
         self.assertTrue(
