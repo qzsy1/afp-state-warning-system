@@ -217,20 +217,51 @@ function New-AfpStagedRelease {
         [Parameter(Mandatory = $true)][string]$ReferenceRelease,
         [string]$ExistingExecutable = "",
         [string]$PythonExecutable = "",
-        [string]$HelperExecutable = ""
+        [string]$HelperExecutable = "",
+        [string]$SourceRoot = ""
     )
     $script = Join-Path $Paths.SourceRoot "pre_sensor\build-candidate.ps1"
     $arguments = @("-ReferenceRelease", $ReferenceRelease, "-WorkspaceRoot", $Paths.WorkspaceRoot)
     if ($ExistingExecutable) { $arguments += @("-ExistingExecutable", $ExistingExecutable) }
     if ($PythonExecutable) { $arguments += @("-PythonExecutable", $PythonExecutable) }
     if ($HelperExecutable) { $arguments += @("-HelperExecutable", $HelperExecutable) }
+    if ($SourceRoot) { $arguments += @("-SourceRoot", $SourceRoot) }
     $json = & $script @arguments
     if ($LASTEXITCODE -ne 0) { throw "Staged release build failed." }
     return (($json -join "`n") | ConvertFrom-Json)
 }
 
+function New-AfpRollbackStage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][psobject]$Paths,
+        [Parameter(Mandatory = $true)][string]$GitRef,
+        [Parameter(Mandatory = $true)][string]$ReferenceRelease
+    )
+    $source = Join-Path $Paths.StagingRoot ("rollback-source-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $Paths.StagingRoot -Force | Out-Null
+    $created = $false
+    try {
+        & git -C $Paths.SourceRoot worktree add --detach $source $GitRef *> $null
+        if ($LASTEXITCODE -ne 0) { throw "Git rollback worktree could not be created." }
+        $created = $true
+        & git -C $source lfs pull *> $null
+        if ($LASTEXITCODE -ne 0) { throw "Git LFS rollback inputs could not be materialized." }
+        return New-AfpStagedRelease -Paths $Paths -ReferenceRelease $ReferenceRelease -SourceRoot $source
+    } finally {
+        if ($created) {
+            & git -C $Paths.SourceRoot worktree remove --force $source *> $null
+        }
+        if (Test-Path -LiteralPath $source) {
+            $resolved = Assert-AfpMutableTarget -Path $source -Paths $Paths -Kind Staging
+            Remove-Item -LiteralPath $resolved -Recurse -Force
+        }
+    }
+}
+
 Export-ModuleMember -Function @(
     "New-AfpStagedRelease",
+    "New-AfpRollbackStage",
     "Test-AfpReleaseGate",
     "Test-AfpBuildReadiness",
     "Remove-AfpDeploymentStaging"

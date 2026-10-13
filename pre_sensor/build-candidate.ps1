@@ -4,12 +4,14 @@ param(
     [string]$ExistingExecutable = "",
     [string]$TargetRoot = "",
     [string]$WorkspaceRoot = "",
+    [string]$SourceRoot = "",
     [string]$PythonExecutable = "",
     [string]$HelperExecutable = ""
 )
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
+$BuildSourceRoot = if ($SourceRoot) { [IO.Path]::GetFullPath($SourceRoot) } else { $RepoRoot }
 $pathsModule = Join-Path $PSScriptRoot "SingleRuntimePaths.psm1"
 $pathConfig = Join-Path $PSScriptRoot "single-runtime-paths.json"
 Import-Module $pathsModule -Force
@@ -18,14 +20,14 @@ $paths = if ($WorkspaceRoot) {
 } else {
     Get-AfpDeploymentPaths -ConfigPath $pathConfig
 }
-$contractPath = Join-Path $PSScriptRoot "release-contract.json"
+$contractPath = Join-Path $BuildSourceRoot "pre_sensor\release-contract.json"
 $contract = Get-Content -LiteralPath $contractPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $version = [string]$contract.identity.application_version
-$gitRevision = (& git -C $RepoRoot rev-parse --short=12 HEAD).Trim()
+$gitRevision = (& git -C $BuildSourceRoot rev-parse --short=12 HEAD).Trim()
 if (-not $gitRevision) { throw "Cannot resolve source revision." }
 $revision = $gitRevision
 $candidateRevision = $gitRevision
-$diff = (& git -C $RepoRoot diff --binary HEAD -- .) -join "`n"
+$diff = (& git -C $BuildSourceRoot diff --binary HEAD -- .) -join "`n"
 if ($diff) {
     $algorithm = [Security.Cryptography.SHA256]::Create()
     try {
@@ -55,7 +57,7 @@ if (-not $ReferenceRelease) {
     if (Test-Path -LiteralPath (Join-Path $paths.RuntimeRoot "AFP_Integrated_System_Modular.exe") -PathType Leaf) {
         $ReferenceRelease = $paths.RuntimeRoot
     } else {
-        $releaseRoots = @(Get-ChildItem -LiteralPath (Join-Path $RepoRoot "delivery") -Directory | Where-Object {
+        $releaseRoots = @(Get-ChildItem -LiteralPath (Join-Path $BuildSourceRoot "delivery") -Directory | Where-Object {
             Test-Path -LiteralPath (Join-Path $_.FullName "AFP_Integrated_System_Modular.exe") -PathType Leaf
         })
         if ($releaseRoots.Count -ne 1) {
@@ -82,7 +84,7 @@ try {
     if (-not $HelperExecutable) {
         $helperBuildRoot = Join-Path $resolvedTargetRoot ("helper-" + [guid]::NewGuid().ToString("N"))
         $HelperExecutable = Join-Path $helperBuildRoot "AFP_Local_Capture_Helper.exe"
-        & (Join-Path $RepoRoot "visualization_app\build_local_capture_helper.ps1") `
+        & (Join-Path $BuildSourceRoot "visualization_app\build_local_capture_helper.ps1") `
             -PythonExecutable $PythonExecutable `
             -OutputDirectory $helperBuildRoot | Out-Null
     }
@@ -90,18 +92,18 @@ try {
     if (-not (Test-Path -LiteralPath $HelperExecutable -PathType Leaf)) {
         throw "Helper build input does not exist: $HelperExecutable"
     }
-    & (Join-Path $RepoRoot "modular_runtime\assemble_modular_delivery.ps1") `
+    & (Join-Path $BuildSourceRoot "modular_runtime\assemble_modular_delivery.ps1") `
         -ReferenceRelease $ReferenceRelease `
         -TargetDir $target `
         -ApplicationVersion $version `
         -LauncherVersion $version `
         -ExistingExecutable $ExistingExecutable `
-        -ModelsSource (Join-Path $RepoRoot "visualization_app\models") `
-        -DataSource (Join-Path $RepoRoot "visualization_app\data") `
-        -NewCollectionSource (Join-Path $RepoRoot "visualization_app\new_collection_demo_v11_3") `
-        -ModelRuntimeSource (Join-Path $RepoRoot "visualization_app\model_runtime") `
-        -SoftConsistencySource (Join-Path $RepoRoot "outputs_tc_hi_soft_consistency_v13_8") `
-        -CausalConsistencySource (Join-Path $RepoRoot "outputs_causal_online_consistency_v13_9") `
+        -ModelsSource (Join-Path $BuildSourceRoot "visualization_app\models") `
+        -DataSource (Join-Path $BuildSourceRoot "visualization_app\data") `
+        -NewCollectionSource (Join-Path $BuildSourceRoot "visualization_app\new_collection_demo_v11_3") `
+        -ModelRuntimeSource (Join-Path $BuildSourceRoot "visualization_app\model_runtime") `
+        -SoftConsistencySource (Join-Path $BuildSourceRoot "outputs_tc_hi_soft_consistency_v13_8") `
+        -CausalConsistencySource (Join-Path $BuildSourceRoot "outputs_causal_online_consistency_v13_9") `
         -HelperExecutable $HelperExecutable `
         -ReleaseContract $contractPath `
         -CandidateId $candidateId `
