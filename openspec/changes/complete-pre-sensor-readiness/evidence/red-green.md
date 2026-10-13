@@ -149,6 +149,15 @@
 - RED：最终 Harness full 的 `frontend-public-contracts` 中，`test_real_helper_target_mysql_is_server_only_and_finalizes_after_last_batch` 返回 `release_contract_mismatch`。测试只给 Helper 声明 `real_capture` 与 `unified_frame_v1`，却仍期待生产启动成功，违反本变更的启动前版本/协议门禁。
 - GREEN：测试从权威发行合同填入 helper version、build ID、协议、统一帧及配置/readiness schema；没有放宽生产门禁。目标用例 1/1、`frontend-public-contracts` 单项及最终 full 中该检查均通过。
 
+## 候选Helper可安装文件闭环修正
+
+- RED 1：复核旧候选 `2.0.5-rc.1-7ebcc3afa865-20261011T002212Z` 时发现安装脚本存在，但 `local_helper/AFP_Local_Capture_Helper.exe` 缺失，发行 manifest 也没有声明该可执行文件。新增两个聚焦合同用例后分别以 `KeyError: required_executables` 和装配源缺少 `HelperExecutable` 失败。
+- GREEN 1：候选生成器改为在隔离临时目录构建 Helper，装配器显式接收并复制 EXE，发行合同写入文件路径与 SHA-256；正式 `delivery` 的旧构建路径保持兼容，候选路径不会写入正式目录。聚焦用例及候选/Helper/运行时相关 51/51 通过。
+- RED 2：第一次实际运行新冻结 EXE 时，`acquisition.py` 在 PyInstaller `_MEI*` 临时解压目录寻找发行合同并以 `ReleaseContractError` 退出，证明“文件存在”不足以证明 Helper 可运行。
+- GREEN 2：共享发行合同加载器在冻结态优先从 `sys.executable` 所在目录向上寻找 `RELEASE-MANIFEST.json`。单元合同 10/10 通过；重建候选内 Helper `--version` 返回 `AFP Local Capture Helper complete-pre-sensor-readiness-v1 (protocol 2)` 且退出 0。
+- 当前候选：`2.0.5-rc.1-aaef27614132-20261013T115759Z`（源提交 `aaef27614132`）。主程序文件校验、自检、模块状态均退出 0，候选验证器零问题；短路径副本 `D:\AFP-Validation-aaef276` 核验 6191 个摘要文件通过。旧候选明确废止。
+- 修正后综合回归：Harness 199/199、modular runtime 34/34、Python compileall、三份 PowerShell AST、OpenSpec strict、`git diff --check`、正式 `delivery` 6176 文件只读基线均通过。
+
 ## 最终墙钟耐久与综合验证
 
 - `local_direct`：1800.156 秒、18001 帧、9.999981 Hz、最大帧间隔 119.534 ms、writer 队列峰值 1；CSV/质量侧车各 18001 行，绝对序号 0–18000 连续，对账通过。
