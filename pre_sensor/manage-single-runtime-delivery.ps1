@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("Inventory", "Stage", "Switchover", "StartupPreview", "Evidence", "CleanupPreview", "Cleanup", "Rollback")]
+    [ValidateSet("Inventory", "Stage", "Switchover", "StartupPreview", "StartupApply", "Evidence", "CleanupPreview", "Cleanup", "Rollback")]
     [string]$Mode,
     [string]$WorkspaceRoot = "",
     [string]$ReferenceRelease = "",
@@ -98,7 +98,15 @@ if ($Mode -eq "Switchover") {
 
 if ($Mode -eq "StartupPreview") {
     $inventory = Get-AfpRuntimeInventory -PublicUrl $PublicUrl -FunnelOrigin $FunnelOrigin
-    New-AfpApprovalSummary -Inventory $inventory -Operation Startup | ConvertTo-Json -Depth 10
+    Get-AfpStartupRepairPreview -Inventory $inventory -Paths $paths | ConvertTo-Json -Depth 10
+    exit 0
+}
+
+if ($Mode -eq "StartupApply") {
+    if (-not $ApprovedInventoryDigest) { throw "StartupApply requires the approved preview digest." }
+    $inventory = Get-AfpRuntimeInventory -PublicUrl $PublicUrl -FunnelOrigin $FunnelOrigin
+    $preview = Get-AfpStartupRepairPreview -Inventory $inventory -Paths $paths
+    Set-AfpApprovedStartupTargets -Preview $preview -PreviewDigest $ApprovedInventoryDigest | ConvertTo-Json -Depth 10
     exit 0
 }
 

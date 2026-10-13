@@ -55,6 +55,17 @@ class PublicTunnelWatchdogContractTests(unittest.TestCase):
         self.assertIn("$DeliveryRoot = $PSScriptRoot", text)
         self.assertIn('Test-Path (Join-Path $DeliveryRoot "AFP_Integrated_System_Modular.exe")', text)
 
+    def test_watchdog_has_no_versioned_or_legacy_delivery_fallback(self):
+        text = self.source_text()
+        self.assertIn('"AFP_Integrated_System_Modular"', text)
+        self.assertNotIn("AFP_Integrated_System_Modular_v2.0.4_Agentic", text)
+        self.assertNotIn(r"F:\AFP_Integrated_Modular_v2", text)
+
+    def source_text(self):
+        return Path(__file__).with_name("public_tunnel_watchdog.ps1").read_text(
+            encoding="utf-8-sig"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

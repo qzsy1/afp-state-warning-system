@@ -41,6 +41,12 @@ class TailscaleFunnelWatchdogContractTests(unittest.TestCase):
         self.assertIn("$DeliveryRoot = $PSScriptRoot", text)
         self.assertIn('Test-Path (Join-Path $DeliveryRoot "AFP_Integrated_System_Modular.exe")', text)
 
+    def test_watchdog_has_no_versioned_or_legacy_delivery_fallback(self):
+        text = self.source.read_text(encoding="utf-8-sig")
+        self.assertIn('"AFP_Integrated_System_Modular"', text)
+        self.assertNotIn("AFP_Integrated_System_Modular_v2.0.4_Agentic", text)
+        self.assertNotIn(r"F:\AFP_Integrated_Modular_v2", text)
+
     def test_watchdog_starts_origin_without_opening_a_second_desktop_window(self):
         text = self.source.read_text(encoding="utf-8-sig")
         self.assertIn('-ArgumentList "--server-only"', text)

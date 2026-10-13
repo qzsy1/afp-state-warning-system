@@ -301,6 +301,117 @@ function Test-AfpRuntimeServices {
     }
 }
 
+function Get-AfpStartupRepairPreview {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][psobject]$Inventory,
+        [Parameter(Mandatory = $true)][psobject]$Paths,
+        [object[]]$StartupRecords
+    )
+    if (-not $PSBoundParameters.ContainsKey("StartupRecords")) {
+        $StartupRecords = @()
+        $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+        $run = Get-ItemProperty -LiteralPath $runKey -ErrorAction SilentlyContinue
+        if ($run) {
+            foreach ($property in $run.PSObject.Properties | Where-Object { $_.Name -like "AFP*" }) {
+                $StartupRecords += [pscustomobject]@{ Name = $property.Name; Value = [string]$property.Value; Source = "HKCU Run" }
+            }
+        }
+        foreach ($task in @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like "AFP*" })) {
+            foreach ($action in @($task.Actions)) {
+                $StartupRecords += [pscustomobject]@{
+                    Name = $task.TaskName
+                    Value = (([string]$action.Execute) + " " + ([string]$action.Arguments)).Trim()
+                    TargetPath = [string]$action.Execute
+                    Source = "ScheduledTask"
+                }
+            }
+        }
+    }
+    $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $changes = [Collections.Generic.List[object]]::new()
+    $issues = [Collections.Generic.List[string]]::new()
+    foreach ($record in $StartupRecords) {
+        $name = [string]$record.Name
+        $source = [string]$record.Source
+        $oldValue = if ($record.PSObject.Properties.Name -contains "Value") { [string]$record.Value } else { "" }
+        if ($oldValue -match '(?i)(password|token|pair(?:ing)?[_-]?code|credential|secret)') {
+            $issues.Add("startup value contains sensitive arguments: $name")
+            continue
+        }
+        $newValue = ""
+        $action = "set"
+        switch ($name) {
+            "AFP_Tailscale_Funnel_Watchdog" {
+                $script = Join-Path $Paths.RuntimeRoot "tailscale_funnel_watchdog.ps1"
+                $newValue = "$powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$script`" -Mode Run"
+            }
+            "AFP_Public_Tunnel_Watchdog" { $action = "remove" }
+            "AFP Local Capture Helper" {
+                $helper = Join-Path $Paths.RuntimeRoot "local_helper\AFP_Local_Capture_Helper.exe"
+                $newValue = "`"$helper`" --background"
+            }
+            default { continue }
+        }
+        if ($action -eq "remove" -or $oldValue -ne $newValue) {
+            $changes.Add([pscustomobject][ordered]@{
+                name = $name
+                source = $source
+                action = $action
+                old_value = $oldValue
+                new_value = $newValue
+                recovery_value = $oldValue
+            })
+        }
+    }
+    $stable = [ordered]@{ inventory_digest = [string]$Inventory.digest; changes = @($changes); issues = @($issues) }
+    $digest = Get-AfpTextSha256 -Text ($stable | ConvertTo-Json -Depth 10 -Compress)
+    return [pscustomobject][ordered]@{
+        status = if ($issues.Count) { "blocked" } elseif ($changes.Count) { "approval_required" } else { "passed" }
+        inventory_digest = [string]$Inventory.digest
+        changes = @($changes)
+        issues = @($issues)
+        digest = $digest
+    }
+}
+
+function Set-AfpApprovedStartupTargets {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][psobject]$Preview,
+        [Parameter(Mandatory = $true)][string]$PreviewDigest,
+        [scriptblock]$ApplyRunner
+    )
+    if ($Preview.status -ne "approval_required") { throw "Startup repair preview is not approved for application." }
+    if (-not [string]::Equals([string]$Preview.digest, $PreviewDigest, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Startup repair preview changed after approval."
+    }
+    foreach ($change in @($Preview.changes)) {
+        if ($ApplyRunner) {
+            & $ApplyRunner $change
+            continue
+        }
+        if ($change.source -eq "HKCU Run") {
+            $runKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+            if ($change.action -eq "remove") {
+                Remove-ItemProperty -LiteralPath $runKey -Name $change.name -ErrorAction SilentlyContinue
+            } else {
+                New-Item -Path $runKey -Force | Out-Null
+                Set-ItemProperty -LiteralPath $runKey -Name $change.name -Value $change.new_value
+            }
+        } elseif ($change.name -eq "AFP Local Capture Helper") {
+            $match = [regex]::Match([string]$change.new_value, '^"([^"]+AFP_Local_Capture_Helper\.exe)"')
+            if (-not $match.Success) { throw "Helper startup target is invalid." }
+            $runtime = Split-Path -Parent (Split-Path -Parent $match.Groups[1].Value)
+            & (Join-Path $runtime "install_local_helper_autostart.ps1")
+            if ($LASTEXITCODE -ne 0) { throw "Helper startup task update failed." }
+        } else {
+            throw "Unsupported startup target: $($change.name)"
+        }
+    }
+    return [pscustomobject]@{ status = "passed"; applied = @($Preview.changes).Count }
+}
+
 Export-ModuleMember -Function @(
     "Get-AfpRuntimeInventory",
     "Test-AfpInventoryUnchanged",
@@ -308,5 +419,7 @@ Export-ModuleMember -Function @(
     "Invoke-AfpRuntimePromotion",
     "Restore-AfpRuntimePromotion",
     "Complete-AfpRuntimePromotion",
-    "Test-AfpRuntimeServices"
+    "Test-AfpRuntimeServices",
+    "Get-AfpStartupRepairPreview",
+    "Set-AfpApprovedStartupTargets"
 )
