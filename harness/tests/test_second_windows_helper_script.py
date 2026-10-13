@@ -42,6 +42,8 @@ class SecondWindowsHelperScriptTests(unittest.TestCase):
         )
         self.assertIn("second-windows-helper.ps1", assembly)
         self.assertIn("pre_sensor_drill.py", assembly)
+        self.assertIn("AFP_Local_Capture_Helper.exe", assembly)
+        self.assertIn("HelperExecutable", assembly)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import visualization_app.release_contract as release_contract_module
 
 from visualization_app.release_contract import (
     ReleaseContractError,
@@ -61,6 +64,23 @@ class ReleaseContractTests(unittest.TestCase):
         for marker in ("password", "token", "credential", "api_key", "secret"):
             with self.subTest(marker=marker):
                 self.assertNotIn(marker, text)
+
+    def test_frozen_helper_loads_manifest_beside_executable(self) -> None:
+        source = ROOT / "pre_sensor" / "release-contract.json"
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate = Path(temporary) / "candidate"
+            helper = candidate / "local_helper" / "AFP_Local_Capture_Helper.exe"
+            helper.parent.mkdir(parents=True)
+            helper.write_bytes(b"synthetic")
+            (candidate / "RELEASE-MANIFEST.json").write_bytes(source.read_bytes())
+            extraction_module = Path(temporary) / "_MEI-test" / "acquisition.py"
+            with patch.object(
+                release_contract_module.sys, "frozen", True, create=True
+            ), patch.object(
+                release_contract_module.sys, "executable", str(helper)
+            ):
+                contract = load_release_contract(start=extraction_module)
+        self.assertEqual(contract.source_path, candidate / "RELEASE-MANIFEST.json")
 
 
 if __name__ == "__main__":

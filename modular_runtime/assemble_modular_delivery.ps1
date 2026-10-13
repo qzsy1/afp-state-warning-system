@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory = $true)][string]$ApplicationVersion,
     [string]$LauncherSourceDir = "",
     [string]$ExistingExecutable = "",
+    [string]$HelperExecutable = "",
     [string]$LauncherVersion = "",
     [string]$ReleaseContract = "",
     [string]$CandidateId = "",
@@ -59,6 +60,9 @@ foreach ($required in @(
         throw "Required delivery assembly input is missing: $required"
     }
 }
+if ($ReleaseContract -and -not (Test-Path -LiteralPath $HelperExecutable -PathType Leaf)) {
+    throw "Release candidate Helper executable is missing: $HelperExecutable"
+}
 
 if ((Test-Path -LiteralPath $TargetDir) -and -not $AllowExistingTarget) {
     throw "Target already exists; choose a new directory: $TargetDir"
@@ -109,8 +113,12 @@ $configTarget = Join-Path $TargetDir "config"
 $preSensorConfigTarget = Join-Path $configTarget "pre_sensor"
 $nativeTarget = Join-Path $TargetDir "native_dll"
 $docsTarget = Join-Path $TargetDir "docs"
-foreach ($path in @($appTarget, $legacyTarget, $legacyStaticTarget, $uiTarget, $configTarget, $preSensorConfigTarget, $nativeTarget, $docsTarget)) {
+$helperTarget = Join-Path $TargetDir "local_helper"
+foreach ($path in @($appTarget, $legacyTarget, $legacyStaticTarget, $uiTarget, $configTarget, $preSensorConfigTarget, $nativeTarget, $docsTarget, $helperTarget)) {
     New-Item -ItemType Directory -Force -Path $path | Out-Null
+}
+if ($HelperExecutable) {
+    Copy-Item -LiteralPath $HelperExecutable -Destination (Join-Path $helperTarget "AFP_Local_Capture_Helper.exe") -Force
 }
 
 Copy-Item -LiteralPath (Join-Path $ScriptDir "app\bootstrap.py") -Destination $appTarget -Force
@@ -354,6 +362,13 @@ if ($ReleaseContract) {
             throw "Release contract native component is missing: $($component.path)"
         }
         $component | Add-Member -NotePropertyName sha256 -NotePropertyValue ((Get-Sha256Hex $nativePath).ToLowerInvariant()) -Force
+    }
+    foreach ($executable in @($releaseManifest.runtime_requirements.required_executables)) {
+        $executablePath = Join-Path $TargetDir ([string]$executable.path).Replace('/', '\')
+        if (-not (Test-Path -LiteralPath $executablePath -PathType Leaf)) {
+            throw "Release contract required executable is missing: $($executable.path)"
+        }
+        $executable | Add-Member -NotePropertyName sha256 -NotePropertyValue ((Get-Sha256Hex $executablePath).ToLowerInvariant()) -Force
     }
     $releaseManifest | Add-Member -NotePropertyName candidate -NotePropertyValue ([ordered]@{
         candidate_id = $CandidateId
