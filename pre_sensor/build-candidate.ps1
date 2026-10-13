@@ -3,12 +3,21 @@ param(
     [string]$ReferenceRelease = "",
     [string]$ExistingExecutable = "",
     [string]$TargetRoot = "",
+    [string]$WorkspaceRoot = "",
     [string]$PythonExecutable = "",
     [string]$HelperExecutable = ""
 )
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
+$pathsModule = Join-Path $PSScriptRoot "SingleRuntimePaths.psm1"
+$pathConfig = Join-Path $PSScriptRoot "single-runtime-paths.json"
+Import-Module $pathsModule -Force
+$paths = if ($WorkspaceRoot) {
+    Get-AfpDeploymentPaths -ConfigPath $pathConfig -WorkspaceRootOverride $WorkspaceRoot
+} else {
+    Get-AfpDeploymentPaths -ConfigPath $pathConfig
+}
 $contractPath = Join-Path $PSScriptRoot "release-contract.json"
 $contract = Get-Content -LiteralPath $contractPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $version = [string]$contract.identity.application_version
@@ -32,20 +41,28 @@ $safeVersion = $version -replace '[^A-Za-z0-9._-]', '-'
 $safeRevision = $candidateRevision -replace '[^A-Za-z0-9._-]', '-'
 $candidateId = "$safeVersion-$safeRevision-$stamp"
 if (-not $TargetRoot) {
-    $TargetRoot = Join-Path $RepoRoot "artifacts\pre-sensor-candidates"
+    $TargetRoot = $paths.StagingRoot
 }
-$target = Join-Path $TargetRoot $candidateId
+$resolvedTargetRoot = [IO.Path]::GetFullPath($TargetRoot).TrimEnd('\')
+if (-not [string]::Equals($resolvedTargetRoot, $paths.StagingRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "TargetRoot must equal the configured .afp-staging root: $resolvedTargetRoot"
+}
+$target = Join-Path $resolvedTargetRoot ("deployment-" + [guid]::NewGuid().ToString("N"))
 if (Test-Path -LiteralPath $target) {
-    throw "Target already exists; choose a new candidate id: $target"
+    throw "Target already exists; choose a new deployment id: $target"
 }
 if (-not $ReferenceRelease) {
-    $releaseRoots = @(Get-ChildItem -LiteralPath (Join-Path $RepoRoot "delivery") -Directory | Where-Object {
-        Test-Path -LiteralPath (Join-Path $_.FullName "AFP_Integrated_System_Modular.exe") -PathType Leaf
-    })
-    if ($releaseRoots.Count -ne 1) {
-        throw "Expected exactly one reference release; pass -ReferenceRelease explicitly."
+    if (Test-Path -LiteralPath (Join-Path $paths.RuntimeRoot "AFP_Integrated_System_Modular.exe") -PathType Leaf) {
+        $ReferenceRelease = $paths.RuntimeRoot
+    } else {
+        $releaseRoots = @(Get-ChildItem -LiteralPath (Join-Path $RepoRoot "delivery") -Directory | Where-Object {
+            Test-Path -LiteralPath (Join-Path $_.FullName "AFP_Integrated_System_Modular.exe") -PathType Leaf
+        })
+        if ($releaseRoots.Count -ne 1) {
+            throw "Expected exactly one reference release; pass -ReferenceRelease explicitly."
+        }
+        $ReferenceRelease = $releaseRoots[0].FullName
     }
-    $ReferenceRelease = $releaseRoots[0].FullName
 }
 if (-not $ExistingExecutable) {
     $ExistingExecutable = Join-Path $ReferenceRelease "AFP_Integrated_System_Modular.exe"
@@ -59,9 +76,11 @@ if (-not $PythonExecutable) {
     }
 }
 $helperBuildRoot = ""
+$buildSucceeded = $false
 try {
+    New-Item -ItemType Directory -Path $resolvedTargetRoot -Force | Out-Null
     if (-not $HelperExecutable) {
-        $helperBuildRoot = Join-Path ([IO.Path]::GetTempPath()) ("afp-candidate-helper-" + [guid]::NewGuid().ToString("N"))
+        $helperBuildRoot = Join-Path $resolvedTargetRoot ("helper-" + [guid]::NewGuid().ToString("N"))
         $HelperExecutable = Join-Path $helperBuildRoot "AFP_Local_Capture_Helper.exe"
         & (Join-Path $RepoRoot "visualization_app\build_local_capture_helper.ps1") `
             -PythonExecutable $PythonExecutable `
@@ -90,16 +109,26 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "Candidate assembly failed with exit code $LASTEXITCODE."
     }
+    $buildSucceeded = $true
 }
 finally {
-    $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
     if ($helperBuildRoot) {
         $resolvedHelperBuildRoot = [IO.Path]::GetFullPath($helperBuildRoot)
-        if ($resolvedHelperBuildRoot.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -and
-            (Split-Path -Leaf $resolvedHelperBuildRoot).StartsWith("afp-candidate-helper-", [StringComparison]::OrdinalIgnoreCase) -and
+        if ($resolvedHelperBuildRoot.StartsWith($paths.StagingRoot + '\', [StringComparison]::OrdinalIgnoreCase) -and
+            (Split-Path -Leaf $resolvedHelperBuildRoot).StartsWith("helper-", [StringComparison]::OrdinalIgnoreCase) -and
             (Test-Path -LiteralPath $resolvedHelperBuildRoot)) {
             Remove-Item -LiteralPath $resolvedHelperBuildRoot -Recurse -Force
         }
     }
+    if (-not $buildSucceeded -and (Test-Path -LiteralPath $target)) {
+        $safeTarget = Assert-AfpMutableTarget -Path $target -Paths $paths -Kind Staging
+        Remove-Item -LiteralPath $safeTarget -Recurse -Force
+    }
 }
-Write-Output $target
+[pscustomobject][ordered]@{
+    status = "staged"
+    deployment_id = Split-Path -Leaf $target
+    staging_path = $target
+    candidate_id = $candidateId
+    source_revision = $revision
+} | ConvertTo-Json -Compress

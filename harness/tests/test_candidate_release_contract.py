@@ -13,16 +13,20 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class CandidateReleaseContractTests(unittest.TestCase):
-    def test_candidate_builder_is_isolated_and_refuses_existing_target(self) -> None:
+    def test_candidate_builder_uses_ephemeral_f_drive_staging(self) -> None:
         script = ROOT / "pre_sensor" / "build-candidate.ps1"
         source = script.read_text(encoding="utf-8")
-        self.assertIn("artifacts\\pre-sensor-candidates", source)
+        self.assertIn("single-runtime-paths.json", source)
+        self.assertIn(".afp-staging", source)
+        self.assertNotIn("artifacts\\pre-sensor-candidates", source)
         self.assertIn("Target already exists", source)
         self.assertNotIn("AllowExistingTarget", source)
         self.assertNotIn("delivery\\AFP_Integrated", source)
         self.assertIn("build_local_capture_helper.ps1", source)
         self.assertIn("-OutputDirectory", source)
         self.assertIn("-HelperExecutable", source)
+        self.assertIn("deployment-", source)
+        self.assertIn("candidate_id", source)
 
     def test_candidate_runtime_requires_the_local_helper(self) -> None:
         source = (
