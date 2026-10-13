@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("Inventory", "Stage", "Switchover", "StartupPreview", "StartupApply", "Evidence", "CleanupPreview", "Cleanup", "Rollback")]
+    [ValidateSet("Inventory", "Stage", "Switchover", "StartupPreview", "StartupApply", "Evidence", "CleanupPreview", "Cleanup", "Report", "Rollback")]
     [string]$Mode,
     [string]$WorkspaceRoot = "",
     [string]$ReferenceRelease = "",
@@ -11,13 +11,17 @@ param(
     [string]$LanIPv4 = "",
     [string]$FunnelOrigin = "http://127.0.0.1:8770",
     [string]$ExpectedCandidateId = "",
-    [string]$GitRef = "HEAD"
+    [string]$GitRef = "HEAD",
+    [string]$EvidenceSource = "",
+    [string[]]$CleanupTargets = @(),
+    [string]$PreviewPath = ""
 )
 
 $ErrorActionPreference = "Stop"
 Import-Module (Join-Path $PSScriptRoot "SingleRuntimePaths.psm1") -Force
 Import-Module (Join-Path $PSScriptRoot "SingleRuntimeRelease.psm1") -Force
 Import-Module (Join-Path $PSScriptRoot "SingleRuntimeDeployment.psm1") -Force
+Import-Module (Join-Path $PSScriptRoot "SingleRuntimeEvidence.psm1") -Force
 $configPath = Join-Path $PSScriptRoot "single-runtime-paths.json"
 $paths = if ($WorkspaceRoot) {
     Get-AfpDeploymentPaths -ConfigPath $configPath -WorkspaceRootOverride $WorkspaceRoot
@@ -107,6 +111,53 @@ if ($Mode -eq "StartupApply") {
     $inventory = Get-AfpRuntimeInventory -PublicUrl $PublicUrl -FunnelOrigin $FunnelOrigin
     $preview = Get-AfpStartupRepairPreview -Inventory $inventory -Paths $paths
     Set-AfpApprovedStartupTargets -Preview $preview -PreviewDigest $ApprovedInventoryDigest | ConvertTo-Json -Depth 10
+    exit 0
+}
+
+if ($Mode -eq "Evidence") {
+    if (-not $EvidenceSource) { throw "Evidence mode requires EvidenceSource." }
+    $destination = Join-Path $paths.EvidenceRoot (Split-Path -Leaf ([IO.Path]::GetFullPath($EvidenceSource).TrimEnd('\')))
+    Copy-AfpEvidenceSafely -Source $EvidenceSource -Destination $destination -Paths $paths | ConvertTo-Json -Depth 12
+    exit 0
+}
+
+$legacyTargets = @(
+    "D:\AFP-Main-Candidate-16e887f",
+    "D:\AFP-Main-Candidate-2585ca",
+    "D:\AFP-Main-Evidence\CROSS-20261013-01"
+)
+if ($Mode -eq "CleanupPreview") {
+    if (-not $CleanupTargets.Count) { throw "CleanupPreview requires exact CleanupTargets." }
+    $inventory = Get-AfpRuntimeInventory -PublicUrl $PublicUrl -FunnelOrigin $FunnelOrigin
+    $preview = Get-AfpCleanupPreview -Targets $CleanupTargets -Paths $paths -Inventory $inventory -AllowedExternalTargets $legacyTargets
+    $path = Write-State "cleanup-preview.json" $preview
+    [pscustomobject]@{ preview = $preview; evidence = $path } | ConvertTo-Json -Depth 12
+    exit 0
+}
+
+if ($Mode -eq "Cleanup") {
+    if (-not $PreviewPath) { $PreviewPath = Join-Path $evidenceDir "cleanup-preview.json" }
+    if (-not (Test-Path -LiteralPath $PreviewPath -PathType Leaf)) { throw "Cleanup preview file is missing." }
+    $preview = Get-Content -LiteralPath $PreviewPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $inventory = Get-AfpRuntimeInventory -PublicUrl $PublicUrl -FunnelOrigin $FunnelOrigin
+    Remove-AfpApprovedTargets -Preview $preview -PreviewDigest $ApprovedInventoryDigest -Paths $paths -CurrentInventory $inventory | ConvertTo-Json -Depth 12
+    exit 0
+}
+
+if ($Mode -eq "Report") {
+    $state = [pscustomobject]@{
+        runtime_identity = $ExpectedCandidateId
+        runtime_path = $paths.RuntimeRoot
+        remaining_candidate_count = @($CleanupTargets | Where-Object { Test-Path -LiteralPath $_ }).Count
+        released_bytes = 0
+        evidence_directory = $paths.EvidenceRoot
+        remaining_blockers = @()
+        pairing = "blocked"
+        simulation = "blocked"
+        physical_sensor = "physical_sensor_pending"
+    }
+    $path = Write-AfpSingleRuntimeReport -State $state -OutputPath (Join-Path $evidenceDir "final-report.json") -Paths $paths
+    [pscustomobject]@{ status = "passed"; report = $path } | ConvertTo-Json
     exit 0
 }
 
