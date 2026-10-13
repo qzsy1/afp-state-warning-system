@@ -518,6 +518,20 @@ def probe_candidate_runtime(context: Mapping[str, Any]) -> ProbeOutcome:
     if missing_modules:
         raise ValueError(f"required module is missing: {', '.join(missing_modules)}")
 
+    required_executables = requirements.get("required_executables")
+    if not isinstance(required_executables, list) or not required_executables:
+        raise ValueError("required executable declarations are missing")
+    for item in required_executables:
+        if not isinstance(item, Mapping) or not item.get("id") or not item.get("path"):
+            raise ValueError("required executable declaration is invalid")
+        executable_id = str(item["id"])
+        executable_path = (root / str(item["path"])).resolve()
+        if root not in executable_path.parents or not executable_path.is_file():
+            raise ValueError(f"required executable {executable_id} is missing")
+        declared_digest = str(item.get("sha256") or "").lower()
+        if not declared_digest or _sha256(executable_path) != declared_digest:
+            raise ValueError(f"required executable {executable_id} digest mismatch")
+
     native_components = requirements.get("native_components")
     if not isinstance(native_components, list) or not native_components:
         raise ValueError("native component declarations are missing")
@@ -583,6 +597,7 @@ def probe_candidate_runtime(context: Mapping[str, Any]) -> ProbeOutcome:
         details={
             "runtime_files": len(runtime_files),
             "required_modules": len(modules),
+            "required_executables": len(required_executables),
             "native_components": len(native_components),
             "vendor_sdks": len(sdks),
             "drivers": len(drivers),

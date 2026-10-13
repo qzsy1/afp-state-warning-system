@@ -33,8 +33,8 @@
 
 ## 最终候选与全新目录演练
 
-- 候选：`2.0.5-rc.1-7ebcc3afa865-20261011T002212Z`。
-- 源提交：`7ebcc3afa865`；候选独立位于 `artifacts/pre-sensor-candidates/`，未覆盖正式发行。
+- 当前候选：`2.0.5-rc.1-aaef27614132-20261013T115759Z`。
+- 源提交：`aaef27614132`；候选独立位于 `artifacts/pre-sensor-candidates/`，未覆盖正式发行。旧候选 `2.0.5-rc.1-7ebcc3afa865-20261011T002212Z` 因遗漏 Helper EXE 已被废止，不得用于双机验证或正式提升。
 - 候选规模：6222 个文件、1,079,090,277 bytes；`SHA256SUMS.txt` 6190 项。
 - 发行身份：应用、Helper、启动器均为 `2.0.5-rc.1`；协议 2、统一帧 `unified_frame_v1`、配置/readiness schema 均为 1。
 - 候选验证：包内导入、manifest、8 项静态资源、3 项配置资产、native DLL/SDK/驱动声明均通过；`--self-test`、`--module-status`、`--verify-files` 返回码均为 0。
@@ -63,6 +63,8 @@
 
 本轮最后一个 RED→GREEN：旧公网 Helper 测试仅声明 `real_capture`/`unified_frame_v1`，启动被正确拒绝并返回 `release_contract_mismatch`；测试夹具改为携带权威版本、build、协议、统一帧和 schema 能力后，目标用例 1/1、`frontend-public-contracts` 1/1 以及最终 full 中该检查均通过。生产失败关闭语义未放宽。
 
+2026-10-13 候选 Helper 装配复核发现旧候选虽然带安装与双机脚本，但缺少 `local_helper/AFP_Local_Capture_Helper.exe`。新增合同测试首先以 `KeyError: required_executables` 和装配脚本缺少 `HelperExecutable` 得到 2 项 RED；补入 Helper 构建、复制、manifest SHA-256、候选运行时探针后转为 GREEN。首次真实冻结 EXE 运行又因从 PyInstaller 临时目录寻找发行合同而失败；统一从冻结 EXE 所在候选目录解析后，Helper `--version` 返回 `complete-pre-sensor-readiness-v1 (protocol 2)`。当前候选的主程序 `--verify-files`、`--self-test`、`--module-status` 均返回 0，候选验证器返回零问题，SHA-256 共核验 6191 个受管文件。Harness 单元/合同现为 199/199，modular runtime 34/34，PowerShell AST、Python compileall、OpenSpec strict 与 `git diff --check` 均通过；正式 `delivery` 仍为 6176 个受管文件且只读基线通过。
+
 ## 30 分钟双模式耐久
 
 | 模式 | 墙钟时长 | 帧数 | 有效频率 | 最大间隔 | writer 队列峰值 | journal | 对账 |
@@ -76,7 +78,7 @@
 
 | 阻塞项 | 当前证据 | 解除条件 | 证据等级 |
 |---|---|---|---|
-| 第二台 Windows | 当前没有可访问的第二台电脑；本机 300 帧协议演练不能替代跨机 | 在第二台电脑运行候选内 `second-windows-helper.ps1`，完成安装/启停/重启、配对、HTTP/WebSocket、断网、睡眠恢复和网络切换 | `blocked / remote_integration` |
+| 第二台 Windows / 主辅跨机 | 已在当前电脑短路径 `D:\AFP-Validation-aaef276` 核验候选和 Helper，但尚未获得另一台主电脑的服务地址及可调度会话；本机协议演练不能替代跨机 | 以另一台电脑为主程序、当前电脑为 Helper，完成安装/启停/重启、重新配对、HTTP/WebSocket、断网、睡眠恢复和网络切换 | `blocked / remote_integration` |
 
 已解除的 Windows 环境项：AC 睡眠为从不、活动 Intel WLAN 禁止系统断电、AC USB 选择性挂起禁用、W32Time 为有效 Leap 0 同步。最终统一预检 8/8 Windows 状态通过；证据位于 `artifacts/pre-sensor-evidence/current-host-windows-after/`。
 
@@ -87,3 +89,13 @@
 ## 真实设备边界
 
 `pre_sensor/real-device-only-checklist.json` 仅保留 9 类物理验证：设备身份/端口、真实通道、单位/量程/倍率/大小端/方向、校准/零点/噪声/漂移/串扰、全设备 10 Hz、USB 供电/带宽/电磁环境、真拔线/断电/重启、真实驱动关闭、接近正式时长的实物耐久。版本、配置、网络、存储、MySQL、Helper 部署和 Windows 设置均不在该清单中。
+
+## OpenSpec完成前复核（2026-10-13）
+
+| 维度 | 结果 |
+|---|---|
+| 完整性 | 60/60 tasks；27/27 ADDED requirements 均有实现与证据映射 |
+| 正确性 | 27/27 requirements、57/57 scenarios 具有代码路径、自动测试或明确的外部 `blocked` 分支；无 REMOVED/RENAMED 项 |
+| 一致性 | 8/8 design decisions 均被遵循；候选构建仍隔离，双模式仍复用既有采集核心，正式 `delivery` 只读 |
+
+未发现 OpenSpec 实现层面的 CRITICAL、WARNING 或 SUGGESTION；`openspec validate complete-pre-sensor-readiness --strict` 通过。实现已满足归档条件，但本变更暂不归档：真实主辅两机部署/网络演练仍缺另一台主电脑的服务地址与协同执行证据，必须继续保留为 `blocked / remote_integration`，不能据此宣称全部传感器前环境已闭环。

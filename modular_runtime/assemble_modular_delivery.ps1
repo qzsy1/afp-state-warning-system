@@ -379,6 +379,13 @@ if ($ReleaseContract) {
         }
         $component | Add-Member -NotePropertyName sha256 -NotePropertyValue ((Get-Sha256Hex $nativePath).ToLowerInvariant()) -Force
     }
+    foreach ($executable in @($releaseManifest.runtime_requirements.required_executables)) {
+        $executablePath = Join-Path $TargetDir ([string]$executable.path).Replace('/', '\')
+        if (-not (Test-Path -LiteralPath $executablePath -PathType Leaf)) {
+            throw "Release contract required executable is missing: $($executable.path)"
+        }
+        $executable | Add-Member -NotePropertyName sha256 -NotePropertyValue ((Get-Sha256Hex $executablePath).ToLowerInvariant()) -Force
+    }
     $releaseManifest | Add-Member -NotePropertyName candidate -NotePropertyValue ([ordered]@{
         candidate_id = $CandidateId
         source_revision = $SourceRevision

@@ -3,7 +3,7 @@ param(
     [string]$ReferenceRelease = "",
     [string]$ExistingExecutable = "",
     [string]$TargetRoot = "",
-    [string]$PythonExecutable = "py",
+    [string]$PythonExecutable = "",
     [string]$HelperExecutable = ""
 )
 
@@ -50,7 +50,14 @@ if (-not $ReferenceRelease) {
 if (-not $ExistingExecutable) {
     $ExistingExecutable = Join-Path $ReferenceRelease "AFP_Integrated_System_Modular.exe"
 }
-
+if (-not $PythonExecutable) {
+    $repositoryPython = Join-Path $RepoRoot ".venv\Scripts\python.exe"
+    $PythonExecutable = if (Test-Path -LiteralPath $repositoryPython -PathType Leaf) {
+        $repositoryPython
+    } else {
+        "py"
+    }
+}
 $helperBuildRoot = ""
 try {
     if (-not $HelperExecutable) {
@@ -64,7 +71,6 @@ try {
     if (-not (Test-Path -LiteralPath $HelperExecutable -PathType Leaf)) {
         throw "Helper build input does not exist: $HelperExecutable"
     }
-
     & (Join-Path $RepoRoot "modular_runtime\assemble_modular_delivery.ps1") `
         -ReferenceRelease $ReferenceRelease `
         -TargetDir $target `

@@ -41,6 +41,7 @@ class RealAcquisitionPreflightTests(unittest.TestCase):
             "review-windows-remediation.ps1": b"Write-Host review\n",
             "second-windows-helper.ps1": b"exit 0\n",
             "local_helper/AFP_Local_Capture_Helper.exe": b"synthetic-helper",
+            "install_local_helper_autostart.ps1": b"Write-Host install\n",
             "_internal/runtime.txt": b"runtime",
             "app/legacy/acquisition.py": b"from real_acquisition import ChannelQuality\n",
             "app/legacy/real_acquisition.py": (
@@ -74,6 +75,7 @@ class RealAcquisitionPreflightTests(unittest.TestCase):
             path.write_bytes(content)
         static_relative = "app/ui/app.js"
         native_relative = "native_dll/BsvUvcNative.dll"
+        helper_relative = "local_helper/AFP_Local_Capture_Helper.exe"
         configuration_relatives = [
             "config/pre_sensor/schema.json",
             "config/pre_sensor/local_direct.json",
@@ -120,6 +122,15 @@ class RealAcquisitionPreflightTests(unittest.TestCase):
                 "digest_algorithm": "sha256",
             },
             "runtime_requirements": {
+                "required_executables": [
+                    {
+                        "id": "local_capture_helper",
+                        "path": helper_relative,
+                        "sha256": __import__("hashlib").sha256(
+                            (candidate / helper_relative).read_bytes()
+                        ).hexdigest(),
+                    }
+                ],
                 "native_components": [
                     {
                         "id": "bsv_uvc",

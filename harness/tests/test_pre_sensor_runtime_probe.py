@@ -45,10 +45,20 @@ class CandidateRuntimeProbeTests(unittest.TestCase):
         if native is not None:
             native_path.parent.mkdir()
             native_path.write_bytes(native)
+        helper_path = root / "local_helper" / "AFP_Local_Capture_Helper.exe"
+        helper_path.parent.mkdir()
+        helper_path.write_bytes(b"helper")
         manifest = {
             "runtime_requirements": {
                 "python_runtime": "bundled",
                 "required_modules": ["json", "required_vendor_module"],
+                "required_executables": [
+                    {
+                        "id": "local_capture_helper",
+                        "path": "local_helper/AFP_Local_Capture_Helper.exe",
+                        "sha256": hashlib.sha256(b"helper").hexdigest(),
+                    }
+                ],
                 "native_components": [
                     {
                         "id": "vendor",
@@ -84,6 +94,7 @@ class CandidateRuntimeProbeTests(unittest.TestCase):
             outcome = probe_candidate_runtime(context)
         self.assertEqual(outcome.status, "passed")
         self.assertEqual(outcome.details["required_modules"], 2)
+        self.assertEqual(outcome.details["required_executables"], 1)
         self.assertEqual(outcome.details["native_components"], 1)
         self.assertEqual(outcome.details["drivers"], 2)
 

@@ -194,6 +194,7 @@ _CANDIDATE_REQUIRED_FILES = (
     "run-pre-sensor-preflight.ps1",
     "review-windows-remediation.ps1",
     "second-windows-helper.ps1",
+    "install_local_helper_autostart.ps1",
     "local_helper/AFP_Local_Capture_Helper.exe",
     "app/legacy/acquisition.py",
     "app/legacy/real_acquisition.py",
@@ -429,6 +430,28 @@ def validate_candidate_release_contract(candidate_root: Path) -> tuple[str, ...]
                 issues.append(f"release native component missing: {relative}")
             elif _sha256_file(component_path) != str(item.get("sha256") or "").lower():
                 issues.append(f"release native hash mismatch: {relative}")
+    required_executables = runtime.get("required_executables")
+    if not isinstance(required_executables, list) or not required_executables:
+        issues.append("release required executable declarations are missing")
+    else:
+        for item in required_executables:
+            if not isinstance(item, dict):
+                issues.append("release required executable declaration is invalid")
+                continue
+            relative = str(item.get("path") or "")
+            executable_path = (root / relative).resolve()
+            if not item.get("id") or not relative:
+                issues.append("release required executable id/path is missing")
+            elif root not in executable_path.parents:
+                issues.append(
+                    f"release required executable path escapes candidate: {relative}"
+                )
+            elif not executable_path.is_file():
+                issues.append(f"release required executable missing: {relative}")
+            elif _sha256_file(executable_path) != str(
+                item.get("sha256") or ""
+            ).lower():
+                issues.append(f"release required executable hash mismatch: {relative}")
     if not isinstance(runtime.get("vendor_sdks"), list) or not runtime.get("vendor_sdks"):
         issues.append("release vendor SDK declarations are missing")
     if not isinstance(runtime.get("drivers"), list) or not runtime.get("drivers"):

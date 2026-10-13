@@ -49,6 +49,9 @@ class CandidateReleaseContractTests(unittest.TestCase):
             native = candidate / "native_dll" / "BsvUvcNative.dll"
             native.parent.mkdir()
             native.write_bytes(b"dll")
+            helper = candidate / "local_helper" / "AFP_Local_Capture_Helper.exe"
+            helper.parent.mkdir()
+            helper.write_bytes(b"helper")
             template_hashes = {}
             for relative in source_contract["configuration_templates"]["required"]:
                 template = candidate / relative
@@ -74,6 +77,13 @@ class CandidateReleaseContractTests(unittest.TestCase):
                 },
                 "runtime_requirements": {
                     **source_contract["runtime_requirements"],
+                    "required_executables": [
+                        {
+                            "id": "local_capture_helper",
+                            "path": "local_helper/AFP_Local_Capture_Helper.exe",
+                            "sha256": hashlib.sha256(b"helper").hexdigest(),
+                        }
+                    ],
                     "native_components": [
                         {
                             "id": "bsv_uvc",
@@ -95,6 +105,66 @@ class CandidateReleaseContractTests(unittest.TestCase):
             asset.write_bytes(b"tampered")
             self.assertIn(
                 "release static hash mismatch: app/ui/app.js",
+                validate_candidate_release_contract(candidate),
+            )
+
+    def test_release_contract_binds_the_installable_helper_executable(self) -> None:
+        source_contract = json.loads(
+            (ROOT / "pre_sensor" / "release-contract.json").read_text(encoding="utf-8")
+        )
+        required = source_contract["runtime_requirements"]["required_executables"]
+        self.assertEqual(
+            required,
+            [
+                {
+                    "id": "local_capture_helper",
+                    "path": "local_helper/AFP_Local_Capture_Helper.exe",
+                }
+            ],
+        )
+
+        assembly = (ROOT / "modular_runtime" / "assemble_modular_delivery.ps1").read_text(
+            encoding="utf-8-sig"
+        )
+        builder = (ROOT / "pre_sensor" / "build-candidate.ps1").read_text(
+            encoding="utf-8-sig"
+        )
+        self.assertIn("HelperExecutable", assembly)
+        self.assertIn("AFP_Local_Capture_Helper.exe", assembly)
+        self.assertIn("build_local_capture_helper.ps1", builder)
+        self.assertIn("HelperExecutable", builder)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate = Path(temporary)
+            manifest = {
+                **source_contract,
+                "candidate": {
+                    "candidate_id": "2.0.5-rc.1-test",
+                    "source_revision": "abc123",
+                    "created_at": "2026-10-13T00:00:00Z",
+                },
+                "static_assets": {"required": [], "sha256": {}},
+                "configuration_templates": {"required": [], "sha256": {}},
+                "runtime_requirements": {
+                    **source_contract["runtime_requirements"],
+                    "native_components": [],
+                    "vendor_sdks": [],
+                    "drivers": [],
+                    "required_executables": [
+                        {
+                            "id": "local_capture_helper",
+                            "path": "local_helper/AFP_Local_Capture_Helper.exe",
+                            "sha256": "0" * 64,
+                        }
+                    ],
+                },
+            }
+            (candidate / "RELEASE-MANIFEST.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            self.assertIn(
+                "release required executable missing: "
+                "local_helper/AFP_Local_Capture_Helper.exe",
                 validate_candidate_release_contract(candidate),
             )
 

@@ -26,7 +26,9 @@ from local_capture_agent import HelperTransport, LocalCaptureAgent
 from release_contract import load_release_contract
 
 
-RELEASE_CONTRACT = load_release_contract(start=__file__)
+RELEASE_CONTRACT = load_release_contract(
+    start=(Path(sys.executable) if getattr(sys, "frozen", False) else Path(__file__))
+)
 HELPER_PROTOCOL_VERSION = RELEASE_CONTRACT.helper_protocol_version
 HELPER_VERSION = RELEASE_CONTRACT.helper_version
 HELPER_BUILD_ID = RELEASE_CONTRACT.release_revision
