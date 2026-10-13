@@ -20,6 +20,15 @@ class CandidateReleaseContractTests(unittest.TestCase):
         self.assertIn("Target already exists", source)
         self.assertNotIn("AllowExistingTarget", source)
         self.assertNotIn("delivery\\AFP_Integrated", source)
+        self.assertIn("build_local_capture_helper.ps1", source)
+        self.assertIn("-OutputDirectory", source)
+        self.assertIn("-HelperExecutable", source)
+
+    def test_candidate_runtime_requires_the_local_helper(self) -> None:
+        source = (
+            ROOT / "harness" / "engine" / "real_acquisition_preflight.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"local_helper/AFP_Local_Capture_Helper.exe"', source)
 
     def test_release_manifest_binds_static_native_and_managed_assets(self) -> None:
         source_contract = json.loads(

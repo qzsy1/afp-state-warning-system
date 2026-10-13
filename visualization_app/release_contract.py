@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -113,7 +114,11 @@ def _candidate_paths(start: Path | None) -> tuple[Path, ...]:
         candidates.append(Path(configured).expanduser())
     origin = Path(start or __file__).resolve()
     base = origin if origin.is_dir() else origin.parent
-    for parent in (base, *base.parents):
+    search_roots = [base, *base.parents]
+    if getattr(sys, "frozen", False):
+        executable_root = Path(sys.executable).resolve().parent
+        search_roots.extend((executable_root, *executable_root.parents))
+    for parent in dict.fromkeys(search_roots):
         candidates.append(parent / "RELEASE-MANIFEST.json")
         candidates.append(parent / "pre_sensor" / "release-contract.json")
     return tuple(dict.fromkeys(path.resolve() for path in candidates))

@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 from acquisition import AcquisitionManager, acquisition_config_from_payload
 from helper_relay import HelperRegistry
+import release_contract
 from release_contract import ReleaseContractError
 
 
@@ -38,6 +39,20 @@ def _real_payload() -> dict:
 
 
 class ReleaseContractStartGateTests(unittest.TestCase):
+    def test_frozen_helper_finds_manifest_beside_candidate_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate = Path(temporary) / "candidate"
+            helper = candidate / "local_helper" / "AFP_Local_Capture_Helper.exe"
+            helper.parent.mkdir(parents=True)
+            helper.write_bytes(b"helper")
+            manifest = candidate / "RELEASE-MANIFEST.json"
+            manifest.write_text("{}", encoding="utf-8")
+            with patch.object(release_contract.sys, "frozen", True, create=True), patch.object(
+                release_contract.sys, "executable", str(helper)
+            ):
+                paths = release_contract._candidate_paths(Path(temporary) / "extracted" / "release_contract.py")
+            self.assertIn(manifest.resolve(), paths)
+
     def test_local_contract_mismatch_stops_before_driver_and_session(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             capture_root = Path(temporary) / "capture"

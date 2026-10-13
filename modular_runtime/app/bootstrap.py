@@ -415,10 +415,18 @@ def functional_smoke(context: Any, manager: Any) -> dict[str, Any]:
     legacy_app = _legacy_module("app", context)
     acquisition = _legacy_module("acquisition", context)
     training = _legacy_module("web_training_pipeline", context)
-    report_root = context.root / "verification" / "functional_smoke"
+    report_root = context.root / "verification" / "functional_smoke" / str(time.time_ns())
     report_root.mkdir(parents=True, exist_ok=True)
+    smoke_token = format(time.time_ns(), "x")[-8:]
+    capture_root = context.paths.runtime_dir / f"fs-{smoke_token}"
 
     dashboard = legacy_app.DashboardData()
+    # A packaged diagnostic must never inherit or mutate the operator's
+    # durable F:\\AFP_Capture recovery state.  Use a fresh, candidate-local
+    # capture root so repeated release checks are independent and reproducible.
+    dashboard.acquisition = acquisition.AcquisitionManager(
+        capture_root, recovery_scan=True
+    )
     bootstrap_payload = dashboard.bootstrap()
     schema = "new_collection_v11_3"
     sensors = list(acquisition.ACQUISITION_SCHEMAS[schema]["sensors"])
@@ -443,7 +451,7 @@ def functional_smoke(context: Any, manager: Any) -> dict[str, Any]:
         condition_id="SMOKE",
         layer=1,
         replicate=1,
-        save_root=str(report_root / "captured"),
+        save_root=str(capture_root),
     )
     dashboard.validate_prediction_setup(config, load_model=True)
     dashboard.acquisition.start(config)

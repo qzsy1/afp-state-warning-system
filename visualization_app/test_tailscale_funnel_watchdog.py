@@ -75,6 +75,8 @@ class TailscaleFunnelWatchdogContractTests(unittest.TestCase):
         self.assertIn("$pythonPrefix = @()", text)
         self.assertIn("& $pythonCommand @pythonPrefix -m PyInstaller", text)
         self.assertIn('[string]$DeliveryRoot = ""', text)
+        self.assertIn('[string]$OutputDirectory = ""', text)
+        self.assertIn("afp-local-helper-build-", text)
 
     def test_helper_build_refreshes_delivery_integrity_manifest(self):
         build = Path(__file__).with_name("build_local_capture_helper.ps1")

@@ -77,6 +77,13 @@ class BuildScriptContractTests(unittest.TestCase):
         self.assertIn("Get-ChildItem -LiteralPath $LauncherSourceDir -Force", self.assembly)
         self.assertNotIn("Copy-Item -LiteralPath $LauncherSourceDir -Destination $TargetDir -Recurse", self.assembly)
 
+    def test_functional_smoke_uses_an_isolated_capture_root(self) -> None:
+        source = (RUNTIME_ROOT / "app" / "bootstrap.py").read_text(encoding="utf-8")
+        self.assertIn('"functional_smoke" / str(time.time_ns())', source)
+        self.assertIn('context.paths.runtime_dir / f"fs-{smoke_token}"', source)
+        self.assertIn("dashboard.acquisition = acquisition.AcquisitionManager(", source)
+        self.assertIn("capture_root, recovery_scan=True", source)
+
     def test_build_copies_simulation_and_diagnosis_runtime_modules(self) -> None:
         self.assertIn('"diagnosis_jobs.py"', self.assembly)
         self.assertIn('"simulation_packages.py"', self.assembly)
@@ -101,6 +108,22 @@ class BuildScriptContractTests(unittest.TestCase):
         ):
             self.assertIn(f'"{name}"', self.assembly)
 
+    def test_candidate_assembly_uses_current_generated_artifacts_and_helper(self) -> None:
+        for parameter in (
+            "ModelsSource",
+            "DataSource",
+            "NewCollectionSource",
+            "ModelRuntimeSource",
+            "SoftConsistencySource",
+            "CausalConsistencySource",
+            "HelperExecutable",
+        ):
+            self.assertIn(f"${parameter}", self.assembly)
+        self.assertNotIn('Join-Path $ReferenceRelease "models\\*"', self.assembly)
+        self.assertNotIn('Join-Path $referenceData "*"', self.assembly)
+        self.assertIn('"local_helper"', self.assembly)
+        self.assertIn('"AFP_Local_Capture_Helper.exe"', self.assembly)
+
     def test_build_does_not_embed_external_legacy_entrypoint(self) -> None:
         self.assertNotIn('"--hidden-import", "interface_agent"', self.launcher)
 
@@ -112,6 +135,33 @@ class BuildScriptContractTests(unittest.TestCase):
             (reference / "_internal" / "data" / "reference.txt").write_text("data", encoding="utf-8")
             (reference / "models").mkdir()
             (reference / "models" / "model.txt").write_text("model", encoding="utf-8")
+
+            models = root / "current-models"
+            models.mkdir()
+            (models / "model.txt").write_text("current-model", encoding="utf-8")
+            data = root / "current-data"
+            data.mkdir()
+            (data / "data.txt").write_text("current-data", encoding="utf-8")
+            new_collection = root / "current-new-collection"
+            new_collection.mkdir()
+            (new_collection / "artifacts.joblib").write_text("current", encoding="utf-8")
+            (new_collection / "manifest.csv").write_text("file\n", encoding="utf-8")
+            (new_collection / "simulator_stream.csv").write_text("timestamp\n", encoding="utf-8")
+            (new_collection / "models").mkdir()
+            (new_collection / "models" / "new_collection_hi_artifacts.joblib").write_text(
+                "current", encoding="utf-8"
+            )
+            model_runtime = root / "current-model-runtime"
+            model_runtime.mkdir()
+            (model_runtime / "runtime.txt").write_text("current", encoding="utf-8")
+            soft_consistency = root / "current-soft-consistency"
+            soft_consistency.mkdir()
+            (soft_consistency / "soft.csv").write_text("current", encoding="utf-8")
+            causal_consistency = root / "current-causal-consistency"
+            causal_consistency.mkdir()
+            (causal_consistency / "causal.joblib").write_text("current", encoding="utf-8")
+            helper = root / "AFP_Local_Capture_Helper.exe"
+            helper.write_bytes(b"trusted-helper-bytes")
 
             launcher = root / "trusted-launcher"
             (launcher / "_internal").mkdir(parents=True)
@@ -133,6 +183,13 @@ class BuildScriptContractTests(unittest.TestCase):
                     "-TargetDir", str(target),
                     "-ApplicationVersion", "test-split",
                     "-ExistingExecutable", str(executable),
+                    "-ModelsSource", str(models),
+                    "-DataSource", str(data),
+                    "-NewCollectionSource", str(new_collection),
+                    "-ModelRuntimeSource", str(model_runtime),
+                    "-SoftConsistencySource", str(soft_consistency),
+                    "-CausalConsistencySource", str(causal_consistency),
+                    "-HelperExecutable", str(helper),
                 ],
                 cwd=RUNTIME_ROOT.parent,
                 capture_output=True,
@@ -146,6 +203,13 @@ class BuildScriptContractTests(unittest.TestCase):
             self.assertEqual(hashlib.sha256(assembled.read_bytes()).hexdigest(), expected_hash)
             self.assertTrue((target / "_internal" / "runtime.txt").is_file())
             self.assertTrue((target / "config" / "runtime.json").is_file())
+            self.assertEqual(
+                (target / "local_helper" / "AFP_Local_Capture_Helper.exe").read_bytes(),
+                b"trusted-helper-bytes",
+            )
+            self.assertEqual((target / "models" / "model.txt").read_text(), "current-model")
+            self.assertTrue((target / "app" / "outputs_tc_hi_soft_consistency_v13_8" / "soft.csv").is_file())
+            self.assertTrue((target / "app" / "outputs_causal_online_consistency_v13_9" / "causal.joblib").is_file())
             self.assertIn("AFP_Integrated_System_Modular.exe", (target / "SHA256SUMS.txt").read_text(encoding="utf-8-sig"))
             version = json.loads((target / "VERSION.json").read_text(encoding="utf-8-sig"))
             self.assertEqual(version["application_version"], "test-split")

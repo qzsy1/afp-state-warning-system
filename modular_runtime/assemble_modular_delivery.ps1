@@ -9,6 +9,13 @@ param(
     [string]$ReleaseContract = "",
     [string]$CandidateId = "",
     [string]$SourceRevision = "",
+    [string]$ModelsSource = "",
+    [string]$DataSource = "",
+    [string]$NewCollectionSource = "",
+    [string]$ModelRuntimeSource = "",
+    [string]$SoftConsistencySource = "",
+    [string]$CausalConsistencySource = "",
+    [string]$HelperExecutable = "",
     [switch]$AllowExistingTarget
 )
 
@@ -16,12 +23,12 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Split-Path -Parent $ScriptDir
 $LegacySource = Join-Path $RepoRoot "visualization_app"
-$referenceInternal = Join-Path $ReferenceRelease "_internal"
-$referenceLegacy = Join-Path $ReferenceRelease "app\legacy"
-$referenceData = Join-Path $referenceInternal "data"
-if (-not (Test-Path -LiteralPath $referenceData) -and (Test-Path -LiteralPath (Join-Path $referenceLegacy "data"))) {
-    $referenceData = Join-Path $referenceLegacy "data"
-}
+if (-not $ModelsSource) { $ModelsSource = Join-Path $LegacySource "models" }
+if (-not $DataSource) { $DataSource = Join-Path $LegacySource "data" }
+if (-not $NewCollectionSource) { $NewCollectionSource = Join-Path $LegacySource "new_collection_demo_v11_3" }
+if (-not $ModelRuntimeSource) { $ModelRuntimeSource = Join-Path $LegacySource "model_runtime" }
+if (-not $SoftConsistencySource) { $SoftConsistencySource = Join-Path $RepoRoot "outputs_tc_hi_soft_consistency_v13_8" }
+if (-not $CausalConsistencySource) { $CausalConsistencySource = Join-Path $RepoRoot "outputs_causal_online_consistency_v13_9" }
 
 if ($LauncherSourceDir -and $ExistingExecutable) {
     throw "Specify LauncherSourceDir or ExistingExecutable, not both."
@@ -52,12 +59,22 @@ foreach ($required in @(
     $ReferenceRelease,
     (Join-Path $ScriptDir "app\bootstrap.py"),
     (Join-Path $LegacySource "app.py"),
-    $referenceData,
-    (Join-Path $ReferenceRelease "models")
+    $ModelsSource,
+    $DataSource,
+    $NewCollectionSource,
+    (Join-Path $NewCollectionSource "manifest.csv"),
+    (Join-Path $NewCollectionSource "simulator_stream.csv"),
+    (Join-Path $NewCollectionSource "models\new_collection_hi_artifacts.joblib"),
+    $ModelRuntimeSource,
+    $SoftConsistencySource,
+    $CausalConsistencySource
 )) {
     if (-not (Test-Path -LiteralPath $required)) {
         throw "Required delivery assembly input is missing: $required"
     }
+}
+if ($ReleaseContract -and (-not $HelperExecutable -or -not (Test-Path -LiteralPath $HelperExecutable -PathType Leaf))) {
+    throw "A built local helper executable is required for a release candidate: $HelperExecutable"
 }
 
 if ((Test-Path -LiteralPath $TargetDir) -and -not $AllowExistingTarget) {
@@ -226,28 +243,35 @@ Get-ChildItem -LiteralPath $simulationPackageSource -Force | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination $simulationPackageTarget -Recurse -Force
 }
 
-New-Item -ItemType Directory -Force -Path (Join-Path $TargetDir "models"), (Join-Path $legacyTarget "data") | Out-Null
-Copy-Item -Path (Join-Path $ReferenceRelease "models\*") -Destination (Join-Path $TargetDir "models") -Recurse -Force
-Copy-Item -Path (Join-Path $referenceData "*") -Destination (Join-Path $legacyTarget "data") -Recurse -Force
-if (Test-Path -LiteralPath (Join-Path $referenceData "new_collection_demo_v11_3")) {
-    New-Item -ItemType Directory -Force -Path (Join-Path $legacyTarget "new_collection_demo_v11_3") | Out-Null
-    Copy-Item -Path (Join-Path $referenceData "new_collection_demo_v11_3\*") -Destination (Join-Path $legacyTarget "new_collection_demo_v11_3") -Recurse -Force
-} elseif (Test-Path -LiteralPath (Join-Path $referenceLegacy "new_collection_demo_v11_3")) {
-    New-Item -ItemType Directory -Force -Path (Join-Path $legacyTarget "new_collection_demo_v11_3") | Out-Null
-    Copy-Item -Path (Join-Path $referenceLegacy "new_collection_demo_v11_3\*") -Destination (Join-Path $legacyTarget "new_collection_demo_v11_3") -Recurse -Force
-} elseif (Test-Path -LiteralPath (Join-Path $LegacySource "new_collection_demo_v11_3")) {
-    New-Item -ItemType Directory -Force -Path (Join-Path $legacyTarget "new_collection_demo_v11_3") | Out-Null
-    Copy-Item -Path (Join-Path $LegacySource "new_collection_demo_v11_3\*") -Destination (Join-Path $legacyTarget "new_collection_demo_v11_3") -Recurse -Force
+$modelsTarget = Join-Path $TargetDir "models"
+$dataTarget = Join-Path $legacyTarget "data"
+$newCollectionTarget = Join-Path $legacyTarget "new_collection_demo_v11_3"
+$modelRuntimeTarget = Join-Path $legacyTarget "model_runtime"
+$softConsistencyTarget = Join-Path $appTarget "outputs_tc_hi_soft_consistency_v13_8"
+$causalConsistencyTarget = Join-Path $appTarget "outputs_causal_online_consistency_v13_9"
+New-Item -ItemType Directory -Force -Path $modelsTarget, $dataTarget, $newCollectionTarget, $modelRuntimeTarget, $softConsistencyTarget, $causalConsistencyTarget | Out-Null
+Get-ChildItem -LiteralPath $ModelsSource -Force | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination $modelsTarget -Recurse -Force
 }
-if (Test-Path -LiteralPath (Join-Path $referenceData "model_runtime")) {
-    New-Item -ItemType Directory -Force -Path (Join-Path $legacyTarget "model_runtime") | Out-Null
-    Copy-Item -Path (Join-Path $referenceData "model_runtime\*") -Destination (Join-Path $legacyTarget "model_runtime") -Recurse -Force
-} elseif (Test-Path -LiteralPath (Join-Path $referenceLegacy "model_runtime")) {
-    New-Item -ItemType Directory -Force -Path (Join-Path $legacyTarget "model_runtime") | Out-Null
-    Copy-Item -Path (Join-Path $referenceLegacy "model_runtime\*") -Destination (Join-Path $legacyTarget "model_runtime") -Recurse -Force
-} else {
-    New-Item -ItemType Directory -Force -Path (Join-Path $legacyTarget "model_runtime") | Out-Null
-    Copy-Item -Path (Join-Path $LegacySource "model_runtime\*") -Destination (Join-Path $legacyTarget "model_runtime") -Recurse -Force
+Get-ChildItem -LiteralPath $DataSource -Force | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination $dataTarget -Recurse -Force
+}
+Get-ChildItem -LiteralPath $NewCollectionSource -Force | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination $newCollectionTarget -Recurse -Force
+}
+Get-ChildItem -LiteralPath $ModelRuntimeSource -Force | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination $modelRuntimeTarget -Recurse -Force
+}
+Get-ChildItem -LiteralPath $SoftConsistencySource -Force | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination $softConsistencyTarget -Recurse -Force
+}
+Get-ChildItem -LiteralPath $CausalConsistencySource -Force | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination $causalConsistencyTarget -Recurse -Force
+}
+if ($HelperExecutable) {
+    $helperTarget = Join-Path $TargetDir "local_helper"
+    New-Item -ItemType Directory -Force -Path $helperTarget | Out-Null
+    Copy-Item -LiteralPath $HelperExecutable -Destination (Join-Path $helperTarget "AFP_Local_Capture_Helper.exe") -Force
 }
 Get-ChildItem -LiteralPath (Join-Path $LegacySource "hardware_dlls") -File | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination $nativeTarget -Force

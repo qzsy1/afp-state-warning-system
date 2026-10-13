@@ -1,5 +1,15 @@
 # Tasks
 
+## 0. 2026-10-13修复收口与候选生命周期
+
+- [x] 0.1 配置被 Git 忽略的 Harness 本机可信 Python、正式稳定基线 EXE 和基线 SHA-256，运行环境检查并保存证据
+- [x] 0.2 仅使用仓库声明的权威输入和生成器恢复缺失的 Dashboard、模型和历史派生测试产物，记录输入、生成命令及输出摘要；禁止从正式 `2.0.4` delivery 复制产物冒充当前源码产物
+- [x] 0.3 重跑 Harness 单元/合同、quick、full 和 OpenSpec strict，确认三个既有缺失产物失败已得到真实修复且没有新增回归
+- [x] 0.4 使用候选装配入口把修正版 `2.0.5` 候选生成到新的唯一独立目录，确保主程序、Helper、配置、静态资源、运行依赖、manifest 和 `SHA256SUMS.txt` 完整且来源一致
+- [x] 0.5 对新候选执行装配后摘要、`--verify-files`、`--self-test`、`--module-status`、隔离运行和所需 Harness release 检查，并确认自检前后受管摘要一致、正式 `delivery/` 摘要不变
+- [x] 0.6 导出新旧候选身份、路径、manifest、摘要、验证结论和运行时引用检查；只有 0.3 至 0.5 全部通过且旧候选无引用时，删除明确列出的、不再需要的旧候选目录
+- [x] 0.7 删除后确认旧目标不存在、新候选仍通过摘要验证、源码仓库/正式 `delivery/`/证据目录未改变，并把最终结果保存到 `CROSS-20261013-01` 证据目录
+
 ## 1. OpenSpec、基线与Harness优先合同
 
 - [x] 1.1 记录 `main@2047f35` 包含 `prepare-real-acquisition` 的提交/引用证据、工作树路径、Harness 128/128 与 quick 9/9 基线，并以 `openspec validate complete-pre-sensor-readiness --strict` 验证本变更规划产物

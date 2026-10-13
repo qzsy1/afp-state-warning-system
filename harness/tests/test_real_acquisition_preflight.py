@@ -39,6 +39,8 @@ class RealAcquisitionPreflightTests(unittest.TestCase):
             "AFP_Integrated_System_Modular.exe": b"synthetic-launcher",
             "run-pre-sensor-preflight.ps1": b"exit 0\n",
             "review-windows-remediation.ps1": b"Write-Host review\n",
+            "second-windows-helper.ps1": b"exit 0\n",
+            "local_helper/AFP_Local_Capture_Helper.exe": b"synthetic-helper",
             "_internal/runtime.txt": b"runtime",
             "app/legacy/acquisition.py": b"from real_acquisition import ChannelQuality\n",
             "app/legacy/real_acquisition.py": (
@@ -48,6 +50,9 @@ class RealAcquisitionPreflightTests(unittest.TestCase):
             "app/legacy/pre_sensor_config.py": b"CONFIG = 1\n",
             "app/legacy/pre_sensor_preflight.py": b"PREFLIGHT = 1\n",
             "app/legacy/local_direct_acquisition.py": b"MODE = 'local_direct'\n",
+            "app/legacy/new_collection_demo_v11_3/manifest.csv": b"file\n",
+            "app/legacy/new_collection_demo_v11_3/simulator_stream.csv": b"timestamp\n",
+            "app/legacy/new_collection_demo_v11_3/models/new_collection_hi_artifacts.joblib": b"model",
             "config/pre_sensor/schema.json": b"{}",
             "config/pre_sensor/local_direct.json": b"{}",
             "config/pre_sensor/remote_helper.json": b"{}",
