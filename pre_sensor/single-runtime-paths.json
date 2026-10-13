@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "workspace_root": "F:\\new_AFP_exam",
+  "source_root": "F:\\new_AFP_exam\\AFP-Readiness-Repo",
+  "runtime_root": "F:\\new_AFP_exam\\AFP_Integrated_System_Modular",
+  "evidence_root": "F:\\new_AFP_exam\\AFP-Main-Evidence",
+  "staging_root": "F:\\new_AFP_exam\\.afp-staging"
+}
