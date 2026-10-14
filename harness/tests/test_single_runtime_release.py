@@ -231,11 +231,28 @@ if (-not ($result.issues -contains 'insufficient staging capacity')) {{ throw ($
             source.mkdir(parents=True)
             reference = workspace / "reference"
             reference.mkdir()
+            helper = reference / "local_helper" / "AFP_Local_Capture_Helper.exe"
+            helper.parent.mkdir()
+            helper.write_bytes(b"matching-helper")
+            helper_digest = hashlib.sha256(helper.read_bytes()).hexdigest()
+            (reference / "RELEASE-MANIFEST.json").write_text(
+                json.dumps({"identity": {"helper_version": "2.0.5-rc.1"}}),
+                encoding="utf-8",
+            )
+            (reference / "SHA256SUMS.txt").write_text(
+                f"{helper_digest} *local_helper\\AFP_Local_Capture_Helper.exe\n",
+                encoding="utf-8",
+            )
+            (source / "release-contract.json").write_text(
+                json.dumps({"identity": {"helper_version": "2.0.5-rc.1"}}),
+                encoding="utf-8",
+            )
             fake = source / "build-candidate.ps1"
             fake.write_text(
-                "param([string]$ReferenceRelease,[string]$WorkspaceRoot,[string]$SourceRoot)\n"
+                "param([string]$ReferenceRelease,[string]$WorkspaceRoot,[string]$SourceRoot,[string]$HelperExecutable)\n"
                 "if ($ReferenceRelease -ne $env:AFP_TEST_REFERENCE) { throw 'reference binding failed' }\n"
                 "if ($WorkspaceRoot -ne $env:AFP_TEST_WORKSPACE) { throw 'workspace binding failed' }\n"
+                "if ($HelperExecutable -ne $env:AFP_TEST_HELPER) { throw 'helper binding failed' }\n"
                 "[pscustomobject]@{ staging_path = (Join-Path $WorkspaceRoot '.afp-staging\\deployment-test'); candidate_id = 'candidate-test' } | ConvertTo-Json\n",
                 encoding="utf-8-sig",
             )
@@ -246,11 +263,21 @@ Import-Module {_ps_quote(MODULE)} -Force
 $paths = Get-AfpDeploymentPaths -ConfigPath {_ps_quote(PATH_CONFIG)} -WorkspaceRootOverride {_ps_quote(workspace)}
 $env:AFP_TEST_REFERENCE = {_ps_quote(reference)}
 $env:AFP_TEST_WORKSPACE = {_ps_quote(workspace)}
+$env:AFP_TEST_HELPER = {_ps_quote(helper)}
 try {{
+    $manifestVersion = [string](Get-Content -LiteralPath (Join-Path {_ps_quote(reference)} 'RELEASE-MANIFEST.json') -Raw | ConvertFrom-Json).identity.helper_version
+    $contractVersion = [string](Get-Content -LiteralPath (Join-Path $paths.SourceRoot 'pre_sensor\release-contract.json') -Raw | ConvertFrom-Json).identity.helper_version
+    $sumLine = [string](Get-Content -LiteralPath (Join-Path {_ps_quote(reference)} 'SHA256SUMS.txt') | Select-Object -First 1)
+    if ($manifestVersion -ne $contractVersion) {{ throw "fixture version mismatch: $manifestVersion / $contractVersion" }}
+    if ($sumLine -notmatch '^([0-9A-Fa-f]{{64}}) [ *](.+)$') {{ throw "fixture sum mismatch: $sumLine" }}
+    $normalizedSumPath = $Matches[2].Replace('\', '/')
+    if ($normalizedSumPath -ne 'local_helper/AFP_Local_Capture_Helper.exe') {{ throw "fixture path mismatch: $normalizedSumPath" }}
+    $resolvedHelper = Resolve-AfpReusableHelper -ReferenceRelease {_ps_quote(reference)} -SourceRoot $paths.SourceRoot
+    if ($resolvedHelper -ne $env:AFP_TEST_HELPER) {{ throw "reusable helper resolution failed: [$resolvedHelper]" }}
     $result = New-AfpStagedRelease -Paths $paths -ReferenceRelease {_ps_quote(reference)}
     if ($result.candidate_id -ne 'candidate-test') {{ throw ($result | ConvertTo-Json -Depth 8) }}
 }} finally {{
-    Remove-Item Env:AFP_TEST_REFERENCE, Env:AFP_TEST_WORKSPACE -ErrorAction SilentlyContinue
+    Remove-Item Env:AFP_TEST_REFERENCE, Env:AFP_TEST_WORKSPACE, Env:AFP_TEST_HELPER -ErrorAction SilentlyContinue
 }}
 """
             result = _run_ps(script)

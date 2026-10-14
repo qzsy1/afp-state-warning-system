@@ -269,6 +269,40 @@ function Remove-AfpDeploymentStaging {
     }
 }
 
+function Resolve-AfpReusableHelper {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ReferenceRelease,
+        [Parameter(Mandatory = $true)][string]$SourceRoot
+    )
+
+    $helperRelative = "local_helper/AFP_Local_Capture_Helper.exe"
+    $helperPath = Join-Path $ReferenceRelease $helperRelative.Replace('/', '\')
+    $manifestPath = Join-Path $ReferenceRelease "RELEASE-MANIFEST.json"
+    $sumsPath = Join-Path $ReferenceRelease "SHA256SUMS.txt"
+    $contractPath = Join-Path $SourceRoot "pre_sensor\release-contract.json"
+    foreach ($required in @($helperPath, $manifestPath, $sumsPath, $contractPath)) {
+        if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { return "" }
+    }
+    try {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $contract = Get-Content -LiteralPath $contractPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ([string]$manifest.identity.helper_version -ne [string]$contract.identity.helper_version) { return "" }
+        $expected = ""
+        foreach ($line in @(Get-Content -LiteralPath $sumsPath -Encoding UTF8)) {
+            $match = [regex]::Match($line.Trim(), '^([0-9A-Fa-f]{64}) [ *](.+)$')
+            if ($match.Success -and $match.Groups[2].Value.Replace('\', '/') -eq $helperRelative) {
+                $expected = $match.Groups[1].Value.ToLowerInvariant()
+                break
+            }
+        }
+        if (-not $expected) { return "" }
+        $actual = Get-AfpFileSha256 -Path $helperPath
+        if ($actual -ne $expected) { return "" }
+        return [IO.Path]::GetFullPath($helperPath)
+    } catch { return "" }
+}
+
 function New-AfpStagedRelease {
     [CmdletBinding()]
     param(
@@ -280,6 +314,10 @@ function New-AfpStagedRelease {
         [string]$SourceRoot = ""
     )
     $script = Join-Path $Paths.SourceRoot "pre_sensor\build-candidate.ps1"
+    $buildSourceRoot = if ($SourceRoot) { $SourceRoot } else { $Paths.SourceRoot }
+    if (-not $HelperExecutable) {
+        $HelperExecutable = Resolve-AfpReusableHelper -ReferenceRelease $ReferenceRelease -SourceRoot $buildSourceRoot
+    }
     $arguments = @{
         ReferenceRelease = $ReferenceRelease
         WorkspaceRoot = $Paths.WorkspaceRoot
@@ -323,6 +361,7 @@ function New-AfpRollbackStage {
 
 Export-ModuleMember -Function @(
     "Resolve-AfpReferenceRelease",
+    "Resolve-AfpReusableHelper",
     "New-AfpStagedRelease",
     "New-AfpRollbackStage",
     "Test-AfpReleaseGate",
