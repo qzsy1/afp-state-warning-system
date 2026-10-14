@@ -29,6 +29,11 @@ $paths = if ($WorkspaceRoot) {
     Get-AfpDeploymentPaths -ConfigPath $configPath
 }
 $evidenceDir = Join-Path $paths.EvidenceRoot "SINGLE-RUNTIME-MIGRATION"
+$legacyTargets = @(
+    "D:\AFP-Main-Candidate-16e887f",
+    "D:\AFP-Main-Candidate-2585ca",
+    "D:\AFP-Main-Evidence\CROSS-20261013-01"
+)
 
 function Write-State([string]$Name, [psobject]$Value) {
     New-Item -ItemType Directory -Path $evidenceDir -Force | Out-Null
@@ -38,7 +43,8 @@ function Write-State([string]$Name, [psobject]$Value) {
 }
 
 if ($Mode -eq "Inventory") {
-    $inventory = Get-AfpRuntimeInventory -PublicUrl $PublicUrl -FunnelOrigin $FunnelOrigin
+    $runtimeInventory = Get-AfpRuntimeInventory -PublicUrl $PublicUrl -FunnelOrigin $FunnelOrigin
+    $inventory = Get-AfpMigrationInventory -Paths $paths -RuntimeInventory $runtimeInventory -ExternalTargets $legacyTargets
     $path = Write-State "inventory.json" $inventory
     [pscustomobject]@{ status = "inventoried"; inventory = $inventory; evidence = $path } | ConvertTo-Json -Depth 12
     exit 0
@@ -121,11 +127,6 @@ if ($Mode -eq "Evidence") {
     exit 0
 }
 
-$legacyTargets = @(
-    "D:\AFP-Main-Candidate-16e887f",
-    "D:\AFP-Main-Candidate-2585ca",
-    "D:\AFP-Main-Evidence\CROSS-20261013-01"
-)
 if ($Mode -eq "CleanupPreview") {
     if (-not $CleanupTargets.Count) { throw "CleanupPreview requires exact CleanupTargets." }
     $inventory = Get-AfpRuntimeInventory -PublicUrl $PublicUrl -FunnelOrigin $FunnelOrigin

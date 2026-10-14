@@ -80,6 +80,41 @@ if (Test-AfpInventoryUnchanged -Expected $baseline -Current (New-Inventory 42 'D
         result = _run_ps(script)
         self.assertEqual(result.returncode, 0, msg=result.stderr)
 
+    def test_migration_inventory_includes_directories_disk_and_rollback_inputs(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            workspace = Path(temporary) / "workspace"
+            legacy = workspace / "legacy-candidate"
+            legacy.mkdir(parents=True)
+            (legacy / "payload.bin").write_bytes(b"12345")
+            (legacy / "RELEASE-MANIFEST.json").write_text(
+                json.dumps({"candidate": {"candidate_id": "candidate-old"}}),
+                encoding="utf-8",
+            )
+            marker = legacy / "unchanged.txt"
+            marker.write_text("unchanged", encoding="utf-8")
+            script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(PATH_MODULE)} -Force
+Import-Module {_ps_quote(MODULE)} -Force
+$paths = Get-AfpDeploymentPaths -ConfigPath {_ps_quote(PATH_CONFIG)} -WorkspaceRootOverride {_ps_quote(workspace)}
+$runtime = Get-AfpRuntimeInventory `
+    -ProcessRecords @([pscustomobject]@{{ ProcessId = 42; Name = 'AFP_Integrated_System_Modular.exe'; ExecutablePath = (Join-Path {_ps_quote(legacy)} 'AFP_Integrated_System_Modular.exe') }}) `
+    -ListenerRecords @([pscustomobject]@{{ LocalPort = 8770; LocalAddress = '0.0.0.0'; OwningProcess = 42 }}) `
+    -StartupRecords @([pscustomobject]@{{ Name = 'AFP Startup'; TargetPath = (Join-Path {_ps_quote(legacy)} 'watchdog.ps1'); ValueHash = 'abc'; Source = 'Run' }})
+$migration = Get-AfpMigrationInventory -Paths $paths -RuntimeInventory $runtime -DirectoryTargets @([pscustomobject]@{{ path = {_ps_quote(legacy)}; kind = 'legacy_candidate' }}) -FreeSpaceProvider {{ param($WorkspaceRoot) 123456 }} -RollbackProbe {{ param($SourceRoot) [pscustomobject]@{{ source_revision = 'abc123'; working_tree_clean = $true; git_lfs_available = $true; required_inputs_available = $true }} }}
+$entry = $migration.directories[0]
+if ($entry.candidate_id -ne 'candidate-old' -or $entry.size_bytes -lt 5) {{ throw ($migration | ConvertTo-Json -Depth 12) }}
+if ($entry.active_process_pids[0] -ne 42 -or $entry.startup_references[0] -ne 'AFP Startup') {{ throw ($migration | ConvertTo-Json -Depth 12) }}
+if ($migration.disk.free_bytes -ne 123456 -or -not $migration.rollback.ready) {{ throw ($migration | ConvertTo-Json -Depth 12) }}
+"""
+            result = _run_ps(script)
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertEqual(marker.read_text(encoding="utf-8"), "unchanged")
+
     def test_promotion_is_whole_directory_and_can_restore(self) -> None:
         with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
             workspace = Path(temporary) / "workspace"

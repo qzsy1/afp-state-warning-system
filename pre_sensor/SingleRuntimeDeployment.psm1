@@ -90,8 +90,15 @@ function Get-AfpRuntimeInventory {
         $path = [string]$_.ExecutablePath
         $identity = "unknown"
         if ($path) {
-            $versionPath = Join-Path (Split-Path -Parent $path) "VERSION.json"
-            if (Test-Path -LiteralPath $versionPath -PathType Leaf) {
+            $processRoot = Split-Path -Parent $path
+            $manifestPath = Join-Path $processRoot "RELEASE-MANIFEST.json"
+            $versionPath = Join-Path $processRoot "VERSION.json"
+            if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+                try {
+                    $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                    $identity = [string]$manifest.candidate.candidate_id
+                } catch { $identity = "unknown" }
+            } elseif (Test-Path -LiteralPath $versionPath -PathType Leaf) {
                 try {
                     $version = Get-Content -LiteralPath $versionPath -Raw -Encoding UTF8 | ConvertFrom-Json
                     $identity = [string]$version.application_version
@@ -146,6 +153,143 @@ function Get-AfpRuntimeInventory {
         public_url = $stable.public_url
         funnel_origin = $stable.funnel_origin
         digest = $digest
+    }
+}
+
+function Test-AfpInventoryPathWithin {
+    param([string]$Path, [string]$Root)
+    if (-not $Path -or -not $Root) { return $false }
+    try {
+        $candidate = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+        $parent = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+        return $candidate.Equals($parent, [StringComparison]::OrdinalIgnoreCase) -or
+            $candidate.StartsWith($parent + '\', [StringComparison]::OrdinalIgnoreCase)
+    } catch { return $false }
+}
+
+function Get-AfpMigrationInventory {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][psobject]$Paths,
+        [Parameter(Mandatory = $true)][psobject]$RuntimeInventory,
+        [object[]]$DirectoryTargets,
+        [string[]]$ExternalTargets = @(),
+        [scriptblock]$FreeSpaceProvider,
+        [scriptblock]$RollbackProbe
+    )
+
+    if (-not $PSBoundParameters.ContainsKey("DirectoryTargets")) {
+        $discovered = [Collections.Generic.List[object]]::new()
+        foreach ($entry in @(
+            [pscustomobject]@{ path = $Paths.RuntimeRoot; kind = "fixed_runtime" },
+            [pscustomobject]@{ path = $Paths.EvidenceRoot; kind = "fixed_evidence" },
+            [pscustomobject]@{ path = $Paths.StagingRoot; kind = "staging" }
+        )) { $discovered.Add($entry) }
+        $candidateRoot = Join-Path $Paths.SourceRoot "artifacts\pre-sensor-candidates"
+        foreach ($item in @(Get-ChildItem -LiteralPath $candidateRoot -Directory -ErrorAction SilentlyContinue)) {
+            $discovered.Add([pscustomobject]@{ path = $item.FullName; kind = "historical_candidate" })
+        }
+        $deliveryRoot = Join-Path $Paths.SourceRoot "delivery"
+        foreach ($item in @(Get-ChildItem -LiteralPath $deliveryRoot -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "AFP_Integrated_System_Modular*" })) {
+            $discovered.Add([pscustomobject]@{ path = $item.FullName; kind = "historical_delivery" })
+        }
+        foreach ($target in $ExternalTargets) {
+            $kind = if ($target -like "*Evidence*") { "legacy_evidence" } else { "legacy_candidate" }
+            $discovered.Add([pscustomobject]@{ path = $target; kind = $kind })
+        }
+        foreach ($process in @($RuntimeInventory.processes)) {
+            if ($process.executable_path) {
+                $discovered.Add([pscustomobject]@{ path = (Split-Path -Parent $process.executable_path); kind = "active_runtime_source" })
+            }
+        }
+        foreach ($startup in @($RuntimeInventory.startup)) {
+            if ($startup.target_path) {
+                $discovered.Add([pscustomobject]@{ path = (Split-Path -Parent $startup.target_path); kind = "startup_source" })
+            }
+        }
+        $DirectoryTargets = @($discovered)
+    }
+
+    $directories = [Collections.Generic.List[object]]::new()
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($target in @($DirectoryTargets)) {
+        $rawPath = if ($target -is [string]) { [string]$target } else { [string]$target.path }
+        $kind = if ($target -is [string]) { "historical" } else { [string]$target.kind }
+        if (-not $rawPath) { continue }
+        $resolved = [IO.Path]::GetFullPath($rawPath).TrimEnd('\')
+        if (-not $seen.Add($resolved)) { continue }
+        $exists = Test-Path -LiteralPath $resolved -PathType Container
+        $size = 0L
+        $candidateId = ""
+        $applicationVersion = ""
+        if ($exists) {
+            foreach ($file in @(Get-ChildItem -LiteralPath $resolved -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+                $size += [long]$file.Length
+            }
+            $manifestPath = Join-Path $resolved "RELEASE-MANIFEST.json"
+            $versionPath = Join-Path $resolved "VERSION.json"
+            if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+                try { $candidateId = [string](Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json).candidate.candidate_id } catch {}
+            }
+            if (Test-Path -LiteralPath $versionPath -PathType Leaf) {
+                try { $applicationVersion = [string](Get-Content -LiteralPath $versionPath -Raw -Encoding UTF8 | ConvertFrom-Json).application_version } catch {}
+            }
+        }
+        $processPids = @($RuntimeInventory.processes | Where-Object { Test-AfpInventoryPathWithin -Path $_.executable_path -Root $resolved } | ForEach-Object { [int]$_.pid })
+        $startupNames = @($RuntimeInventory.startup | Where-Object { Test-AfpInventoryPathWithin -Path $_.target_path -Root $resolved } | ForEach-Object { [string]$_.name })
+        $directories.Add([pscustomobject][ordered]@{
+            path = $resolved
+            kind = $kind
+            exists = $exists
+            size_bytes = $size
+            candidate_id = $candidateId
+            application_version = $applicationVersion
+            active_process_pids = $processPids
+            startup_references = $startupNames
+        })
+    }
+
+    $freeBytes = -1L
+    try {
+        if ($FreeSpaceProvider) { $freeBytes = [long](& $FreeSpaceProvider $Paths.WorkspaceRoot) }
+        else {
+            $driveName = ([IO.Path]::GetPathRoot([IO.Path]::GetFullPath($Paths.WorkspaceRoot))).TrimEnd('\').TrimEnd(':')
+            $freeBytes = [long](Get-PSDrive -Name $driveName -ErrorAction Stop).Free
+        }
+    } catch {}
+
+    if ($RollbackProbe) {
+        $rollback = & $RollbackProbe $Paths.SourceRoot
+    } else {
+        $revisionOutput = @(& git -C $Paths.SourceRoot rev-parse HEAD 2>$null)
+        $revisionOk = $LASTEXITCODE -eq 0 -and $revisionOutput.Count -gt 0
+        $statusOutput = @(& git -C $Paths.SourceRoot status --porcelain 2>$null)
+        $statusOk = $LASTEXITCODE -eq 0
+        & git -C $Paths.SourceRoot lfs env *> $null
+        $lfsOk = $LASTEXITCODE -eq 0
+        $inputsOk = (Test-Path -LiteralPath (Join-Path $Paths.SourceRoot "pre_sensor\release-contract.json") -PathType Leaf) -and
+            (Test-Path -LiteralPath (Join-Path $Paths.SourceRoot "modular_runtime\assemble_modular_delivery.ps1") -PathType Leaf)
+        $rollback = [pscustomobject]@{
+            source_revision = if ($revisionOk) { [string]$revisionOutput[0] } else { "" }
+            working_tree_clean = $statusOk -and $statusOutput.Count -eq 0
+            git_lfs_available = $lfsOk
+            required_inputs_available = $inputsOk
+        }
+    }
+    $rollbackReady = [bool]$rollback.source_revision -and [bool]$rollback.working_tree_clean -and [bool]$rollback.git_lfs_available -and [bool]$rollback.required_inputs_available
+    return [pscustomobject][ordered]@{
+        captured_at_utc = (Get-Date).ToUniversalTime().ToString("o")
+        status = "inventoried"
+        runtime = $RuntimeInventory
+        directories = @($directories)
+        disk = [pscustomobject]@{ workspace_root = $Paths.WorkspaceRoot; free_bytes = $freeBytes }
+        rollback = [pscustomobject]@{
+            ready = $rollbackReady
+            source_revision = [string]$rollback.source_revision
+            working_tree_clean = [bool]$rollback.working_tree_clean
+            git_lfs_available = [bool]$rollback.git_lfs_available
+            required_inputs_available = [bool]$rollback.required_inputs_available
+        }
     }
 }
 
@@ -466,6 +610,7 @@ function Set-AfpApprovedStartupTargets {
 
 Export-ModuleMember -Function @(
     "Get-AfpRuntimeInventory",
+    "Get-AfpMigrationInventory",
     "Test-AfpInventoryUnchanged",
     "New-AfpApprovalSummary",
     "Invoke-AfpRuntimePromotion",
