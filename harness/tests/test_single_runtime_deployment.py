@@ -161,6 +161,27 @@ if ($bad.status -ne 'failed' -or $bad.issues -notcontains 'service probe failed:
         result = _run_ps(script)
         self.assertEqual(result.returncode, 0, msg=result.stderr)
 
+    def test_service_gate_waits_for_delayed_startup_and_reports_attempts(self) -> None:
+        script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(MODULE)} -Force
+$script:attempt = 0
+$probe = {{
+    param($Name, $Target)
+    if ($Name -eq 'listener_8770') {{ $script:attempt++ }}
+    [pscustomobject]@{{ passed = ($script:attempt -ge 3); detail = "attempt=$script:attempt" }}
+}}
+$result = Wait-AfpRuntimeServices -RuntimeRoot 'F:\runtime' -PublicUrl 'https://example.test/' -LanIPv4 '192.0.2.10' -ExpectedCandidateId 'candidate' -FunnelOrigin 'http://127.0.0.1:8770' -TimeoutSeconds 5 -PollIntervalMilliseconds 1 -ProbeRunner $probe -DelayRunner {{ param($Milliseconds) }}
+if ($result.status -ne 'passed' -or $result.attempts -ne 3) {{ throw ($result | ConvertTo-Json -Depth 8) }}
+if ($result.checks.Count -ne 7) {{ throw ($result | ConvertTo-Json -Depth 8) }}
+"""
+        result = _run_ps(script)
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+
     def test_public_static_identity_compares_remote_bytes_to_fixed_runtime(self) -> None:
         with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
             runtime = Path(temporary) / "AFP_Integrated_System_Modular"
@@ -193,7 +214,7 @@ if ($same.uri -notmatch '^https://example\.test/app\.js\?afp_identity_check=') {
         self.assertIn("New-AfpRollbackStage", source)
         self.assertIn("Test-AfpReleaseGate", source)
         self.assertIn("New-AfpApprovalSummary", source)
-        self.assertIn("Test-AfpRuntimeServices", source)
+        self.assertIn("Wait-AfpRuntimeServices", source)
         self.assertNotIn("previous-runtime", source.lower())
         release = (ROOT / "pre_sensor" / "SingleRuntimeRelease.psm1").read_text(
             encoding="utf-8-sig"

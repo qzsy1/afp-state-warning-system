@@ -93,7 +93,7 @@ if ($Mode -eq "Switchover") {
     $promotion = Invoke-AfpRuntimePromotion -StagingPath $StagingPath -Paths $paths -ApprovedInventoryDigest $ApprovedInventoryDigest -CurrentInventory $inventory
     $exe = Join-Path $paths.RuntimeRoot "AFP_Integrated_System_Modular.exe"
     Start-Process -FilePath $exe -WorkingDirectory $paths.RuntimeRoot -WindowStyle Hidden | Out-Null
-    $services = Test-AfpRuntimeServices -RuntimeRoot $paths.RuntimeRoot -PublicUrl $PublicUrl -LanIPv4 $LanIPv4 -ExpectedCandidateId $ExpectedCandidateId -FunnelOrigin $FunnelOrigin
+    $services = Wait-AfpRuntimeServices -RuntimeRoot $paths.RuntimeRoot -PublicUrl $PublicUrl -LanIPv4 $LanIPv4 -ExpectedCandidateId $ExpectedCandidateId -FunnelOrigin $FunnelOrigin -TimeoutSeconds 90 -PollIntervalMilliseconds 1000
     if ($services.status -ne "passed") {
         Get-CimInstance Win32_Process -Filter "Name='AFP_Integrated_System_Modular.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -eq $exe } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
         Restore-AfpRuntimePromotion -Promotion $promotion -Paths $paths

@@ -499,6 +499,49 @@ function Test-AfpRuntimeServices {
     }
 }
 
+function Wait-AfpRuntimeServices {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+        [string]$PublicUrl = "",
+        [string]$LanIPv4 = "",
+        [string]$ExpectedCandidateId = "",
+        [string]$FunnelOrigin = "",
+        [ValidateRange(0, 600)][int]$TimeoutSeconds = 90,
+        [ValidateRange(1, 60000)][int]$PollIntervalMilliseconds = 1000,
+        [scriptblock]$ProbeRunner,
+        [scriptblock]$DelayRunner
+    )
+
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $attempts = 0
+    do {
+        $attempts++
+        $arguments = @{
+            RuntimeRoot = $RuntimeRoot
+            PublicUrl = $PublicUrl
+            LanIPv4 = $LanIPv4
+            ExpectedCandidateId = $ExpectedCandidateId
+            FunnelOrigin = $FunnelOrigin
+        }
+        if ($ProbeRunner) { $arguments.ProbeRunner = $ProbeRunner }
+        $result = Test-AfpRuntimeServices @arguments
+        if ($result.status -eq "passed") { break }
+        if ($stopwatch.Elapsed.TotalSeconds -ge $TimeoutSeconds) { break }
+        if ($DelayRunner) { & $DelayRunner $PollIntervalMilliseconds }
+        else { Start-Sleep -Milliseconds $PollIntervalMilliseconds }
+    } while ($true)
+    $stopwatch.Stop()
+
+    return [pscustomobject][ordered]@{
+        status = [string]$result.status
+        attempts = $attempts
+        elapsed_milliseconds = [int64]$stopwatch.ElapsedMilliseconds
+        checks = @($result.checks)
+        issues = @($result.issues)
+    }
+}
+
 function Get-AfpStartupRepairPreview {
     [CmdletBinding()]
     param(
@@ -620,6 +663,7 @@ Export-ModuleMember -Function @(
     "Complete-AfpRuntimePromotion",
     "Test-AfpPublicStaticIdentity",
     "Test-AfpRuntimeServices",
+    "Wait-AfpRuntimeServices",
     "Get-AfpStartupRepairPreview",
     "Set-AfpApprovedStartupTargets"
 )
