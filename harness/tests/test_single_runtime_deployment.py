@@ -82,6 +82,33 @@ if (Test-AfpInventoryUnchanged -Expected $baseline -Current (New-Inventory 42 'D
         result = _run_ps(script)
         self.assertEqual(result.returncode, 0, msg=result.stderr)
 
+    def test_switchover_stops_all_fixed_runtime_processes_and_starts_server_first(self) -> None:
+        script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(MODULE)} -Force
+$runtimeExe = 'F:\runtime\AFP_Integrated_System_Modular.exe'
+$inventory = Get-AfpRuntimeInventory `
+    -ProcessRecords @(
+        [pscustomobject]@{{ ProcessId = 41; Name = 'AFP_Integrated_System_Modular.exe'; ExecutablePath = $runtimeExe; CommandLine = ('"' + $runtimeExe + '"') }},
+        [pscustomobject]@{{ ProcessId = 42; Name = 'AFP_Integrated_System_Modular.exe'; ExecutablePath = $runtimeExe; CommandLine = ('"' + $runtimeExe + '" --server-only') }},
+        [pscustomobject]@{{ ProcessId = 99; Name = 'AFP_Integrated_System_Modular.exe'; ExecutablePath = 'D:\other\AFP_Integrated_System_Modular.exe'; CommandLine = 'D:\other\AFP_Integrated_System_Modular.exe --server-only' }}
+    ) `
+    -ListenerRecords @([pscustomobject]@{{ LocalPort = 8770; LocalAddress = '0.0.0.0'; OwningProcess = 42 }}) `
+    -StartupRecords @()
+$stopped = [Collections.Generic.List[int]]::new()
+$plan = Stop-AfpManagedRuntimeProcesses -Inventory $inventory -RuntimeExecutable $runtimeExe -StopRunner {{ param($PidValue) $stopped.Add([int]$PidValue) }}
+if (($stopped -join ',') -ne '41,42') {{ throw "unexpected stop set: $($stopped -join ',')" }}
+$started = [Collections.Generic.List[string]]::new()
+$count = Start-AfpManagedRuntimeProcesses -Processes $plan -RuntimeExecutable $runtimeExe -WorkingDirectory 'F:\runtime' -StartRunner {{ param($Exe, $Arguments, $WorkingDirectory) $started.Add([string]$Arguments) }}
+if ($count -ne 2 -or ($started -join ',') -ne '--server-only,') {{ throw "unexpected restart roles: $($started -join ',')" }}
+"""
+        result = _run_ps(script)
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+
     def test_migration_inventory_includes_directories_disk_and_rollback_inputs(self) -> None:
         with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
             workspace = Path(temporary) / "workspace"

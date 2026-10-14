@@ -386,8 +386,17 @@ class HelperRegistry:
                 "payload": dict(payload or {}),
             }
             if helper.sender is not None:
-                helper.sender(request)
-                request["queued"] = True
+                sender = helper.sender
+                try:
+                    sender(request)
+                    request["queued"] = True
+                except (ConnectionError, OSError, TimeoutError):
+                    if helper.sender is sender:
+                        helper.sender = None
+                        helper.online = False
+                    request["ok"] = False
+                    request["queued"] = False
+                    request["error"] = "helper_transport_send_failed"
             else:
                 if not helper.online:
                     request["queued"] = False

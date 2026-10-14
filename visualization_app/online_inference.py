@@ -408,6 +408,15 @@ def inspect_prediction_model(
         inferred_type = _infer_model_type(path)
         if inferred_type != "i_T_G":
             selected_type = inferred_type
+    # Browsers on LAN clients can retain an absolute path from an older
+    # delivery in localStorage.  Built-in model paths are deployment details,
+    # not user-owned selections, so relocate a missing one to the equivalent
+    # checkpoint in the currently running delivery.  Keep failing closed for
+    # genuinely custom paths so a typo cannot silently select another model.
+    if (not path.is_file()) and _is_builtin_checkpoint_path(path):
+        relocated = _registered_checkpoint(selected_type, schema_mode)
+        if relocated is not None and Path(relocated).is_file():
+            path = Path(relocated).resolve()
     if not path.exists() or not path.is_file():
         raise FileNotFoundError(f"预测模型文件不存在：{path}")
     metadata_path = next(

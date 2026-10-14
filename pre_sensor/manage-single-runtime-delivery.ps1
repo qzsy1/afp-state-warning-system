@@ -84,21 +84,32 @@ if ($Mode -eq "Switchover") {
     if (-not $ApprovedInventoryDigest -or -not $StagingPath) { throw "Switchover requires ApprovedInventoryDigest and StagingPath." }
     $inventory = Get-AfpRuntimeInventory -PublicUrl $PublicUrl -FunnelOrigin $FunnelOrigin
     if ($inventory.digest -ne $ApprovedInventoryDigest) { throw "Runtime inventory changed after approval." }
-    $listener = @($inventory.listeners | Where-Object { $_.port -eq 8770 } | Select-Object -First 1)
-    $oldProcess = $null
-    if ($listener.Count) {
-        $oldProcess = @($inventory.processes | Where-Object { $_.pid -eq $listener[0].pid } | Select-Object -First 1)
-        if (-not $oldProcess.Count) { throw "The approved 8770 listener is not an inventoried AFP process." }
-        Stop-Process -Id $listener[0].pid -Force -ErrorAction Stop
-    }
-    $promotion = Invoke-AfpRuntimePromotion -StagingPath $StagingPath -Paths $paths -ApprovedInventoryDigest $ApprovedInventoryDigest -CurrentInventory $inventory
     $exe = Join-Path $paths.RuntimeRoot "AFP_Integrated_System_Modular.exe"
-    Start-Process -FilePath $exe -WorkingDirectory $paths.RuntimeRoot -WindowStyle Hidden | Out-Null
+    $managedProcesses = @($inventory.processes | Where-Object {
+        $_.executable_path -and
+        [string]::Equals([IO.Path]::GetFullPath([string]$_.executable_path), [IO.Path]::GetFullPath($exe), [StringComparison]::OrdinalIgnoreCase)
+    })
+    $listener = @($inventory.listeners | Where-Object { $_.port -eq 8770 } | Select-Object -First 1)
+    if ($listener.Count) {
+        $listenerProcess = @($managedProcesses | Where-Object { $_.pid -eq $listener[0].pid } | Select-Object -First 1)
+        if (-not $listenerProcess.Count) { throw "The approved 8770 listener is not a fixed-runtime AFP process." }
+    }
+    $oldProcesses = @(Stop-AfpManagedRuntimeProcesses -Inventory $inventory -RuntimeExecutable $exe)
+    $promotion = Invoke-AfpRuntimePromotion -StagingPath $StagingPath -Paths $paths -ApprovedInventoryDigest $ApprovedInventoryDigest -CurrentInventory $inventory
+    $restartPlan = if ($oldProcesses.Count) {
+        $oldProcesses
+    } else {
+        @([pscustomobject]@{ pid = 0; launch_arguments = "--server-only" })
+    }
+    Start-AfpManagedRuntimeProcesses -Processes $restartPlan -RuntimeExecutable $exe -WorkingDirectory $paths.RuntimeRoot | Out-Null
     $services = Wait-AfpRuntimeServices -RuntimeRoot $paths.RuntimeRoot -PublicUrl $PublicUrl -LanIPv4 $LanIPv4 -ExpectedCandidateId $ExpectedCandidateId -FunnelOrigin $FunnelOrigin -TimeoutSeconds 90 -PollIntervalMilliseconds 1000
     if ($services.status -ne "passed") {
-        Get-CimInstance Win32_Process -Filter "Name='AFP_Integrated_System_Modular.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -eq $exe } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        $failedInventory = Get-AfpRuntimeInventory -PublicUrl $PublicUrl -FunnelOrigin $FunnelOrigin
+        Stop-AfpManagedRuntimeProcesses -Inventory $failedInventory -RuntimeExecutable $exe | Out-Null
         Restore-AfpRuntimePromotion -Promotion $promotion -Paths $paths
-        if ($oldProcess -and $oldProcess.Count) { Start-Process -FilePath $oldProcess[0].executable_path -WorkingDirectory (Split-Path -Parent $oldProcess[0].executable_path) -WindowStyle Hidden | Out-Null }
+        if ($oldProcesses.Count) {
+            Start-AfpManagedRuntimeProcesses -Processes $oldProcesses -RuntimeExecutable $exe -WorkingDirectory $paths.RuntimeRoot | Out-Null
+        }
         $services | ConvertTo-Json -Depth 10
         exit 4
     }

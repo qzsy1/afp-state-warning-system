@@ -1,4 +1,9 @@
 from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import textwrap
+import time
 import unittest
 
 
@@ -50,6 +55,236 @@ class TailscaleFunnelWatchdogContractTests(unittest.TestCase):
     def test_watchdog_starts_origin_without_opening_a_second_desktop_window(self):
         text = self.source.read_text(encoding="utf-8-sig")
         self.assertIn('-ArgumentList "--server-only"', text)
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "Windows PowerShell required")
+    def test_unhealthy_origin_starts_server_when_only_gui_process_exists(self):
+        source = str(self.source.resolve()).replace("'", "''")
+        harness = textwrap.dedent(
+            f"""
+            $source = Get-Content -LiteralPath '{source}' -Raw
+            $tokens = $null
+            $errors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+                $source, [ref]$tokens, [ref]$errors
+            )
+            if ($errors.Count -ne 0) {{ exit 90 }}
+            $functions = $ast.FindAll({{
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+            }}, $true)
+            Invoke-Expression (($functions | ForEach-Object {{ $_.Extent.Text }}) -join "`n`n")
+
+            $script:startCount = 0
+            function Test-Origin {{
+                return $script:startCount -ge 1
+            }}
+            function Test-OriginListener {{ return $false }}
+            function Get-AppProcess {{
+                return [pscustomobject]@{{ ProcessId = 4100; Role = 'desktop_gui' }}
+            }}
+            function Test-Path {{
+                param([string]$LiteralPath, [string]$PathType)
+                return $true
+            }}
+            function Start-Process {{
+                param(
+                    [string]$FilePath,
+                    [object]$ArgumentList,
+                    [string]$WorkingDirectory,
+                    [string]$WindowStyle
+                )
+                $script:startCount += 1
+            }}
+            function Start-Sleep {{ param([int]$Seconds, [int]$Milliseconds) }}
+            function Write-FunnelState {{
+                param([string]$Code, [string]$Message, [string]$PublicUrl = '')
+            }}
+
+            $AppExe = 'C:\\test\\AFP_Integrated_System_Modular.exe'
+            $DeliveryRoot = 'C:\\test'
+            $OriginLaunchMutexName = 'Local\\AFP_Watchdog_GUI_Recovery_Test'
+            $result = Ensure-Origin
+            if (-not $result) {{ exit 21 }}
+            if ($script:startCount -ne 1) {{ exit 23 }}
+            exit 0
+            """
+        )
+
+        completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "-",
+            ],
+            input=harness,
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stdout + completed.stderr,
+        )
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "Windows PowerShell required")
+    def test_origin_listener_probe_reports_only_actual_8770_listener(self):
+        source = str(self.source.resolve()).replace("'", "''")
+        harness = textwrap.dedent(
+            f"""
+            $source = Get-Content -LiteralPath '{source}' -Raw
+            $tokens = $null
+            $errors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+                $source, [ref]$tokens, [ref]$errors
+            )
+            if ($errors.Count -ne 0) {{ exit 90 }}
+            $definition = $ast.FindAll({{
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Test-OriginListener'
+            }}, $true) | Select-Object -First 1
+            if ($null -eq $definition) {{ exit 91 }}
+            Invoke-Expression $definition.Extent.Text
+
+            $script:hasListener = $false
+            function Get-NetTCPConnection {{
+                param([string]$State, [int]$LocalPort, [string]$ErrorAction)
+                if ($script:hasListener -and $State -eq 'Listen' -and $LocalPort -eq 8770) {{
+                    return [pscustomobject]@{{ LocalPort = 8770; State = 'Listen' }}
+                }}
+            }}
+
+            if (Test-OriginListener) {{ exit 31 }}
+            $script:hasListener = $true
+            if (-not (Test-OriginListener)) {{ exit 32 }}
+            exit 0
+            """
+        )
+
+        completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "-",
+            ],
+            input=harness,
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+
+        self.assertEqual(
+            completed.returncode,
+            0,
+            completed.stdout + completed.stderr,
+        )
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "Windows PowerShell required")
+    def test_concurrent_origin_recovery_starts_only_one_server(self):
+        source = str(self.source.resolve()).replace("'", "''")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gate = str(root / "gate").replace("'", "''")
+            health = str(root / "health").replace("'", "''")
+            starts = str(root / "starts.log").replace("'", "''")
+            mutex_name = f"Local\\AFP_Watchdog_Test_{root.name}"
+            harness = textwrap.dedent(
+                f"""
+                $source = Get-Content -LiteralPath '{source}' -Raw
+                $tokens = $null
+                $errors = $null
+                $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+                    $source, [ref]$tokens, [ref]$errors
+                )
+                if ($errors.Count -ne 0) {{ exit 90 }}
+                $definition = $ast.FindAll({{
+                    param($node)
+                    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -eq 'Ensure-Origin'
+                }}, $true) | Select-Object -First 1
+                if ($null -eq $definition) {{ exit 91 }}
+                Invoke-Expression $definition.Extent.Text
+
+                $OriginLaunchMutexName = '{mutex_name}'
+                $AppExe = 'C:\\test\\AFP_Integrated_System_Modular.exe'
+                $DeliveryRoot = 'C:\\test'
+                function Test-Origin {{
+                    if ([System.IO.File]::Exists('{health}')) {{ return $true }}
+                    [System.Threading.Thread]::Sleep(150)
+                    return $false
+                }}
+                function Test-OriginListener {{ return $false }}
+                function Test-Path {{
+                    param([string]$LiteralPath, [string]$PathType)
+                    return $true
+                }}
+                function Start-Process {{
+                    param(
+                        [string]$FilePath,
+                        [object]$ArgumentList,
+                        [string]$WorkingDirectory,
+                        [string]$WindowStyle
+                    )
+                    [System.IO.File]::AppendAllText('{starts}', "start`n")
+                    [System.Threading.Thread]::Sleep(200)
+                    [System.IO.File]::WriteAllText('{health}', 'ok')
+                }}
+                function Start-Sleep {{
+                    param([int]$Seconds, [int]$Milliseconds)
+                    [System.Threading.Thread]::Sleep(10)
+                }}
+                function Write-FunnelState {{
+                    param([string]$Code, [string]$Message, [string]$PublicUrl = '')
+                }}
+
+                while (-not [System.IO.File]::Exists('{gate}')) {{
+                    [System.Threading.Thread]::Sleep(10)
+                }}
+                if (Ensure-Origin) {{ exit 0 }}
+                exit 21
+                """
+            )
+            processes = [
+                subprocess.Popen(
+                    [
+                        "powershell.exe",
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-Command",
+                        harness,
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                for _ in range(2)
+            ]
+            time.sleep(0.2)
+            Path(gate).write_text("go", encoding="ascii")
+            outputs = []
+            for process in processes:
+                stdout, stderr = process.communicate(timeout=20)
+                outputs.append((process.returncode, stdout, stderr))
+
+            self.assertEqual(outputs[0][0], 0, outputs[0][1] + outputs[0][2])
+            self.assertEqual(outputs[1][0], 0, outputs[1][1] + outputs[1][2])
+            start_lines = (
+                Path(starts).read_text(encoding="utf-8").splitlines()
+                if Path(starts).is_file()
+                else []
+            )
+            self.assertEqual(start_lines, ["start"])
 
     def test_watchdog_records_actionable_authentication_state(self):
         text = self.source.read_text(encoding="utf-8-sig")

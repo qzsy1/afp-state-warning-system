@@ -837,10 +837,26 @@ function readModelSelectionHistory() {
     return {};
   }
 }
+function isBundledModelPath(checkpoint) {
+  const normalized = String(checkpoint || "").replaceAll("\\", "/").toLowerCase();
+  return [
+    "/models/legacy/",
+    "/models/new/",
+    "/_internal/models/",
+    "/new_collection_demo_v11_3/models/",
+  ].some((marker) => normalized.includes(marker));
+}
 function rememberModelPath(schemaMode, modelType, checkpoint) {
   if (!checkpoint) return;
   const history = readModelSelectionHistory();
-  history[modelSelectionKey(schemaMode, modelType)] = checkpoint;
+  const key = modelSelectionKey(schemaMode, modelType);
+  if (isBundledModelPath(checkpoint)) {
+    // Packaged paths change when a delivery is upgraded or moved.  The
+    // bootstrap profile already supplies the correct path for this server.
+    delete history[key];
+  } else {
+    history[key] = checkpoint;
+  }
   try {
     localStorage.setItem(MODEL_SELECTION_HISTORY_KEY, JSON.stringify(history));
   } catch (_) {
@@ -848,7 +864,19 @@ function rememberModelPath(schemaMode, modelType, checkpoint) {
   }
 }
 function lastModelPath(schemaMode, modelType) {
-  return readModelSelectionHistory()[modelSelectionKey(schemaMode, modelType)] || "";
+  const history = readModelSelectionHistory();
+  const key = modelSelectionKey(schemaMode, modelType);
+  const checkpoint = history[key] || "";
+  if (isBundledModelPath(checkpoint)) {
+    delete history[key];
+    try {
+      localStorage.setItem(MODEL_SELECTION_HISTORY_KEY, JSON.stringify(history));
+    } catch (_) {
+      // Ignore storage failures; returning an empty path still uses bootstrap.
+    }
+    return "";
+  }
+  return checkpoint;
 }
 
 function toast(message) {

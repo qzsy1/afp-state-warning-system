@@ -4,6 +4,32 @@ import unittest
 
 
 class GuestSimulationFrontendContractTests(unittest.TestCase):
+    def test_builtin_model_paths_are_not_restored_after_delivery_moves(self):
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        start = text.index("const MODEL_SELECTION_HISTORY_KEY")
+        end = text.index("function toast(", start)
+        functions = text[start:end]
+        script = r'''
+const values = new Map();
+const localStorage = {
+  getItem(key) { return values.has(key) ? values.get(key) : null; },
+  setItem(key, value) { values.set(key, String(value)); },
+};
+''' + functions + r'''
+const key = modelSelectionKey("new_collection_v11_3", "i_T_G");
+const stale = "F:\\retired\\delivery\\AFP_v2.0.3\\models\\new\\i_T_G\\checkpoint.pth";
+localStorage.setItem(MODEL_SELECTION_HISTORY_KEY, JSON.stringify({[key]: stale}));
+if (lastModelPath("new_collection_v11_3", "i_T_G") !== "") process.exit(1);
+if (readModelSelectionHistory()[key]) process.exit(2);
+rememberModelPath("new_collection_v11_3", "i_T_G", stale);
+if (readModelSelectionHistory()[key]) process.exit(3);
+const custom = "D:\\trained\\my-model.pth";
+rememberModelPath("new_collection_v11_3", "i_T_G", custom);
+if (lastModelPath("new_collection_v11_3", "i_T_G") !== custom) process.exit(4);
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_guest_access_badge_is_labeled_as_simulation_demo(self):
         root = Path(__file__).with_name("static")
         html = (root / "index.html").read_text(encoding="utf-8")
@@ -169,7 +195,7 @@ const fetch = async () => { requests += 1; return {ok: true, json: async () => (
     def test_failed_server_target_mysql_has_a_session_bound_retry_control(self):
         html = (Path(__file__).with_name("static") / "index.html").read_text(encoding="utf-8")
         self.assertIn('id="retryTargetMysqlButton"', html)
-        self.assertIn('/app.js?v=20261008-manual-sim-routing-v1', html)
+        self.assertIn('/app.js?v=20261014-model-path-relocation-v1', html)
         text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
         start = text.index("async function retryServerTargetMysql()")
         end = text.index("async function stopAcquisition()", start)

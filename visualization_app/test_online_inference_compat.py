@@ -2,6 +2,8 @@ import types
 import unittest
 from pathlib import Path
 import sys
+import tempfile
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import online_inference
@@ -49,6 +51,34 @@ class OnlineInferenceCompatibilityTest(unittest.TestCase):
         )
         self.assertIsInstance(model, _FullModel)
         self.assertTrue(model.loaded)
+
+    def test_missing_checkpoint_from_old_delivery_is_relocated(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            current = Path(temporary) / "models" / "new" / "i_T_G" / "checkpoint.pth"
+            current.parent.mkdir(parents=True)
+            current.write_bytes(b"checkpoint")
+            stale = Path("F:/retired/delivery/AFP_v2.0.3/models/new/i_T_G/checkpoint.pth")
+            with patch.object(online_inference, "_registered_checkpoint", return_value=current):
+                profile = online_inference.inspect_prediction_model(
+                    stale,
+                    model_type="i_T_G",
+                    schema_mode="new_collection_v11_3",
+                )
+            self.assertEqual(profile["checkpoint"], str(current.resolve()))
+
+    def test_missing_custom_checkpoint_is_not_silently_replaced(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            current = Path(temporary) / "models" / "new" / "i_T_G" / "checkpoint.pth"
+            current.parent.mkdir(parents=True)
+            current.write_bytes(b"checkpoint")
+            custom = Path(temporary) / "user-models" / "missing.pth"
+            with patch.object(online_inference, "_registered_checkpoint", return_value=current):
+                with self.assertRaisesRegex(FileNotFoundError, "预测模型文件不存在"):
+                    online_inference.inspect_prediction_model(
+                        custom,
+                        model_type="i_T_G",
+                        schema_mode="new_collection_v11_3",
+                    )
 
 
 if __name__ == "__main__":

@@ -205,6 +205,33 @@ class HelperRelayTests(unittest.TestCase):
         self.assertEqual(first_messages, [])
         self.assertEqual(second_messages[0]["request_id"], request["request_id"])
 
+    def test_command_send_failure_returns_terminal_transport_error(self):
+        registry = HelperRegistry()
+        challenge = registry.start_pairing("session-a")
+        paired = registry.complete_pairing(challenge["challenge"], "device-a", {})
+
+        def disconnected_sender(_request):
+            raise BrokenPipeError("connection closed")
+
+        self.assertTrue(
+            registry.attach(
+                "session-a",
+                "device-a",
+                paired["pairing_token"],
+                disconnected_sender,
+            )
+        )
+
+        try:
+            result = registry.command("session-a", "status", {})
+        except BrokenPipeError as exc:
+            self.fail(f"transport failure escaped command lifecycle: {exc}")
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["queued"])
+        self.assertEqual(result["error"], "helper_transport_send_failed")
+        self.assertFalse(registry.status("session-a")["online"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -90,6 +90,7 @@ function Get-AfpRuntimeInventory {
 
     $processes = @($ProcessRecords | ForEach-Object {
         $path = [string]$_.ExecutablePath
+        $commandLine = if ($_.PSObject.Properties.Name -contains "CommandLine") { [string]$_.CommandLine } else { "" }
         $identity = "unknown"
         if ($path) {
             $processRoot = Split-Path -Parent $path
@@ -112,6 +113,7 @@ function Get-AfpRuntimeInventory {
             name = [string]$_.Name
             executable_path = $path
             release_identity = $identity
+            launch_arguments = if ($commandLine -match '(?i)(?:^|\s)--server-only(?:\s|$)') { "--server-only" } else { "" }
         }
     } | Sort-Object pid)
     $listeners = @($ListenerRecords | ForEach-Object {
@@ -156,6 +158,65 @@ function Get-AfpRuntimeInventory {
         funnel_origin = $stable.funnel_origin
         digest = $digest
     }
+}
+
+function Stop-AfpManagedRuntimeProcesses {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][psobject]$Inventory,
+        [Parameter(Mandatory = $true)][string]$RuntimeExecutable,
+        [scriptblock]$StopRunner
+    )
+
+    $resolvedExecutable = [IO.Path]::GetFullPath($RuntimeExecutable)
+    $processes = @($Inventory.processes | Where-Object {
+        $_.executable_path -and
+        [string]::Equals(
+            [IO.Path]::GetFullPath([string]$_.executable_path),
+            $resolvedExecutable,
+            [StringComparison]::OrdinalIgnoreCase
+        )
+    } | Sort-Object pid)
+    foreach ($process in $processes) {
+        if ($StopRunner) {
+            & $StopRunner ([int]$process.pid) | Out-Null
+        } else {
+            Stop-Process -Id ([int]$process.pid) -Force -ErrorAction Stop
+            Wait-Process -Id ([int]$process.pid) -Timeout 15 -ErrorAction SilentlyContinue
+        }
+    }
+    return $processes
+}
+
+function Start-AfpManagedRuntimeProcesses {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Processes,
+        [Parameter(Mandatory = $true)][string]$RuntimeExecutable,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [scriptblock]$StartRunner
+    )
+
+    $started = 0
+    $orderedProcesses = @($Processes | Sort-Object `
+        @{ Expression = { if ([string]$_.launch_arguments -eq "--server-only") { 0 } else { 1 } } }, `
+        @{ Expression = { [int]$_.pid } })
+    foreach ($process in $orderedProcesses) {
+        $arguments = if ($process.PSObject.Properties.Name -contains "launch_arguments") { [string]$process.launch_arguments } else { "" }
+        if ($StartRunner) {
+            & $StartRunner $RuntimeExecutable $arguments $WorkingDirectory | Out-Null
+        } else {
+            $start = @{
+                FilePath = $RuntimeExecutable
+                WorkingDirectory = $WorkingDirectory
+                WindowStyle = "Hidden"
+            }
+            if ($arguments) { $start.ArgumentList = $arguments }
+            Start-Process @start | Out-Null
+        }
+        $started++
+    }
+    return $started
 }
 
 function Test-AfpInventoryPathWithin {
@@ -655,6 +716,8 @@ function Set-AfpApprovedStartupTargets {
 
 Export-ModuleMember -Function @(
     "Get-AfpRuntimeInventory",
+    "Stop-AfpManagedRuntimeProcesses",
+    "Start-AfpManagedRuntimeProcesses",
     "Get-AfpMigrationInventory",
     "Test-AfpInventoryUnchanged",
     "New-AfpApprovalSummary",

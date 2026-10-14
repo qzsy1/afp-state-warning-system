@@ -170,6 +170,29 @@ class HelperSamplePump:
         return value
 
 
+class HelperResultOutbox:
+    """Retain command results until the server acknowledges them."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._pending: dict[str, dict[str, Any]] = {}
+
+    def remember(self, response: dict[str, Any]) -> None:
+        request_id = str(response.get("request_id") or "")
+        if not request_id:
+            return
+        with self._lock:
+            self._pending[request_id] = dict(response)
+
+    def acknowledge(self, request_id: str) -> bool:
+        with self._lock:
+            return self._pending.pop(str(request_id), None) is not None
+
+    def pending(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(response) for response in self._pending.values()]
+
+
 def default_runtime_config_path() -> Path:
     local_app_data = os.environ.get("LOCALAPPDATA")
     root = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
@@ -949,7 +972,10 @@ def _report_helper_response(
     transport: HelperTransport,
     device_id: str,
     response: dict[str, Any],
-) -> None:
+    result_outbox: HelperResultOutbox | None = None,
+) -> bool:
+    outbox = result_outbox or HelperResultOutbox()
+    outbox.remember(response)
     result_payload = {
         "device_id": device_id,
         "request_id": response["request_id"],
@@ -958,13 +984,16 @@ def _report_helper_response(
     delay = 0.5
     for attempt in range(3):
         try:
-            transport.http_json("api/helper/result", result_payload)
-            return
+            accepted = transport.http_json("api/helper/result", result_payload)
+            if accepted.get("ok"):
+                outbox.acknowledge(str(response.get("request_id") or ""))
+                return True
         except Exception:
-            if attempt >= 2:
-                return
+            pass
+        if attempt < 2:
             time.sleep(delay)
             delay = min(delay * 2.0, 4.0)
+    return False
 
 
 def flush_http_sample_batch(
@@ -1027,8 +1056,10 @@ def run_http_forever(
     device_id: str,
     *,
     agent: LocalCaptureAgent | None = None,
+    result_outbox: HelperResultOutbox | None = None,
 ) -> None:
     agent = agent or LocalCaptureAgent()
+    result_outbox = result_outbox or HelperResultOutbox()
     transport = HelperTransport(server_url, pairing_token, device_id=device_id)
     dispatcher = HelperCommandDispatcher(
         agent,
@@ -1041,6 +1072,13 @@ def run_http_forever(
                 polled = transport.http_json("api/helper/poll", {"device_id": device_id})
                 if not polled.get("ok"):
                     raise RuntimeError(polled.get("error") or "辅助服务拒绝连接")
+                for pending_result in result_outbox.pending():
+                    _report_helper_response(
+                        transport,
+                        device_id,
+                        pending_result,
+                        result_outbox,
+                    )
                 command = polled.get("command")
                 if isinstance(command, dict):
                     dispatcher.submit(
@@ -1049,6 +1087,7 @@ def run_http_forever(
                             transport,
                             device_id,
                             response,
+                            result_outbox,
                         ),
                     )
                 flush_http_sample_batch(agent, transport, device_id)
@@ -1072,10 +1111,12 @@ def run_forever(
     *,
     max_consecutive_failures: int | None = None,
     agent: LocalCaptureAgent | None = None,
+    result_outbox: HelperResultOutbox | None = None,
 ) -> bool:
     agent = agent or LocalCaptureAgent()
     transport = HelperTransport(server_url, pairing_token, device_id=device_id)
     sample_pump = HelperSamplePump(agent, route_type=_paired_route(server_url)[1])
+    result_outbox = result_outbox or HelperResultOutbox()
     delay = 1.0
     failures = 0
     while True:
@@ -1096,12 +1137,13 @@ def run_forever(
                 with send_lock:
                     connection.send(encoded)
 
-            failures = 0
             send_json(
                 transport.hello(
                     capabilities=helper_capabilities(server_url)
                 )
             )
+            for pending_result in result_outbox.pending():
+                send_json(pending_result)
             sender_stop = threading.Event()
             sender_errors: list[BaseException] = []
 
@@ -1127,7 +1169,6 @@ def run_forever(
                 daemon=True,
             )
             sender_thread.start()
-            delay = 1.0
             try:
                 connection.settimeout(1.0)
             except Exception:
@@ -1150,15 +1191,20 @@ def run_forever(
                             last_heartbeat = time.monotonic()
                         continue
                     raise
-                if raw is None:
-                    break
+                if raw is None or raw == "" or raw == b"":
+                    raise ConnectionError("helper_websocket_closed")
                 try:
                     message = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
                 except (TypeError, ValueError, UnicodeDecodeError):
                     continue
                 if not isinstance(message, dict):
                     continue
-                if message.get("type") in {"hello_ack", "heartbeat_ack", "result_ack"}:
+                failures = 0
+                delay = 1.0
+                if message.get("type") == "result_ack":
+                    result_outbox.acknowledge(str(message.get("request_id") or ""))
+                    continue
+                if message.get("type") in {"hello_ack", "heartbeat_ack"}:
                     continue
                 if message.get("type") == "sample_ack":
                     if message.get("ok"):
@@ -1171,7 +1217,11 @@ def run_forever(
                     if str(message.get("error") or "") == "helper_authentication_failed":
                         raise PairingRequiredError(authentication_failure_message())
                     continue
-                dispatcher.submit(message, send_json)
+                def send_result(response: dict[str, Any]) -> None:
+                    result_outbox.remember(response)
+                    send_json(response)
+
+                dispatcher.submit(message, send_result)
         except KeyboardInterrupt:
             return True
         except PairingRequiredError:
@@ -1212,6 +1262,7 @@ def run_auto_forever(
     place, so a public tunnel outage cannot make the helper exit.
     """
     shared_agent = agent or LocalCaptureAgent()
+    result_outbox = HelperResultOutbox()
     try:
         connected = run_forever(
             server_url,
@@ -1219,6 +1270,7 @@ def run_auto_forever(
             device_id,
             max_consecutive_failures=3,
             agent=shared_agent,
+            result_outbox=result_outbox,
         )
     except PairingRequiredError:
         raise
@@ -1228,6 +1280,7 @@ def run_auto_forever(
             pairing_token,
             device_id,
             agent=shared_agent,
+            result_outbox=result_outbox,
         )
 
 

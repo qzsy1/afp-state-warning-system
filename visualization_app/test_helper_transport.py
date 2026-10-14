@@ -387,6 +387,193 @@ class HelperTransportTests(unittest.TestCase):
         self.assertEqual(first["batch"], replay["batch"])
         agent.ack_sample_batch.assert_not_called()
 
+    def test_websocket_empty_read_reconnects_instead_of_spinning(self):
+        class Connection:
+            def __init__(self, incoming):
+                self.incoming = list(incoming)
+
+            def send(self, _payload):
+                return None
+
+            def recv(self):
+                item = self.incoming.pop(0)
+                if isinstance(item, BaseException):
+                    raise item
+                return item
+
+            def settimeout(self, _timeout):
+                return None
+
+            def close(self):
+                return None
+
+        first = Connection(["", KeyboardInterrupt()])
+        second = Connection([KeyboardInterrupt()])
+        transport = Mock()
+        transport.connect_once.side_effect = [first, second]
+        transport.hello.return_value = {"type": "hello"}
+
+        class IdlePump:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def next_message(self):
+                return None
+
+            def wait_for_activity(self, timeout):
+                time.sleep(min(float(timeout), 0.001))
+
+            def connection_lost(self):
+                return None
+
+        dispatcher = Mock()
+        with patch.object(helper_entry, "HelperTransport", return_value=transport), \
+             patch.object(helper_entry, "HelperSamplePump", IdlePump), \
+             patch.object(helper_entry, "HelperCommandDispatcher", return_value=dispatcher):
+            self.assertTrue(
+                helper_entry.run_forever(
+                    "https://example.test", "token", "local-helper", agent=Mock()
+                )
+            )
+
+        self.assertEqual(transport.connect_once.call_count, 2)
+
+    def test_consecutive_websocket_eof_reaches_http_fallback_threshold(self):
+        class Connection:
+            def send(self, _payload):
+                return None
+
+            def recv(self):
+                return ""
+
+            def settimeout(self, _timeout):
+                return None
+
+            def close(self):
+                return None
+
+        transport = Mock()
+        transport.connect_once.side_effect = [Connection(), Connection(), Connection()]
+        transport.hello.return_value = {"type": "hello"}
+
+        class IdlePump:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def next_message(self):
+                return None
+
+            def wait_for_activity(self, timeout):
+                time.sleep(min(float(timeout), 0.001))
+
+            def connection_lost(self):
+                return None
+
+        dispatcher = Mock()
+        with patch.object(helper_entry, "HelperTransport", return_value=transport), \
+             patch.object(helper_entry, "HelperSamplePump", IdlePump), \
+             patch.object(helper_entry, "HelperCommandDispatcher", return_value=dispatcher), \
+             patch.object(helper_entry.time, "sleep", return_value=None):
+            connected = helper_entry.run_forever(
+                "https://example.test",
+                "token",
+                "local-helper",
+                max_consecutive_failures=3,
+                agent=Mock(),
+            )
+
+        self.assertFalse(connected)
+        self.assertEqual(transport.connect_once.call_count, 3)
+
+    def test_websocket_replays_unacknowledged_command_result_after_reconnect(self):
+        command = {
+            "type": "command",
+            "request_id": "start-1",
+            "command": "start_capture",
+            "payload": {},
+        }
+        response = {
+            "type": "result",
+            "request_id": "start-1",
+            "payload": {"ok": False, "error": "first_sample_timeout"},
+        }
+
+        class Connection:
+            def __init__(self, incoming, *, fail_result_send=False):
+                self.incoming = list(incoming)
+                self.fail_result_send = fail_result_send
+                self.sent = []
+
+            def send(self, raw):
+                message = json.loads(raw)
+                self.sent.append(message)
+                if self.fail_result_send and message.get("type") == "result":
+                    raise OSError("connection closed during result send")
+
+            def recv(self):
+                item = self.incoming.pop(0)
+                if isinstance(item, BaseException):
+                    raise item
+                return item
+
+            def settimeout(self, _timeout):
+                return None
+
+            def close(self):
+                return None
+
+        first = Connection([json.dumps(command)], fail_result_send=True)
+        second = Connection(
+            [json.dumps({"type": "result_ack", "request_id": "start-1"}), ""]
+        )
+        third = Connection([KeyboardInterrupt()])
+        transport = Mock()
+        transport.connect_once.side_effect = [first, second, third]
+        transport.hello.return_value = {"type": "hello"}
+        outbox = helper_entry.HelperResultOutbox()
+
+        class IdlePump:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def next_message(self):
+                return None
+
+            def wait_for_activity(self, timeout):
+                time.sleep(min(float(timeout), 0.001))
+
+            def connection_lost(self):
+                return None
+
+        class SynchronousDispatcher:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def submit(self, _message, callback):
+                callback(dict(response))
+
+            def close(self):
+                return None
+
+        with patch.object(helper_entry, "HelperTransport", return_value=transport), \
+             patch.object(helper_entry, "HelperSamplePump", IdlePump), \
+             patch.object(helper_entry, "HelperCommandDispatcher", SynchronousDispatcher), \
+             patch.object(helper_entry.time, "sleep", return_value=None):
+            self.assertTrue(
+                helper_entry.run_forever(
+                    "https://example.test",
+                    "token",
+                    "local-helper",
+                    agent=Mock(),
+                    result_outbox=outbox,
+                )
+            )
+
+        replayed = [item for item in second.sent if item.get("type") == "result"]
+        self.assertEqual(replayed, [response])
+        self.assertFalse(any(item.get("type") == "result" for item in third.sent))
+        self.assertEqual(outbox.pending(), [])
+
     def test_new_capture_is_not_blocked_by_previous_capture_wire_batch(self):
         agent = Mock()
         old_batch = {
@@ -643,6 +830,91 @@ class HelperTransportTests(unittest.TestCase):
 
         self.assertIs(run_wss.call_args.kwargs["agent"], sentinel_agent)
         self.assertIs(run_http.call_args.kwargs["agent"], sentinel_agent)
+
+    @patch("local_capture_helper_entry.run_http_forever")
+    @patch("local_capture_helper_entry.run_forever", return_value=False)
+    def test_auto_fallback_preserves_unacknowledged_command_results(self, run_wss, run_http):
+        helper_entry.run_auto_forever(
+            "https://afp.example.test", "token", "pc-01", agent=Mock()
+        )
+
+        self.assertIsNotNone(run_wss.call_args.kwargs.get("result_outbox"))
+        self.assertIs(
+            run_wss.call_args.kwargs.get("result_outbox"),
+            run_http.call_args.kwargs.get("result_outbox"),
+        )
+
+    def test_http_fallback_replays_pending_command_result_until_accepted(self):
+        response = {
+            "type": "result",
+            "request_id": "start-1",
+            "payload": {"ok": False, "error": "first_sample_timeout"},
+        }
+        outbox = helper_entry.HelperResultOutbox()
+        outbox.remember(response)
+        delivered = []
+
+        class FakeTransport:
+            decode_command = staticmethod(local_capture_agent.HelperTransport.decode_command)
+
+            def __init__(self, *_args, **_kwargs):
+                self.polls = 0
+                self.result_attempts = 0
+
+            def http_json(self, path, payload, **_kwargs):
+                if path == "api/helper/poll":
+                    self.polls += 1
+                    if self.polls > 1:
+                        raise KeyboardInterrupt
+                    return {"ok": True, "command": None, "heartbeat": True}
+                if path == "api/helper/result":
+                    self.result_attempts += 1
+                    delivered.append(dict(payload))
+                    if self.result_attempts == 1:
+                        return {"ok": False, "error": "result_not_accepted"}
+                    return {"ok": True, "request_id": payload["request_id"]}
+                return {"ok": True, "idle": True}
+
+        agent = Mock()
+        agent.next_sample_batch.return_value = None
+        self.assertIn(
+            "result_outbox",
+            inspect.signature(helper_entry.run_http_forever).parameters,
+        )
+        with patch.object(helper_entry, "HelperTransport", FakeTransport), \
+             patch.object(helper_entry.time, "sleep", return_value=None):
+            helper_entry.run_http_forever(
+                "https://example.test",
+                "token",
+                "local-helper",
+                agent=agent,
+                result_outbox=outbox,
+            )
+
+        self.assertEqual([item["request_id"] for item in delivered], ["start-1", "start-1"])
+        self.assertEqual(outbox.pending(), [])
+
+    def test_http_result_rejection_keeps_command_result_pending(self):
+        response = {
+            "type": "result",
+            "request_id": "start-1",
+            "payload": {"ok": False, "error": "first_sample_timeout"},
+        }
+        outbox = helper_entry.HelperResultOutbox()
+        transport = Mock()
+        transport.http_json.return_value = {"ok": False, "error": "result_not_accepted"}
+
+        with patch.object(helper_entry.time, "sleep", return_value=None):
+            accepted = helper_entry._report_helper_response(
+                transport,
+                "local-helper",
+                response,
+                outbox,
+            )
+
+        self.assertFalse(accepted)
+        self.assertEqual(transport.http_json.call_count, 3)
+        self.assertEqual(outbox.pending(), [response])
 
     def test_dispatch_discover_returns_structured_result(self):
         agent = Mock()

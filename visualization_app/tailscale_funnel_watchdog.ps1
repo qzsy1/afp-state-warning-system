@@ -25,6 +25,7 @@ $FunnelUrlFile = Join-Path $FunnelRoot "funnel-url.txt"
 $FunnelStatusFile = Join-Path $FunnelRoot "funnel-status.json"
 $OriginUrl = "http://127.0.0.1:8770"
 $FunnelArguments = "funnel --bg --https=443 --yes http://127.0.0.1:8770"
+$OriginLaunchMutexName = "Local\AFP_Tailscale_Funnel_Watchdog_Origin_Start"
 
 function Find-TailscaleExe {
     $candidates = @(
@@ -131,6 +132,13 @@ function Test-Origin {
     }
 }
 
+function Test-OriginListener {
+    $listeners = @(
+        Get-NetTCPConnection -State Listen -LocalPort 8770 -ErrorAction SilentlyContinue
+    )
+    return $listeners.Count -gt 0
+}
+
 function Test-PublicFunnel([string]$PublicUrl) {
     if (-not $PublicUrl) { return $false }
     $healthUrl = $PublicUrl.TrimEnd("/") + "/api/health"
@@ -177,19 +185,38 @@ function Ensure-Origin {
         Write-FunnelState "origin_executable_missing" "找不到系统主程序，未启动公网入口。"
         return $false
     }
-    if (-not (Get-AppProcess)) {
-        Start-Process -FilePath $AppExe `
-            -ArgumentList "--server-only" `
-            -WorkingDirectory $DeliveryRoot `
-            -WindowStyle Hidden | Out-Null
-    }
-    $deadline = (Get-Date).AddSeconds(45)
-    while ((Get-Date) -lt $deadline) {
+    $launchMutex = New-Object System.Threading.Mutex($false, $OriginLaunchMutexName)
+    $mutexHeld = $false
+    try {
+        try {
+            $mutexHeld = $launchMutex.WaitOne([TimeSpan]::FromSeconds(60))
+        } catch [System.Threading.AbandonedMutexException] {
+            $mutexHeld = $true
+        }
+        if (-not $mutexHeld) {
+            Write-FunnelState "origin_recovery_busy" "本地系统恢复操作仍在进行。"
+            return $false
+        }
         if (Test-Origin) { return $true }
-        Start-Sleep -Seconds 2
+        if (-not (Test-OriginListener)) {
+            Start-Process -FilePath $AppExe `
+                -ArgumentList "--server-only" `
+                -WorkingDirectory $DeliveryRoot `
+                -WindowStyle Hidden | Out-Null
+        }
+        $deadline = (Get-Date).AddSeconds(45)
+        while ((Get-Date) -lt $deadline) {
+            if (Test-Origin) { return $true }
+            Start-Sleep -Seconds 2
+        }
+        Write-FunnelState "origin_unavailable" "本地系统未能在127.0.0.1:8770正常启动。"
+        return $false
+    } finally {
+        if ($mutexHeld) {
+            $launchMutex.ReleaseMutex()
+        }
+        $launchMutex.Dispose()
     }
-    Write-FunnelState "origin_unavailable" "本地系统未能在127.0.0.1:8770正常启动。"
-    return $false
 }
 
 function Ensure-Helper {
