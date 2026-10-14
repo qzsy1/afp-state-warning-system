@@ -255,6 +255,9 @@ function Write-AfpSingleRuntimeReport {
         if ($State.PSObject.Properties.Name -contains $name) {
             $value = [string]$State.$name
             if ($value -notin $validStatuses) { throw "Invalid acceptance status for ${name}: $value" }
+            if ($value -eq "physical_sensor_pending" -and $name -ne "physical_sensor") {
+                throw "physical_sensor_pending is reserved for the physical_sensor field."
+            }
         }
     }
     New-Item -ItemType Directory -Path (Split-Path -Parent $output) -Force | Out-Null

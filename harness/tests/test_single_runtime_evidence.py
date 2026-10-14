@@ -148,6 +148,12 @@ $state = [pscustomobject]@{{ runtime_identity = 'candidate'; runtime_path = $pat
 $path = Write-AfpSingleRuntimeReport -State $state -OutputPath {_ps_quote(output)} -Paths $paths
 $payload = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
 if ($payload.runtime_identity -ne 'candidate' -or $payload.remaining_candidate_count -ne 0 -or $payload.pairing -ne 'blocked') {{ throw ($payload | ConvertTo-Json -Depth 10) }}
+$invalid = [pscustomobject]@{{ runtime_identity = 'candidate'; pairing = 'physical_sensor_pending'; physical_sensor = 'physical_sensor_pending' }}
+try {{
+    Write-AfpSingleRuntimeReport -State $invalid -OutputPath (Join-Path $paths.EvidenceRoot 'invalid.json') -Paths $paths
+    throw 'non-physical status accepted physical_sensor_pending'
+}} catch {{ if ($_.Exception.Message -eq 'non-physical status accepted physical_sensor_pending') {{ throw }} }}
+exit 0
 """
             result = _run_ps(script)
             self.assertEqual(result.returncode, 0, msg=result.stderr)
