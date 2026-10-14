@@ -32,7 +32,8 @@ $evidenceDir = Join-Path $paths.EvidenceRoot "SINGLE-RUNTIME-MIGRATION"
 $legacyTargets = @(
     "D:\AFP-Main-Candidate-16e887f",
     "D:\AFP-Main-Candidate-2585ca",
-    "D:\AFP-Main-Evidence\CROSS-20261013-01"
+    "D:\AFP-Main-Evidence\CROSS-20261013-01",
+    "F:\AFP_Integrated_Modular_v2\delivery\AFP_Integrated_System_Modular_v2.0.3_Agentic"
 )
 
 function Write-State([string]$Name, [psobject]$Value) {

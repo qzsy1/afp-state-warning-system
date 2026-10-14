@@ -215,6 +215,10 @@ if ($same.uri -notmatch '^https://example\.test/app\.js\?afp_identity_check=') {
         self.assertIn("Test-AfpReleaseGate", source)
         self.assertIn("New-AfpApprovalSummary", source)
         self.assertIn("Wait-AfpRuntimeServices", source)
+        self.assertIn(
+            r"F:\AFP_Integrated_Modular_v2\delivery\AFP_Integrated_System_Modular_v2.0.3_Agentic",
+            source,
+        )
         self.assertNotIn("previous-runtime", source.lower())
         release = (ROOT / "pre_sensor" / "SingleRuntimeRelease.psm1").read_text(
             encoding="utf-8-sig"
