@@ -51,6 +51,8 @@ $inventory = Get-AfpRuntimeInventory -ProcessRecords $processes -ListenerRecords
 $json = $inventory | ConvertTo-Json -Depth 10
 if ($json -match 'topsecret|token=secret') {{ throw 'inventory leaked a secret' }}
 if ($inventory.processes[0].pid -ne 42 -or $inventory.listeners[0].port -ne 8770) {{ throw $json }}
+$scriptStartup = Get-AfpRuntimeInventory -ProcessRecords @() -ListenerRecords @() -StartupRecords @([pscustomobject]@{{ Name = 'AFP Watchdog'; Value = '"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -File "D:\old\tailscale_funnel_watchdog.ps1"'; Source = 'HKCU Run' }})
+if ($scriptStartup.startup[0].target_path -ne 'D:\old\tailscale_funnel_watchdog.ps1') {{ throw ($scriptStartup | ConvertTo-Json -Depth 10) }}
 $summary = New-AfpApprovalSummary -Inventory $inventory -Operation Switchover
 $summaryJson = $summary | ConvertTo-Json -Depth 10
 foreach ($required in @('current_listener_pid','current_listener_path','impact','expected_interruption','rollback_plan','inventory_digest')) {{

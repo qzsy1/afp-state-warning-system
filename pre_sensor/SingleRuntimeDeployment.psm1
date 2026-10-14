@@ -41,11 +41,13 @@ function Get-AfpStartupTarget {
         return [string]$Record.TargetPath
     }
     $value = if ($Record.PSObject.Properties.Name -contains "Value") { [string]$Record.Value } else { "" }
-    $match = [regex]::Match($value, '(?i)(?:"([^\"]+\.(?:exe|ps1))"|([^\s]+\.(?:exe|ps1)))')
-    if ($match.Success) {
-        if ($match.Groups[1].Success) { return $match.Groups[1].Value }
-        return $match.Groups[2].Value
-    }
+    $matches = [regex]::Matches($value, '(?i)(?:"([^\"]+\.(?:exe|ps1))"|([^\s]+\.(?:exe|ps1)))')
+    $targets = @($matches | ForEach-Object {
+        if ($_.Groups[1].Success) { $_.Groups[1].Value } else { $_.Groups[2].Value }
+    })
+    $scriptTarget = @($targets | Where-Object { $_ -match '(?i)\.ps1$' } | Select-Object -Last 1)
+    if ($scriptTarget.Count) { return [string]$scriptTarget[0] }
+    if ($targets.Count) { return [string]$targets[0] }
     return ""
 }
 
