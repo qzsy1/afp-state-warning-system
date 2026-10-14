@@ -156,6 +156,43 @@ function Test-AfpReleaseGate {
     }
 }
 
+function Resolve-AfpReferenceRelease {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][psobject]$Paths,
+        [string]$RequestedPath = ""
+    )
+
+    if ($RequestedPath) {
+        $resolved = [IO.Path]::GetFullPath($RequestedPath).TrimEnd('\')
+        if (-not (Test-Path -LiteralPath $resolved -PathType Container)) {
+            throw "Reference release does not exist: $resolved"
+        }
+        return $resolved
+    }
+    if (Test-Path -LiteralPath $Paths.RuntimeRoot -PathType Container) {
+        return [IO.Path]::GetFullPath($Paths.RuntimeRoot).TrimEnd('\')
+    }
+    $deliveryRoot = Join-Path $Paths.SourceRoot "delivery"
+    $matches = @(
+        Get-ChildItem -LiteralPath $deliveryRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "AFP_Integrated_System_Modular*" }
+    )
+    if ($matches.Count -ne 1) {
+        throw "Reference release is ambiguous or unavailable; specify ReferenceRelease explicitly."
+    }
+    return [IO.Path]::GetFullPath($matches[0].FullName).TrimEnd('\')
+}
+
+function Get-AfpDirectoryBytes {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $total = 0L
+    foreach ($file in @(Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction Stop)) {
+        $total += [long]$file.Length
+    }
+    return $total
+}
+
 function Test-AfpBuildReadiness {
     [CmdletBinding()]
     param(
@@ -163,7 +200,9 @@ function Test-AfpBuildReadiness {
         [Parameter(Mandatory = $true)][string]$RepoRoot,
         [string]$GitRef = "HEAD",
         [string[]]$RequiredInputs = @(),
-        [long]$RequiredBytes = 0
+        [long]$RequiredBytes = 0,
+        [string]$ReferenceRelease = "",
+        [scriptblock]$FreeSpaceProvider
     )
 
     $issues = [Collections.Generic.List[string]]::new()
@@ -180,10 +219,28 @@ function Test-AfpBuildReadiness {
             $issues.Add("required build input is missing")
         }
     }
+    $requiredCapacity = $RequiredBytes
+    if ($ReferenceRelease) {
+        if (-not (Test-Path -LiteralPath $ReferenceRelease -PathType Container)) {
+            $issues.Add("reference release is missing")
+        } else {
+            try {
+                $referenceBytes = Get-AfpDirectoryBytes -Path $ReferenceRelease
+                if ($referenceBytes -gt $requiredCapacity) { $requiredCapacity = $referenceBytes }
+            } catch {
+                $issues.Add("reference release size could not be determined")
+            }
+        }
+    }
+    $freeBytes = -1L
     try {
-        $driveName = ([IO.Path]::GetPathRoot([IO.Path]::GetFullPath($Paths.WorkspaceRoot))).TrimEnd('\').TrimEnd(':')
-        $freeBytes = [long](Get-PSDrive -Name $driveName -ErrorAction Stop).Free
-        if ($RequiredBytes -gt 0 -and $freeBytes -lt $RequiredBytes) {
+        if ($FreeSpaceProvider) {
+            $freeBytes = [long](& $FreeSpaceProvider $Paths.WorkspaceRoot)
+        } else {
+            $driveName = ([IO.Path]::GetPathRoot([IO.Path]::GetFullPath($Paths.WorkspaceRoot))).TrimEnd('\').TrimEnd(':')
+            $freeBytes = [long](Get-PSDrive -Name $driveName -ErrorAction Stop).Free
+        }
+        if ($requiredCapacity -gt 0 -and $freeBytes -lt $requiredCapacity) {
             $issues.Add("insufficient staging capacity")
         }
     } catch {
@@ -192,6 +249,8 @@ function Test-AfpBuildReadiness {
     return [pscustomobject]@{
         status = if ($issues.Count -eq 0) { "passed" } else { "blocked" }
         issues = @($issues)
+        required_bytes = $requiredCapacity
+        free_bytes = $freeBytes
     }
 }
 
@@ -260,6 +319,7 @@ function New-AfpRollbackStage {
 }
 
 Export-ModuleMember -Function @(
+    "Resolve-AfpReferenceRelease",
     "New-AfpStagedRelease",
     "New-AfpRollbackStage",
     "Test-AfpReleaseGate",

@@ -45,16 +45,16 @@ if ($Mode -eq "Inventory") {
 }
 
 if ($Mode -in @("Stage", "Rollback")) {
+    $ReferenceRelease = Resolve-AfpReferenceRelease -Paths $paths -RequestedPath $ReferenceRelease
     $readiness = Test-AfpBuildReadiness -Paths $paths -RepoRoot $paths.SourceRoot -GitRef $GitRef -RequiredInputs @(
         (Join-Path $paths.SourceRoot "pre_sensor\release-contract.json"),
         (Join-Path $paths.SourceRoot "modular_runtime\assemble_modular_delivery.ps1")
-    ) -RequiredBytes 1
+    ) -ReferenceRelease $ReferenceRelease
     if ($readiness.status -ne "passed") {
         $readiness | ConvertTo-Json -Depth 10
         exit 2
     }
     $staged = if ($Mode -eq "Rollback") {
-        if (-not $ReferenceRelease) { $ReferenceRelease = $paths.RuntimeRoot }
         New-AfpRollbackStage -Paths $paths -GitRef $GitRef -ReferenceRelease $ReferenceRelease
     } else {
         New-AfpStagedRelease -Paths $paths -ReferenceRelease $ReferenceRelease

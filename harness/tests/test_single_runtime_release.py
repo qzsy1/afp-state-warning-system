@@ -197,6 +197,33 @@ if ($result.issues.Count -lt 2) {{ throw 'expected multiple readiness issues' }}
             )
             self.assertEqual(marker.read_text(encoding="utf-8"), "unchanged")
 
+    def test_reference_resolution_and_peak_capacity_use_real_release_size(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            workspace = Path(temporary) / "workspace"
+            source = workspace / "AFP-Readiness-Repo"
+            historical = source / "delivery" / "AFP_Integrated_System_Modular_previous"
+            historical.mkdir(parents=True)
+            (historical / "first.bin").write_bytes(b"1234")
+            (historical / "second.bin").write_bytes(b"123456")
+            script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(PATH_MODULE)} -Force
+Import-Module {_ps_quote(MODULE)} -Force
+$paths = Get-AfpDeploymentPaths -ConfigPath {_ps_quote(PATH_CONFIG)} -WorkspaceRootOverride {_ps_quote(workspace)}
+$reference = Resolve-AfpReferenceRelease -Paths $paths
+if ($reference -ne {_ps_quote(historical)}) {{ throw "unexpected reference: $reference" }}
+$result = Test-AfpBuildReadiness -Paths $paths -RepoRoot {_ps_quote(ROOT)} -GitRef 'HEAD' -RequiredInputs @({_ps_quote(ROOT / 'pre_sensor' / 'release-contract.json')}) -ReferenceRelease $reference -FreeSpaceProvider {{ param($WorkspaceRoot) 9 }}
+if ($result.status -ne 'blocked') {{ throw ($result | ConvertTo-Json -Depth 8) }}
+if ($result.required_bytes -ne 10 -or $result.free_bytes -ne 9) {{ throw ($result | ConvertTo-Json -Depth 8) }}
+if (-not ($result.issues -contains 'insufficient staging capacity')) {{ throw ($result | ConvertTo-Json -Depth 8) }}
+"""
+            result = _run_ps(script)
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+
     def test_staging_cleanup_removes_only_deployment_child(self) -> None:
         with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
             workspace = Path(temporary) / "workspace"
