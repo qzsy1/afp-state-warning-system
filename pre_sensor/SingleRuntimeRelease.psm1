@@ -280,13 +280,16 @@ function New-AfpStagedRelease {
         [string]$SourceRoot = ""
     )
     $script = Join-Path $Paths.SourceRoot "pre_sensor\build-candidate.ps1"
-    $arguments = @("-ReferenceRelease", $ReferenceRelease, "-WorkspaceRoot", $Paths.WorkspaceRoot)
-    if ($ExistingExecutable) { $arguments += @("-ExistingExecutable", $ExistingExecutable) }
-    if ($PythonExecutable) { $arguments += @("-PythonExecutable", $PythonExecutable) }
-    if ($HelperExecutable) { $arguments += @("-HelperExecutable", $HelperExecutable) }
-    if ($SourceRoot) { $arguments += @("-SourceRoot", $SourceRoot) }
+    $arguments = @{
+        ReferenceRelease = $ReferenceRelease
+        WorkspaceRoot = $Paths.WorkspaceRoot
+    }
+    if ($ExistingExecutable) { $arguments.ExistingExecutable = $ExistingExecutable }
+    if ($PythonExecutable) { $arguments.PythonExecutable = $PythonExecutable }
+    if ($HelperExecutable) { $arguments.HelperExecutable = $HelperExecutable }
+    if ($SourceRoot) { $arguments.SourceRoot = $SourceRoot }
     $json = & $script @arguments
-    if ($LASTEXITCODE -ne 0) { throw "Staged release build failed." }
+    if (-not $?) { throw "Staged release build failed." }
     return (($json -join "`n") | ConvertFrom-Json)
 }
 
