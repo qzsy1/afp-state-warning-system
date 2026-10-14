@@ -123,6 +123,33 @@ for (let index = 0; index < first.channels.length; index += 1) {
                       text.index("function updateIntegrationSource()")]
         self.assertIn("setPublicDemoControlVisibility(publicDemo);", update)
 
+    def test_acquisition_heading_distinguishes_demo_from_real_capture(self):
+        text = APP_JS.read_text(encoding="utf-8")
+        start = text.index("function setPublicDemoControlVisibility(publicDemo)")
+        end = text.index("function synchronizeAcquisitionButtons()", start)
+        function = text[start:end]
+        script = r'''
+const summary = {textContent: ""};
+const hiddenNode = {classList: {toggle() {}}};
+const document = {
+  body: {classList: {toggle() {}}},
+  querySelector() { return hiddenNode; },
+  querySelectorAll() { return []; },
+};
+const $ = (name) => name === "acquisitionSection"
+  ? {querySelector: () => summary}
+  : hiddenNode;
+const controls = {};
+function usesBrowserLocalExport() { return false; }
+''' + function + r'''
+setPublicDemoControlVisibility(true);
+if (summary.textContent !== "模拟采集演示") process.exit(1);
+setPublicDemoControlVisibility(false);
+if (summary.textContent !== "真实采集与保存") process.exit(2);
+'''
+        completed = run_node(script)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_public_demo_uses_stable_incremental_renderer(self):
         text = APP_JS.read_text(encoding="utf-8")
         render_demo = text[text.index("function renderPublicDemoIndex("):

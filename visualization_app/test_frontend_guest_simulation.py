@@ -4,6 +4,34 @@ import unittest
 
 
 class GuestSimulationFrontendContractTests(unittest.TestCase):
+    def test_guest_access_badge_is_labeled_as_simulation_demo(self):
+        root = Path(__file__).with_name("static")
+        html = (root / "index.html").read_text(encoding="utf-8")
+        text = (root / "app.js").read_text(encoding="utf-8")
+        start = text.index("function renderAccessState()")
+        end = text.index("async function loadAccessSession()", start)
+        function = text[start:end]
+        script = r'''
+const nodes = new Map();
+const node = () => ({textContent: "", className: "", value: "real", disabled: false,
+  classList: {toggle() {}}});
+const $ = (id) => {
+  if (!nodes.has(id)) nodes.set(id, node());
+  return nodes.get(id);
+};
+const state = {accessRole: "guest", modelAccess: false, secureTransport: true};
+const renderAgentGate = () => {};
+''' + function + r'''
+renderAccessState();
+if ($("access-mode-badge").textContent !== "模拟采集演示") process.exit(1);
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(
+            '<span id="access-mode-badge" class="access-mode-badge">模拟采集演示</span>',
+            html,
+        )
+
     def test_interface_check_allows_unverified_port_without_weakening_start_gate(self):
         text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
         start = text.index("function physicalInterfaceBindingIssues(")

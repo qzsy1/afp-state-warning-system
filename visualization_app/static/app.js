@@ -120,7 +120,7 @@ function renderAccessState() {
   if (badge) {
     badge.textContent = state.accessRole === "local_admin" ? "本机管理模式"
       : state.accessRole === "lan_operator" ? "局域网边缘采集模式"
-      : state.accessRole === "authorized" ? "真实模式已解锁" : "访客模拟模式";
+      : state.accessRole === "authorized" ? "真实模式已解锁" : "模拟采集演示";
     badge.className = `access-mode-badge ${state.accessRole}`;
   }
   unlock?.classList.toggle("hidden", state.accessRole !== "guest");
@@ -5680,7 +5680,7 @@ function setPublicDemoControlVisibility(publicDemo) {
   const browserExport = !publicDemo && usesBrowserLocalExport();
   const acquisitionSummary = $("acquisitionSection")?.querySelector("summary");
   if (acquisitionSummary) {
-    acquisitionSummary.textContent = publicDemo ? "预计算合成数据演示" : "真实采集与保存";
+    acquisitionSummary.textContent = publicDemo ? "模拟采集演示" : "真实采集与保存";
   }
   [
     controls.processingMode,
