@@ -124,6 +124,32 @@ if ($bad.status -ne 'failed' -or $bad.issues -notcontains 'service probe failed:
         result = _run_ps(script)
         self.assertEqual(result.returncode, 0, msg=result.stderr)
 
+    def test_public_static_identity_compares_remote_bytes_to_fixed_runtime(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            runtime = Path(temporary) / "AFP_Integrated_System_Modular"
+            asset = runtime / "app" / "ui" / "app.js"
+            asset.parent.mkdir(parents=True)
+            asset.write_bytes(b"current-static-identity")
+            (runtime / "RELEASE-MANIFEST.json").write_text(
+                json.dumps({"candidate": {"candidate_id": "candidate-current"}}),
+                encoding="utf-8",
+            )
+            script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(MODULE)} -Force
+$same = Test-AfpPublicStaticIdentity -RuntimeRoot {_ps_quote(runtime)} -PublicUrl 'https://example.test/' -ExpectedCandidateId 'candidate-current' -ContentFetcher {{ param($Uri) [IO.File]::ReadAllBytes({_ps_quote(asset)}) }}
+if (-not $same.passed) {{ throw ($same | ConvertTo-Json -Depth 8) }}
+$old = Test-AfpPublicStaticIdentity -RuntimeRoot {_ps_quote(runtime)} -PublicUrl 'https://example.test/' -ExpectedCandidateId 'candidate-current' -ContentFetcher {{ param($Uri) [Text.Encoding]::UTF8.GetBytes('old-static-identity') }}
+if ($old.passed) {{ throw ($old | ConvertTo-Json -Depth 8) }}
+if ($same.uri -notmatch '^https://example\.test/app\.js\?afp_identity_check=') {{ throw "unexpected URI: $($same.uri)" }}
+"""
+            result = _run_ps(script)
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+
     def test_rollback_plan_reuses_staging_and_fixed_runtime(self) -> None:
         source = CLI.read_text(encoding="utf-8-sig")
         self.assertIn('"Rollback"', source)

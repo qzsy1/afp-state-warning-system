@@ -13,6 +13,16 @@ function Get-AfpTextSha256 {
     }
 }
 
+function Get-AfpBytesSha256 {
+    param([Parameter(Mandatory = $true)][byte[]]$Bytes)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($algorithm.ComputeHash($Bytes))).Replace("-", "").ToLowerInvariant()
+    } finally {
+        $algorithm.Dispose()
+    }
+}
+
 function ConvertTo-AfpPublicEndpoint {
     param([string]$Value)
     if (-not $Value) { return "" }
@@ -239,6 +249,47 @@ function Complete-AfpRuntimePromotion {
     }
 }
 
+function Test-AfpPublicStaticIdentity {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+        [Parameter(Mandatory = $true)][string]$PublicUrl,
+        [Parameter(Mandatory = $true)][string]$ExpectedCandidateId,
+        [scriptblock]$ContentFetcher
+    )
+
+    $endpoint = ConvertTo-AfpPublicEndpoint -Value $PublicUrl
+    $assetPath = Join-Path $RuntimeRoot "app\ui\app.js"
+    $manifestPath = Join-Path $RuntimeRoot "RELEASE-MANIFEST.json"
+    $uri = ""
+    try {
+        if ($endpoint -eq "invalid" -or -not $endpoint) { throw "public endpoint is invalid" }
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ([string]$manifest.candidate.candidate_id -ne $ExpectedCandidateId) {
+            throw "runtime candidate identity mismatch"
+        }
+        $localBytes = [IO.File]::ReadAllBytes($assetPath)
+        $localHash = Get-AfpBytesSha256 -Bytes $localBytes
+        $uri = "$endpoint/app.js?afp_identity_check=$($localHash.Substring(0, 16))"
+        if ($ContentFetcher) {
+            $remoteBytes = [byte[]](& $ContentFetcher $uri)
+        } else {
+            $client = [Net.WebClient]::new()
+            try { $remoteBytes = [byte[]]$client.DownloadData($uri) }
+            finally { $client.Dispose() }
+        }
+        $remoteHash = Get-AfpBytesSha256 -Bytes $remoteBytes
+        $passed = $localHash -eq $remoteHash
+        return [pscustomobject]@{
+            passed = $passed
+            detail = if ($passed) { "public app.js matches fixed runtime" } else { "public app.js digest mismatch" }
+            uri = $uri
+        }
+    } catch {
+        return [pscustomobject]@{ passed = $false; detail = "public static identity probe failed"; uri = $uri }
+    }
+}
+
 function Test-AfpRuntimeServices {
     [CmdletBinding()]
     param(
@@ -265,6 +316,7 @@ function Test-AfpRuntimeServices {
             $probe = & $ProbeRunner ([string]$entry.Key) ([string]$entry.Value)
         } else {
             $passed = $false
+            $probeDetail = ""
             try {
                 switch ([string]$entry.Key) {
                     "listener_8770" {
@@ -283,13 +335,13 @@ function Test-AfpRuntimeServices {
                     "public_https" { $passed = [bool]$entry.Value -and (Invoke-WebRequest -UseBasicParsing -Uri ([string]$entry.Value) -TimeoutSec 12).StatusCode -eq 200 }
                     "funnel_origin" { $passed = [string]::Equals([string]$entry.Value, "http://127.0.0.1:8770", [StringComparison]::OrdinalIgnoreCase) }
                     "static_identity" {
-                        $manifestPath = Join-Path $RuntimeRoot "RELEASE-MANIFEST.json"
-                        $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
-                        $passed = [string]$manifest.candidate.candidate_id -eq [string]$entry.Value
+                        $identityProbe = Test-AfpPublicStaticIdentity -RuntimeRoot $RuntimeRoot -PublicUrl $PublicUrl -ExpectedCandidateId $ExpectedCandidateId
+                        $passed = [bool]$identityProbe.passed
+                        $probeDetail = [string]$identityProbe.detail
                     }
                 }
             } catch { $passed = $false }
-            $probe = [pscustomobject]@{ passed = $passed; detail = if ($passed) { "ok" } else { "probe failed" } }
+            $probe = [pscustomobject]@{ passed = $passed; detail = if ($probeDetail) { $probeDetail } elseif ($passed) { "ok" } else { "probe failed" } }
         }
         $checks.Add([pscustomobject]@{ name = [string]$entry.Key; passed = [bool]$probe.passed; detail = [string]$probe.detail })
         if (-not $probe.passed) { $issues.Add("service probe failed: $($entry.Key)") }
@@ -419,6 +471,7 @@ Export-ModuleMember -Function @(
     "Invoke-AfpRuntimePromotion",
     "Restore-AfpRuntimePromotion",
     "Complete-AfpRuntimePromotion",
+    "Test-AfpPublicStaticIdentity",
     "Test-AfpRuntimeServices",
     "Get-AfpStartupRepairPreview",
     "Set-AfpApprovedStartupTargets"
