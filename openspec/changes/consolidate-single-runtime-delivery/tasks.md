@@ -34,10 +34,10 @@
 
 ## 6. 文档与回归
 
-- [ ] 6.1 更新 `pre_sensor/FIELD-OPERATIONS.md` 与 `README.md`，说明固定路径、两次审批门、Git 重建回滚及模拟/真实验收边界；通过文档合同测试验证不再指导用户长期保存版本化候选。
-- [ ] 6.2 更新回归矩阵、基线配置和测试中仍指向版本化 delivery 的活动路径；运行路径引用扫描，确认生产入口不再包含旧工程根或旧版本化运行路径。
-- [ ] 6.3 运行单一运行目录定向测试、完整 `.venv` unittest 套件和 `openspec validate consolidate-single-runtime-delivery --strict`，保存全部通过的脱敏输出。
-- [ ] 6.4 使用 OpenSpec verify 工作流核对实现、spec、design 与任务状态；未完成或未验证项目保持未勾选，不提前声明完成。
+- [x] 6.1 更新 `pre_sensor/FIELD-OPERATIONS.md` 与 `README.md`，说明固定路径、两次审批门、Git 重建回滚及模拟/真实验收边界；通过文档合同测试验证不再指导用户长期保存版本化候选。
+- [x] 6.2 更新回归矩阵、基线配置和测试中仍指向版本化 delivery 的活动路径；运行路径引用扫描，确认生产入口不再包含旧工程根或旧版本化运行路径。
+- [x] 6.3 运行单一运行目录定向测试、完整 `.venv` unittest 套件和 `openspec validate consolidate-single-runtime-delivery --strict`，保存全部通过的脱敏输出。
+- [x] 6.4 使用 OpenSpec verify 工作流核对实现、spec、design 与任务状态；未完成或未验证项目保持未勾选，不提前声明完成。
 
 ## 7. 首次迁移（需要独立操作授权）
 

@@ -1,8 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$PythonExecutable = "",
-    [string]$ReferenceRelease = "F:\AFP_Integrated_Native_InterfaceMapped\AFP_Integrated_System_SMRF_HID_Restored_20260824_v1.12.1\AFP_Integrated_System",
-    [string]$TargetDir = "F:\AFP_Integrated_Modular_v2\delivery\AFP_Integrated_System_Modular_v2.0.1",
+    [string]$ReferenceRelease = "F:\new_AFP_exam\AFP_Integrated_System_Modular",
+    [string]$TargetDir = "",
     [string]$ApplicationVersion = "2.0.2",
     [switch]$SkipExecutableBuild,
     [switch]$AllowExistingTarget,
@@ -13,6 +13,9 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BuildLauncher = Join-Path $ScriptDir "build_launcher.ps1"
 $AssembleDelivery = Join-Path $ScriptDir "assemble_modular_delivery.ps1"
+if (-not $TargetDir) {
+    $TargetDir = Join-Path "F:\new_AFP_exam\.afp-staging" ("manual-build-" + [guid]::NewGuid().ToString("N"))
+}
 
 foreach ($script in @($BuildLauncher, $AssembleDelivery)) {
     if (-not (Test-Path -LiteralPath $script -PathType Leaf)) {

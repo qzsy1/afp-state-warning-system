@@ -143,10 +143,16 @@ def run_isolated_assembly(
     reference = Path(reference_release).resolve()
     launcher_path = Path(launcher).resolve()
     parent = Path(target_parent).resolve()
-    official_delivery = (repo / "delivery").resolve()
-    if parent == official_delivery or official_delivery in parent.parents:
+    fixed_runtime = (repo.parent / "AFP_Integrated_System_Modular").resolve()
+    historical_delivery = (repo / "delivery").resolve()
+    if (
+        parent == fixed_runtime
+        or fixed_runtime in parent.parents
+        or parent == historical_delivery
+        or historical_delivery in parent.parents
+    ):
         raise ValueError(
-            f"isolated assembly target must not be inside official delivery: {parent}"
+            f"isolated assembly target must not be inside the fixed runtime: {parent}"
         )
     parent.mkdir(parents=True, exist_ok=True)
     target = parent / f"real-acquisition-{uuid.uuid4().hex}"

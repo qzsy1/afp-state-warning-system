@@ -143,12 +143,15 @@ class RegressionMatrixContractTests(unittest.TestCase):
 
         self.assertTrue(check.blocking)
         self.assertEqual(check.profiles, ("quick", "full", "release"))
-        self.assertIn("verification.test_real_acquisition_pipeline", command)
+        self.assertIn(
+            r"F:\new_AFP_exam\AFP_Integrated_System_Modular\verification\test_real_acquisition_pipeline.py",
+            command,
+        )
         self.assertIn("STARTUP-001", check.requirements)
         self.assertIn("SIMULATION-001", check.requirements)
         self.assertIn("MODE_ISOLATION-001", check.requirements)
         self.assertIn(
-            "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/verification/test_real_acquisition_pipeline.py",
+            "visualization_app/real_acquisition.py",
             check.change_patterns,
         )
 

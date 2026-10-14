@@ -386,15 +386,15 @@
       "id": "real-acquisition-protocol-contracts",
       "title": "真实采集协议与交付前端模拟启动生命周期契约",
       "kind": "command",
-      "command": ["{python}", "-m", "unittest", "verification.test_real_acquisition_pipeline", "-v"],
-      "cwd": "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic",
+      "command": ["{python}", "F:\\new_AFP_exam\\AFP_Integrated_System_Modular\\verification\\test_real_acquisition_pipeline.py", "-v"],
+      "cwd": ".",
       "timeout_seconds": 180,
       "profiles": ["quick", "full", "release"],
       "environments": ["local"],
       "blocking": true,
       "evidence_tier": "protocol_simulation",
       "requirements": ["STARTUP-001", "SIMULATION-001", "SIMULATION-002", "INTERFACES-002", "REAL_ACQUISITION-001", "PHYSICAL_READINESS-001", "MODE_ISOLATION-001", "DIAGNOSIS-001", "LIVE_PREDICTION_SAFETY-001", "CAPTURE_PERSISTENCE-001", "REAL_PREP_PROTOCOL-001"],
-      "change_patterns": ["delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/ui/**", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/legacy/static/**", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/legacy/app.py", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/legacy/acquisition.py", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/app/legacy/real_acquisition.py", "delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/verification/test_real_acquisition_pipeline.py", "openspec/changes/harden-real-acquisition-pipeline/**"]
+      "change_patterns": ["visualization_app/static/**", "visualization_app/app.py", "visualization_app/acquisition.py", "visualization_app/real_acquisition.py", "pre_sensor/**", "modular_runtime/**", "openspec/changes/harden-real-acquisition-pipeline/**"]
     },
     {
       "id": "release-module-status",

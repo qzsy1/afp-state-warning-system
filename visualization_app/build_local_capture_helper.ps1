@@ -11,7 +11,7 @@ if ($OutputDirectory -and $DeliveryRoot) {
     throw "Specify OutputDirectory or DeliveryRoot, not both."
 }
 if (-not $OutputDirectory -and -not $DeliveryRoot) {
-    $DeliveryRoot = Join-Path $root "delivery\AFP_Integrated_System_Modular_v2.0.4_Agentic"
+    $OutputDirectory = Join-Path "F:\new_AFP_exam\.afp-staging" ("helper-build-" + [guid]::NewGuid().ToString("N"))
 }
 $delivery = if ($OutputDirectory) {
     [IO.Path]::GetFullPath($OutputDirectory)

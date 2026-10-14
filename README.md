@@ -53,7 +53,7 @@ AFP_Integrated_System_Modular.exe --functional-smoke
 
 完整 Windows 软件文件夹可直接复制到其它 Windows 电脑，目标电脑不需要另装 Python 或 PyTorch，但必须保持 EXE、`_internal`、`app`、`config`、`models` 和 `native_dll` 的相对位置。使用 MySQL 时需要可访问的 MySQL Server；使用真实传感器时需要相应设备、驱动、通信参数与权限。
 
-当前唯一受支持的完整交付版本为 `delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/`。该目录中的程序、依赖、模型和演示数据通过 Git LFS 同步；日志、运行状态、回滚目录、验证输出、采集数据和本机配置不进入 Git。
+本机只维护一个受支持的完整运行目录：`F:\new_AFP_exam\AFP_Integrated_System_Modular`。源码固定在 `F:\new_AFP_exam\AFP-Readiness-Repo`，脱敏证据固定在 `F:\new_AFP_exam\AFP-Main-Evidence`。构建中间产物只能进入 `F:\new_AFP_exam\.afp-staging`，发布完成或失败后受控清理；candidate ID 只作为 manifest 和审计身份，不再作为长期目录名。
 
 另一台电脑首次同步需要安装 Git LFS：
 
@@ -70,23 +70,14 @@ git lfs pull
 git switch main
 git pull --ff-only origin main
 git lfs pull
-.\delivery\AFP_Integrated_System_Modular_v2.0.4_Agentic\AFP_Integrated_System_Modular.exe --verify-files
-.\delivery\AFP_Integrated_System_Modular_v2.0.4_Agentic\AFP_Integrated_System_Modular.exe --self-test
+& 'F:\new_AFP_exam\AFP_Integrated_System_Modular\AFP_Integrated_System_Modular.exe' --verify-files
+& 'F:\new_AFP_exam\AFP_Integrated_System_Modular\AFP_Integrated_System_Modular.exe' --self-test
 ```
 
-如果该电脑在本次发布前已经有一个未被 Git 管理的同名 `v2.0.4` 目录，首次更新前先将它改名备份，否则 Git 会拒绝覆盖未跟踪文件：
+更新流程先在 `.afp-staging` 完成组装、完整性、自检和模块检查；随后输出准确的监听进程、目录、影响和恢复方法，等待“切换审批”。只有明确批准后才停止已锁定的旧 AFP 进程，并以同卷目录交换方式提升到固定运行目录。服务门禁全部通过后，启动项修改仍需单独授权。
 
-```powershell
-Rename-Item `
-  .\delivery\AFP_Integrated_System_Modular_v2.0.4_Agentic `
-  AFP_Integrated_System_Modular_v2.0.4_Agentic_local_backup
-git switch main
-git pull --ff-only origin main
-git lfs pull
-```
-
-新目录通过 `--verify-files` 和 `--self-test` 后，可以自行删除 `_local_backup` 备份。
+旧候选、旧 delivery 或旧证据副本不会自动删除。系统先逐项输出绝对路径、大小、活动引用和 Git 重建回滚方法，再等待独立的“清理审批”。回滚使用已记录的 Git 提交或标签重新在 staging 构建并通过相同门禁，不依赖长期保留多套可运行目录。
 
 两台电脑的 `git rev-parse HEAD` 相同且 `--verify-files` 通过时，发布程序内容一致。原始采集数据、正式实验数据库、个人路径和运行时状态继续保留在各自电脑中。
 
-模拟/OOD/弱标签预警只表示模型证据，不等同于独立确认的真实缺陷。生产部署和论文结论应使用真实传感器、独立缺陷检测或力学性能证据重新确认阈值、精度和适用范围。
+模拟采集、OOD 和弱标签预警只表示模型或协议证据，不等同于真实传感器或真实双机验收。只有尚未执行的真实传感器现场项可以标记 `physical_sensor_pending`；Helper、网络、MySQL、Windows readiness 等未完成项必须使用 `blocked` 或 `failed`。生产部署和论文结论应使用真实传感器、独立缺陷检测或力学性能证据重新确认阈值、精度和适用范围。

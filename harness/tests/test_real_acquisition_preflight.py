@@ -227,17 +227,17 @@ class RealAcquisitionPreflightTests(unittest.TestCase):
             ),
         )
 
-    def test_isolated_assembly_never_targets_official_delivery(self) -> None:
+    def test_isolated_assembly_never_targets_fixed_runtime(self) -> None:
         preflight = self._preflight()
-        release = self.repo / "delivery" / "AFP_Integrated_System_Modular_v2.0.4_Agentic"
+        release = self.repo.parent / "AFP_Integrated_System_Modular"
         launcher = release / "AFP_Integrated_System_Modular.exe"
 
-        with self.assertRaisesRegex(ValueError, "official delivery"):
+        with self.assertRaisesRegex(ValueError, "fixed runtime"):
             preflight.run_isolated_assembly(
                 self.repo,
                 release,
                 launcher,
-                self.repo / "delivery",
+                release,
             )
 
     def test_isolated_assembly_preserves_failure_command_and_logs(self) -> None:
