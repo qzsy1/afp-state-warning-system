@@ -4,7 +4,7 @@ import unittest
 
 
 class GuestSimulationFrontendContractTests(unittest.TestCase):
-    def test_builtin_model_paths_are_not_restored_after_delivery_moves(self):
+    def test_model_history_uses_explicit_server_provenance(self):
         text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
         start = text.index("const MODEL_SELECTION_HISTORY_KEY")
         end = text.index("function toast(", start)
@@ -19,13 +19,12 @@ const localStorage = {
 const key = modelSelectionKey("new_collection_v11_3", "i_T_G");
 const stale = "F:\\retired\\delivery\\AFP_v2.0.3\\models\\new\\i_T_G\\checkpoint.pth";
 localStorage.setItem(MODEL_SELECTION_HISTORY_KEY, JSON.stringify({[key]: stale}));
-if (lastModelPath("new_collection_v11_3", "i_T_G") !== "") process.exit(1);
+if (lastModelPath("new_collection_v11_3", "i_T_G") !== stale) process.exit(1);
+rememberModelPath("new_collection_v11_3", "i_T_G", stale, "bundled");
 if (readModelSelectionHistory()[key]) process.exit(2);
-rememberModelPath("new_collection_v11_3", "i_T_G", stale);
-if (readModelSelectionHistory()[key]) process.exit(3);
 const custom = "D:\\trained\\my-model.pth";
-rememberModelPath("new_collection_v11_3", "i_T_G", custom);
-if (lastModelPath("new_collection_v11_3", "i_T_G") !== custom) process.exit(4);
+rememberModelPath("new_collection_v11_3", "i_T_G", custom, "external");
+if (lastModelPath("new_collection_v11_3", "i_T_G") !== custom) process.exit(3);
 '''
         completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
         self.assertEqual(completed.returncode, 0, completed.stderr)

@@ -120,6 +120,9 @@ class RealAcquisitionPreflightTests(unittest.TestCase):
             "managed_files": {
                 "manifest": "SHA256SUMS.txt",
                 "digest_algorithm": "sha256",
+                "managed_model_roots": [
+                    "app/legacy/new_collection_demo_v11_3/models"
+                ],
             },
             "runtime_requirements": {
                 "required_executables": [
