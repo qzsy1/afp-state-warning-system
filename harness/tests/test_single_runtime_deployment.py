@@ -37,6 +37,106 @@ def _run_ps(script: str) -> subprocess.CompletedProcess[str]:
 
 
 class SingleRuntimeDeploymentTests(unittest.TestCase):
+    def test_service_gate_rejects_split_dns_success_without_forced_edge(self) -> None:
+        script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(MODULE)} -Force
+$ordinary = {{ param($Name, $Target) [pscustomobject]@{{ passed = $true; detail = 'ordinary route' }} }}
+$forced = {{ param($Name, $Target) [pscustomobject]@{{ passed = $false; detail = 'forced edge unavailable' }} }}
+$result = Test-AfpRuntimeServices -RuntimeRoot 'F:\runtime' -PublicUrl 'https://example.test/' -LanIPv4 '192.0.2.10' -ExpectedCandidateId 'candidate' -FunnelOrigin 'http://127.0.0.1:8770' -ProbeRunner $ordinary -PublicEdgeProbeRunner $forced
+if ($result.status -ne 'failed') {{ throw ($result | ConvertTo-Json -Depth 8) }}
+if ($result.issues -notcontains 'service probe failed: public_https') {{ throw ($result | ConvertTo-Json -Depth 8) }}
+"""
+        result = _run_ps(script)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+    def test_service_gate_rejects_redirect_and_non_200(self) -> None:
+        script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(MODULE)} -Force
+$ordinary = {{ param($Name, $Target) [pscustomobject]@{{ passed = $true; detail = 'ok' }} }}
+foreach ($status in @(301, 204)) {{
+    $forced = {{ param($Name, $Target, $ExpectedHash) [pscustomobject]@{{ passed = $false; detail = "unexpected_http_status:$status" }} }}
+    $result = Test-AfpRuntimeServices -RuntimeRoot 'F:\runtime' -PublicUrl 'https://example.test/' -LanIPv4 '192.0.2.10' -ExpectedCandidateId 'candidate' -FunnelOrigin 'http://127.0.0.1:8770' -ProbeRunner $ordinary -PublicEdgeProbeRunner $forced
+    if ($result.status -ne 'failed') {{ throw ($result | ConvertTo-Json -Depth 8) }}
+}}
+"""
+        result = _run_ps(script)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+    def test_active_capture_blocks_promotion_before_process_stop(self) -> None:
+        script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(MODULE)} -Force
+$script:stops = 0
+$inventory = [pscustomobject]@{{ digest = 'approved'; processes = @() }}
+$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='F:\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
+    -CutoverReadinessRunner {{ [pscustomobject]@{{ allowed = $false; active_capture_uuids = @('capture-a') }} }} `
+    -StopRunner {{ $script:stops++ }} -StartRunner {{ }} -ServiceProbeRunner {{ }} -IngressPublisher {{ }} -CompletionRunner {{ }} -RestoreRunner {{ }}
+if ($result.status -ne 'blocked' -or $script:stops -ne 0) {{ throw ($result | ConvertTo-Json -Depth 8) }}
+"""
+        result = _run_ps(script)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+    def test_promotion_does_not_complete_before_edge_and_state_gates(self) -> None:
+        script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(MODULE)} -Force
+$events = [Collections.Generic.List[string]]::new()
+$inventory = [pscustomobject]@{{ digest = 'approved'; processes = @() }}
+$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='F:\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
+    -CutoverReadinessRunner {{ [pscustomobject]@{{ allowed = $true }} }} `
+    -StopRunner {{ $events.Add('stop') }} `
+    -PromotionRunner {{ $events.Add('promote'); [pscustomobject]@{{ status='switched' }} }} `
+    -StartRunner {{ $events.Add('start') }} `
+    -ServiceProbeRunner {{ $events.Add('edge'); [pscustomobject]@{{ status='passed' }} }} `
+    -IngressPublisher {{ $events.Add('ingress'); [pscustomobject]@{{ generation=4 }} }} `
+    -CompletionRunner {{ $events.Add('complete') }} `
+    -RestoreRunner {{ $events.Add('restore') }}
+if ($result.status -ne 'completed') {{ throw ($result | ConvertTo-Json -Depth 8) }}
+if (($events -join ',') -ne 'stop,promote,start,edge,ingress,complete') {{ throw ($events -join ',') }}
+"""
+        result = _run_ps(script)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+    def test_each_exception_point_restores_runtime_and_ingress_snapshot(self) -> None:
+        script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(MODULE)} -Force
+foreach ($failure in @('promote','start','edge','ingress','complete')) {{
+    $script:restores = 0
+    $inventory = [pscustomobject]@{{ digest = 'approved'; processes = @() }}
+    $throwAt = {{ param($name) if ($failure -eq $name) {{ throw "failure:$name" }} }}
+    $result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='F:\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
+        -CutoverReadinessRunner {{ [pscustomobject]@{{ allowed = $true }} }} `
+        -StopRunner {{ }} `
+        -PromotionRunner {{ & $throwAt 'promote'; [pscustomobject]@{{ status='switched' }} }} `
+        -StartRunner {{ & $throwAt 'start' }} `
+        -ServiceProbeRunner {{ & $throwAt 'edge'; [pscustomobject]@{{ status='passed' }} }} `
+        -IngressPublisher {{ & $throwAt 'ingress'; [pscustomobject]@{{ generation=4 }} }} `
+        -CompletionRunner {{ & $throwAt 'complete' }} `
+        -RestoreRunner {{ param($Promotion, $IngressSnapshot) $script:restores++ }}
+    if ($result.status -ne 'rolled_back' -or $script:restores -ne 1) {{ throw ($result | ConvertTo-Json -Depth 8) }}
+}}
+"""
+        result = _run_ps(script)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+    def test_rollback_failure_is_terminal_and_preserves_both_evidence_paths(self) -> None:
+        script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(MODULE)} -Force
+$inventory = [pscustomobject]@{{ digest = 'approved'; processes = @() }}
+$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='F:\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
+    -FailureEvidencePath 'F:\evidence\promotion.json' -RollbackEvidencePath 'F:\evidence\rollback.json' `
+    -CutoverReadinessRunner {{ [pscustomobject]@{{ allowed = $true }} }} -StopRunner {{ }} `
+    -PromotionRunner {{ throw 'promotion failed' }} -StartRunner {{ }} -ServiceProbeRunner {{ }} -IngressPublisher {{ }} -CompletionRunner {{ }} `
+    -RestoreRunner {{ throw 'rollback failed' }}
+if ($result.status -ne 'rollback_failed' -or $result.failure_evidence_path -ne 'F:\evidence\promotion.json' -or $result.rollback_evidence_path -ne 'F:\evidence\rollback.json') {{ throw ($result | ConvertTo-Json -Depth 8) }}
+"""
+        result = _run_ps(script)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
     def test_inventory_is_read_only_sanitized_and_approval_is_complete(self) -> None:
         with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
             marker = Path(temporary) / "marker.txt"

@@ -94,28 +94,104 @@ if ($Mode -eq "Switchover") {
         $listenerProcess = @($managedProcesses | Where-Object { $_.pid -eq $listener[0].pid } | Select-Object -First 1)
         if (-not $listenerProcess.Count) { throw "The approved 8770 listener is not a fixed-runtime AFP process." }
     }
-    $oldProcesses = @(Stop-AfpManagedRuntimeProcesses -Inventory $inventory -RuntimeExecutable $exe)
-    $promotion = Invoke-AfpRuntimePromotion -StagingPath $StagingPath -Paths $paths -ApprovedInventoryDigest $ApprovedInventoryDigest -CurrentInventory $inventory
-    $restartPlan = if ($oldProcesses.Count) {
-        $oldProcesses
-    } else {
-        @([pscustomobject]@{ pid = 0; launch_arguments = "--server-only" })
-    }
-    Start-AfpManagedRuntimeProcesses -Processes $restartPlan -RuntimeExecutable $exe -WorkingDirectory $paths.RuntimeRoot | Out-Null
-    $services = Wait-AfpRuntimeServices -RuntimeRoot $paths.RuntimeRoot -PublicUrl $PublicUrl -LanIPv4 $LanIPv4 -ExpectedCandidateId $ExpectedCandidateId -FunnelOrigin $FunnelOrigin -TimeoutSeconds 90 -PollIntervalMilliseconds 1000
-    if ($services.status -ne "passed") {
-        $failedInventory = Get-AfpRuntimeInventory -PublicUrl $PublicUrl -FunnelOrigin $FunnelOrigin
-        Stop-AfpManagedRuntimeProcesses -Inventory $failedInventory -RuntimeExecutable $exe | Out-Null
-        Restore-AfpRuntimePromotion -Promotion $promotion -Paths $paths
-        if ($oldProcesses.Count) {
-            Start-AfpManagedRuntimeProcesses -Processes $oldProcesses -RuntimeExecutable $exe -WorkingDirectory $paths.RuntimeRoot | Out-Null
+    $script:oldProcesses = @()
+    $script:activePromotion = $null
+    $script:verifiedServices = $null
+    $failureEvidence = Join-Path $evidenceDir "switchover-failure.json"
+    $rollbackEvidence = Join-Path $evidenceDir "switchover-rollback.json"
+    $transaction = Invoke-AfpVerifiedRuntimePromotion `
+        -StagingPath $StagingPath `
+        -Paths $paths `
+        -ApprovedInventoryDigest $ApprovedInventoryDigest `
+        -CurrentInventory $inventory `
+        -FailureEvidencePath $failureEvidence `
+        -RollbackEvidencePath $rollbackEvidence `
+        -StopRunner {
+            $script:oldProcesses = @(Stop-AfpManagedRuntimeProcesses -Inventory $inventory -RuntimeExecutable $exe)
+        } `
+        -PromotionRunner {
+            $script:activePromotion = Invoke-AfpRuntimePromotion -StagingPath $StagingPath -Paths $paths `
+                -ApprovedInventoryDigest $ApprovedInventoryDigest -CurrentInventory $inventory
+            return $script:activePromotion
+        } `
+        -StartRunner {
+            $restartPlan = if ($script:oldProcesses.Count) {
+                $script:oldProcesses
+            } else {
+                @([pscustomobject]@{ pid = 0; launch_arguments = "--server-only" })
+            }
+            Start-AfpManagedRuntimeProcesses -Processes $restartPlan -RuntimeExecutable $exe `
+                -WorkingDirectory $paths.RuntimeRoot | Out-Null
+        } `
+        -ServiceProbeRunner {
+            $script:verifiedServices = Wait-AfpRuntimeServices -RuntimeRoot $paths.RuntimeRoot `
+                -PublicUrl $PublicUrl -LanIPv4 $LanIPv4 -ExpectedCandidateId $ExpectedCandidateId `
+                -FunnelOrigin $FunnelOrigin -TimeoutSeconds 90 -PollIntervalMilliseconds 1000
+            return $script:verifiedServices
+        } `
+        -IngressPublisher {
+            $modulePath = Join-Path $paths.RuntimeRoot "PublicIngress.psm1"
+            Import-Module $modulePath -Force -ErrorAction Stop
+            $statePath = Join-Path $paths.RuntimeRoot "runtime\public-ingress-state.json"
+            $manifest = Get-Content -LiteralPath (Join-Path $paths.RuntimeRoot "RELEASE-MANIFEST.json") `
+                -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+            $candidateId = [string]$manifest.candidate.candidate_id
+            if ($ExpectedCandidateId -and $candidateId -cne $ExpectedCandidateId) {
+                throw "runtime candidate identity mismatch"
+            }
+            $current = $null
+            try { $current = Read-AfpPublicIngressState -Path $statePath }
+            catch { $current = $null }
+            $hostName = ([Uri]$PublicUrl).DnsSafeHost.ToLowerInvariant()
+            $provider = if ($current) { [string]$current.provider } `
+                elseif ($hostName.EndsWith(".ts.net")) { "tailscale" } `
+                elseif ($hostName.EndsWith(".trycloudflare.com")) { "cloudflare" } `
+                else { "external" }
+            $owner = if ($current) { [string]$current.recovery_owner } else { $provider }
+            $layers = @{}
+            foreach ($check in @($script:verifiedServices.checks)) {
+                $layers[[string]$check.name] = @{ ok = [bool]$check.passed; code = [string]$check.detail }
+            }
+            $parameters = @{
+                Path = $statePath
+                PublicUrl = $PublicUrl
+                Provider = $provider
+                RecoveryOwner = $owner
+                CandidateId = $candidateId
+                Layers = $layers
+            }
+            if ($current) { $parameters.ExpectedGeneration = [long]$current.generation }
+            $published = Publish-AfpPublicIngressState @parameters
+            Read-AfpPublicIngressState -Path $statePath -ExpectedCandidateId $candidateId | Out-Null
+            return $published
+        } `
+        -CompletionRunner {
+            Complete-AfpRuntimePromotion -Promotion $script:activePromotion -Paths $paths
+        } `
+        -RestoreRunner {
+            param($Promotion, $IngressSnapshot)
+            $failedInventory = Get-AfpRuntimeInventory -PublicUrl $PublicUrl -FunnelOrigin $FunnelOrigin
+            Stop-AfpManagedRuntimeProcesses -Inventory $failedInventory -RuntimeExecutable $exe | Out-Null
+            if ($Promotion) { Restore-AfpRuntimePromotion -Promotion $Promotion -Paths $paths }
+            $statePath = Join-Path $paths.RuntimeRoot "runtime\public-ingress-state.json"
+            if ($null -ne $IngressSnapshot) {
+                $stateDirectory = Split-Path -Parent $statePath
+                if (-not (Test-Path -LiteralPath $stateDirectory -PathType Container)) {
+                    [IO.Directory]::CreateDirectory($stateDirectory) | Out-Null
+                }
+                [IO.File]::WriteAllBytes($statePath, [byte[]]$IngressSnapshot)
+            } elseif (Test-Path -LiteralPath $statePath -PathType Leaf) {
+                Remove-Item -LiteralPath $statePath -Force
+            }
+            if ($script:oldProcesses.Count) {
+                Start-AfpManagedRuntimeProcesses -Processes $script:oldProcesses -RuntimeExecutable $exe `
+                    -WorkingDirectory $paths.RuntimeRoot | Out-Null
+            }
         }
-        $services | ConvertTo-Json -Depth 10
-        exit 4
-    }
-    Complete-AfpRuntimePromotion -Promotion $promotion -Paths $paths
-    [pscustomobject]@{ status = "service_verified"; promotion = $promotion; services = $services } | ConvertTo-Json -Depth 12
-    exit 0
+    $transaction | ConvertTo-Json -Depth 12
+    if ($transaction.status -eq "completed") { exit 0 }
+    if ($transaction.status -eq "blocked") { exit 5 }
+    exit 4
 }
 
 if ($Mode -eq "StartupPreview") {

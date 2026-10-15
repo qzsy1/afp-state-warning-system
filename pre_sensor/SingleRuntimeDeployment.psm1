@@ -456,13 +456,124 @@ function Complete-AfpRuntimePromotion {
     }
 }
 
+function Invoke-AfpVerifiedRuntimePromotion {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$StagingPath,
+        [Parameter(Mandatory = $true)][psobject]$Paths,
+        [Parameter(Mandatory = $true)][string]$ApprovedInventoryDigest,
+        [Parameter(Mandatory = $true)][psobject]$CurrentInventory,
+        [scriptblock]$CutoverReadinessRunner,
+        [scriptblock]$StopRunner,
+        [scriptblock]$PromotionRunner,
+        [scriptblock]$StartRunner,
+        [scriptblock]$ServiceProbeRunner,
+        [scriptblock]$IngressPublisher,
+        [scriptblock]$CompletionRunner,
+        [scriptblock]$RestoreRunner,
+        [string]$FailureEvidencePath = "",
+        [string]$RollbackEvidencePath = ""
+    )
+
+    if (-not [string]::Equals(
+        $ApprovedInventoryDigest,
+        [string]$CurrentInventory.digest,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "Runtime inventory changed after approval."
+    }
+    $readiness = if ($CutoverReadinessRunner) {
+        & $CutoverReadinessRunner
+    } else {
+        try {
+            Invoke-RestMethod -Uri "http://127.0.0.1:8770/api/ingress/cutover-readiness" -Method Get -TimeoutSec 5
+        } catch {
+            [pscustomobject]@{ allowed = $false; error = "cutover_readiness_unavailable" }
+        }
+    }
+    if (-not $readiness -or -not [bool]$readiness.allowed) {
+        return [pscustomobject][ordered]@{
+            status = "blocked"
+            error = "active_capture_or_reconciliation_blocks_promotion"
+            readiness = $readiness
+        }
+    }
+
+    $ingressSnapshot = $null
+    $statePath = Join-Path ([string]$Paths.RuntimeRoot) "runtime\public-ingress-state.json"
+    if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+        try { $ingressSnapshot = [IO.File]::ReadAllBytes($statePath) } catch { $ingressSnapshot = $null }
+    }
+    $promotion = $null
+    $failed = $false
+    try {
+        if ($StopRunner) { & $StopRunner | Out-Null }
+        $promotion = if ($PromotionRunner) {
+            & $PromotionRunner
+        } else {
+            Invoke-AfpRuntimePromotion -StagingPath $StagingPath -Paths $Paths `
+                -ApprovedInventoryDigest $ApprovedInventoryDigest -CurrentInventory $CurrentInventory
+        }
+        if ($StartRunner) { & $StartRunner | Out-Null }
+        $services = if ($ServiceProbeRunner) { & $ServiceProbeRunner } else { $null }
+        if (-not $services -or [string]$services.status -ne "passed") {
+            throw "runtime_service_gate_failed"
+        }
+        $ingress = if ($IngressPublisher) { & $IngressPublisher } else { $null }
+        if (-not $ingress) { throw "ingress_publication_gate_failed" }
+        if ($CompletionRunner) { & $CompletionRunner | Out-Null }
+        return [pscustomobject][ordered]@{
+            status = "completed"
+            promotion = $promotion
+            services = $services
+            ingress = $ingress
+        }
+    } catch {
+        $failed = $true
+        $failure = $_.Exception.Message
+        try {
+            if ($RestoreRunner) {
+                & $RestoreRunner $promotion $ingressSnapshot | Out-Null
+            } elseif ($promotion) {
+                Restore-AfpRuntimePromotion -Promotion $promotion -Paths $Paths
+                if ($null -ne $ingressSnapshot) {
+                    $directory = Split-Path -Parent $statePath
+                    if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+                        [IO.Directory]::CreateDirectory($directory) | Out-Null
+                    }
+                    [IO.File]::WriteAllBytes($statePath, [byte[]]$ingressSnapshot)
+                }
+            }
+            return [pscustomobject][ordered]@{
+                status = "rolled_back"
+                error = $failure
+                failure_evidence_path = $FailureEvidencePath
+                rollback_evidence_path = $RollbackEvidencePath
+            }
+        } catch {
+            return [pscustomobject][ordered]@{
+                status = "rollback_failed"
+                error = $failure
+                rollback_error = $_.Exception.Message
+                failure_evidence_path = $FailureEvidencePath
+                rollback_evidence_path = $RollbackEvidencePath
+            }
+        }
+    } finally {
+        if ($failed) {
+            # Restoration is owned by the catch path so it executes exactly once.
+        }
+    }
+}
+
 function Test-AfpPublicStaticIdentity {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$RuntimeRoot,
         [Parameter(Mandatory = $true)][string]$PublicUrl,
         [Parameter(Mandatory = $true)][string]$ExpectedCandidateId,
-        [scriptblock]$ContentFetcher
+        [scriptblock]$ContentFetcher,
+        [scriptblock]$PublicEdgeProbeRunner
     )
 
     $endpoint = ConvertTo-AfpPublicEndpoint -Value $PublicUrl
@@ -478,12 +589,33 @@ function Test-AfpPublicStaticIdentity {
         $localBytes = [IO.File]::ReadAllBytes($assetPath)
         $localHash = Get-AfpBytesSha256 -Bytes $localBytes
         $uri = "$endpoint/app.js?afp_identity_check=$($localHash.Substring(0, 16))"
-        if ($ContentFetcher) {
+        if ($PublicEdgeProbeRunner) {
+            $probe = & $PublicEdgeProbeRunner "public_static_identity" $uri $localHash
+            $passed = [bool]$probe.passed
+            return [pscustomobject]@{
+                passed = $passed
+                detail = if ($passed) { "public app.js matches fixed runtime" } else { [string]$probe.detail }
+                uri = $uri
+            }
+        } elseif ($ContentFetcher) {
             $remoteBytes = [byte[]](& $ContentFetcher $uri)
         } else {
-            $client = [Net.WebClient]::new()
-            try { $remoteBytes = [byte[]]$client.DownloadData($uri) }
-            finally { $client.Dispose() }
+            $modulePath = Join-Path $RuntimeRoot "PublicIngress.psm1"
+            Import-Module $modulePath -Force -ErrorAction Stop
+            $target = [Uri]$uri
+            $addresses = @(Resolve-AfpPublicEdgeAddresses -HostName $target.DnsSafeHost)
+            $passed = $false
+            foreach ($address in $addresses) {
+                if ((Invoke-AfpForcedPublicProbe -Uri $target -Address $address -ExpectedSha256 $localHash).ok) {
+                    $passed = $true
+                    break
+                }
+            }
+            return [pscustomobject]@{
+                passed = $passed
+                detail = if ($passed) { "public app.js matches fixed runtime" } else { "public static identity forced-edge probe failed" }
+                uri = $uri
+            }
         }
         $remoteHash = Get-AfpBytesSha256 -Bytes $remoteBytes
         $passed = $localHash -eq $remoteHash
@@ -505,7 +637,8 @@ function Test-AfpRuntimeServices {
         [string]$LanIPv4 = "",
         [string]$ExpectedCandidateId = "",
         [string]$FunnelOrigin = "",
-        [scriptblock]$ProbeRunner
+        [scriptblock]$ProbeRunner,
+        [scriptblock]$PublicEdgeProbeRunner
     )
     $targets = [ordered]@{
         listener_8770 = Join-Path $RuntimeRoot "AFP_Integrated_System_Modular.exe"
@@ -519,7 +652,14 @@ function Test-AfpRuntimeServices {
     $checks = [Collections.Generic.List[object]]::new()
     $issues = [Collections.Generic.List[string]]::new()
     foreach ($entry in $targets.GetEnumerator()) {
-        if ($ProbeRunner) {
+        if ($PublicEdgeProbeRunner -and [string]$entry.Key -eq "public_https") {
+            $probe = & $PublicEdgeProbeRunner "public_https" ([string]$entry.Value) ""
+        } elseif ($PublicEdgeProbeRunner -and [string]$entry.Key -eq "static_identity") {
+            $identityProbe = Test-AfpPublicStaticIdentity -RuntimeRoot $RuntimeRoot `
+                -PublicUrl $PublicUrl -ExpectedCandidateId $ExpectedCandidateId `
+                -PublicEdgeProbeRunner $PublicEdgeProbeRunner
+            $probe = [pscustomobject]@{ passed = [bool]$identityProbe.passed; detail = [string]$identityProbe.detail }
+        } elseif ($ProbeRunner) {
             $probe = & $ProbeRunner ([string]$entry.Key) ([string]$entry.Value)
         } else {
             $passed = $false
@@ -539,7 +679,18 @@ function Test-AfpRuntimeServices {
                     }
                     "localhost_http" { $passed = (Invoke-WebRequest -UseBasicParsing -Uri ([string]$entry.Value) -TimeoutSec 8).StatusCode -eq 200 }
                     "lan_http" { $passed = [bool]$entry.Value -and (Invoke-WebRequest -UseBasicParsing -Uri ([string]$entry.Value) -TimeoutSec 8).StatusCode -eq 200 }
-                    "public_https" { $passed = [bool]$entry.Value -and (Invoke-WebRequest -UseBasicParsing -Uri ([string]$entry.Value) -TimeoutSec 12).StatusCode -eq 200 }
+                    "public_https" {
+                        $modulePath = Join-Path $RuntimeRoot "PublicIngress.psm1"
+                        Import-Module $modulePath -Force -ErrorAction Stop
+                        $target = [Uri]([string]$entry.Value)
+                        $addresses = @(Resolve-AfpPublicEdgeAddresses -HostName $target.DnsSafeHost)
+                        foreach ($address in $addresses) {
+                            if ((Invoke-AfpForcedPublicProbe -Uri $target -Address $address).ok) {
+                                $passed = $true
+                                break
+                            }
+                        }
+                    }
                     "funnel_origin" { $passed = [string]::Equals([string]$entry.Value, "http://127.0.0.1:8770", [StringComparison]::OrdinalIgnoreCase) }
                     "static_identity" {
                         $identityProbe = Test-AfpPublicStaticIdentity -RuntimeRoot $RuntimeRoot -PublicUrl $PublicUrl -ExpectedCandidateId $ExpectedCandidateId
@@ -571,6 +722,7 @@ function Wait-AfpRuntimeServices {
         [ValidateRange(0, 600)][int]$TimeoutSeconds = 90,
         [ValidateRange(1, 60000)][int]$PollIntervalMilliseconds = 1000,
         [scriptblock]$ProbeRunner,
+        [scriptblock]$PublicEdgeProbeRunner,
         [scriptblock]$DelayRunner
     )
 
@@ -586,6 +738,7 @@ function Wait-AfpRuntimeServices {
             FunnelOrigin = $FunnelOrigin
         }
         if ($ProbeRunner) { $arguments.ProbeRunner = $ProbeRunner }
+        if ($PublicEdgeProbeRunner) { $arguments.PublicEdgeProbeRunner = $PublicEdgeProbeRunner }
         $result = Test-AfpRuntimeServices @arguments
         if ($result.status -eq "passed") { break }
         if ($stopwatch.Elapsed.TotalSeconds -ge $TimeoutSeconds) { break }
@@ -724,6 +877,7 @@ Export-ModuleMember -Function @(
     "Invoke-AfpRuntimePromotion",
     "Restore-AfpRuntimePromotion",
     "Complete-AfpRuntimePromotion",
+    "Invoke-AfpVerifiedRuntimePromotion",
     "Test-AfpPublicStaticIdentity",
     "Test-AfpRuntimeServices",
     "Wait-AfpRuntimeServices",
