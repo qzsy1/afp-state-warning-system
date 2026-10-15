@@ -113,3 +113,22 @@
 - **WHEN** 重试成功且 CSV、质量侧车、journal 与 MySQL 完成身份和计数对账
 - **THEN** 阻止状态 MUST 可持久地清除，随后预检可通过
 
+### Requirement: Helper端点和会话必须匹配当前入口代次
+`remote_helper` 的端点选择、自动重连、配对、readiness 和命令通道 SHALL 使用服务器当前公网入口代次。Helper 保存的端点仅可用于同一代次内重连，不得覆盖操作员或候选交接提供的更新入口，也不得在代次不匹配时形成就绪状态。
+
+#### Scenario: 保存端点与当前交接入口不同
+- **WHEN** Helper 启动时保存的 URL 属于旧代次，而操作员或候选交接提供当前入口及其新代次
+- **THEN** Helper MUST 使用当前入口，MUST NOT 静默回退到旧 URL，并在重新配对前保持 `ready=false`
+
+#### Scenario: 同一代次连接暂时中断
+- **WHEN** Helper 与服务器的连接中断但权威 URL、候选身份和入口代次未变化
+- **THEN** Helper MAY 使用保存端点自动重连，并 MUST 清理陈旧连接状态后重新声明同一代次 readiness
+
+#### Scenario: Helper收到旧代次命令
+- **WHEN** Helper 收到的采集命令代次与当前会话代次不一致
+- **THEN** Helper MUST 拒绝执行并返回明确失败，不得打开设备、创建采集或把命令重新解释为当前代次
+
+#### Scenario: 无法取得当前入口代次
+- **WHEN** Helper 无法读取或验证服务器当前入口代次
+- **THEN** 进程 MAY 保持运行并报告诊断，但预检 MUST 为 `blocked` 或 `failed`，不得报告已配对、在线或可执行采集
+
