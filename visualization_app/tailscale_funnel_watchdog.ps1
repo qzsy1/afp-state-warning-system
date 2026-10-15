@@ -134,6 +134,70 @@ function Test-WatchdogMutationAllowed {
     return [pscustomobject]@{ allowed = $true; reason = "approved_cutover" }
 }
 
+function ConvertTo-WatchdogLayerTable($Layers) {
+    $table = @{}
+    if ($Layers) {
+        foreach ($property in $Layers.PSObject.Properties) {
+            $table[$property.Name] = @{
+                ok = [bool]$property.Value.ok
+                code = [string]$property.Value.code
+            }
+        }
+    }
+    return $table
+}
+
+function Restore-PreviousIngressState($PreviousState, [long]$PublishedGeneration) {
+    try {
+        if (-not $PreviousState) {
+            Remove-Item -LiteralPath $IngressStateFile -Force -ErrorAction Stop
+            return -not (Test-Path -LiteralPath $IngressStateFile -PathType Leaf)
+        }
+        $layers = ConvertTo-WatchdogLayerTable $PreviousState.layers
+        Publish-AfpPublicIngressState -Path $IngressStateFile `
+            -PublicUrl ([string]$PreviousState.public_url) `
+            -Provider ([string]$PreviousState.provider) `
+            -RecoveryOwner ([string]$PreviousState.recovery_owner) `
+            -CandidateId ([string]$PreviousState.candidate_id) `
+            -Layers $layers -ExpectedGeneration $PublishedGeneration | Out-Null
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Stop-CandidateIngress {
+    $result = Invoke-TailscaleWithTimeout @("funnel", "reset")
+    return $result.ExitCode -eq 0
+}
+
+function Retire-PreviousIngress {
+    param(
+        [string]$Provider,
+        [scriptblock]$CloudflareRetirer = $null
+    )
+    if (-not $Provider -or $Provider.Trim().ToLowerInvariant() -eq "tailscale") {
+        return $true
+    }
+    if ($Provider.Trim().ToLowerInvariant() -ne "cloudflare") {
+        return $false
+    }
+    if ($CloudflareRetirer) {
+        return [bool](& $CloudflareRetirer)
+    }
+    try {
+        $processes = @(Get-CimInstance Win32_Process | Where-Object {
+            $_.Name -eq "cloudflared.exe" -and $_.CommandLine -match "127\.0\.0\.1:8770"
+        })
+        foreach ($process in $processes) {
+            Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function Save-FunnelUrlAtomic([string]$Url) {
     New-Item -ItemType Directory -Path $FunnelRoot -Force | Out-Null
     $temporary = $FunnelUrlFile + "." + [Guid]::NewGuid().ToString("N") + ".tmp"
@@ -352,6 +416,9 @@ function Ensure-Funnel {
         Write-FunnelState ([string]$decision.reason) "当前 watchdog 不是公网入口恢复所有者，仅报告状态。"
         return $false
     }
+    $previousProvider = if ($state) { [string]$state.provider } else { "" }
+    $crossProviderCutover = $Mode -eq "Cutover" -and $previousProvider -and
+        $previousProvider.Trim().ToLowerInvariant() -ne "tailscale"
     if (-not $TailscaleExe) {
         Write-FunnelState "tailscale_not_installed" "尚未安装Tailscale。"
         return $false
@@ -404,9 +471,9 @@ function Ensure-Funnel {
         if ($state) { $publishParameters.ExpectedGeneration = [long]$state.generation }
         elseif ($ExpectedGeneration -ge 0) { $publishParameters.ExpectedGeneration = $ExpectedGeneration }
         $publication = Publish-AfpPublicIngressState @publishParameters
-        Save-FunnelUrlAtomic $publicUrl
         $layers.ingress = New-WatchdogLayer $true "ingress_published"
     } catch {
+        if ($crossProviderCutover) { Stop-CandidateIngress | Out-Null }
         Write-FunnelState "ingress_publication_failed" "公网入口状态发布失败。" $publicUrl $layers
         return $false
     }
@@ -416,18 +483,33 @@ function Ensure-Funnel {
     } else {
         New-WatchdogLayer $false "helper_recovery_failed"
     }
+    if (-not $helperReady) {
+        $rolledBack = if ($publication.changed) {
+            Restore-PreviousIngressState $state ([long]$publication.generation)
+        } else { $true }
+        if ($crossProviderCutover) { Stop-CandidateIngress | Out-Null }
+        $code = if ($rolledBack) { "helper_recovery_failed" } else { "cutover_rollback_failed" }
+        Write-FunnelState $code "公网边缘可用，但辅助程序未就绪。" $publicUrl $layers
+        return $false
+    }
     try {
         Publish-AfpPublicIngressState -Path $IngressStateFile -PublicUrl $publicUrl `
             -Provider "tailscale" -RecoveryOwner "tailscale" -CandidateId $candidateId `
             -Layers $layers -ExpectedGeneration ([long]$publication.generation) | Out-Null
     } catch {
-        Write-FunnelState "ingress_publication_failed" "公网入口最终状态发布失败。" $publicUrl $layers
+        $rolledBack = if ($publication.changed) {
+            Restore-PreviousIngressState $state ([long]$publication.generation)
+        } else { $true }
+        if ($crossProviderCutover) { Stop-CandidateIngress | Out-Null }
+        $code = if ($rolledBack) { "ingress_publication_failed" } else { "cutover_rollback_failed" }
+        Write-FunnelState $code "公网入口最终状态发布失败。" $publicUrl $layers
         return $false
     }
-    if (-not $helperReady) {
-        Write-FunnelState "helper_recovery_failed" "公网边缘可用，但辅助程序未就绪。" $publicUrl $layers
+    if ($crossProviderCutover -and -not (Retire-PreviousIngress $previousProvider)) {
+        Write-FunnelState "previous_ingress_retirement_failed" "新入口已就绪，但旧入口需要人工清理。" $publicUrl $layers
         return $false
     }
+    Save-FunnelUrlAtomic $publicUrl
     Write-FunnelState "online" "固定公网地址、系统服务和辅助程序均已启动。" $publicUrl $layers
     return $true
 }

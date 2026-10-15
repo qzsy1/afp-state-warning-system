@@ -27,6 +27,38 @@ class TailscaleFunnelWatchdogContractTests(unittest.TestCase):
         self.assertIn("[switch]$ApproveOwnerCutover", text)
         self.assertIn("Test-WatchdogMutationAllowed", text)
         self.assertIn("Publish-AfpPublicIngressState", text)
+        self.assertIn("Restore-PreviousIngressState", text)
+        self.assertIn("Retire-PreviousIngress", text)
+        self.assertIn('@("funnel", "reset")', text)
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "Windows PowerShell required")
+    def test_explicit_cutover_retires_only_the_previous_cloudflare_provider(self):
+        source = str(self.source.resolve()).replace("'", "''")
+        harness = textwrap.dedent(
+            f"""
+            $source = Get-Content -LiteralPath '{source}' -Raw
+            $tokens = $null; $errors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+            $definition = $ast.FindAll({{
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Retire-PreviousIngress'
+            }}, $true) | Select-Object -First 1
+            Invoke-Expression $definition.Extent.Text
+            $script:calls = 0
+            $retirer = {{ $script:calls += 1; return $true }}
+            if (-not (Retire-PreviousIngress 'cloudflare' $retirer)) {{ exit 21 }}
+            if ($script:calls -ne 1) {{ exit 22 }}
+            if (Retire-PreviousIngress 'unknown' $retirer) {{ exit 23 }}
+            if ($script:calls -ne 1) {{ exit 24 }}
+            exit 0
+            """
+        )
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "-"],
+            input=harness, text=True, capture_output=True, timeout=15, check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
 
     @unittest.skipUnless(shutil.which("powershell.exe"), "Windows PowerShell required")
     def test_non_owner_and_active_capture_decisions_fail_closed(self):

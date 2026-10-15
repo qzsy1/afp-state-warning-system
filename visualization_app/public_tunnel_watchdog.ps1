@@ -104,6 +104,70 @@ function Test-WatchdogMutationAllowed {
     return [pscustomobject]@{ allowed = $true; reason = "approved_cutover" }
 }
 
+function ConvertTo-WatchdogLayerTable($Layers) {
+    $table = @{}
+    if ($Layers) {
+        foreach ($property in $Layers.PSObject.Properties) {
+            $table[$property.Name] = @{
+                ok = [bool]$property.Value.ok
+                code = [string]$property.Value.code
+            }
+        }
+    }
+    return $table
+}
+
+function Restore-PreviousIngressState($PreviousState, [long]$PublishedGeneration) {
+    try {
+        if (-not $PreviousState) {
+            Remove-Item -LiteralPath $IngressStateFile -Force -ErrorAction Stop
+            return -not (Test-Path -LiteralPath $IngressStateFile -PathType Leaf)
+        }
+        $layers = ConvertTo-WatchdogLayerTable $PreviousState.layers
+        Publish-AfpPublicIngressState -Path $IngressStateFile `
+            -PublicUrl ([string]$PreviousState.public_url) `
+            -Provider ([string]$PreviousState.provider) `
+            -RecoveryOwner ([string]$PreviousState.recovery_owner) `
+            -CandidateId ([string]$PreviousState.candidate_id) `
+            -Layers $layers -ExpectedGeneration $PublishedGeneration | Out-Null
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Stop-CandidateIngress {
+    try {
+        Stop-StaleTunnel
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Retire-PreviousIngress {
+    param(
+        [string]$Provider,
+        [scriptblock]$TailscaleRetirer = $null
+    )
+    if (-not $Provider -or $Provider.Trim().ToLowerInvariant() -eq "cloudflare") {
+        return $true
+    }
+    if ($Provider.Trim().ToLowerInvariant() -ne "tailscale") {
+        return $false
+    }
+    if ($TailscaleRetirer) {
+        return [bool](& $TailscaleRetirer)
+    }
+    try {
+        $command = Get-Command tailscale.exe -ErrorAction Stop
+        & $command.Source funnel reset 2>&1 | Out-Null
+        return $LASTEXITCODE -eq 0
+    } catch {
+        return $false
+    }
+}
+
 function Save-TunnelUrlAtomic([string]$Url) {
     $temporary = $TunnelUrlFile + "." + [Guid]::NewGuid().ToString("N") + ".tmp"
     try {
@@ -264,6 +328,9 @@ function Ensure-Tunnel {
         Write-TunnelState ([string]$decision.reason)
         return $false
     }
+    $previousProvider = if ($state) { [string]$state.provider } else { "" }
+    $crossProviderCutover = $Mode -eq "Cutover" -and $previousProvider -and
+        $previousProvider.Trim().ToLowerInvariant() -ne "cloudflare"
     if (-not (Ensure-Origin)) { return $false }
     if (-not (Test-Tunnel)) {
         Stop-StaleTunnel
@@ -303,9 +370,9 @@ function Ensure-Tunnel {
         if ($state) { $publishParameters.ExpectedGeneration = [long]$state.generation }
         elseif ($ExpectedGeneration -ge 0) { $publishParameters.ExpectedGeneration = $ExpectedGeneration }
         $publication = Publish-AfpPublicIngressState @publishParameters
-        Save-TunnelUrlAtomic $publicUrl
         $layers.ingress = New-WatchdogLayer $true "ingress_published"
     } catch {
+        if ($crossProviderCutover) { Stop-CandidateIngress | Out-Null }
         Write-TunnelState "ingress_publication_failed" $publicUrl $layers
         return $false
     }
@@ -315,18 +382,33 @@ function Ensure-Tunnel {
     } else {
         New-WatchdogLayer $false "helper_recovery_failed"
     }
+    if (-not $helperReady) {
+        $rolledBack = if ($publication.changed) {
+            Restore-PreviousIngressState $state ([long]$publication.generation)
+        } else { $true }
+        if ($crossProviderCutover) { Stop-CandidateIngress | Out-Null }
+        $code = if ($rolledBack) { "helper_recovery_failed" } else { "cutover_rollback_failed" }
+        Write-TunnelState $code $publicUrl $layers
+        return $false
+    }
     try {
         Publish-AfpPublicIngressState -Path $IngressStateFile -PublicUrl $publicUrl `
             -Provider "cloudflare" -RecoveryOwner "cloudflare" -CandidateId $candidateId `
             -Layers $layers -ExpectedGeneration ([long]$publication.generation) | Out-Null
     } catch {
-        Write-TunnelState "ingress_publication_failed" $publicUrl $layers
+        $rolledBack = if ($publication.changed) {
+            Restore-PreviousIngressState $state ([long]$publication.generation)
+        } else { $true }
+        if ($crossProviderCutover) { Stop-CandidateIngress | Out-Null }
+        $code = if ($rolledBack) { "ingress_publication_failed" } else { "cutover_rollback_failed" }
+        Write-TunnelState $code $publicUrl $layers
         return $false
     }
-    if (-not $helperReady) {
-        Write-TunnelState "helper_recovery_failed" $publicUrl $layers
+    if ($crossProviderCutover -and -not (Retire-PreviousIngress $previousProvider)) {
+        Write-TunnelState "previous_ingress_retirement_failed" $publicUrl $layers
         return $false
     }
+    Save-TunnelUrlAtomic $publicUrl
     Write-TunnelState "online" $publicUrl $layers
     return $true
 }

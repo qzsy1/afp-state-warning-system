@@ -1,4 +1,7 @@
 from pathlib import Path
+import shutil
+import subprocess
+import textwrap
 import unittest
 
 
@@ -20,6 +23,38 @@ class PublicTunnelWatchdogContractTests(unittest.TestCase):
         self.assertIn("[switch]$ApproveOwnerCutover", text)
         self.assertIn("Test-WatchdogMutationAllowed", text)
         self.assertIn("non_owner_observe_only", text)
+        self.assertIn("Restore-PreviousIngressState", text)
+        self.assertIn("Retire-PreviousIngress", text)
+        self.assertIn("funnel reset", text)
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "Windows PowerShell required")
+    def test_explicit_cutover_retires_only_the_previous_tailscale_provider(self):
+        source = str(Path(__file__).with_name("public_tunnel_watchdog.ps1").resolve()).replace("'", "''")
+        harness = textwrap.dedent(
+            f"""
+            $source = Get-Content -LiteralPath '{source}' -Raw
+            $tokens = $null; $errors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+            $definition = $ast.FindAll({{
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Retire-PreviousIngress'
+            }}, $true) | Select-Object -First 1
+            Invoke-Expression $definition.Extent.Text
+            $script:calls = 0
+            $retirer = {{ $script:calls += 1; return $true }}
+            if (-not (Retire-PreviousIngress 'tailscale' $retirer)) {{ exit 21 }}
+            if ($script:calls -ne 1) {{ exit 22 }}
+            if (Retire-PreviousIngress 'unknown' $retirer) {{ exit 23 }}
+            if ($script:calls -ne 1) {{ exit 24 }}
+            exit 0
+            """
+        )
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "-"],
+            input=harness, text=True, capture_output=True, timeout=15, check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
 
     def test_layered_status_requires_helper_success(self):
         text = self.source_text()
