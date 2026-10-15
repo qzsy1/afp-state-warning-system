@@ -67,6 +67,12 @@ class HelperWebSocketTransportTests(unittest.TestCase):
         self.assertIn('message.get("type") == "sample_ack"', helper)
         self.assertIn("next_sample_batch", helper)
 
+    def test_server_websocket_enforces_ingress_generation_on_results_and_samples(self):
+        server = Path(__file__).with_name("app.py").read_text(encoding="utf-8")
+        self.assertIn('ingress_generation=message.get("ingress_generation")', server)
+        self.assertIn("authorize_generation", server)
+        self.assertIn('"error": "ingress_generation_mismatch"', server)
+
     def test_live_routes_select_session_remote_acquisition(self):
         server = Path(__file__).with_name("app.py").read_text(encoding="utf-8")
         self.assertIn("def _request_acquisition", server)

@@ -8,6 +8,7 @@ import gzip
 import hashlib
 import hmac
 import inspect
+import ipaddress
 import io
 import json
 import math
@@ -86,6 +87,10 @@ from edge_capture import RemoteAcquisitionRegistry, select_acquisition_for_ident
 from local_capture_agent import LocalCaptureAgent
 from diagnosis_jobs import DiagnosisJobStore
 from public_status import build_public_device_status
+from public_ingress_state import (
+    public_ingress_state_path,
+    release_candidate_id,
+)
 from web_access import (
     REAL_ACCESS_ROLES,
     PermissionPolicy,
@@ -4424,6 +4429,10 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def _ingest_helper_sample(self, session_id: str, batch: dict[str, Any]) -> dict[str, Any]:
         trusted_batch = dict(batch) if isinstance(batch, dict) else {}
+        if not self.dashboard.helper_registry.authorize_generation(
+            session_id, trusted_batch.get("ingress_generation")
+        ):
+            return {"ok": False, "error": "ingress_generation_mismatch"}
         helper_status = self.dashboard.helper_registry.status(session_id)
         capabilities = dict(helper_status.get("capabilities") or {})
         if capabilities.get("unified_frame_v1"):
@@ -4442,8 +4451,22 @@ class AppHandler(BaseHTTPRequestHandler):
         )
 
     def _accept_helper_result(
-        self, device_id: str, token: str, request_id: str, payload: dict[str, Any]
+        self,
+        device_id: str,
+        token: str,
+        request_id: str,
+        payload: dict[str, Any],
+        ingress_generation: Any = None,
     ) -> dict[str, Any]:
+        accepted = self.dashboard.helper_registry.accept_result(
+            device_id,
+            token,
+            request_id,
+            payload,
+            ingress_generation=ingress_generation,
+        )
+        if not accepted.get("ok"):
+            return accepted
         session_id = self.dashboard.helper_registry.authenticate(device_id, token)
         if session_id is not None:
             capture_uuid = str((payload or {}).get("capture_uuid") or "").strip()
@@ -4455,9 +4478,52 @@ class AppHandler(BaseHTTPRequestHandler):
             self.dashboard.remote_acquisitions.for_session(
                 session_id
             ).observe_helper_status(payload)
-        return self.dashboard.helper_registry.accept_result(
-            device_id, token, request_id, payload
+        return accepted
+
+    def _is_loopback_client(self) -> bool:
+        peer = str(self.client_address[0] if self.client_address else "").strip()
+        try:
+            return ipaddress.ip_address(peer).is_loopback
+        except ValueError:
+            return peer.lower() == "localhost"
+
+    def _cutover_readiness(self) -> dict[str, Any]:
+        readiness = self.dashboard.helper_registry.cutover_readiness()
+        captures = set(str(value) for value in readiness["active_capture_uuids"] if value)
+        blockers = set(str(value) for value in readiness["blocking_request_ids"] if value)
+        try:
+            local_status = self.dashboard.acquisition.status()
+        except Exception:
+            local_status = {}
+        if isinstance(local_status, dict) and local_status.get("running"):
+            captures.add(str(local_status.get("capture_uuid") or "local_capture"))
+
+        mirrors = self.dashboard.remote_acquisitions
+        with mirrors._lock:
+            remote_statuses = [mirror.status() for mirror in mirrors._mirrors.values()]
+        for status in remote_statuses:
+            if status.get("running") or status.get("flush_state") == "flushing":
+                captures.add(str(status.get("capture_uuid") or "remote_capture"))
+
+        journal = self.target_capture_journal
+        with journal._lock:
+            blockers.update(request_id for _session_id, request_id in journal._pending_starts)
+        try:
+            with journal._connection() as connection:
+                rows = connection.execute(
+                    "SELECT capture_uuid FROM captures "
+                    "WHERE final_status IS NULL OR save_state IN ('receiving','saving')"
+                ).fetchall()
+            captures.update(str(row[0]) for row in rows if row and row[0])
+        except Exception:
+            blockers.add("journal_reconciliation_unavailable")
+
+        readiness["active_capture_uuids"] = sorted(captures)
+        readiness["blocking_request_ids"] = sorted(blockers)
+        readiness["allowed"] = bool(
+            readiness.get("allowed") and not captures and not blockers
         )
+        return readiness
 
     def _diagnostic_context(
         self, hardware_result: dict[str, Any]
@@ -4899,6 +4965,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         message.get("payload")
                         if isinstance(message.get("payload"), dict)
                         else {},
+                        ingress_generation=message.get("ingress_generation"),
                     )
                     sender({"type": "result_ack", **accepted})
                 elif message_type == "sample_batch":
@@ -4917,6 +4984,15 @@ class AppHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "请求 Host 不被允许"}, HTTPStatus.FORBIDDEN)
             return
         parsed = urlparse(self.path)
+        if parsed.path == "/api/ingress/cutover-readiness":
+            if not self._is_loopback_client():
+                self._send_json(
+                    {"ok": False, "error": "loopback_required"},
+                    HTTPStatus.FORBIDDEN,
+                )
+                return
+            self._send_json(self._cutover_readiness())
+            return
         self._ensure_browser_cookies()
         if parsed.path.startswith("/api/") and not self._require_permission(
             "GET", parsed.path
@@ -5401,6 +5477,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         device_id, token,
                         str(payload.get("request_id") or ""),
                         payload.get("payload") if isinstance(payload.get("payload"), dict) else {},
+                        ingress_generation=payload.get("ingress_generation"),
                     )
                 self._send_json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.UNAUTHORIZED)
                 return
@@ -6394,9 +6471,16 @@ def create_server(
     access_context: str = "public",
     public_web_config: dict[str, Any] | None = None,
     network_status_provider: Any = None,
+    ingress_state_file: str | Path | None = None,
+    expected_ingress_candidate_id: str = "",
 ) -> ThreadingHTTPServer:
     active_dashboard = dashboard or DashboardData()
-    runtime_root = (APP_DIR.parent / "runtime").resolve()
+    selected_ingress_state = (
+        Path(ingress_state_file).resolve()
+        if ingress_state_file is not None
+        else public_ingress_state_path(RELEASE_CONTRACT)
+    )
+    runtime_root = selected_ingress_state.parent
     active_security_store = security_store or SecurityStore(
         runtime_root / "public_web_security.sqlite3"
     )
@@ -6420,7 +6504,12 @@ def create_server(
     )
     active_control_lease = control_lease or RealControlLease()
     helper_registry = HelperRegistry(
-        persistence_path=runtime_root / "helper_registry.json"
+        persistence_path=runtime_root / "helper_registry.json",
+        ingress_state_path=selected_ingress_state,
+        expected_candidate_id=(
+            str(expected_ingress_candidate_id or "")
+            or release_candidate_id(RELEASE_CONTRACT)
+        ),
     )
     active_dashboard.helper_registry = helper_registry
     active_dashboard.remote_acquisitions = RemoteAcquisitionRegistry()

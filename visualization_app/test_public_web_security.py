@@ -379,8 +379,9 @@ class PublicWebAccessTests(unittest.TestCase):
 
 class PublicWebHttpTests(unittest.TestCase):
     def setUp(self) -> None:
-        from app import create_server
+        from app import RELEASE_CONTRACT, create_server
         from guest_simulation import GuestSimulationManager
+        from public_ingress_state import release_candidate_id
         from web_auth import SecurityStore
 
         self.temp = tempfile.TemporaryDirectory()
@@ -458,6 +459,23 @@ class PublicWebHttpTests(unittest.TestCase):
             root / "public_simulation",
             {"builtin": {"source_type": "single_csv", "path": str(source)}},
         )
+        ingress_state = root / "public-ingress-state.json"
+        ingress_state.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "generation": 1,
+                    "public_url": "https://afp.example.test",
+                    "provider": "tailscale",
+                    "recovery_owner": "tailscale",
+                    "candidate_id": release_candidate_id(RELEASE_CONTRACT),
+                    "status": "online",
+                    "published_at": "2026-10-15T00:00:00+00:00",
+                    "layers": {"edge": {"ok": True}},
+                }
+            ),
+            encoding="utf-8",
+        )
         self.server = create_server(
             "127.0.0.1",
             0,
@@ -466,10 +484,54 @@ class PublicWebHttpTests(unittest.TestCase):
             security_store=store,
             guest_manager=guest_manager,
             access_context="public",
+            ingress_state_file=ingress_state,
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.cookies: dict[str, str] = {}
+
+    def test_cutover_readiness_is_loopback_only_and_contains_no_secrets(self):
+        status, payload, _ = self.request_json("GET", "/api/ingress/cutover-readiness")
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(payload["allowed"])
+        self.assertEqual(payload["generation"], 1)
+        encoded = json.dumps(payload)
+        for forbidden in ("pairing_token", "challenge", "payload", "password", "cookie"):
+            self.assertNotIn(forbidden, encoded.lower())
+
+        handler = self.server.RequestHandlerClass
+        fake = object.__new__(handler)
+        fake.client_address = ("192.168.1.20", 12345)
+        self.assertFalse(handler._is_loopback_client(fake))
+
+    def test_stale_generation_sample_submission_is_rejected(self):
+        self.request_json("GET", "/api/auth/session")
+        self.request_json(
+            "POST", "/api/auth/login", {"password": "Correct-Horse-2026"},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        _, challenge, _ = self.request_json("POST", "/api/helper/pair/start", {})
+        _, paired, _ = self.request_json(
+            "POST", "/api/helper/pair/complete",
+            {"challenge": challenge["challenge"], "device_id": "visitor-stale"},
+        )
+        status, result, _ = self.request_json(
+            "POST", "/api/helper/samples",
+            {
+                "device_id": "visitor-stale",
+                "batch": {
+                    "ingress_generation": 0,
+                    "capture_uuid": "stale-capture",
+                    "sequence": 0,
+                    "rows": [],
+                    "timestamps": [],
+                },
+            },
+            headers={"Authorization": f"Bearer {paired['pairing_token']}"},
+            csrf=False,
+        )
+        self.assertEqual(status, 401)
+        self.assertEqual(result["error"], "ingress_generation_mismatch")
 
     def tearDown(self) -> None:
         self.server.shutdown()
@@ -630,6 +692,7 @@ class PublicWebHttpTests(unittest.TestCase):
             {
                 "device_id": "visitor-pc",
                 "batch": {
+                    "ingress_generation": paired["ingress_generation"],
                     "capture_uuid": "capture-a",
                     "sequence": 0,
                     "rows": [{"温度": 350.0}],
@@ -727,10 +790,12 @@ class PublicWebHttpTests(unittest.TestCase):
         request_id = polled["command"]["request_id"]
         self.request_json("POST", "/api/helper/result", {
             "device_id": "visitor-pc", "request_id": request_id,
+            "ingress_generation": paired["ingress_generation"],
             "payload": {"running": True, "capture_uuid": "capture-target-a"},
         }, headers={"Authorization": f"Bearer {paired['pairing_token']}"}, csrf=False)
         _, accepted, _ = self.request_json("POST", "/api/helper/samples", {
             "device_id": "visitor-pc", "batch": {
+                "ingress_generation": paired["ingress_generation"],
                 "capture_uuid": "capture-target-a", "sequence": 0,
                 "rows": [{"薄膜压力": 10.0}], "timestamps": [10.0],
                 "frames": [{
@@ -1404,6 +1469,7 @@ class BuildManifestTests(unittest.TestCase):
             "control_lease.py",
             "simulation_replay.py",
             "simulation_source_transfer.py",
+            "public_ingress_state.py",
         ):
             self.assertIn(f'"{name}"', script)
 

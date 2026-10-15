@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from public_ingress_state import PublicIngressState, load_public_ingress_state
 from release_contract import (
     helper_capability_mismatches,
     load_release_contract,
@@ -87,6 +88,7 @@ class _Pairing:
     challenge_hash: str
     created_at: float
     expires_at: float
+    generation: int
 
 
 @dataclass
@@ -94,12 +96,23 @@ class _Helper:
     session_id: str
     device_id: str
     token_hash: str
+    generation: int
     capabilities: dict[str, Any] = field(default_factory=dict)
     online: bool = False
     last_seen: float | None = None
     sender: Callable[[dict[str, Any]], None] | None = None
     queue: deque[dict[str, Any]] = field(default_factory=deque)
     results: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+@dataclass
+class _CommandRecord:
+    request_id: str
+    session_id: str
+    command: str
+    generation: int
+    delivery_state: str
+    terminal_error: str = ""
 
 
 class HelperRegistry:
@@ -111,16 +124,85 @@ class HelperRegistry:
         challenge_ttl_seconds: int = 300,
         heartbeat_ttl_seconds: int = 60,
         persistence_path: str | Path | None = None,
+        ingress_state_path: str | Path | None = None,
+        expected_candidate_id: str = "",
+        ingress_state_loader: Callable[..., PublicIngressState] | None = None,
     ) -> None:
         self.challenge_ttl_seconds = max(30, int(challenge_ttl_seconds))
         self.heartbeat_ttl_seconds = max(1, int(heartbeat_ttl_seconds))
         self.persistence_path = Path(persistence_path).resolve() if persistence_path else None
+        self.ingress_state_path = Path(ingress_state_path).resolve() if ingress_state_path else None
+        self.expected_candidate_id = str(expected_candidate_id or "")
+        self.ingress_state_loader = ingress_state_loader or load_public_ingress_state
         self._lock = threading.RLock()
         self._pairings: dict[str, _Pairing] = {}
         self._helpers: dict[str, _Helper] = {}
-        self._load_persisted_helpers()
+        self._commands: dict[str, _CommandRecord] = {}
+        self._terminal_results: dict[tuple[str, str], dict[str, Any]] = {}
+        self._active_captures: dict[str, str] = {}
+        self._ingress_state: PublicIngressState | None = None
+        self._ingress_generation = 0
+        self._ingress_error = ""
+        with self._lock:
+            self._synchronize_ingress_locked()
+            self._load_persisted_helpers_locked()
 
-    def _load_persisted_helpers(self) -> None:
+    def _terminalize_generation_locked(self, generation: int) -> None:
+        terminal = {
+            "ok": False,
+            "error": "ingress_generation_changed",
+            "terminal": True,
+        }
+        for record in self._commands.values():
+            if record.generation <= generation and record.delivery_state not in {"terminal", "completed"}:
+                record.delivery_state = "terminal"
+                record.terminal_error = "ingress_generation_changed"
+                self._terminal_results[(record.session_id, record.request_id)] = dict(terminal)
+        self._pairings.clear()
+        for helper in self._helpers.values():
+            helper.sender = None
+            helper.online = False
+        self._helpers.clear()
+        self._active_captures.clear()
+        self._persist_helpers_locked()
+
+    def _synchronize_ingress_locked(self) -> bool:
+        if self.ingress_state_path is None:
+            self._ingress_error = ""
+            self._ingress_generation = 0
+            return True
+        try:
+            state = self.ingress_state_loader(
+                self.ingress_state_path,
+                self.expected_candidate_id,
+            )
+            if not isinstance(state, PublicIngressState):
+                raise ValueError("ingress state loader returned an invalid value")
+        except Exception as exc:
+            self._ingress_error = str(exc) or exc.__class__.__name__
+            return False
+
+        previous = self._ingress_state
+        if previous is not None:
+            if state.generation < previous.generation:
+                self._ingress_error = "public ingress generation rollback detected"
+                return False
+            if state.generation == previous.generation and (
+                state.public_url != previous.public_url
+                or state.provider != previous.provider
+                or state.recovery_owner != previous.recovery_owner
+                or state.candidate_id != previous.candidate_id
+            ):
+                self._ingress_error = "public ingress identity changed without a new generation"
+                return False
+            if state.generation > previous.generation:
+                self._terminalize_generation_locked(previous.generation)
+        self._ingress_state = state
+        self._ingress_generation = state.generation
+        self._ingress_error = ""
+        return True
+
+    def _load_persisted_helpers_locked(self) -> None:
         path = self.persistence_path
         if path is None or not path.is_file():
             return
@@ -129,22 +211,74 @@ class HelperRegistry:
             helpers = payload.get("helpers", {}) if isinstance(payload, dict) else {}
             if not isinstance(helpers, dict):
                 return
-            with self._lock:
-                for session_id, item in helpers.items():
+            for session_id, item in helpers.items():
+                if not isinstance(item, dict):
+                    continue
+                device_id = str(item.get("device_id") or "").strip()
+                token_hash = str(item.get("token_hash") or "").strip()
+                try:
+                    generation = int(item.get("generation", 0))
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    not device_id
+                    or len(token_hash) != 64
+                    or generation != self._ingress_generation
+                    or self._ingress_error
+                ):
+                    continue
+                self._helpers[str(session_id)] = _Helper(
+                    session_id=str(session_id),
+                    device_id=device_id,
+                    token_hash=token_hash,
+                    generation=generation,
+                    capabilities=dict(item.get("capabilities") or {}),
+                    online=False,
+                    last_seen=None,
+                )
+            commands = payload.get("commands", {}) if isinstance(payload, dict) else {}
+            if isinstance(commands, dict):
+                for request_id, item in commands.items():
                     if not isinstance(item, dict):
                         continue
-                    device_id = str(item.get("device_id") or "").strip()
-                    token_hash = str(item.get("token_hash") or "").strip()
-                    if not device_id or len(token_hash) != 64:
+                    try:
+                        generation = int(item.get("generation", -1))
+                    except (TypeError, ValueError):
                         continue
-                    self._helpers[str(session_id)] = _Helper(
-                        session_id=str(session_id),
-                        device_id=device_id,
-                        token_hash=token_hash,
-                        capabilities=dict(item.get("capabilities") or {}),
-                        online=False,
-                        last_seen=None,
+                    record = _CommandRecord(
+                        request_id=str(request_id),
+                        session_id=str(item.get("session_id") or ""),
+                        command=str(item.get("command") or ""),
+                        generation=generation,
+                        delivery_state=str(item.get("delivery_state") or "terminal"),
+                        terminal_error=str(item.get("terminal_error") or ""),
                     )
+                    if not record.session_id or not record.command:
+                        continue
+                    if generation != self._ingress_generation and record.delivery_state not in {"terminal", "completed"}:
+                        record.delivery_state = "terminal"
+                        record.terminal_error = "ingress_generation_changed"
+                    self._commands[record.request_id] = record
+                    if record.delivery_state == "terminal" and record.terminal_error:
+                        self._terminal_results[(record.session_id, record.request_id)] = {
+                            "ok": False,
+                            "error": record.terminal_error,
+                            "terminal": True,
+                        }
+            try:
+                persisted_generation = int(payload.get("ingress_generation", -1))
+            except (TypeError, ValueError):
+                persisted_generation = -1
+            active_captures = payload.get("active_captures", {})
+            if persisted_generation == self._ingress_generation and isinstance(active_captures, dict):
+                self._active_captures.update(
+                    {
+                        str(capture_uuid): str(session_id)
+                        for capture_uuid, session_id in active_captures.items()
+                        if str(capture_uuid).strip() and str(session_id).strip()
+                    }
+                )
+            self._persist_helpers_locked()
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return
 
@@ -155,15 +289,28 @@ class HelperRegistry:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             payload = {
-                "version": 1,
+                "version": 2,
+                "ingress_generation": self._ingress_generation,
                 "helpers": {
                     session_id: {
                         "device_id": helper.device_id,
                         "token_hash": helper.token_hash,
+                        "generation": helper.generation,
                         "capabilities": dict(helper.capabilities),
                     }
                     for session_id, helper in self._helpers.items()
                 },
+                "commands": {
+                    request_id: {
+                        "session_id": record.session_id,
+                        "command": record.command,
+                        "generation": record.generation,
+                        "delivery_state": record.delivery_state,
+                        "terminal_error": record.terminal_error,
+                    }
+                    for request_id, record in self._commands.items()
+                },
+                "active_captures": dict(self._active_captures),
             }
             temporary = path.with_name(path.name + ".tmp")
             temporary.write_text(
@@ -180,11 +327,14 @@ class HelperRegistry:
         challenge = secrets.token_urlsafe(24)
         now = time.time()
         with self._lock:
+            if not self._synchronize_ingress_locked():
+                return {"ok": False, "error": "ingress_state_unavailable"}
             self._pairings[session_id] = _Pairing(
                 session_id=session_id,
                 challenge_hash=_hash(challenge),
                 created_at=now,
                 expires_at=now + self.challenge_ttl_seconds,
+                generation=self._ingress_generation,
             )
         return {
             "ok": True,
@@ -201,9 +351,11 @@ class HelperRegistry:
         challenge = normalize_pairing_code(challenge)
         now = time.time()
         with self._lock:
+            if not self._synchronize_ingress_locked():
+                return {"ok": False, "error": "ingress_state_unavailable"}
             matched_session = None
             for session_id, pairing in self._pairings.items():
-                if pairing.expires_at >= now and hmac.compare_digest(
+                if pairing.generation == self._ingress_generation and pairing.expires_at >= now and hmac.compare_digest(
                     pairing.challenge_hash, _hash(challenge)
                 ):
                     matched_session = session_id
@@ -216,6 +368,7 @@ class HelperRegistry:
                 session_id=matched_session,
                 device_id=str(device_id),
                 token_hash=_hash(token),
+                generation=self._ingress_generation,
                 capabilities=dict(capabilities or {}),
                 online=True,
                 last_seen=now,
@@ -226,6 +379,7 @@ class HelperRegistry:
                 "session_id": matched_session,
                 "device_id": str(device_id),
                 "pairing_token": token,
+                "ingress_generation": self._ingress_generation,
             }
 
     def attach(
@@ -237,8 +391,14 @@ class HelperRegistry:
         capabilities: dict[str, Any] | None = None,
     ) -> bool:
         with self._lock:
+            if not self._synchronize_ingress_locked():
+                return False
             helper = self._helpers.get(session_id)
-            if helper is None or helper.device_id != str(device_id):
+            if (
+                helper is None
+                or helper.generation != self._ingress_generation
+                or helper.device_id != str(device_id)
+            ):
                 return False
             if not hmac.compare_digest(helper.token_hash, _hash(pairing_token)):
                 return False
@@ -270,27 +430,42 @@ class HelperRegistry:
                 helper.online = False
                 helper.sender = None
 
+    def _authenticate_locked(self, device_id: str, pairing_token: str) -> str | None:
+        for session_id, helper in self._helpers.items():
+            if (
+                helper.generation == self._ingress_generation
+                and helper.device_id == str(device_id)
+                and hmac.compare_digest(helper.token_hash, _hash(pairing_token))
+            ):
+                helper.online = True
+                helper.last_seen = time.time()
+                return session_id
+        return None
+
     def authenticate(self, device_id: str, pairing_token: str) -> str | None:
         """Return the owning session for a helper bearer token."""
         with self._lock:
-            for session_id, helper in self._helpers.items():
-                if helper.device_id == str(device_id) and hmac.compare_digest(
-                    helper.token_hash, _hash(pairing_token)
-                ):
-                    helper.online = True
-                    helper.last_seen = time.time()
-                    return session_id
-        return None
+            if not self._synchronize_ingress_locked():
+                return None
+            return self._authenticate_locked(device_id, pairing_token)
 
     def poll(self, device_id: str, pairing_token: str) -> dict[str, Any]:
-        session_id = self.authenticate(device_id, pairing_token)
-        if session_id is None:
-            return {"ok": False, "error": "helper_authentication_failed"}
         with self._lock:
+            if not self._synchronize_ingress_locked():
+                return {"ok": False, "error": "ingress_state_unavailable"}
+            session_id = self._authenticate_locked(device_id, pairing_token)
+            if session_id is None:
+                return {"ok": False, "error": "helper_authentication_failed"}
             helper = self._helpers[session_id]
             if helper.queue:
-                return {"ok": True, "command": helper.queue.popleft()}
-            return {"ok": True, "command": None, "heartbeat": True}
+                command = helper.queue.popleft()
+                record = self._commands.get(str(command.get("request_id") or ""))
+                if record is None or record.generation != self._ingress_generation:
+                    return {"ok": False, "error": "ingress_generation_changed"}
+                record.delivery_state = "delivered"
+                self._persist_helpers_locked()
+                return {"ok": True, "command": command, "ingress_generation": self._ingress_generation}
+            return {"ok": True, "command": None, "heartbeat": True, "ingress_generation": self._ingress_generation}
 
     def accept_result(
         self,
@@ -298,17 +473,51 @@ class HelperRegistry:
         pairing_token: str,
         request_id: str,
         payload: dict[str, Any],
+        ingress_generation: int | None = None,
     ) -> dict[str, Any]:
-        session_id = self.authenticate(device_id, pairing_token)
-        if session_id is None:
-            return {"ok": False, "error": "helper_authentication_failed"}
         with self._lock:
+            if not self._synchronize_ingress_locked():
+                return {"ok": False, "error": "ingress_state_unavailable"}
+            session_id = self._authenticate_locked(device_id, pairing_token)
+            if session_id is None:
+                return {"ok": False, "error": "helper_authentication_failed"}
             helper = self._helpers[session_id]
-            helper.results[str(request_id)] = dict(payload)
+            record = self._commands.get(str(request_id))
+            if record is None or record.session_id != session_id:
+                return {"ok": False, "error": "helper_request_unknown"}
+            try:
+                received_generation = (
+                    helper.generation
+                    if ingress_generation is None
+                    else int(ingress_generation)
+                )
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "ingress_generation_mismatch"}
+            if received_generation != self._ingress_generation or record.generation != self._ingress_generation:
+                return {"ok": False, "error": "ingress_generation_mismatch"}
+            result = dict(payload)
+            helper.results[str(request_id)] = result
+            record.delivery_state = "completed"
+            record.terminal_error = ""
+            capture_uuid = str(result.get("capture_uuid") or "").strip()
+            if record.command in {"start_capture", "status"} and result.get("running") is True and capture_uuid:
+                self._active_captures[capture_uuid] = session_id
+            if result.get("running") is False and capture_uuid:
+                self._active_captures.pop(capture_uuid, None)
+            self._persist_helpers_locked()
         return {"ok": True, "request_id": str(request_id)}
 
     def pop_result(self, session_id: str, request_id: str) -> dict[str, Any] | None:
         with self._lock:
+            self._synchronize_ingress_locked()
+            terminal = self._terminal_results.pop((session_id, str(request_id)), None)
+            if terminal is not None:
+                record = self._commands.get(str(request_id))
+                if record is not None:
+                    record.delivery_state = "completed"
+                    record.terminal_error = ""
+                    self._persist_helpers_locked()
+                return terminal
             helper = self._helpers.get(session_id)
             if helper is None:
                 return None
@@ -316,6 +525,7 @@ class HelperRegistry:
 
     def status(self, session_id: str) -> dict[str, Any]:
         with self._lock:
+            ready = self._synchronize_ingress_locked()
             helper = self._helpers.get(session_id)
             if helper is None:
                 return {
@@ -323,6 +533,9 @@ class HelperRegistry:
                     "online": False,
                     "capabilities": {},
                     "protocol_compatible": False,
+                    "ingress_generation": self._ingress_generation,
+                    "ingress_state_ready": ready,
+                    "ingress_error": "" if ready else "ingress_state_unavailable",
                 }
             if helper.online and helper.last_seen is not None:
                 if time.time() - helper.last_seen > self.heartbeat_ttl_seconds:
@@ -345,7 +558,42 @@ class HelperRegistry:
                 "protocol_version": protocol_version,
                 "protocol_compatible": protocol_compatible,
                 "last_seen": helper.last_seen,
+                "ingress_generation": self._ingress_generation,
+                "ingress_state_ready": ready,
+                "ingress_error": "" if ready else "ingress_state_unavailable",
             }
+
+    def cutover_readiness(self) -> dict[str, Any]:
+        with self._lock:
+            ready = self._synchronize_ingress_locked()
+            blocking = sorted(
+                record.request_id
+                for record in self._commands.values()
+                if record.command in {"start_capture", "stop_capture"}
+                and record.delivery_state not in {"completed", "terminal"}
+            )
+            captures = sorted(self._active_captures)
+            return {
+                "allowed": bool(ready and not captures and not blocking),
+                "generation": self._ingress_generation,
+                "active_capture_uuids": captures,
+                "blocking_request_ids": blocking,
+            }
+
+    def authorize_generation(self, session_id: str, generation: Any) -> bool:
+        with self._lock:
+            if not self._synchronize_ingress_locked():
+                return False
+            helper = self._helpers.get(str(session_id))
+            try:
+                supplied = int(generation)
+            except (TypeError, ValueError):
+                supplied = 0 if self.ingress_state_path is None else -1
+            return bool(
+                helper is not None
+                and helper.generation == self._ingress_generation
+                and supplied == self._ingress_generation
+            )
 
     def command(
         self,
@@ -357,8 +605,10 @@ class HelperRegistry:
         if command not in ALLOWED_HELPER_COMMANDS:
             return {"ok": False, "error": "command_not_allowed"}
         with self._lock:
+            if not self._synchronize_ingress_locked():
+                return {"ok": False, "queued": False, "error": "ingress_state_unavailable"}
             helper = self._helpers.get(session_id)
-            if helper is None:
+            if helper is None or helper.generation != self._ingress_generation:
                 return {"ok": False, "error": "helper_not_paired"}
             if helper.online and helper.last_seen is not None:
                 if time.time() - helper.last_seen > self.heartbeat_ttl_seconds:
@@ -384,12 +634,22 @@ class HelperRegistry:
                 "request_id": uuid.uuid4().hex,
                 "command": command,
                 "payload": dict(payload or {}),
+                "ingress_generation": self._ingress_generation,
             }
+            record = _CommandRecord(
+                request_id=request["request_id"],
+                session_id=session_id,
+                command=command,
+                generation=self._ingress_generation,
+                delivery_state="queued",
+            )
+            self._commands[record.request_id] = record
             if helper.sender is not None:
                 sender = helper.sender
                 try:
                     sender(request)
                     request["queued"] = True
+                    record.delivery_state = "delivered"
                 except (ConnectionError, OSError, TimeoutError):
                     if helper.sender is sender:
                         helper.sender = None
@@ -397,6 +657,8 @@ class HelperRegistry:
                     request["ok"] = False
                     request["queued"] = False
                     request["error"] = "helper_transport_send_failed"
+                    record.delivery_state = "terminal"
+                    record.terminal_error = "helper_transport_send_failed"
             else:
                 if not helper.online:
                     request["queued"] = False
@@ -404,4 +666,5 @@ class HelperRegistry:
                 else:
                     helper.queue.append(request)
                     request["queued"] = True
+            self._persist_helpers_locked()
             return request
