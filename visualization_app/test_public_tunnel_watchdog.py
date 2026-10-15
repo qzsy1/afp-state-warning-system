@@ -12,6 +12,30 @@ class PublicTunnelWatchdogContractTests(unittest.TestCase):
         self.assertIn("Start-Process", text)
         self.assertIn("127.0.0.1:8770", text)
 
+    def test_cloudflare_watchdog_is_non_owner_without_explicit_cutover(self):
+        text = self.source_text()
+        self.assertIn("PublicIngress.psm1", text)
+        self.assertIn('"Cutover"', text)
+        self.assertIn("[long]$ExpectedGeneration", text)
+        self.assertIn("[switch]$ApproveOwnerCutover", text)
+        self.assertIn("Test-WatchdogMutationAllowed", text)
+        self.assertIn("non_owner_observe_only", text)
+
+    def test_layered_status_requires_helper_success(self):
+        text = self.source_text()
+        for field in (
+            "overall_status",
+            "origin",
+            "control_plane",
+            "dns",
+            "public_edge",
+            "ingress",
+            "helper",
+            "non_sensitive_error",
+        ):
+            self.assertIn(field, text)
+        self.assertIn("helper_recovery_failed", text)
+
     def test_watchdog_registers_logon_and_startup_recovery(self):
         source = Path(__file__).with_name("public_tunnel_watchdog.ps1")
         text = source.read_text(encoding="utf-8-sig")

@@ -1,7 +1,9 @@
 ﻿[CmdletBinding()]
 param(
-    [ValidateSet("Run", "Install", "Uninstall", "Once", "Status")]
-    [string]$Mode = "Run"
+    [ValidateSet("Run", "Install", "Uninstall", "Once", "Status", "Cutover")]
+    [string]$Mode = "Run",
+    [long]$ExpectedGeneration = -1,
+    [switch]$ApproveOwnerCutover
 )
 
 $ErrorActionPreference = "SilentlyContinue"
@@ -9,8 +11,6 @@ $ErrorActionPreference = "SilentlyContinue"
 $TaskName = "AFP Tailscale Funnel Watchdog"
 $RunKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 $RunValueName = "AFP_Tailscale_Funnel_Watchdog"
-$LegacyTaskName = "AFP Public Tunnel Watchdog"
-$LegacyRunValueName = "AFP_Public_Tunnel_Watchdog"
 $DeliveryRoot = $PSScriptRoot
 if (-not (Test-Path (Join-Path $DeliveryRoot "AFP_Integrated_System_Modular.exe"))) {
     $ProjectRoot = Split-Path -Parent $PSScriptRoot
@@ -26,6 +26,10 @@ $FunnelStatusFile = Join-Path $FunnelRoot "funnel-status.json"
 $OriginUrl = "http://127.0.0.1:8770"
 $FunnelArguments = "funnel --bg --https=443 --yes http://127.0.0.1:8770"
 $OriginLaunchMutexName = "Local\AFP_Tailscale_Funnel_Watchdog_Origin_Start"
+$IngressModule = Join-Path $PSScriptRoot "PublicIngress.psm1"
+Import-Module $IngressModule -Force -ErrorAction Stop
+$IngressStateFile = Join-Path $DeliveryRoot "runtime\public-ingress-state.json"
+$ReleaseManifestFile = Join-Path $DeliveryRoot "RELEASE-MANIFEST.json"
 
 function Find-TailscaleExe {
     $candidates = @(
@@ -44,16 +48,105 @@ function Find-TailscaleExe {
 
 $TailscaleExe = Find-TailscaleExe
 
-function Write-FunnelState([string]$Code, [string]$Message, [string]$PublicUrl = "") {
+function New-WatchdogLayer([bool]$Ok, [string]$Code) {
+    return [ordered]@{ ok = $Ok; code = $Code }
+}
+
+function Write-FunnelState([string]$Code, [string]$Message, [string]$PublicUrl = "", $Layers = $null) {
     New-Item -ItemType Directory -Path $FunnelRoot -Force | Out-Null
+    if (-not $Layers) {
+        $Layers = @{
+            origin = New-WatchdogLayer $false $Code
+            control_plane = New-WatchdogLayer $false $Code
+            dns = New-WatchdogLayer $false $Code
+            public_edge = New-WatchdogLayer $false $Code
+            ingress = New-WatchdogLayer $false $Code
+            helper = New-WatchdogLayer $false $Code
+        }
+    }
+    $allReady = $true
+    foreach ($layer in $Layers.Values) {
+        if (-not [bool]$layer.ok) { $allReady = $false }
+    }
     $payload = [ordered]@{
-        ok = ($Code -eq "online")
+        ok = $allReady
         code = $Code
         message = $Message
         public_url = $PublicUrl
+        overall_status = if ($allReady) { "online" } else { "failed" }
+        origin = $Layers.origin
+        control_plane = $Layers.control_plane
+        dns = $Layers.dns
+        public_edge = $Layers.public_edge
+        ingress = $Layers.ingress
+        helper = $Layers.helper
+        non_sensitive_error = if ($allReady) { "" } else { $Code }
         checked_at = (Get-Date).ToString("o")
     }
     $payload | ConvertTo-Json | Set-Content -LiteralPath $FunnelStatusFile -Encoding UTF8
+}
+
+function Get-CandidateId {
+    try {
+        return [string](Get-Content -LiteralPath $ReleaseManifestFile -Raw -Encoding UTF8 |
+            ConvertFrom-Json -ErrorAction Stop).candidate.candidate_id
+    } catch {
+        return ""
+    }
+}
+
+function Get-CurrentIngressState {
+    try { return Read-AfpPublicIngressState -Path $IngressStateFile -ExpectedCandidateId (Get-CandidateId) }
+    catch { return $null }
+}
+
+function Get-CutoverReadiness {
+    try {
+        return Invoke-RestMethod -Uri ($OriginUrl + "/api/ingress/cutover-readiness") `
+            -Method Get -TimeoutSec 5
+    } catch {
+        return [pscustomobject]@{ allowed = $false; error = "cutover_readiness_unavailable" }
+    }
+}
+
+function Test-WatchdogMutationAllowed {
+    param($State, [string]$Provider, [string]$RequestedMode, [long]$RequiredGeneration, [bool]$Approved, $Readiness)
+    $owner = if ($State) { [string]$State.recovery_owner } else { "" }
+    $generation = if ($State) { [long]$State.generation } else { 0L }
+    if ($RequestedMode -eq "Install") {
+        return [pscustomobject]@{ allowed = $false; reason = "install_observe_only" }
+    }
+    if ($owner -and $owner.Trim().ToLowerInvariant() -eq $Provider.Trim().ToLowerInvariant()) {
+        return [pscustomobject]@{ allowed = $true; reason = "current_owner" }
+    }
+    if ($RequestedMode -ne "Cutover") {
+        return [pscustomobject]@{ allowed = $false; reason = "non_owner_observe_only" }
+    }
+    if (-not $Approved) {
+        return [pscustomobject]@{ allowed = $false; reason = "owner_cutover_not_approved" }
+    }
+    if ($RequiredGeneration -lt 0 -or $RequiredGeneration -ne $generation) {
+        return [pscustomobject]@{ allowed = $false; reason = "ingress_generation_mismatch" }
+    }
+    if (-not $Readiness -or -not [bool]$Readiness.allowed) {
+        return [pscustomobject]@{ allowed = $false; reason = "active_capture_blocks_cutover" }
+    }
+    return [pscustomobject]@{ allowed = $true; reason = "approved_cutover" }
+}
+
+function Save-FunnelUrlAtomic([string]$Url) {
+    New-Item -ItemType Directory -Path $FunnelRoot -Force | Out-Null
+    $temporary = $FunnelUrlFile + "." + [Guid]::NewGuid().ToString("N") + ".tmp"
+    try {
+        Set-Content -LiteralPath $temporary -Value ($Url.TrimEnd("/") + "/") -Encoding ASCII
+        if (Test-Path -LiteralPath $FunnelUrlFile -PathType Leaf) {
+            [IO.File]::Replace($temporary, $FunnelUrlFile, $null, $true)
+        } else {
+            [IO.File]::Move($temporary, $FunnelUrlFile)
+        }
+    } finally {
+        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Invoke-Tailscale([string[]]$Arguments) {
@@ -139,23 +232,32 @@ function Test-OriginListener {
     return $listeners.Count -gt 0
 }
 
-function Test-PublicFunnel([string]$PublicUrl) {
+function Test-PublicFunnel {
+    param(
+        [Parameter(Position = 0)]
+        [string]$PublicUrl,
+        [Parameter(Position = 1)]
+        [scriptblock]$ProbeRunner = $null
+    )
     if (-not $PublicUrl) { return $false }
-    $healthUrl = $PublicUrl.TrimEnd("/") + "/api/health"
+    try {
+        $healthUri = [Uri]($PublicUrl.TrimEnd("/") + "/api/health")
+    } catch {
+        return $false
+    }
+    if ($healthUri.Scheme -ne "https") { return $false }
+    $addresses = @(Resolve-AfpPublicEdgeAddresses -HostName $healthUri.DnsSafeHost)
+    if (-not $addresses.Count) { return $false }
     foreach ($attempt in 1..3) {
-        try {
-            $response = Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 12
-            if ($response.StatusCode -eq 200) { return $true }
-        } catch {
-            # Windows PowerShell may fail Schannel renegotiation used by Funnel;
-            # curl.exe is the TLS-compatible fallback on supported Windows.
-            $curl = Get-Command "curl.exe" -ErrorAction SilentlyContinue
-            if ($curl) {
-                & $curl.Source --fail --silent --show-error --max-time 12 $healthUrl | Out-Null
-                if ($LASTEXITCODE -eq 0) { return $true }
+        foreach ($address in $addresses) {
+            if ($ProbeRunner) {
+                if (& $ProbeRunner $healthUri $address) { return $true }
+            } else {
+                $result = Invoke-AfpForcedPublicProbe -Uri $healthUri -Address $address
+                if ($result.ok) { return $true }
             }
-            if ($attempt -lt 3) { Start-Sleep -Seconds 2 }
         }
+        if ($attempt -lt 3) { Start-Sleep -Seconds 2 }
     }
     return $false
 }
@@ -165,18 +267,6 @@ function Test-Funnel {
     $result = Invoke-Tailscale @("funnel", "status", "--json")
     if ($result.ExitCode -ne 0 -or -not $result.Output) { return $false }
     return $result.Output -match "127\.0\.0\.1:8770|localhost:8770"
-}
-
-function Save-FunnelUrl([string]$Url) {
-    if (-not $Url) { return $false }
-    New-Item -ItemType Directory -Path $FunnelRoot -Force | Out-Null
-    $normalized = $Url.TrimEnd("/") + "/"
-    $previous = ""
-    if (Test-Path -LiteralPath $FunnelUrlFile) {
-        $previous = (Get-Content -LiteralPath $FunnelUrlFile -Raw).Trim()
-    }
-    Set-Content -LiteralPath $FunnelUrlFile -Value $normalized -Encoding ASCII
-    return $previous -ne $normalized
 }
 
 function Ensure-Origin {
@@ -255,6 +345,13 @@ function Start-Funnel {
 }
 
 function Ensure-Funnel {
+    $state = Get-CurrentIngressState
+    $readiness = Get-CutoverReadiness
+    $decision = Test-WatchdogMutationAllowed $state "tailscale" $Mode $ExpectedGeneration ([bool]$ApproveOwnerCutover) $readiness
+    if (-not $decision.allowed) {
+        Write-FunnelState ([string]$decision.reason) "当前 watchdog 不是公网入口恢复所有者，仅报告状态。"
+        return $false
+    }
     if (-not $TailscaleExe) {
         Write-FunnelState "tailscale_not_installed" "尚未安装Tailscale。"
         return $false
@@ -263,6 +360,10 @@ function Ensure-Funnel {
     $publicUrl = Get-PublicUrl
     if (-not $publicUrl) {
         Write-FunnelState "tailscale_login_required" "Tailscale尚未登录，需先在服务器电脑完成一次账号登录。"
+        return $false
+    }
+    if ($state -and [string]$state.public_url -ne $publicUrl.TrimEnd("/") -and -not [bool]$readiness.allowed) {
+        Write-FunnelState "active_capture_blocks_cutover" "活动采集期间不得切换公网地址。" $publicUrl
         return $false
     }
     if (-not (Test-Funnel)) {
@@ -281,22 +382,57 @@ function Ensure-Funnel {
         Write-FunnelState "public_health_failed" "固定公网地址已生成，但公网健康检查未通过。" $publicUrl
         return $false
     }
-    $urlChanged = Save-FunnelUrl $publicUrl
-    if ($urlChanged) { Restart-Helper | Out-Null } else { Ensure-Helper | Out-Null }
-    Write-FunnelState "online" "固定公网地址、系统服务和辅助程序均已启动。" $publicUrl
+    $layers = @{
+        origin = New-WatchdogLayer $true "origin_ready"
+        control_plane = New-WatchdogLayer $true "tailscale_running"
+        dns = New-WatchdogLayer $true "public_dns_ready"
+        public_edge = New-WatchdogLayer $true "public_edge_200"
+        ingress = New-WatchdogLayer $false "ingress_not_published"
+        helper = New-WatchdogLayer $false "helper_not_checked"
+    }
+    try {
+        $candidateId = Get-CandidateId
+        if (-not $candidateId) { throw "candidate_identity_unavailable" }
+        $publishParameters = @{
+            Path = $IngressStateFile
+            PublicUrl = $publicUrl
+            Provider = "tailscale"
+            RecoveryOwner = "tailscale"
+            CandidateId = $candidateId
+            Layers = $layers
+        }
+        if ($state) { $publishParameters.ExpectedGeneration = [long]$state.generation }
+        elseif ($ExpectedGeneration -ge 0) { $publishParameters.ExpectedGeneration = $ExpectedGeneration }
+        $publication = Publish-AfpPublicIngressState @publishParameters
+        Save-FunnelUrlAtomic $publicUrl
+        $layers.ingress = New-WatchdogLayer $true "ingress_published"
+    } catch {
+        Write-FunnelState "ingress_publication_failed" "公网入口状态发布失败。" $publicUrl $layers
+        return $false
+    }
+    $helperReady = if ($publication.changed) { Restart-Helper } else { Ensure-Helper }
+    $layers.helper = if ($helperReady) {
+        New-WatchdogLayer $true "helper_ready"
+    } else {
+        New-WatchdogLayer $false "helper_recovery_failed"
+    }
+    try {
+        Publish-AfpPublicIngressState -Path $IngressStateFile -PublicUrl $publicUrl `
+            -Provider "tailscale" -RecoveryOwner "tailscale" -CandidateId $candidateId `
+            -Layers $layers -ExpectedGeneration ([long]$publication.generation) | Out-Null
+    } catch {
+        Write-FunnelState "ingress_publication_failed" "公网入口最终状态发布失败。" $publicUrl $layers
+        return $false
+    }
+    if (-not $helperReady) {
+        Write-FunnelState "helper_recovery_failed" "公网边缘可用，但辅助程序未就绪。" $publicUrl $layers
+        return $false
+    }
+    Write-FunnelState "online" "固定公网地址、系统服务和辅助程序均已启动。" $publicUrl $layers
     return $true
 }
 
-function Disable-LegacyQuickTunnel {
-    Unregister-ScheduledTask -TaskName $LegacyTaskName -Confirm:$false -ErrorAction SilentlyContinue
-    Remove-ItemProperty -Path $RunKey -Name $LegacyRunValueName -ErrorAction SilentlyContinue
-    Get-CimInstance Win32_Process | Where-Object {
-        $_.Name -eq "cloudflared.exe" -and $_.CommandLine -match "127\.0\.0\.1:8770"
-    } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
-}
-
 function Install-Watchdog {
-    if (-not (Ensure-Funnel)) { return $false }
     $scriptPath = $PSCommandPath
     $powershell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
     $arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -Mode Run"
@@ -328,7 +464,6 @@ function Install-Watchdog {
         New-Item -Path $RunKey -Force | Out-Null
         Set-ItemProperty -Path $RunKey -Name $RunValueName -Value ($powershell + " " + $arguments)
     }
-    Disable-LegacyQuickTunnel
     return $true
 }
 
@@ -341,6 +476,9 @@ if ($Mode -eq "Uninstall") {
     exit 0
 }
 if ($Mode -eq "Once") {
+    if (Ensure-Funnel) { exit 0 } else { exit 2 }
+}
+if ($Mode -eq "Cutover") {
     if (Ensure-Funnel) { exit 0 } else { exit 2 }
 }
 if ($Mode -eq "Status") {

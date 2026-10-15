@@ -19,6 +19,50 @@ class TailscaleFunnelWatchdogContractTests(unittest.TestCase):
         self.assertIn("127.0.0.1:8770", text)
         self.assertNotIn("trycloudflare", text)
 
+    def test_watchdog_uses_shared_ingress_generation_and_explicit_cutover(self):
+        text = self.source.read_text(encoding="utf-8-sig")
+        self.assertIn("PublicIngress.psm1", text)
+        self.assertIn('"Cutover"', text)
+        self.assertIn("[long]$ExpectedGeneration", text)
+        self.assertIn("[switch]$ApproveOwnerCutover", text)
+        self.assertIn("Test-WatchdogMutationAllowed", text)
+        self.assertIn("Publish-AfpPublicIngressState", text)
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "Windows PowerShell required")
+    def test_non_owner_and_active_capture_decisions_fail_closed(self):
+        source = str(self.source.resolve()).replace("'", "''")
+        harness = textwrap.dedent(
+            f"""
+            $source = Get-Content -LiteralPath '{source}' -Raw
+            $tokens = $null; $errors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+            $definition = $ast.FindAll({{
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Test-WatchdogMutationAllowed'
+            }}, $true) | Select-Object -First 1
+            if ($null -eq $definition) {{ exit 91 }}
+            Invoke-Expression $definition.Extent.Text
+            $state = [pscustomobject]@{{ generation = 8; provider = 'cloudflare'; recovery_owner = 'cloudflare' }}
+            $ready = [pscustomobject]@{{ allowed = $true }}
+            if ((Test-WatchdogMutationAllowed $state 'tailscale' 'Run' 0 $false $ready).allowed) {{ exit 21 }}
+            if ((Test-WatchdogMutationAllowed $state 'tailscale' 'Cutover' 8 $false $ready).allowed) {{ exit 22 }}
+            $blocked = [pscustomobject]@{{ allowed = $false; active_capture_uuids = @('capture-a') }}
+            if ((Test-WatchdogMutationAllowed $state 'tailscale' 'Cutover' 8 $true $blocked).allowed) {{ exit 23 }}
+            if (-not (Test-WatchdogMutationAllowed $state 'tailscale' 'Cutover' 8 $true $ready).allowed) {{ exit 24 }}
+            exit 0
+            """
+        )
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "-"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+
     def test_watchdog_derives_and_persists_stable_tsnet_url(self):
         text = self.source.read_text(encoding="utf-8-sig")
         self.assertIn("status --json", text)
@@ -297,11 +341,12 @@ class TailscaleFunnelWatchdogContractTests(unittest.TestCase):
         self.assertIn("WaitForExit", text)
         self.assertIn("Stop-Process -Id $process.Id -Force", text)
 
-    def test_public_health_has_windows_tls_fallback(self):
+    def test_public_health_uses_shared_forced_edge_probe(self):
         text = self.source.read_text(encoding="utf-8-sig")
-        self.assertIn("curl.exe", text)
-        self.assertIn("--fail", text)
-        self.assertIn("--max-time", text)
+        self.assertIn("Resolve-AfpPublicEdgeAddresses", text)
+        self.assertIn("Invoke-AfpForcedPublicProbe", text)
+        self.assertNotIn("function Test-PublicIPv4", text)
+        self.assertNotIn("function Invoke-ForcedPublicProbe", text)
 
     def test_helper_build_updates_watchdog_in_existing_delivery(self):
         build = Path(__file__).with_name("build_local_capture_helper.ps1")

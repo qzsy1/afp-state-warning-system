@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("Run", "Install", "Uninstall", "Once")]
-    [string]$Mode = "Run"
+    [ValidateSet("Run", "Install", "Uninstall", "Once", "Cutover")]
+    [string]$Mode = "Run",
+    [long]$ExpectedGeneration = -1,
+    [switch]$ApproveOwnerCutover
 )
 
 $ErrorActionPreference = "SilentlyContinue"
@@ -24,6 +26,97 @@ $TunnelLog = Join-Path $CloudflaredRoot "quick-tunnel-watchdog.log"
 $TunnelUrlFile = Join-Path $CloudflaredRoot "quick-tunnel-url.txt"
 $OriginUrl = "http://127.0.0.1:8770"
 $MetricsUrl = "http://127.0.0.1:20241/metrics"
+$TunnelStatusFile = Join-Path $CloudflaredRoot "quick-tunnel-status.json"
+$IngressModule = Join-Path $PSScriptRoot "PublicIngress.psm1"
+Import-Module $IngressModule -Force -ErrorAction Stop
+$IngressStateFile = Join-Path $DeliveryRoot "runtime\public-ingress-state.json"
+$ReleaseManifestFile = Join-Path $DeliveryRoot "RELEASE-MANIFEST.json"
+
+function New-WatchdogLayer([bool]$Ok, [string]$Code) {
+    return [ordered]@{ ok = $Ok; code = $Code }
+}
+
+function Write-TunnelState([string]$Code, [string]$PublicUrl = "", $Layers = $null) {
+    if (-not $Layers) {
+        $Layers = @{
+            origin = New-WatchdogLayer $false $Code
+            control_plane = New-WatchdogLayer $false $Code
+            dns = New-WatchdogLayer $false $Code
+            public_edge = New-WatchdogLayer $false $Code
+            ingress = New-WatchdogLayer $false $Code
+            helper = New-WatchdogLayer $false $Code
+        }
+    }
+    $allReady = $true
+    foreach ($layer in $Layers.Values) {
+        if (-not [bool]$layer.ok) { $allReady = $false }
+    }
+    [ordered]@{
+        overall_status = if ($allReady) { "online" } else { "failed" }
+        origin = $Layers.origin
+        control_plane = $Layers.control_plane
+        dns = $Layers.dns
+        public_edge = $Layers.public_edge
+        ingress = $Layers.ingress
+        helper = $Layers.helper
+        public_url = $PublicUrl
+        non_sensitive_error = if ($allReady) { "" } else { $Code }
+        checked_at = (Get-Date).ToString("o")
+    } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $TunnelStatusFile -Encoding UTF8
+}
+
+function Get-CandidateId {
+    try {
+        return [string](Get-Content -LiteralPath $ReleaseManifestFile -Raw -Encoding UTF8 |
+            ConvertFrom-Json -ErrorAction Stop).candidate.candidate_id
+    } catch { return "" }
+}
+
+function Get-CurrentIngressState {
+    try { return Read-AfpPublicIngressState -Path $IngressStateFile -ExpectedCandidateId (Get-CandidateId) }
+    catch { return $null }
+}
+
+function Get-CutoverReadiness {
+    try {
+        return Invoke-RestMethod -Uri ($OriginUrl + "/api/ingress/cutover-readiness") -Method Get -TimeoutSec 5
+    } catch {
+        return [pscustomobject]@{ allowed = $false; error = "cutover_readiness_unavailable" }
+    }
+}
+
+function Test-WatchdogMutationAllowed {
+    param($State, [string]$Provider, [string]$RequestedMode, [long]$RequiredGeneration, [bool]$Approved, $Readiness)
+    $owner = if ($State) { [string]$State.recovery_owner } else { "" }
+    $generation = if ($State) { [long]$State.generation } else { 0L }
+    if ($RequestedMode -eq "Install") { return [pscustomobject]@{ allowed = $false; reason = "install_observe_only" } }
+    if ($owner -and $owner.Trim().ToLowerInvariant() -eq $Provider.Trim().ToLowerInvariant()) {
+        return [pscustomobject]@{ allowed = $true; reason = "current_owner" }
+    }
+    if ($RequestedMode -ne "Cutover") { return [pscustomobject]@{ allowed = $false; reason = "non_owner_observe_only" } }
+    if (-not $Approved) { return [pscustomobject]@{ allowed = $false; reason = "owner_cutover_not_approved" } }
+    if ($RequiredGeneration -lt 0 -or $RequiredGeneration -ne $generation) {
+        return [pscustomobject]@{ allowed = $false; reason = "ingress_generation_mismatch" }
+    }
+    if (-not $Readiness -or -not [bool]$Readiness.allowed) {
+        return [pscustomobject]@{ allowed = $false; reason = "active_capture_blocks_cutover" }
+    }
+    return [pscustomobject]@{ allowed = $true; reason = "approved_cutover" }
+}
+
+function Save-TunnelUrlAtomic([string]$Url) {
+    $temporary = $TunnelUrlFile + "." + [Guid]::NewGuid().ToString("N") + ".tmp"
+    try {
+        Set-Content -LiteralPath $temporary -Value ($Url.TrimEnd("/") + "/") -Encoding ASCII
+        if (Test-Path -LiteralPath $TunnelUrlFile -PathType Leaf) {
+            [IO.File]::Replace($temporary, $TunnelUrlFile, $null, $true)
+        } else {
+            [IO.File]::Move($temporary, $TunnelUrlFile)
+        }
+    } finally {
+        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+    }
+}
 
 function Get-AppProcess {
     Get-CimInstance Win32_Process | Where-Object {
@@ -74,22 +167,18 @@ function Get-TunnelUrl([string]$Metrics) {
 
 function Test-PublicTunnel([string]$PublicUrl) {
     if (-not $PublicUrl) { return $false }
-    $healthUrl = $PublicUrl.TrimEnd("/") + "/api/health"
-    foreach ($attempt in 1..2) {
+    try { $healthUri = [Uri]($PublicUrl.TrimEnd("/") + "/api/health") }
+    catch { return $false }
+    if ($healthUri.Scheme -ne "https") { return $false }
+    try { $addresses = @(Resolve-AfpPublicEdgeAddresses -HostName $healthUri.DnsSafeHost) }
+    catch { return $false }
+    foreach ($address in $addresses) {
         try {
-            $response = Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 8
-            if ($response.StatusCode -eq 200) { return $true }
+            if ((Invoke-AfpForcedPublicProbe -Uri $healthUri -Address $address).ok) { return $true }
         } catch {
-            if ($attempt -lt 2) { Start-Sleep -Seconds 2 }
         }
     }
     return $false
-}
-
-function Save-TunnelUrl([string]$Url) {
-    if (-not $Url) { return $false }
-    Set-Content -LiteralPath $TunnelUrlFile -Value ($Url.TrimEnd("/") + "/") -Encoding ASCII
-    return $true
 }
 
 function Test-Tunnel {
@@ -100,7 +189,7 @@ function Test-Tunnel {
     $url = Get-TunnelUrl $metrics
     if (-not $url) { return $false }
     if (-not (Test-PublicTunnel $url)) { return $false }
-    return [bool](Save-TunnelUrl $url)
+    return $true
 }
 
 function Ensure-Origin {
@@ -168,15 +257,78 @@ function Start-Tunnel {
 }
 
 function Ensure-Tunnel {
-    if (-not (Ensure-Origin)) { return $false }
-    if (Test-Tunnel) {
-        Ensure-Helper | Out-Null
-        return $true
+    $state = Get-CurrentIngressState
+    $readiness = Get-CutoverReadiness
+    $decision = Test-WatchdogMutationAllowed $state "cloudflare" $Mode $ExpectedGeneration ([bool]$ApproveOwnerCutover) $readiness
+    if (-not $decision.allowed) {
+        Write-TunnelState ([string]$decision.reason)
+        return $false
     }
-    Stop-StaleTunnel
-    $started = Start-Tunnel
-    if ($started) { Restart-Helper | Out-Null }
-    return $started
+    if (-not (Ensure-Origin)) { return $false }
+    if (-not (Test-Tunnel)) {
+        Stop-StaleTunnel
+        if (-not (Start-Tunnel)) {
+            Write-TunnelState "control_plane_unavailable"
+            return $false
+        }
+    }
+    $publicUrl = Get-TunnelUrl (Get-TunnelMetrics)
+    if (-not $publicUrl -or -not (Test-PublicTunnel $publicUrl)) {
+        Write-TunnelState "public_edge_unavailable" $publicUrl
+        return $false
+    }
+    if ($state -and [string]$state.public_url -ne $publicUrl.TrimEnd("/") -and -not [bool]$readiness.allowed) {
+        Write-TunnelState "active_capture_blocks_cutover" $publicUrl
+        return $false
+    }
+    $layers = @{
+        origin = New-WatchdogLayer $true "origin_ready"
+        control_plane = New-WatchdogLayer $true "cloudflare_running"
+        dns = New-WatchdogLayer $true "public_dns_ready"
+        public_edge = New-WatchdogLayer $true "public_edge_200"
+        ingress = New-WatchdogLayer $false "ingress_not_published"
+        helper = New-WatchdogLayer $false "helper_not_checked"
+    }
+    try {
+        $candidateId = Get-CandidateId
+        if (-not $candidateId) { throw "candidate_identity_unavailable" }
+        $publishParameters = @{
+            Path = $IngressStateFile
+            PublicUrl = $publicUrl
+            Provider = "cloudflare"
+            RecoveryOwner = "cloudflare"
+            CandidateId = $candidateId
+            Layers = $layers
+        }
+        if ($state) { $publishParameters.ExpectedGeneration = [long]$state.generation }
+        elseif ($ExpectedGeneration -ge 0) { $publishParameters.ExpectedGeneration = $ExpectedGeneration }
+        $publication = Publish-AfpPublicIngressState @publishParameters
+        Save-TunnelUrlAtomic $publicUrl
+        $layers.ingress = New-WatchdogLayer $true "ingress_published"
+    } catch {
+        Write-TunnelState "ingress_publication_failed" $publicUrl $layers
+        return $false
+    }
+    $helperReady = if ($publication.changed) { Restart-Helper } else { Ensure-Helper }
+    $layers.helper = if ($helperReady) {
+        New-WatchdogLayer $true "helper_ready"
+    } else {
+        New-WatchdogLayer $false "helper_recovery_failed"
+    }
+    try {
+        Publish-AfpPublicIngressState -Path $IngressStateFile -PublicUrl $publicUrl `
+            -Provider "cloudflare" -RecoveryOwner "cloudflare" -CandidateId $candidateId `
+            -Layers $layers -ExpectedGeneration ([long]$publication.generation) | Out-Null
+    } catch {
+        Write-TunnelState "ingress_publication_failed" $publicUrl $layers
+        return $false
+    }
+    if (-not $helperReady) {
+        Write-TunnelState "helper_recovery_failed" $publicUrl $layers
+        return $false
+    }
+    Write-TunnelState "online" $publicUrl $layers
+    return $true
 }
 
 function Install-Watchdog {
@@ -213,7 +365,7 @@ function Install-Watchdog {
         New-Item -Path $RunKey -Force | Out-Null
         Set-ItemProperty -Path $RunKey -Name $RunValueName -Value ($powershell + " " + $arguments)
     }
-    Ensure-Tunnel | Out-Null
+    return $true
 }
 
 if ($Mode -eq "Install") {
@@ -226,8 +378,10 @@ if ($Mode -eq "Uninstall") {
     exit 0
 }
 if ($Mode -eq "Once") {
-    Ensure-Tunnel | Out-Null
-    exit 0
+    if (Ensure-Tunnel) { exit 0 } else { exit 2 }
+}
+if ($Mode -eq "Cutover") {
+    if (Ensure-Tunnel) { exit 0 } else { exit 2 }
 }
 
 while ($true) {
