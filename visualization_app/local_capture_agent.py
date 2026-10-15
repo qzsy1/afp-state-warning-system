@@ -642,17 +642,30 @@ class HelperTransport:
     message methods here remain safe to log and easy to test.
     """
 
-    def __init__(self, server_url: str, pairing_token: str, *, device_id: str = "") -> None:
+    def __init__(
+        self,
+        server_url: str,
+        pairing_token: str,
+        *,
+        device_id: str = "",
+        ingress_generation: int | None = None,
+    ) -> None:
         self.server_url = str(server_url).strip()
         self.pairing_token = str(pairing_token)
         self.device_id = str(device_id or "local-helper")
+        self.ingress_generation = (
+            int(ingress_generation) if ingress_generation is not None else None
+        )
 
     def hello(self, *, capabilities: dict[str, Any] | None = None) -> dict[str, Any]:
-        return {
+        message = {
             "type": "hello",
             "device_id": self.device_id,
             "capabilities": dict(capabilities or {}),
         }
+        if self.ingress_generation is not None:
+            message["ingress_generation"] = self.ingress_generation
+        return message
 
     @staticmethod
     def decode_command(raw: str | bytes) -> dict[str, Any]:
@@ -670,6 +683,7 @@ class HelperTransport:
             "type": "command",
             "request_id": str(value.get("request_id") or ""),
             "command": command,
+            "ingress_generation": value.get("ingress_generation"),
             "payload": dict(payload) if isinstance(payload, dict) else {},
         }
 
@@ -715,8 +729,14 @@ class HelperTransport:
             # endpoint such as ``/base/api/helper/ws``.
             path = "/api/helper/ws"
         query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-        query = [(key, value) for key, value in query if key != "device_id"]
+        query = [
+            (key, value)
+            for key, value in query
+            if key not in {"device_id", "ingress_generation"}
+        ]
         query.append(("device_id", self.device_id))
+        if self.ingress_generation is not None:
+            query.append(("ingress_generation", str(self.ingress_generation)))
         scheme = {"https": "wss", "http": "ws"}.get(parsed.scheme, parsed.scheme)
         url = urllib.parse.urlunsplit(
             (scheme, parsed.netloc, path, urllib.parse.urlencode(query), "")
@@ -735,6 +755,8 @@ class HelperTransport:
         headers = {"Content-Type": "application/json"}
         if authorized:
             headers["Authorization"] = f"Bearer {self.pairing_token}"
+        if self.ingress_generation is not None:
+            headers["X-AFP-Ingress-Generation"] = str(self.ingress_generation)
         request = urllib.request.Request(
             url,
             data=body,

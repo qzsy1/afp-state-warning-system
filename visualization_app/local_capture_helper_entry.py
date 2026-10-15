@@ -84,9 +84,16 @@ def adaptive_sample_batch_limit(
 class HelperSamplePump:
     """Keep one replayable sample batch in flight and advance only on ACK."""
 
-    def __init__(self, agent: LocalCaptureAgent, *, route_type: str = "unknown") -> None:
+    def __init__(
+        self,
+        agent: LocalCaptureAgent,
+        *,
+        route_type: str = "unknown",
+        ingress_generation: int | None = None,
+    ) -> None:
         self.agent = agent
         self.route_type = str(route_type or "unknown")
+        self.ingress_generation = ingress_generation
         self._in_flight: tuple[str, int] | None = None
         self._last_sent_at: float | None = None
         self._last_ack_at: float | None = None
@@ -120,7 +127,11 @@ class HelperSamplePump:
             transport["paired_route_type"] = self.route_type
         self._in_flight = (capture_uuid, sequence)
         self._last_sent_at = time.monotonic() if now is None else float(now)
-        return {"type": "sample_batch", "batch": batch}
+        message = {"type": "sample_batch", "batch": batch}
+        if self.ingress_generation is not None:
+            message["ingress_generation"] = self.ingress_generation
+            batch["ingress_generation"] = self.ingress_generation
+        return message
 
     def acknowledge(
         self,
@@ -217,11 +228,55 @@ def load_current_server_hint(*, path: str | Path | None = None) -> str:
     return ""
 
 
+def _normalized_server_origin(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parsed = urllib.parse.urlsplit(text)
+    scheme = parsed.scheme.lower()
+    hostname = str(parsed.hostname or "").lower()
+    if scheme not in {"http", "https", "ws", "wss"} or not hostname:
+        return ""
+    port = parsed.port
+    if port is not None and not (
+        (scheme in {"http", "ws"} and port == 80)
+        or (scheme in {"https", "wss"} and port == 443)
+    ):
+        hostname = f"{hostname}:{port}"
+    canonical_scheme = {"ws": "http", "wss": "https"}.get(scheme, scheme)
+    return urllib.parse.urlunsplit((canonical_scheme, hostname, "", "", ""))
+
+
+def select_runtime_endpoint(
+    saved: dict[str, Any] | None,
+    current_hint: str,
+) -> dict[str, Any]:
+    saved = saved if isinstance(saved, dict) else {}
+    saved_server = _normalized_server_origin(str(saved.get("server") or ""))
+    hinted_server = _normalized_server_origin(current_hint)
+    server = hinted_server or saved_server
+    generation = saved.get("ingress_generation")
+    valid_generation = (
+        isinstance(generation, int)
+        and not isinstance(generation, bool)
+        and generation >= 0
+    )
+    same_endpoint = bool(server and saved_server and server == saved_server)
+    token = str(saved.get("pairing_token") or "") if same_endpoint and valid_generation else ""
+    return {
+        "server": server,
+        "pairing_token": token,
+        "ingress_generation": generation if token else None,
+        "pairing_required": not bool(token),
+    }
+
+
 def preferred_setup_server(saved_server: str = "", *, server_hint_path: str | Path | None = None) -> str:
-    saved = str(saved_server or "").strip()
-    if saved:
-        return saved
-    return load_current_server_hint(path=server_hint_path)
+    selected = select_runtime_endpoint(
+        {"server": saved_server},
+        load_current_server_hint(path=server_hint_path),
+    )
+    return str(selected["server"] or "")
 
 
 class _DataBlob(ctypes.Structure):
@@ -291,6 +346,7 @@ def save_runtime_config(
     device_id: str = "local-helper",
     transport: str = "auto",
     *,
+    ingress_generation: int | None = None,
     path: str | Path | None = None,
 ) -> Path:
     config_path = Path(path) if path is not None else default_runtime_config_path()
@@ -304,14 +360,16 @@ def save_runtime_config(
     except (OSError, ValueError, TypeError, json.JSONDecodeError, UnicodeError):
         pass
     payload = {
-        "version": 1,
+        "version": 3,
         "server": str(server).strip().rstrip("/"),
         "pairing_token_encrypted": _protect_secret(pairing_token),
         "device_id": str(device_id or "local-helper"),
         "transport": str(transport or "auto"),
+        "ingress_generation": (
+            int(ingress_generation) if ingress_generation is not None else None
+        ),
     }
     if isinstance(existing.get("local_mysql_profile"), dict):
-        payload["version"] = 2
         payload["local_mysql_profile"] = existing["local_mysql_profile"]
     temporary = config_path.with_name(config_path.name + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
@@ -340,7 +398,7 @@ def save_local_mysql_profile(
     password_envelope = json.dumps(
         {"password": settings.password}, ensure_ascii=False, separators=(",", ":")
     )
-    payload["version"] = 2
+    payload["version"] = max(2, int(payload.get("version") or 0))
     payload["local_mysql_profile"] = {
         "scope": "helper_local",
         "host": settings.host,
@@ -427,7 +485,7 @@ def local_mysql_profile_metadata(
     }
 
 
-def load_saved_runtime_config(*, path: str | Path | None = None) -> dict[str, str] | None:
+def load_saved_runtime_config(*, path: str | Path | None = None) -> dict[str, Any] | None:
     config_path = Path(path) if path is not None else default_runtime_config_path()
     try:
         payload = json.loads(config_path.read_text(encoding="utf-8"))
@@ -439,6 +497,7 @@ def load_saved_runtime_config(*, path: str | Path | None = None) -> dict[str, st
             "server": server,
             "pairing_token": token,
             "device_id": str(payload.get("device_id") or "local-helper"),
+            "ingress_generation": payload.get("ingress_generation"),
             # Old helpers stored ``https`` while the resilient default now
             # means WSS-first with HTTPS polling fallback.
             "transport": (
@@ -696,18 +755,61 @@ class HelperCommandDispatcher:
         *,
         check_runner: Any | None = None,
         source_fetcher: Any | None = None,
+        ingress_generation: int | None = None,
+        before_dispatch=None,
     ) -> None:
         self.agent = agent
         self.check_runner = check_runner or HardwareCheckProcess()
         self.source_fetcher = source_fetcher
+        self.ingress_generation = ingress_generation
+        self.before_dispatch = before_dispatch
+        self._control_lock = threading.RLock()
         self.executor = ThreadPoolExecutor(
             max_workers=3,
             thread_name_prefix="afp-helper-control",
         )
 
+    def update_ingress_generation(self, ingress_generation: int | None) -> None:
+        with self._control_lock:
+            self.ingress_generation = ingress_generation
+
+    def _generation_error(self, command: dict[str, Any]) -> dict[str, Any] | None:
+        expected = self.ingress_generation
+        if expected is None:
+            return None
+        received = command.get("ingress_generation")
+        if (
+            isinstance(received, int)
+            and not isinstance(received, bool)
+            and received == expected
+        ):
+            return None
+        return {
+            "type": "result",
+            "request_id": command["request_id"],
+            "ingress_generation": expected,
+            "payload": {
+                "ok": False,
+                "error": "ingress_generation_changed",
+                "terminal": True,
+            },
+        }
+
     def submit(self, message: dict[str, Any], callback) -> None:
         command = HelperTransport.decode_command(json.dumps(message, ensure_ascii=False))
         name = command["command"]
+
+        def report(response: dict[str, Any]) -> None:
+            outgoing = dict(response)
+            command_generation = command.get("ingress_generation")
+            if (
+                outgoing.get("ingress_generation") is None
+                and isinstance(command_generation, int)
+                and not isinstance(command_generation, bool)
+            ):
+                outgoing["ingress_generation"] = command_generation
+            callback(outgoing)
+
         if name == "check_capture":
             def import_then_callback(response: dict[str, Any]) -> None:
                 payload = response.get("payload") if isinstance(response, dict) else None
@@ -734,102 +836,104 @@ class HelperCommandDispatcher:
                                     "error": f"remote_readiness_snapshot_invalid: {exc}",
                                 },
                             }
-                callback(response)
+                report(response)
 
-            self.check_runner.start(dict(message), import_then_callback)
+            with self._control_lock:
+                rejected = self._generation_error(command)
+                if rejected is not None:
+                    report(rejected)
+                    return
+                self.check_runner.start(dict(message), import_then_callback)
             return
         if name in {"start_capture", "stop_capture"}:
             self.check_runner.cancel(reason="hardware_check_cancelled_for_capture")
 
         def run_control() -> None:
-            prepared_source = None
-            dispatch_message = dict(message)
-            dispatch_payload = dict(dispatch_message.get("payload") or {})
-            transfer = dispatch_payload.get("simulation_source_transfer")
-            ready_reference = dispatch_payload.get("simulation_source_ready")
-            if name == "start_capture" and isinstance(ready_reference, dict):
-                try:
-                    prepared_source = self.agent.resolve_prepared_simulation_source(
-                        ready_reference,
-                        required_channels=list(dispatch_payload.get("selected_sensors") or []),
-                    )
-                    dispatch_payload["simulation_source_type"] = prepared_source["source_type"]
-                    dispatch_payload["simulation_source_path"] = prepared_source["path"]
-                    dispatch_payload.pop("simulation_source_id", None)
-                    dispatch_payload.pop("simulation_source_ready", None)
-                    dispatch_message["payload"] = dispatch_payload
-                except Exception as exc:
-                    callback(
-                        {
+            if callable(self.before_dispatch):
+                self.before_dispatch()
+            with self._control_lock:
+                rejected = self._generation_error(command)
+                if rejected is not None:
+                    report(rejected)
+                    return
+                prepared_source = None
+                dispatch_message = dict(message)
+                dispatch_payload = dict(dispatch_message.get("payload") or {})
+                transfer = dispatch_payload.get("simulation_source_transfer")
+                ready_reference = dispatch_payload.get("simulation_source_ready")
+                if name == "start_capture" and isinstance(ready_reference, dict):
+                    try:
+                        prepared_source = self.agent.resolve_prepared_simulation_source(
+                            ready_reference,
+                            required_channels=list(dispatch_payload.get("selected_sensors") or []),
+                        )
+                        dispatch_payload["simulation_source_type"] = prepared_source["source_type"]
+                        dispatch_payload["simulation_source_path"] = prepared_source["path"]
+                        dispatch_payload.pop("simulation_source_id", None)
+                        dispatch_payload.pop("simulation_source_ready", None)
+                        dispatch_message["payload"] = dispatch_payload
+                    except Exception as exc:
+                        report(
+                            {
+                                "type": "result",
+                                "request_id": command["request_id"],
+                                "payload": {"ok": False, "error": str(exc) or exc.__class__.__name__},
+                            }
+                        )
+                        return
+                elif name in {"prepare_simulation_source", "start_capture"} and isinstance(transfer, dict):
+                    if self.source_fetcher is None:
+                        report({
+                            "type": "result",
+                            "request_id": command["request_id"],
+                            "payload": {"ok": False, "error": "模拟源下载器不可用"},
+                        })
+                        return
+                    try:
+                        prepared_source = self.agent.prepare_simulation_source(
+                            transfer,
+                            self.source_fetcher,
+                            required_channels=list(dispatch_payload.get("selected_sensors") or []),
+                        )
+                        dispatch_payload["simulation_source_type"] = prepared_source["source_type"]
+                        dispatch_payload["simulation_source_path"] = prepared_source["path"]
+                        dispatch_payload.pop("simulation_source_id", None)
+                        dispatch_payload.pop("simulation_source_transfer", None)
+                        dispatch_message["payload"] = dispatch_payload
+                    except Exception as exc:
+                        report({
                             "type": "result",
                             "request_id": command["request_id"],
                             "payload": {"ok": False, "error": str(exc) or exc.__class__.__name__},
-                        }
-                    )
-                    return
-            elif name in {"prepare_simulation_source", "start_capture"} and isinstance(transfer, dict):
-                if self.source_fetcher is None:
-                    response = {
-                        "type": "result",
-                        "request_id": command["request_id"],
-                        "payload": {"ok": False, "error": "模拟源下载器不可用"},
-                    }
-                    callback(response)
-                    return
-                try:
-                    prepared_source = self.agent.prepare_simulation_source(
-                        transfer,
-                        self.source_fetcher,
-                        required_channels=list(dispatch_payload.get("selected_sensors") or []),
-                    )
-                    dispatch_payload["simulation_source_type"] = prepared_source["source_type"]
-                    dispatch_payload["simulation_source_path"] = prepared_source["path"]
-                    dispatch_payload.pop("simulation_source_id", None)
-                    dispatch_payload.pop("simulation_source_transfer", None)
-                    dispatch_message["payload"] = dispatch_payload
-                except Exception as exc:
-                    response = {
-                        "type": "result",
-                        "request_id": command["request_id"],
-                        "payload": {"ok": False, "error": str(exc) or exc.__class__.__name__},
-                    }
-                    callback(response)
-                    return
-            if name == "prepare_simulation_source":
-                if prepared_source is None:
-                    callback(
-                        {
+                        })
+                        return
+                if name == "prepare_simulation_source":
+                    if prepared_source is None:
+                        report({
                             "type": "result",
                             "request_id": command["request_id"],
                             "payload": {"ok": False, "error": "模拟源预下载描述缺失"},
-                        }
-                    )
-                    return
-                public_source = {
-                    key: value
-                    for key, value in prepared_source.items()
-                    if key != "path"
-                }
-                callback(
-                    {
+                        })
+                        return
+                    public_source = {key: value for key, value in prepared_source.items() if key != "path"}
+                    response = {
                         "type": "result",
                         "request_id": command["request_id"],
                         "payload": {"ok": True, **public_source},
                     }
-                )
-                return
-            response = dispatch_command(
-                self.agent,
-                json.dumps(dispatch_message, ensure_ascii=False),
-            )
-            if prepared_source is not None and isinstance(response.get("payload"), dict):
-                response["payload"]["source_transfer"] = {
-                    key: value
-                    for key, value in prepared_source.items()
-                    if key != "path"
-                }
+                else:
+                    response = dispatch_command(
+                        self.agent,
+                        json.dumps(dispatch_message, ensure_ascii=False),
+                    )
+                    if prepared_source is not None and isinstance(response.get("payload"), dict):
+                        response["payload"]["source_transfer"] = {
+                            key: value for key, value in prepared_source.items() if key != "path"
+                        }
+                if self.ingress_generation is not None:
+                    response["ingress_generation"] = self.ingress_generation
             try:
-                callback(response)
+                report(response)
             except Exception:
                 return
 
@@ -981,6 +1085,8 @@ def _report_helper_response(
         "request_id": response["request_id"],
         "payload": response["payload"],
     }
+    if response.get("ingress_generation") is not None:
+        result_payload["ingress_generation"] = response["ingress_generation"]
     delay = 0.5
     for attempt in range(3):
         try:
@@ -1008,7 +1114,22 @@ def flush_http_sample_batch(
         return {"ok": True, "idle": True}
     result = transport.http_json(
         "api/helper/samples",
-        {"device_id": device_id, "batch": batch},
+        {
+            "device_id": device_id,
+            "batch": {
+                **batch,
+                **(
+                    {"ingress_generation": transport.ingress_generation}
+                    if getattr(transport, "ingress_generation", None) is not None
+                    else {}
+                ),
+            },
+            **(
+                {"ingress_generation": transport.ingress_generation}
+                if getattr(transport, "ingress_generation", None) is not None
+                else {}
+            ),
+        },
     )
     if result.get("ok"):
         agent.ack_sample_batch(
@@ -1055,15 +1176,22 @@ def run_http_forever(
     pairing_token: str,
     device_id: str,
     *,
+    ingress_generation: int | None = None,
     agent: LocalCaptureAgent | None = None,
     result_outbox: HelperResultOutbox | None = None,
 ) -> None:
     agent = agent or LocalCaptureAgent()
     result_outbox = result_outbox or HelperResultOutbox()
-    transport = HelperTransport(server_url, pairing_token, device_id=device_id)
+    transport = HelperTransport(
+        server_url,
+        pairing_token,
+        device_id=device_id,
+        ingress_generation=ingress_generation,
+    )
     dispatcher = HelperCommandDispatcher(
         agent,
         source_fetcher=simulation_source_fetcher(transport, device_id),
+        ingress_generation=ingress_generation,
     )
     delay = 1.0
     try:
@@ -1109,13 +1237,23 @@ def run_forever(
     pairing_token: str,
     device_id: str,
     *,
+    ingress_generation: int | None = None,
     max_consecutive_failures: int | None = None,
     agent: LocalCaptureAgent | None = None,
     result_outbox: HelperResultOutbox | None = None,
 ) -> bool:
     agent = agent or LocalCaptureAgent()
-    transport = HelperTransport(server_url, pairing_token, device_id=device_id)
-    sample_pump = HelperSamplePump(agent, route_type=_paired_route(server_url)[1])
+    transport = HelperTransport(
+        server_url,
+        pairing_token,
+        device_id=device_id,
+        ingress_generation=ingress_generation,
+    )
+    sample_pump = HelperSamplePump(
+        agent,
+        route_type=_paired_route(server_url)[1],
+        ingress_generation=ingress_generation,
+    )
     result_outbox = result_outbox or HelperResultOutbox()
     delay = 1.0
     failures = 0
@@ -1129,6 +1267,7 @@ def run_forever(
             dispatcher = HelperCommandDispatcher(
                 agent,
                 source_fetcher=simulation_source_fetcher(transport, device_id),
+                ingress_generation=ingress_generation,
             )
             send_lock = threading.Lock()
 
@@ -1252,6 +1391,7 @@ def run_auto_forever(
     pairing_token: str,
     device_id: str,
     *,
+    ingress_generation: int | None = None,
     agent: LocalCaptureAgent | None = None,
 ) -> None:
     """Prefer WSS, then fall back to the proven HTTPS poller.
@@ -1268,6 +1408,7 @@ def run_auto_forever(
             server_url,
             pairing_token,
             device_id,
+            ingress_generation=ingress_generation,
             max_consecutive_failures=3,
             agent=shared_agent,
             result_outbox=result_outbox,
@@ -1279,6 +1420,7 @@ def run_auto_forever(
             server_url,
             pairing_token,
             device_id,
+            ingress_generation=ingress_generation,
             agent=shared_agent,
             result_outbox=result_outbox,
         )
@@ -1389,18 +1531,27 @@ def resolve_runtime_args(
     """
     parser = _build_parser()
     args = parser.parse_args(argv)
+    args.ingress_generation = None
     saved = None
     if not args.server and not args.pairing_token and not args.pairing_challenge:
         saved = load_saved_runtime_config(path=config_path)
+        endpoint = select_runtime_endpoint(
+            saved,
+            load_current_server_hint(path=server_hint_path),
+        )
         if saved and args.background:
-            args.server = preferred_setup_server(saved["server"], server_hint_path=server_hint_path)
-            args.pairing_token = saved["pairing_token"]
+            if endpoint["pairing_required"]:
+                output_fn("当前公网入口需要重新配对；后台辅助程序未复用旧入口凭据。")
+                return None
+            args.server = endpoint["server"]
+            args.pairing_token = endpoint["pairing_token"]
+            args.ingress_generation = endpoint["ingress_generation"]
             args.device_id = saved["device_id"]
             args.transport = saved["transport"]
             return args
         if saved:
             return (gui_fn or _prompt_setup_gui)(
-                preferred_setup_server(saved["server"], server_hint_path=server_hint_path)
+                endpoint["server"]
             )
     if not args.server:
         output_fn("本地采集辅助程序需要网页地址和配对码。")
@@ -1466,16 +1617,43 @@ def _run_main() -> None:
                     "并在5分钟内重新生成后输入。可直接粘贴网页显示的“配对码：xxxx”。"
                 )
             raise RuntimeError(error_code or "辅助程序配对失败")
+        generation = paired.get("ingress_generation")
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+            raise RuntimeError("辅助程序配对响应缺少有效公网入口代次")
         args.pairing_token = str(paired.get("pairing_token") or "")
-    save_runtime_config(args.server, args.pairing_token, args.device_id, args.transport)
+        args.ingress_generation = generation
+    if args.ingress_generation is None:
+        raise RuntimeError("辅助程序没有有效公网入口代次，需要重新配对")
+    save_runtime_config(
+        args.server,
+        args.pairing_token,
+        args.device_id,
+        args.transport,
+        ingress_generation=args.ingress_generation,
+    )
     while True:
         try:
             if args.transport == "https":
-                run_http_forever(args.server, args.pairing_token, args.device_id)
+                run_http_forever(
+                    args.server,
+                    args.pairing_token,
+                    args.device_id,
+                    ingress_generation=args.ingress_generation,
+                )
             elif args.transport == "wss":
-                run_forever(args.server, args.pairing_token, args.device_id)
+                run_forever(
+                    args.server,
+                    args.pairing_token,
+                    args.device_id,
+                    ingress_generation=args.ingress_generation,
+                )
             else:
-                run_auto_forever(args.server, args.pairing_token, args.device_id)
+                run_auto_forever(
+                    args.server,
+                    args.pairing_token,
+                    args.device_id,
+                    ingress_generation=args.ingress_generation,
+                )
             return
         except PairingRequiredError as exc:
             print(str(exc), flush=True)
@@ -1498,9 +1676,20 @@ def _run_main() -> None:
             if not paired.get("ok"):
                 print(str(paired.get("error") or "重新配对失败"), flush=True)
                 return
+            generation = paired.get("ingress_generation")
+            if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
+                print("重新配对响应缺少有效公网入口代次", flush=True)
+                return
             args = repaired
             args.pairing_token = str(paired.get("pairing_token") or "")
-            save_runtime_config(args.server, args.pairing_token, args.device_id, args.transport)
+            args.ingress_generation = generation
+            save_runtime_config(
+                args.server,
+                args.pairing_token,
+                args.device_id,
+                args.transport,
+                ingress_generation=args.ingress_generation,
+            )
 
 
 def main() -> None:

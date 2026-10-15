@@ -81,11 +81,12 @@ class HelperWebSocketTransportTests(unittest.TestCase):
         self.assertIn("self._request_acquisition(", server)
         self.assertIn(").status()", server)
 
-    def test_websocket_url_adds_helper_endpoint_and_device_id(self):
+    def test_http_and_websocket_transport_send_generation(self):
         transport = HelperTransport(
             "https://afp.example.test/base",
             "pair-token",
             device_id="pc-01",
+            ingress_generation=14,
         )
 
         with patch("websocket.create_connection", return_value=object()) as create:
@@ -96,7 +97,24 @@ class HelperWebSocketTransportTests(unittest.TestCase):
         self.assertEqual(parsed.scheme, "wss")
         self.assertEqual(parsed.path, "/api/helper/ws")
         self.assertEqual(parse_qs(parsed.query)["device_id"], ["pc-01"])
+        self.assertEqual(parse_qs(parsed.query)["ingress_generation"], ["14"])
         self.assertIn("Authorization: Bearer pair-token", create.call_args.kwargs["header"])
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"ok":true}'
+
+        with patch("urllib.request.urlopen", return_value=Response()) as urlopen:
+            transport.http_json("api/helper/poll", {"device_id": "pc-01"})
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.headers["X-afp-ingress-generation"], "14")
+        self.assertEqual(transport.hello()["ingress_generation"], 14)
 
     def test_client_frame_decoder_accepts_masked_json_text(self):
         payload = json.dumps({"type": "heartbeat"}, separators=(",", ":")).encode()

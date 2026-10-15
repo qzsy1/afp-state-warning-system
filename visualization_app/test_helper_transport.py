@@ -25,6 +25,71 @@ def _blocking_hardware_check_worker(_message, _result_queue):
 
 
 class HelperTransportTests(unittest.TestCase):
+    def test_dispatcher_rejects_stale_generation_without_agent_side_effect(self):
+        agent = Mock()
+        dispatcher = helper_entry.HelperCommandDispatcher(agent, ingress_generation=12)
+        responses = []
+        try:
+            dispatcher.submit(
+                {
+                    "type": "command",
+                    "request_id": "stale-start",
+                    "command": "start_capture",
+                    "ingress_generation": 11,
+                    "payload": {},
+                },
+                responses.append,
+            )
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline and not responses:
+                time.sleep(0.01)
+        finally:
+            dispatcher.close()
+
+        self.assertEqual(responses[0]["payload"]["error"], "ingress_generation_changed")
+        self.assertTrue(responses[0]["payload"]["terminal"])
+        self.assertEqual(responses[0]["ingress_generation"], 12)
+        agent.start_capture.assert_not_called()
+
+    def test_concurrent_generation_change_cannot_execute_start_capture(self):
+        agent = Mock()
+        reached_dispatch = threading.Event()
+        resume_dispatch = threading.Event()
+
+        def pause_before_dispatch():
+            reached_dispatch.set()
+            self.assertTrue(resume_dispatch.wait(1.0))
+
+        dispatcher = helper_entry.HelperCommandDispatcher(
+            agent,
+            ingress_generation=20,
+            before_dispatch=pause_before_dispatch,
+        )
+        responses = []
+        try:
+            dispatcher.submit(
+                {
+                    "type": "command",
+                    "request_id": "racing-start",
+                    "command": "start_capture",
+                    "ingress_generation": 20,
+                    "payload": {},
+                },
+                responses.append,
+            )
+            self.assertTrue(reached_dispatch.wait(1.0))
+            dispatcher.update_ingress_generation(21)
+            resume_dispatch.set()
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline and not responses:
+                time.sleep(0.01)
+        finally:
+            resume_dispatch.set()
+            dispatcher.close()
+
+        self.assertEqual(responses[0]["payload"]["error"], "ingress_generation_changed")
+        agent.start_capture.assert_not_called()
+
     def test_helper_handshake_declares_protocol_and_isolated_check_lifecycle(self):
         capabilities = helper_entry.helper_capabilities()
         self.assertGreaterEqual(capabilities["protocol_version"], 2)
@@ -689,16 +754,35 @@ class HelperTransportTests(unittest.TestCase):
         fetcher.assert_not_called()
         agent.resolve_prepared_simulation_source.assert_called_once()
 
-    def test_saved_pairing_server_is_not_rewritten_by_tunnel_hint(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            hint = Path(temp_dir) / "funnel-url.txt"
-            hint.write_text("https://new-public.example.test/\n", encoding="utf-8")
-            selected = helper_entry.preferred_setup_server(
-                "http://192.168.10.20:8770",
-                server_hint_path=hint,
-            )
+    def test_current_hint_replaces_different_saved_url_and_discards_saved_token(self):
+        selected = helper_entry.select_runtime_endpoint(
+            {
+                "server": "https://old-public.example.test",
+                "pairing_token": "old-token",
+                "ingress_generation": 4,
+            },
+            "https://new-public.example.test/",
+        )
 
-        self.assertEqual(selected, "http://192.168.10.20:8770")
+        self.assertEqual(selected["server"], "https://new-public.example.test")
+        self.assertEqual(selected["pairing_token"], "")
+        self.assertIsNone(selected["ingress_generation"])
+        self.assertTrue(selected["pairing_required"])
+
+    def test_same_url_and_generation_reuses_saved_token(self):
+        selected = helper_entry.select_runtime_endpoint(
+            {
+                "server": "HTTPS://AFP.EXAMPLE.TEST:443/",
+                "pairing_token": "saved-token",
+                "ingress_generation": 7,
+            },
+            "https://afp.example.test",
+        )
+
+        self.assertEqual(selected["server"], "https://afp.example.test")
+        self.assertEqual(selected["pairing_token"], "saved-token")
+        self.assertEqual(selected["ingress_generation"], 7)
+        self.assertFalse(selected["pairing_required"])
 
     def test_helper_capabilities_report_fixed_route_without_credentials_or_path(self):
         capabilities = helper_entry.helper_capabilities(
@@ -1059,6 +1143,7 @@ class HelperTransportTests(unittest.TestCase):
                 "https://afp.example.test",
                 "secret-pairing-token",
                 "local-helper",
+                ingress_generation=8,
                 path=path,
             )
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1070,9 +1155,24 @@ class HelperTransportTests(unittest.TestCase):
                     "pairing_token": "secret-pairing-token",
                     "device_id": "local-helper",
                     "transport": "auto",
+                    "ingress_generation": 8,
                 },
             )
-            self.assertEqual(payload["version"], 1)
+            self.assertEqual(payload["version"], 3)
+
+    def test_pairing_response_generation_is_saved_atomically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "helper-config.json"
+            helper_entry.save_runtime_config(
+                "https://afp.example.test",
+                "pair-token",
+                ingress_generation=9,
+                path=path,
+            )
+
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["ingress_generation"], 9)
+            self.assertFalse(path.with_name(path.name + ".tmp").exists())
 
     def test_local_mysql_profile_round_trips_without_plaintext_password(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1157,7 +1257,7 @@ class HelperTransportTests(unittest.TestCase):
             )
             self.assertEqual(result, ("https://afp.example.test", expected))
 
-    def test_helper_cli_preserves_saved_pairing_url_when_tunnel_hint_changes(self):
+    def test_helper_cli_uses_current_hint_when_saved_pairing_url_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "helper-config.json"
             hint_path = Path(directory) / "quick-tunnel-url.txt"
@@ -1168,6 +1268,7 @@ class HelperTransportTests(unittest.TestCase):
                 "https://stale-public.trycloudflare.com",
                 "secret-pairing-token",
                 "local-helper",
+                ingress_generation=3,
                 path=path,
             )
 
@@ -1181,8 +1282,8 @@ class HelperTransportTests(unittest.TestCase):
                 config_path=path,
                 server_hint_path=hint_path,
             )
-            self.assertEqual(result, ("https://stale-public.trycloudflare.com", expected))
-            self.assertEqual(seen["server"], "https://stale-public.trycloudflare.com")
+            self.assertEqual(result, ("https://current-public.trycloudflare.com", expected))
+            self.assertEqual(seen["server"], "https://current-public.trycloudflare.com")
 
     def test_helper_accepts_powershell_utf8_bom_in_tunnel_url_file(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1212,6 +1313,7 @@ class HelperTransportTests(unittest.TestCase):
                 "https://afp.example.test",
                 "secret-pairing-token",
                 "local-helper",
+                ingress_generation=5,
                 path=path,
             )
 
@@ -1229,8 +1331,9 @@ class HelperTransportTests(unittest.TestCase):
             self.assertEqual(result.pairing_token, "secret-pairing-token")
             self.assertEqual(result.device_id, "local-helper")
             self.assertEqual(result.transport, "auto")
+            self.assertEqual(result.ingress_generation, 5)
 
-    def test_background_helper_preserves_saved_pairing_url_when_tunnel_hint_changes(self):
+    def test_authentication_failure_requires_pairing_instead_of_old_url_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "helper-config.json"
             hint_path = Path(directory) / "quick-tunnel-url.txt"
@@ -1239,6 +1342,7 @@ class HelperTransportTests(unittest.TestCase):
                 "https://stale-public.trycloudflare.com",
                 "secret-pairing-token",
                 "local-helper",
+                ingress_generation=2,
                 path=path,
             )
 
@@ -1250,8 +1354,7 @@ class HelperTransportTests(unittest.TestCase):
                 server_hint_path=hint_path,
             )
 
-            self.assertEqual(result.server, "https://stale-public.trycloudflare.com")
-            self.assertEqual(result.pairing_token, "secret-pairing-token")
+            self.assertIsNone(result)
 
     def test_authentication_failure_is_reported_as_repairable_runtime_state(self):
         authentication_failure_message = getattr(helper_entry, "authentication_failure_message", None)
