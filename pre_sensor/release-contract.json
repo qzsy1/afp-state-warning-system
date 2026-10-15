@@ -33,7 +33,11 @@
   },
   "managed_files": {
     "manifest": "SHA256SUMS.txt",
-    "digest_algorithm": "sha256"
+    "digest_algorithm": "sha256",
+    "managed_model_roots": [
+      "models",
+      "new_collection_demo_v11_3/models"
+    ]
   },
   "runtime_requirements": {
     "python_runtime": "bundled",

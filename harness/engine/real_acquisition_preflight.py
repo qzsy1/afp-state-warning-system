@@ -379,6 +379,23 @@ def validate_candidate_release_contract(candidate_root: Path) -> tuple[str, ...]
         issues.append("managed file manifest must be SHA256SUMS.txt")
     if str(managed.get("digest_algorithm") or "").lower() != "sha256":
         issues.append("managed file digest algorithm must be sha256")
+    model_roots = managed.get("managed_model_roots")
+    if not isinstance(model_roots, list) or not model_roots:
+        issues.append("release managed model roots are missing")
+    else:
+        for value in model_roots:
+            relative = str(value or "").strip().replace("\\", "/").strip("/")
+            parts = Path(relative).parts
+            if (
+                not relative
+                or Path(relative).is_absolute()
+                or any(part in {"", ".", ".."} for part in parts)
+            ):
+                issues.append(f"release managed model root is invalid: {value}")
+                continue
+            model_root = (root / relative).resolve()
+            if root not in model_root.parents or not model_root.is_dir():
+                issues.append(f"release managed model root missing or outside candidate: {relative}")
 
     required_assets = static.get("required")
     asset_hashes = static.get("sha256")

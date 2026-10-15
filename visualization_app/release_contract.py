@@ -26,6 +26,7 @@ class ReleaseContract:
     required_static_assets: tuple[str, ...]
     managed_file_manifest: str
     digest_algorithm: str
+    managed_model_roots: tuple[str, ...]
     source_path: Path
 
     def identity_payload(self) -> dict[str, Any]:
@@ -72,6 +73,22 @@ def release_contract_from_mapping(
         isinstance(item, str) and item.strip() for item in assets
     ):
         raise ReleaseContractError("release contract static_assets.required must be non-empty")
+    model_roots = managed.get("managed_model_roots")
+    if not isinstance(model_roots, list) or not model_roots:
+        raise ReleaseContractError("release contract managed_model_roots must be non-empty")
+    normalized_model_roots: list[str] = []
+    for value in model_roots:
+        relative = str(value or "").strip().replace("\\", "/").strip("/")
+        parts = Path(relative).parts
+        if (
+            not relative
+            or Path(relative).is_absolute()
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            raise ReleaseContractError(
+                "release contract managed_model_roots must contain normalized relative paths"
+            )
+        normalized_model_roots.append(relative)
     contract = ReleaseContract(
         schema_version=1,
         application_version=_required_text(identity, "application_version"),
@@ -87,6 +104,7 @@ def release_contract_from_mapping(
         required_static_assets=tuple(str(item) for item in assets),
         managed_file_manifest=_required_text(managed, "manifest"),
         digest_algorithm=_required_text(managed, "digest_algorithm").lower(),
+        managed_model_roots=tuple(normalized_model_roots),
         source_path=Path(source_path or "<mapping>"),
     )
     versions = {
@@ -105,6 +123,17 @@ def release_contract_from_mapping(
     if contract.digest_algorithm != "sha256":
         raise ReleaseContractError("managed file digest_algorithm must be sha256")
     return contract
+
+
+def managed_model_paths(contract: ReleaseContract) -> tuple[Path, ...]:
+    source = contract.source_path.resolve()
+    if source.name.lower() == "release-manifest.json":
+        root = source.parent
+    elif source.name.lower() == "release-contract.json" and source.parent.name.lower() == "pre_sensor":
+        root = source.parent.parent / "visualization_app"
+    else:
+        root = source.parent
+    return tuple((root / relative).resolve() for relative in contract.managed_model_roots)
 
 
 def _candidate_paths(start: Path | None) -> tuple[Path, ...]:

@@ -12,6 +12,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from release_contract import load_release_contract, managed_model_paths
+
 
 APP_DIR = Path(__file__).resolve().parent
 MODULAR_ROOT = Path(os.environ.get("AFP_MODULAR_ROOT") or APP_DIR).resolve()
@@ -74,6 +76,7 @@ DEFAULT_CHECKPOINT = (
     else _WORKSPACE_DEFAULT_CHECKPOINT
 )
 CHECKPOINT = DEFAULT_CHECKPOINT
+RELEASE_CONTRACT = load_release_contract(start=Path(__file__))
 
 MODEL_SENSOR_COLUMNS = [
     "转速",
@@ -219,10 +222,22 @@ def _read_selection_history() -> dict:
         return {}
 
 
-def _remember_model_selection(model_type: str, schema_mode: str, checkpoint: Path) -> None:
+def _remember_model_selection(
+    model_type: str,
+    schema_mode: str,
+    checkpoint: Path,
+    model_source: str,
+) -> None:
     history_path = _selection_history_path()
     history = _read_selection_history()
-    history[f"{_schema_key(schema_mode)}::{normalize_model_type(model_type)}"] = str(checkpoint)
+    key = f"{_schema_key(schema_mode)}::{normalize_model_type(model_type)}"
+    if model_source == "bundled":
+        history.pop(key, None)
+    else:
+        history[key] = {
+            "checkpoint": str(checkpoint),
+            "model_source": "external",
+        }
     try:
         history_path.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
@@ -264,21 +279,29 @@ def _checkpoint_sha256(checkpoint: Path) -> str:
     return digest.hexdigest()
 
 
-def _is_builtin_checkpoint_path(path: Path) -> bool:
-    """Identify paths from an older bundled/source-tree installation.
+def classify_model_source(checkpoint: Path, managed_roots) -> str:
+    try:
+        resolved_checkpoint = Path(checkpoint).resolve(strict=True)
+        if not resolved_checkpoint.is_file():
+            return "invalid"
+    except (OSError, RuntimeError):
+        return "invalid"
+    checkpoint_text = os.path.normcase(str(resolved_checkpoint))
+    for declared_root in managed_roots:
+        try:
+            resolved_root = Path(declared_root).resolve(strict=True)
+            if not resolved_root.is_dir():
+                continue
+            root_text = os.path.normcase(str(resolved_root))
+            if os.path.commonpath((checkpoint_text, root_text)) == root_text:
+                return "bundled"
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return "external"
 
-    A persisted selection from a previous build must not shadow the matching
-    checkpoint that is now shipped beside the EXE.  User-selected checkpoints
-    outside these known application locations remain respected.
-    """
-    normalized = str(path).replace("\\", "/").lower()
-    return any(marker in normalized for marker in (
-        "/models/legacy/",
-        "/models/new/",
-        "/_internal/models/",
-        "/checkpoints/test_",
-        "/new_collection_demo_v11_3/models/",
-    ))
+
+def _current_managed_model_paths() -> tuple[Path, ...]:
+    return managed_model_paths(RELEASE_CONTRACT)
 
 
 def _registered_checkpoint(model_type: str, schema_mode: str = "") -> Path | None:
@@ -287,9 +310,12 @@ def _registered_checkpoint(model_type: str, schema_mode: str = "") -> Path | Non
     history = _read_selection_history()
     remembered = history.get(f"{scope}::{model_type}")
     if remembered:
-        remembered_path = Path(str(remembered)).expanduser()
-        if (remembered_path.exists() and remembered_path.is_file()
-                and not _is_builtin_checkpoint_path(remembered_path)):
+        if isinstance(remembered, dict):
+            remembered_value = remembered.get("checkpoint")
+        else:
+            remembered_value = remembered
+        remembered_path = Path(str(remembered_value or "")).expanduser()
+        if remembered_path.exists() and remembered_path.is_file():
             return remembered_path
 
     # A model trained by the web/native training page is preferred over a
@@ -408,17 +434,11 @@ def inspect_prediction_model(
         inferred_type = _infer_model_type(path)
         if inferred_type != "i_T_G":
             selected_type = inferred_type
-    # Browsers on LAN clients can retain an absolute path from an older
-    # delivery in localStorage.  Built-in model paths are deployment details,
-    # not user-owned selections, so relocate a missing one to the equivalent
-    # checkpoint in the currently running delivery.  Keep failing closed for
-    # genuinely custom paths so a typo cannot silently select another model.
-    if (not path.is_file()) and _is_builtin_checkpoint_path(path):
-        relocated = _registered_checkpoint(selected_type, schema_mode)
-        if relocated is not None and Path(relocated).is_file():
-            path = Path(relocated).resolve()
     if not path.exists() or not path.is_file():
         raise FileNotFoundError(f"预测模型文件不存在：{path}")
+    model_source = classify_model_source(path, _current_managed_model_paths())
+    if model_source == "invalid":
+        raise ValueError(f"预测模型路径无法验证：{path}")
     metadata_path = next(
         (candidate for candidate in _metadata_candidates(path) if candidate.exists()),
         None,
@@ -555,6 +575,7 @@ def inspect_prediction_model(
         "model_label": definition["label"],
         "supports_live": not bool(definition.get("training_only", False)),
         "checkpoint": str(path),
+        "model_source": model_source,
         "metadata_source": metadata_source,
         "input_sensors": input_sensors,
         "output_sensors": output_sensors,
@@ -566,7 +587,7 @@ def inspect_prediction_model(
         "checkpoint_sha256": _checkpoint_sha256(path),
         "validation_loss": _training_validation_loss(path),
     }
-    _remember_model_selection(selected_type, schema_mode, path)
+    _remember_model_selection(selected_type, schema_mode, path, model_source)
     return result
 
 

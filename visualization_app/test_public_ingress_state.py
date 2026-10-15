@@ -81,7 +81,11 @@ class PublicIngressStateTests(unittest.TestCase):
                 "readiness_schema_version": 1,
             },
             "static_assets": {"required": ["app/static/app.js"]},
-            "managed_files": {"manifest": "SHA256SUMS.txt", "digest_algorithm": "sha256"},
+            "managed_files": {
+                "manifest": "SHA256SUMS.txt",
+                "digest_algorithm": "sha256",
+                "managed_model_roots": ["models"],
+            },
         }
         contract = release_contract_from_mapping(
             payload,

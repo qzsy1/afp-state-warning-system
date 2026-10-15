@@ -13,6 +13,34 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class CandidateReleaseContractTests(unittest.TestCase):
+    def test_manifest_missing_managed_model_roots_is_diagnostic(self) -> None:
+        source_contract = json.loads(
+            (ROOT / "pre_sensor" / "release-contract.json").read_text(encoding="utf-8")
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate = Path(temporary)
+            manifest = {
+                **source_contract,
+                "candidate": {
+                    "candidate_id": "candidate-test",
+                    "source_revision": "abc123",
+                    "created_at": "2026-10-15T00:00:00Z",
+                },
+                "managed_files": {
+                    "manifest": "SHA256SUMS.txt",
+                    "digest_algorithm": "sha256",
+                },
+                "static_assets": {"required": [], "sha256": {}},
+                "configuration_templates": {"required": [], "sha256": {}},
+            }
+            (candidate / "RELEASE-MANIFEST.json").write_text(
+                json.dumps(manifest), encoding="utf-8"
+            )
+            self.assertIn(
+                "release managed model roots are missing",
+                validate_candidate_release_contract(candidate),
+            )
+
     def test_candidate_builder_uses_ephemeral_f_drive_staging(self) -> None:
         script = ROOT / "pre_sensor" / "build-candidate.ps1"
         source = script.read_text(encoding="utf-8")
@@ -47,6 +75,8 @@ class CandidateReleaseContractTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             candidate = Path(temporary)
+            for relative in source_contract["managed_files"]["managed_model_roots"]:
+                (candidate / relative).mkdir(parents=True, exist_ok=True)
             asset = candidate / "app" / "ui" / "app.js"
             asset.parent.mkdir(parents=True)
             asset.write_bytes(b"asset")

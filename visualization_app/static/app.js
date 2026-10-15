@@ -822,9 +822,6 @@ function fmt(value, digits = 3) {
   return Number.isFinite(number) ? number.toFixed(digits) : "—";
 }
 
-// v2 intentionally starts clean so an older installation cannot restore a
-// source-tree/internal checkpoint instead of the matching EXE-local weight.
-// New manual selections are still remembered from this version onward.
 const MODEL_SELECTION_HISTORY_KEY = "afp-model-selection-history-v2";
 function modelSelectionKey(schemaMode, modelType) {
   return `${schemaMode || "legacy_original"}::${modelType || "i_T_G"}`;
@@ -837,25 +834,14 @@ function readModelSelectionHistory() {
     return {};
   }
 }
-function isBundledModelPath(checkpoint) {
-  const normalized = String(checkpoint || "").replaceAll("\\", "/").toLowerCase();
-  return [
-    "/models/legacy/",
-    "/models/new/",
-    "/_internal/models/",
-    "/new_collection_demo_v11_3/models/",
-  ].some((marker) => normalized.includes(marker));
-}
-function rememberModelPath(schemaMode, modelType, checkpoint) {
+function rememberModelPath(schemaMode, modelType, checkpoint, modelSource = "external") {
   if (!checkpoint) return;
   const history = readModelSelectionHistory();
   const key = modelSelectionKey(schemaMode, modelType);
-  if (isBundledModelPath(checkpoint)) {
-    // Packaged paths change when a delivery is upgraded or moved.  The
-    // bootstrap profile already supplies the correct path for this server.
+  if (modelSource === "bundled") {
     delete history[key];
   } else {
-    history[key] = checkpoint;
+    history[key] = { checkpoint, model_source: "external" };
   }
   try {
     localStorage.setItem(MODEL_SELECTION_HISTORY_KEY, JSON.stringify(history));
@@ -866,17 +852,10 @@ function rememberModelPath(schemaMode, modelType, checkpoint) {
 function lastModelPath(schemaMode, modelType) {
   const history = readModelSelectionHistory();
   const key = modelSelectionKey(schemaMode, modelType);
-  const checkpoint = history[key] || "";
-  if (isBundledModelPath(checkpoint)) {
-    delete history[key];
-    try {
-      localStorage.setItem(MODEL_SELECTION_HISTORY_KEY, JSON.stringify(history));
-    } catch (_) {
-      // Ignore storage failures; returning an empty path still uses bootstrap.
-    }
-    return "";
-  }
-  return checkpoint;
+  const remembered = history[key] || "";
+  if (typeof remembered === "string") return remembered;
+  if (!remembered || remembered.model_source === "bundled") return "";
+  return remembered.checkpoint || "";
 }
 
 function toast(message) {
@@ -1411,7 +1390,12 @@ async function inspectPredictionModel(setSelections = true) {
       schema_mode: schemaMode,
     });
     applyPredictionModelProfile(profile, setSelections);
-    rememberModelPath(schemaMode, modelType, profile.checkpoint || "");
+    rememberModelPath(
+      schemaMode,
+      modelType,
+      profile.checkpoint || "",
+      profile.model_source || "external",
+    );
     return profile;
   } catch (error) {
     const status = $("predictionModelStatus");
@@ -1433,7 +1417,12 @@ async function selectPredictionModel() {
     });
     if (result.selected) {
       applyPredictionModelProfile(result.model, true);
-      rememberModelPath(schemaMode, modelType, result.path || result.model?.checkpoint || "");
+      rememberModelPath(
+        schemaMode,
+        modelType,
+        result.path || result.model?.checkpoint || "",
+        result.model_source || result.model?.model_source || "external",
+      );
       toast("预测模型已选择，并已按模型元数据设置输入/输出通道");
     }
   } catch (error) {
