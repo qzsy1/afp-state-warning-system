@@ -103,6 +103,7 @@ class BuildScriptContractTests(unittest.TestCase):
     def test_build_copies_release_operational_scripts(self) -> None:
         for name in (
             "install_local_helper_autostart.ps1",
+            "PublicIngress.psm1",
             "public_tunnel_watchdog.ps1",
             "tailscale_funnel_watchdog.ps1",
         ):
@@ -203,6 +204,7 @@ class BuildScriptContractTests(unittest.TestCase):
             self.assertEqual(hashlib.sha256(assembled.read_bytes()).hexdigest(), expected_hash)
             self.assertTrue((target / "_internal" / "runtime.txt").is_file())
             self.assertTrue((target / "config" / "runtime.json").is_file())
+            self.assertTrue((target / "PublicIngress.psm1").is_file())
             self.assertEqual(
                 (target / "local_helper" / "AFP_Local_Capture_Helper.exe").read_bytes(),
                 b"trusted-helper-bytes",
@@ -211,6 +213,7 @@ class BuildScriptContractTests(unittest.TestCase):
             self.assertTrue((target / "app" / "outputs_tc_hi_soft_consistency_v13_8" / "soft.csv").is_file())
             self.assertTrue((target / "app" / "outputs_causal_online_consistency_v13_9" / "causal.joblib").is_file())
             self.assertIn("AFP_Integrated_System_Modular.exe", (target / "SHA256SUMS.txt").read_text(encoding="utf-8-sig"))
+            self.assertIn("PublicIngress.psm1", (target / "SHA256SUMS.txt").read_text(encoding="utf-8-sig"))
             version = json.loads((target / "VERSION.json").read_text(encoding="utf-8-sig"))
             self.assertEqual(version["application_version"], "test-split")
             self.assertEqual(version["launcher_version"], "2.0.4")

@@ -156,6 +156,7 @@ $documentation | ForEach-Object {
 }
 $operationalFiles = @(
     "install_local_helper_autostart.ps1",
+    "PublicIngress.psm1",
     "public_tunnel_watchdog.ps1",
     "tailscale_funnel_watchdog.ps1"
 )
