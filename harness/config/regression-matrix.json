@@ -37,7 +37,12 @@
     {"id": "PRE_SENSOR_RELEASE-001", "title": "主程序、Helper、配置、静态资源和协议绑定同一候选发行身份", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "PRE_SENSOR_ENVIRONMENT-001", "title": "传感器前环境预检严格区分通过、失败、阻塞和物理待验证", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "PRE_SENSOR_ENDURANCE-001", "title": "两种模式的10 Hz耐久、故障恢复、容量和最终对账可验证", "mandatory": true, "profiles": ["full", "release"]},
-    {"id": "PRE_SENSOR_FIELD_OPS-001", "title": "双机检查、现场顺序、脱敏证据和真实设备清单边界可执行", "mandatory": true, "profiles": ["full", "release"]}
+    {"id": "PRE_SENSOR_FIELD_OPS-001", "title": "双机检查、现场顺序、脱敏证据和真实设备清单边界可执行", "mandatory": true, "profiles": ["full", "release"]},
+    {"id": "PRE_SENSOR_PUBLIC_INGRESS-001", "title": "公网入口以公共边缘证据失败关闭并在安全切换前保留回退路径", "mandatory": true, "profiles": ["quick", "full", "release"]},
+    {"id": "PRE_SENSOR_INGRESS_GENERATION-001", "title": "公网入口地址变化必须推进持久化代际并使旧就绪证据失效", "mandatory": true, "profiles": ["quick", "full", "release"]},
+    {"id": "PRE_SENSOR_INGRESS_CUTOVER-001", "title": "入口切换必须验证新入口、发布代际并确认客户端就绪后才能退役旧入口", "mandatory": true, "profiles": ["quick", "full", "release"]},
+    {"id": "PRE_SENSOR_HELPER_GENERATION-001", "title": "Helper 会话、命令和结果必须绑定当前入口代际并拒绝跨代际复用", "mandatory": true, "profiles": ["quick", "full", "release"]},
+    {"id": "PRE_SENSOR_MODEL_PROVENANCE-001", "title": "模型来源必须由发行合同管理的根目录判定并向界面显式报告", "mandatory": true, "profiles": ["quick", "full", "release"]}
   ],
   "checks": [
     {
@@ -67,6 +72,20 @@
       "evidence_tier": "automated",
       "requirements": ["PRE_SENSOR_RELEASE-001"],
       "change_patterns": ["delivery/**", "harness/engine/delivery_readonly.py", "harness/config/delivery-readonly-baseline.json"]
+    },
+    {
+      "id": "public-ingress-cutover-contracts",
+      "title": "公网公共边缘真实性与入口安全切换合同",
+      "kind": "command",
+      "command": ["{python}", "-m", "unittest", "visualization_app.test_public_ingress_module", "visualization_app.test_public_ingress_state", "visualization_app.test_helper_relay", "visualization_app.test_helper_transport", "harness.tests.test_single_runtime_deployment", "visualization_app.test_model_selection_source_contract", "harness.tests.test_public_ingress_contract", "-v"],
+      "cwd": ".",
+      "timeout_seconds": 180,
+      "profiles": ["quick", "full", "release"],
+      "environments": ["local", "ci"],
+      "blocking": true,
+      "evidence_tier": "automated",
+      "requirements": ["PRE_SENSOR_PUBLIC_INGRESS-001", "PRE_SENSOR_INGRESS_GENERATION-001", "PRE_SENSOR_INGRESS_CUTOVER-001", "PRE_SENSOR_HELPER_GENERATION-001", "PRE_SENSOR_MODEL_PROVENANCE-001", "LAN_PUBLIC-001", "EDGE_HELPER-001"],
+      "change_patterns": ["harness/**", "visualization_app/*tunnel*", "visualization_app/*funnel*", "openspec/changes/complete-pre-sensor-readiness/**"]
     },
     {
       "id": "pre-sensor-endurance-unit-contracts",

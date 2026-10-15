@@ -7,76 +7,61 @@ import unittest
 from pathlib import Path
 
 from harness.engine.matrix import load_matrix
-from harness.engine.public_ingress import evaluate_public_ingress
+from harness.engine.public_ingress import adapt_public_ingress_report
 
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 class PublicIngressGateTests(unittest.TestCase):
-    def test_local_and_control_plane_health_cannot_replace_public_edge(self) -> None:
-        result = evaluate_public_ingress(
-            origin_ready=True,
-            control_plane_ready=True,
-            public_edge_ready=False,
-            current_url="https://server.example/",
-            current_owner_confirmed=True,
-            client_ready=True,
+    def test_report_adapter_preserves_production_decision_fields(self) -> None:
+        result = adapt_public_ingress_report(
+            {
+                "overall_status": "failed",
+                "generation": 7,
+                "recovery_owner": "tailscale",
+                "public_edge": {"ok": False, "code": "unexpected_http_status"},
+                "helper": {"ok": True, "code": "helper_ready"},
+                "non_sensitive_error": "public_edge_unverified",
+            }
         )
 
-        self.assertEqual("failed", result.status)
-        self.assertEqual("public_edge_unverified", result.reason)
-        self.assertFalse(result.public_ready)
-        self.assertFalse(result.may_retire_previous)
-        self.assertFalse(result.step3_allowed)
-
-    def test_previous_ingress_can_retire_only_after_owner_is_confirmed(self) -> None:
-        unowned = evaluate_public_ingress(
-            origin_ready=True,
-            control_plane_ready=True,
-            public_edge_ready=True,
-            current_url="https://server.example/",
-            current_owner_confirmed=False,
-        )
-        owned = evaluate_public_ingress(
-            origin_ready=True,
-            control_plane_ready=True,
-            public_edge_ready=True,
-            current_url="https://server.example/",
-            current_owner_confirmed=True,
-        )
-
-        self.assertTrue(unowned.public_ready)
-        self.assertFalse(unowned.may_retire_previous)
-        self.assertTrue(owned.may_retire_previous)
-
-    def test_url_change_invalidates_client_readiness_and_step3(self) -> None:
-        result = evaluate_public_ingress(
-            origin_ready=True,
-            control_plane_ready=True,
-            public_edge_ready=True,
-            previous_url="https://old.example/",
-            current_url="https://new.example/",
-            current_owner_confirmed=True,
-            client_ready=True,
-        )
-
-        self.assertTrue(result.client_readiness_stale)
-        self.assertFalse(result.step3_allowed)
+        self.assertEqual("failed", result.overall_status)
+        self.assertEqual(7, result.generation)
+        self.assertFalse(result.public_edge_ok)
+        self.assertTrue(result.helper_ok)
 
     def test_matrix_routes_public_ingress_contract_to_every_profile(self) -> None:
         matrix = load_matrix(ROOT / "harness" / "config" / "regression-matrix.json")
         requirements = {item.id: item for item in matrix.requirements}
         checks = {item.id: item for item in matrix.checks}
 
-        requirement = requirements["PRE_SENSOR_PUBLIC_INGRESS-001"]
+        required_ids = {
+            "PRE_SENSOR_PUBLIC_INGRESS-001",
+            "PRE_SENSOR_INGRESS_GENERATION-001",
+            "PRE_SENSOR_INGRESS_CUTOVER-001",
+            "PRE_SENSOR_HELPER_GENERATION-001",
+            "PRE_SENSOR_MODEL_PROVENANCE-001",
+        }
+        for requirement_id in required_ids:
+            requirement = requirements[requirement_id]
+            self.assertEqual(("quick", "full", "release"), requirement.profiles)
+            self.assertTrue(requirement.mandatory)
         check = checks["public-ingress-cutover-contracts"]
-        self.assertEqual(("quick", "full", "release"), requirement.profiles)
-        self.assertTrue(requirement.mandatory)
         self.assertEqual(("quick", "full", "release"), check.profiles)
         self.assertTrue(check.blocking)
         self.assertEqual("automated", check.evidence_tier)
-        self.assertIn(requirement.id, check.requirements)
+        self.assertTrue(required_ids.issubset(set(check.requirements)))
+        command = " ".join(check.command)
+        for module in (
+            "visualization_app.test_public_ingress_module",
+            "visualization_app.test_public_ingress_state",
+            "visualization_app.test_helper_relay",
+            "visualization_app.test_helper_transport",
+            "harness.tests.test_single_runtime_deployment",
+            "visualization_app.test_model_selection_source_contract",
+        ):
+            self.assertIn(module, command)
 
 
 @unittest.skipUnless(shutil.which("powershell.exe"), "Windows PowerShell required")

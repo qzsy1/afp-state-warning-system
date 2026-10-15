@@ -60,14 +60,32 @@ http://127.0.0.1:8770`. The resulting
 computer restarts. Run `tailscale_funnel_watchdog.ps1 -Mode Install` from the
 delivery directory after the first Funnel succeeds; it keeps the origin,
 Funnel and local capture helper available and records status under
-`F:\softwawre\tailscale`. Do not enable router port forwarding or open WAN
-port 8770.
+`F:\softwawre\tailscale`. Its public-health decision resolves the hostname
+through public DNS and forces HTTPS to a public edge address so split DNS or a
+tailnet-private route cannot report a false public success. Do not enable
+router port forwarding or open WAN port 8770.
 
 Set the same hostname in the local administrator settings. Use the public
 HTTPS URL when unlocking from LAN or the Internet; direct LAN HTTP remains
 guest-only. Revoke any previously exposed SiliconFlow key, enter a newly
 created key locally, and verify it is absent from browser responses and logs.
 If Funnel is unavailable, continue with the local desktop or LAN guest URL and
-inspect `F:\softwawre\tailscale\funnel-status.json`. The old Cloudflare files
-are retained only as a manual rollback and are disabled after Funnel passes an
-end-to-end public health check.
+inspect `F:\softwawre\tailscale\funnel-status.json`. Installing the Funnel
+watchdog does not stop or unregister an existing public-ingress fallback. Only
+after a phone or second computer proves the new public URL may an operator
+explicitly retire the previous ingress. A changed temporary URL invalidates
+the previous client-readiness result and requires page access and pairing to
+be verified again before any acquisition step.
+
+From the source repository, the following command validates the production
+public-ingress, Helper-generation, deployment-transaction and model-provenance
+contracts without changing the installed delivery or running processes:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest visualization_app.test_public_ingress_module visualization_app.test_public_ingress_state visualization_app.test_helper_relay visualization_app.test_helper_transport harness.tests.test_single_runtime_deployment visualization_app.test_model_selection_source_contract harness.tests.test_public_ingress_contract -v
+```
+
+Deploying or replacing the fixed runtime, stopping or restarting a running
+service, changing the active ingress, and executing dual-computer step 3 each
+require separate explicit authorization. A successful source verification
+does not authorize any of those operations.

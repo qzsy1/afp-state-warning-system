@@ -20,6 +20,11 @@ class PreSensorReadinessMatrixContractTests(unittest.TestCase):
             "PRE_SENSOR_ENVIRONMENT-001": ("quick", "full", "release"),
             "PRE_SENSOR_ENDURANCE-001": ("full", "release"),
             "PRE_SENSOR_FIELD_OPS-001": ("full", "release"),
+            "PRE_SENSOR_PUBLIC_INGRESS-001": ("quick", "full", "release"),
+            "PRE_SENSOR_INGRESS_GENERATION-001": ("quick", "full", "release"),
+            "PRE_SENSOR_INGRESS_CUTOVER-001": ("quick", "full", "release"),
+            "PRE_SENSOR_HELPER_GENERATION-001": ("quick", "full", "release"),
+            "PRE_SENSOR_MODEL_PROVENANCE-001": ("quick", "full", "release"),
         }
         requirements = {item.id: item for item in self.matrix.requirements}
 
@@ -42,6 +47,17 @@ class PreSensorReadinessMatrixContractTests(unittest.TestCase):
                 ("quick", "full", "release"),
                 "automated",
                 {"PRE_SENSOR_RELEASE-001"},
+            ),
+            "public-ingress-cutover-contracts": (
+                ("quick", "full", "release"),
+                "automated",
+                {
+                    "PRE_SENSOR_PUBLIC_INGRESS-001",
+                    "PRE_SENSOR_INGRESS_GENERATION-001",
+                    "PRE_SENSOR_INGRESS_CUTOVER-001",
+                    "PRE_SENSOR_HELPER_GENERATION-001",
+                    "PRE_SENSOR_MODEL_PROVENANCE-001",
+                },
             ),
             "pre-sensor-endurance-contracts": (
                 ("full", "release"),

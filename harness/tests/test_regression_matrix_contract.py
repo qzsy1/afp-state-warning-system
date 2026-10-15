@@ -29,6 +29,9 @@ class RegressionMatrixContractTests(unittest.TestCase):
                 "REAL_PREP_FRAME", "REAL_PREP_EQUIVALENCE",
                 "PRE_SENSOR_RELEASE", "PRE_SENSOR_ENVIRONMENT",
                 "PRE_SENSOR_ENDURANCE", "PRE_SENSOR_FIELD_OPS",
+                "PRE_SENSOR_PUBLIC_INGRESS",
+                "PRE_SENSOR_INGRESS_GENERATION", "PRE_SENSOR_INGRESS_CUTOVER",
+                "PRE_SENSOR_HELPER_GENERATION", "PRE_SENSOR_MODEL_PROVENANCE",
             },
         )
 

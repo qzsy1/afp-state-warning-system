@@ -4,6 +4,7 @@
     "quick": [
       "harness-contracts",
       "pre-sensor-readiness-contracts",
+      "public-ingress-cutover-contracts",
       "delivery-readonly-baseline",
       "real-acquisition-preflight-contracts",
       "real-acquisition-mode-contracts",
@@ -17,6 +18,7 @@
     "full": [
       "harness-contracts",
       "pre-sensor-readiness-contracts",
+      "public-ingress-cutover-contracts",
       "delivery-readonly-baseline",
       "pre-sensor-endurance-unit-contracts",
       "pre-sensor-endurance-contracts",
@@ -43,6 +45,7 @@
     "release": [
       "harness-contracts",
       "pre-sensor-readiness-contracts",
+      "public-ingress-cutover-contracts",
       "delivery-readonly-baseline",
       "pre-sensor-endurance-unit-contracts",
       "pre-sensor-endurance-contracts",

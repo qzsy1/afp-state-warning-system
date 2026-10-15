@@ -45,10 +45,21 @@ EXE判定按职责边界处理：`modular_runtime/build_launcher.ps1` 变化要�
 
 自动化和模拟结果不得冒充真实 USB 拓展坞、SMRF、PLC、ABB、UVC、M3232 或目标 MySQL 的现场硬件证据。`field-usb-dock-topology`、`field-real-hardware` 和 `field-target-mysql` 会明确显示为待人工验证。拓展坞现场步骤见 `field/usb-dock-topology.md`。Harness 不保存 API Key、密码或 Token。
 
+## 公网入口只读验证
+
+在源码仓库根目录运行以下命令，可验证公网边缘探测、入口代际、Helper 会话、部署事务和模型来源合同；这些命令不部署候选、不停止或重启现有程序，也不发送采集启动请求：
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest visualization_app.test_public_ingress_module visualization_app.test_public_ingress_state visualization_app.test_helper_relay visualization_app.test_helper_transport harness.tests.test_single_runtime_deployment visualization_app.test_model_selection_source_contract harness.tests.test_public_ingress_contract -v
+openspec validate complete-pre-sensor-readiness --strict
+```
+
+部署或替换固定运行目录、停止或重启现有服务、修改公网入口以及执行双机步骤 3 均是独立操作，必须分别取得明确授权。Harness 通过只证明代码合同满足要求，不会把 `windows_readiness`、物理传感器或目标 MySQL 的待验证状态自动改为通过。
+
 ## 单项入口索引
 
-软件检查：`harness-contracts`、`modular-runtime-contracts`、`interface-monitor-contracts`、`usb-dock-topology-contracts`、`frontend-behavior-contracts`、`native-function-contracts`、`frontend-public-contracts`、`acquisition-storage-contracts`、`dashboard-runtime-contracts`、`diagnosis-interface-contracts`、`causal-history-evidence`、`edge-helper-websocket-contracts`、`model-prediction-contracts`。
+软件检查：`harness-contracts`、`public-ingress-cutover-contracts`、`modular-runtime-contracts`、`interface-monitor-contracts`、`usb-dock-topology-contracts`、`frontend-behavior-contracts`、`native-function-contracts`、`frontend-public-contracts`、`acquisition-storage-contracts`、`dashboard-runtime-contracts`、`diagnosis-interface-contracts`、`causal-history-evidence`、`edge-helper-websocket-contracts`、`model-prediction-contracts`。
 
-`frontend-behavior-contracts` 执行生产 `app.js` 的关键行为场景，而不是只搜索源码关键字：PLC 与 ABB 共用网卡时两张逻辑接口卡必须同时保留；端口尚未识别时“立即检查”必须继续提交驱动检查，而真实采集门禁仍须阻断。`frontend-public-contracts` 覆盖 LAN 操作员会话与 helper 权限、公网访客隔离和脱敏、Cloudflare/Tailscale 隧道健康；`modular-runtime-contracts` 另外覆盖 LAN 地址选择以及 8770/8771 服务边界。
+`frontend-behavior-contracts` 执行生产 `app.js` 的关键行为场景，而不是只搜索源码关键字：PLC 与 ABB 共用网卡时两张逻辑接口卡必须同时保留；端口尚未识别时“立即检查”必须继续提交驱动检查，而真实采集门禁仍须阻断。`public-ingress-cutover-contracts` 区分本地源站、隧道控制面和公共边缘数据面，要求切换失败时保留既有入口，并在临时 URL 变化后使客户端就绪失效。`frontend-public-contracts` 覆盖 LAN 操作员会话与 helper 权限、公网访客隔离和脱敏、Cloudflare/Tailscale 隧道健康；`modular-runtime-contracts` 另外覆盖 LAN 地址选择以及 8770/8771 服务边界。
 
 EXE 检查：`release-module-status`、`release-self-test`、`release-verify-files`、`release-integration-smoke`、`release-functional-smoke`。现场项：`field-usb-dock-topology`、`field-real-hardware`、`field-target-mysql`。
