@@ -352,6 +352,8 @@ function Start-Tunnel {
         if (Test-Tunnel) { return $true }
         Start-Sleep -Seconds 2
     }
+    try { Stop-StaleTunnel } catch {
+    }
     return $false
 }
 

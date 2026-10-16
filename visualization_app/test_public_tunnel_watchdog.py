@@ -13,6 +13,7 @@ class PublicTunnelWatchdogContractTests(unittest.TestCase):
         self.assertIn("20241/metrics", text)
         self.assertIn("cloudflared_tunnel_ha_connections", text)
         self.assertIn("Start-Process", text)
+        self.assertIn("try { Stop-StaleTunnel }", text)
         self.assertIn("127.0.0.1:8770", text)
 
     def test_cloudflare_watchdog_is_non_owner_without_explicit_cutover(self):

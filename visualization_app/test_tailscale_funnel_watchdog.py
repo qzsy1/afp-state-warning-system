@@ -376,6 +376,7 @@ class TailscaleFunnelWatchdogContractTests(unittest.TestCase):
         text = self.source.read_text(encoding="utf-8-sig")
         self.assertIn("WaitForExit", text)
         self.assertIn("Stop-Process -Id $process.Id -Force", text)
+        self.assertIn("Stop-CandidateIngress | Out-Null", text)
 
     def test_public_health_uses_shared_forced_edge_probe(self):
         text = self.source.read_text(encoding="utf-8-sig")

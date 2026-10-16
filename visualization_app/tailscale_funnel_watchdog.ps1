@@ -434,6 +434,7 @@ function Start-Funnel {
     # tailscale funnel --bg --https=443 --yes http://127.0.0.1:8770
     $result = Invoke-TailscaleWithTimeout @("funnel", "--bg", "--https=443", "--yes", "http://127.0.0.1:8770")
     if ($result.ExitCode -ne 0) {
+        Stop-CandidateIngress | Out-Null
         Write-FunnelState "funnel_approval_required" "Tailscale Funnel 尚未获准；请在受控终端完成登录或审批。"
         return $false
     }
@@ -476,6 +477,7 @@ function Ensure-Funnel {
         }
     }
     if (-not (Test-Funnel)) {
+        if ($candidateStarted) { Stop-CandidateIngress | Out-Null }
         Write-FunnelState "funnel_unavailable" "Tailscale已登录，但Funnel没有指向本地8770端口。" $publicUrl
         return $false
     }
