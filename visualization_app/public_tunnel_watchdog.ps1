@@ -65,7 +65,6 @@ function Write-TunnelState([string]$Code, [string]$PublicUrl = "", $Layers = $nu
         non_sensitive_error = if ($allReady) { "" } else { $Code }
         checked_at = (Get-Date).ToString("o")
     } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $TunnelStatusFile -Encoding UTF8
-    Release-CutoverReservation
 }
 
 function Get-CandidateId {
@@ -73,6 +72,17 @@ function Get-CandidateId {
         return [string](Get-Content -LiteralPath $ReleaseManifestFile -Raw -Encoding UTF8 |
             ConvertFrom-Json -ErrorAction Stop).candidate.candidate_id
     } catch { return "" }
+}
+
+function Get-WatchdogFileSha256([string]$Path) {
+    $stream = [IO.File]::OpenRead($Path)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace("-", "")
+    } finally {
+        $sha.Dispose()
+        $stream.Dispose()
+    }
 }
 
 function Get-CurrentIngressState {
@@ -92,14 +102,16 @@ function Get-CutoverReadiness {
 }
 
 function Release-CutoverReservation {
-    if (-not $script:CutoverReservationId) { return }
+    if (-not $script:CutoverReservationId) { return $true }
     try {
         $body = @{ reservation_id = $script:CutoverReservationId } | ConvertTo-Json -Compress
-        Invoke-RestMethod -Uri ($ControlUrl + "/api/ingress/cutover-release") `
-            -Method Post -ContentType "application/json" -Body $body -TimeoutSec 5 | Out-Null
-    } catch {
-    } finally {
+        $released = Invoke-RestMethod -Uri ($ControlUrl + "/api/ingress/cutover-release") `
+            -Method Post -ContentType "application/json" -Body $body -TimeoutSec 5
+        if (-not [bool]$released.released) { return $false }
         $script:CutoverReservationId = ""
+        return $true
+    } catch {
+        return $false
     }
 }
 
@@ -122,6 +134,10 @@ function Test-WatchdogMutationAllowed {
     param($State, [string]$Provider, [string]$RequestedMode, [long]$RequiredGeneration, [bool]$Approved, $Readiness)
     $owner = if ($State) { [string]$State.recovery_owner } else { "" }
     $generation = if ($State) { [long]$State.generation } else { 0L }
+    if ($Readiness -and $Readiness.PSObject.Properties["generation"] -and
+        [long]$Readiness.generation -ne $generation) {
+        return [pscustomobject]@{ allowed = $false; reason = "ingress_generation_mismatch" }
+    }
     if ($RequestedMode -eq "Install") { return [pscustomobject]@{ allowed = $false; reason = "install_observe_only" } }
     if ($RequestedMode -eq "Cutover") {
         if (-not $Approved) { return [pscustomobject]@{ allowed = $false; reason = "owner_cutover_not_approved" } }
@@ -293,9 +309,26 @@ function Test-PublicTunnel([string]$PublicUrl) {
     if ($healthUri.Scheme -ne "https") { return $false }
     try { $addresses = @(Resolve-AfpPublicEdgeAddresses -HostName $healthUri.DnsSafeHost) }
     catch { return $false }
+    $healthReady = $false
     foreach ($address in $addresses) {
         try {
-            if ((Invoke-AfpForcedPublicProbe -Uri $healthUri -Address $address).ok) { return $true }
+            if ((Invoke-AfpForcedPublicProbe -Uri $healthUri -Address $address).ok) {
+                $healthReady = $true
+                break
+            }
+        } catch {
+        }
+    }
+    if (-not $healthReady) { return $false }
+    $assetPath = Join-Path $DeliveryRoot "app\ui\app.js"
+    if (-not (Test-Path -LiteralPath $assetPath -PathType Leaf)) { return $false }
+    $assetHash = Get-WatchdogFileSha256 $assetPath
+    $assetUri = [Uri]($PublicUrl.TrimEnd("/") + "/app.js?afp_identity_check=" + $assetHash.Substring(0, 16))
+    foreach ($address in $addresses) {
+        try {
+            if ((Invoke-AfpForcedPublicProbe -Uri $assetUri -Address $address -ExpectedSha256 $assetHash).ok) {
+                return $true
+            }
         } catch {
         }
     }
@@ -379,13 +412,7 @@ function Start-Tunnel {
     return $false
 }
 
-function Ensure-Tunnel {
-    $state = Get-CurrentIngressState
-    if (-not (Ensure-Origin)) {
-        Write-TunnelState "origin_unavailable"
-        return $false
-    }
-    $readiness = Get-CutoverReadiness
+function Invoke-TunnelTransaction($state, $readiness) {
     $decision = Test-WatchdogMutationAllowed $state "cloudflare" $Mode $ExpectedGeneration ([bool]$ApproveOwnerCutover) $readiness
     if (-not $decision.allowed) {
         Write-TunnelState ([string]$decision.reason)
@@ -451,24 +478,23 @@ function Ensure-Tunnel {
         New-WatchdogLayer $false "helper_recovery_failed"
     }
     if (-not $helperReady) {
-        $rolledBack = if ($publication.changed) {
-            Restore-PreviousIngressState $state ([long]$publication.generation) $publicUrl $candidateId
-        } else { $true }
-        if ($candidateStarted -or $crossProviderCutover) { Stop-CandidateIngress | Out-Null }
+        $previousReady = $state -and (Test-PublicTunnel ([string]$state.public_url))
+        $rolledBack = $false
+        if ($publication.changed -and $previousReady) {
+            $rolledBack = Restore-PreviousIngressState $state ([long]$publication.generation) $publicUrl $candidateId
+            if ($rolledBack) { Stop-CandidateIngress | Out-Null }
+        } elseif (-not $publication.changed) {
+            $rolledBack = $true
+        } else {
+            $layers.ingress = New-WatchdogLayer $false "previous_ingress_compensation_unavailable"
+            try {
+                Publish-AfpPublicIngressState -Path $IngressStateFile -PublicUrl $publicUrl `
+                    -Provider "cloudflare" -RecoveryOwner "cloudflare" -CandidateId $candidateId `
+                    -Layers $layers -ExpectedGeneration ([long]$publication.generation) | Out-Null
+            } catch {
+            }
+        }
         $code = if ($rolledBack) { "helper_recovery_failed" } else { "cutover_rollback_failed" }
-        Write-TunnelState $code $publicUrl $layers
-        return $false
-    }
-    try {
-        Publish-AfpPublicIngressState -Path $IngressStateFile -PublicUrl $publicUrl `
-            -Provider "cloudflare" -RecoveryOwner "cloudflare" -CandidateId $candidateId `
-            -Layers $layers -ExpectedGeneration ([long]$publication.generation) | Out-Null
-    } catch {
-        $rolledBack = if ($publication.changed) {
-            Restore-PreviousIngressState $state ([long]$publication.generation) $publicUrl $candidateId
-        } else { $true }
-        if ($candidateStarted -or $crossProviderCutover) { Stop-CandidateIngress | Out-Null }
-        $code = if ($rolledBack) { "ingress_publication_failed" } else { "cutover_rollback_failed" }
         Write-TunnelState $code $publicUrl $layers
         return $false
     }
@@ -492,9 +518,51 @@ function Ensure-Tunnel {
         Write-TunnelState $code $publicUrl $layers
         return $false
     }
+    if (-not (Release-CutoverReservation)) {
+        $layers.ingress = New-WatchdogLayer $false "cutover_reservation_release_failed"
+        try {
+            Publish-AfpPublicIngressState -Path $IngressStateFile -PublicUrl $publicUrl `
+                -Provider "cloudflare" -RecoveryOwner "cloudflare" -CandidateId $candidateId `
+                -Layers $layers -ExpectedGeneration ([long]$publication.generation) | Out-Null
+        } catch {
+        }
+        Write-TunnelState "cutover_reservation_release_failed" $publicUrl $layers
+        return $false
+    }
+    try {
+        Publish-AfpPublicIngressState -Path $IngressStateFile -PublicUrl $publicUrl `
+            -Provider "cloudflare" -RecoveryOwner "cloudflare" -CandidateId $candidateId `
+            -Layers $layers -ExpectedGeneration ([long]$publication.generation) | Out-Null
+    } catch {
+        $layers.ingress = New-WatchdogLayer $false "ingress_commit_failed"
+        Write-TunnelState "ingress_publication_failed" $publicUrl $layers
+        return $false
+    }
     Save-TunnelUrlAtomic $publicUrl
     Write-TunnelState "online" $publicUrl $layers
     return $true
+}
+
+function Ensure-Tunnel {
+    if (-not (Ensure-Origin)) {
+        Write-TunnelState "origin_unavailable"
+        return $false
+    }
+    $readiness = Get-CutoverReadiness
+    if ($readiness -and $readiness.PSObject.Properties["reservation_id"]) {
+        $script:CutoverReservationId = [string]$readiness.reservation_id
+    }
+    try {
+        $state = Get-CurrentIngressState
+        return Invoke-TunnelTransaction $state $readiness
+    } catch {
+        Write-TunnelState "cutover_transaction_failed"
+        return $false
+    } finally {
+        if ($script:CutoverReservationId -and -not (Release-CutoverReservation)) {
+            Write-TunnelState "cutover_reservation_release_failed"
+        }
+    }
 }
 
 function Install-Watchdog {

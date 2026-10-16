@@ -86,7 +86,6 @@ function Write-FunnelState([string]$Code, [string]$Message, [string]$PublicUrl =
         checked_at = (Get-Date).ToString("o")
     }
     $payload | ConvertTo-Json | Set-Content -LiteralPath $FunnelStatusFile -Encoding UTF8
-    Release-CutoverReservation
 }
 
 function Get-CandidateId {
@@ -95,6 +94,17 @@ function Get-CandidateId {
             ConvertFrom-Json -ErrorAction Stop).candidate.candidate_id
     } catch {
         return ""
+    }
+}
+
+function Get-WatchdogFileSha256([string]$Path) {
+    $stream = [IO.File]::OpenRead($Path)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace("-", "")
+    } finally {
+        $sha.Dispose()
+        $stream.Dispose()
     }
 }
 
@@ -115,14 +125,16 @@ function Get-CutoverReadiness {
 }
 
 function Release-CutoverReservation {
-    if (-not $script:CutoverReservationId) { return }
+    if (-not $script:CutoverReservationId) { return $true }
     try {
         $body = @{ reservation_id = $script:CutoverReservationId } | ConvertTo-Json -Compress
-        Invoke-RestMethod -Uri ($ControlUrl + "/api/ingress/cutover-release") `
-            -Method Post -ContentType "application/json" -Body $body -TimeoutSec 5 | Out-Null
-    } catch {
-    } finally {
+        $released = Invoke-RestMethod -Uri ($ControlUrl + "/api/ingress/cutover-release") `
+            -Method Post -ContentType "application/json" -Body $body -TimeoutSec 5
+        if (-not [bool]$released.released) { return $false }
         $script:CutoverReservationId = ""
+        return $true
+    } catch {
+        return $false
     }
 }
 
@@ -145,6 +157,10 @@ function Test-WatchdogMutationAllowed {
     param($State, [string]$Provider, [string]$RequestedMode, [long]$RequiredGeneration, [bool]$Approved, $Readiness)
     $owner = if ($State) { [string]$State.recovery_owner } else { "" }
     $generation = if ($State) { [long]$State.generation } else { 0L }
+    if ($Readiness -and $Readiness.PSObject.Properties["generation"] -and
+        [long]$Readiness.generation -ne $generation) {
+        return [pscustomobject]@{ allowed = $false; reason = "ingress_generation_mismatch" }
+    }
     if ($RequestedMode -eq "Install") {
         return [pscustomobject]@{ allowed = $false; reason = "install_observe_only" }
     }
@@ -364,18 +380,34 @@ function Test-PublicFunnel {
         return $false
     }
     if ($healthUri.Scheme -ne "https") { return $false }
-    $addresses = @(Resolve-AfpPublicEdgeAddresses -HostName $healthUri.DnsSafeHost)
+    try { $addresses = @(Resolve-AfpPublicEdgeAddresses -HostName $healthUri.DnsSafeHost) }
+    catch { return $false }
     if (-not $addresses.Count) { return $false }
+    $healthReady = $false
     foreach ($attempt in 1..3) {
         foreach ($address in $addresses) {
             if ($ProbeRunner) {
-                if (& $ProbeRunner $healthUri $address) { return $true }
+                if (& $ProbeRunner $healthUri $address "") { $healthReady = $true; break }
             } else {
                 $result = Invoke-AfpForcedPublicProbe -Uri $healthUri -Address $address
-                if ($result.ok) { return $true }
+                if ($result.ok) { $healthReady = $true; break }
             }
         }
+        if ($healthReady) { break }
         if ($attempt -lt 3) { Start-Sleep -Seconds 2 }
+    }
+    if (-not $healthReady) { return $false }
+    $assetPath = Join-Path $DeliveryRoot "app\ui\app.js"
+    if (-not (Test-Path -LiteralPath $assetPath -PathType Leaf)) { return $false }
+    $assetHash = Get-WatchdogFileSha256 $assetPath
+    $assetUri = [Uri]($PublicUrl.TrimEnd("/") + "/app.js?afp_identity_check=" + $assetHash.Substring(0, 16))
+    foreach ($address in $addresses) {
+        if ($ProbeRunner) {
+            if (& $ProbeRunner $assetUri $address $assetHash) { return $true }
+        } else {
+            $result = Invoke-AfpForcedPublicProbe -Uri $assetUri -Address $address -ExpectedSha256 $assetHash
+            if ($result.ok) { return $true }
+        }
     }
     return $false
 }
@@ -463,14 +495,11 @@ function Start-Funnel {
     return $true
 }
 
-function Ensure-Funnel {
-    $state = Get-CurrentIngressState
+function Invoke-FunnelTransaction($state, $readiness) {
     if (-not $TailscaleExe) {
         Write-FunnelState "tailscale_not_installed" "尚未安装Tailscale。"
         return $false
     }
-    if (-not (Ensure-Origin)) { return $false }
-    $readiness = Get-CutoverReadiness
     $decision = Test-WatchdogMutationAllowed $state "tailscale" $Mode $ExpectedGeneration ([bool]$ApproveOwnerCutover) $readiness
     if (-not $decision.allowed) {
         Write-FunnelState ([string]$decision.reason) "当前 watchdog 不是公网入口恢复所有者，仅报告状态。"
@@ -546,25 +575,24 @@ function Ensure-Funnel {
         New-WatchdogLayer $false "helper_recovery_failed"
     }
     if (-not $helperReady) {
-        $rolledBack = if ($publication.changed) {
-            Restore-PreviousIngressState $state ([long]$publication.generation) $publicUrl $candidateId
-        } else { $true }
-        if ($candidateStarted -or $crossProviderCutover) { Stop-CandidateIngress | Out-Null }
+        $previousReady = $state -and (Test-PublicFunnel ([string]$state.public_url))
+        $rolledBack = $false
+        if ($publication.changed -and $previousReady) {
+            $rolledBack = Restore-PreviousIngressState $state ([long]$publication.generation) $publicUrl $candidateId
+            if ($rolledBack) { Stop-CandidateIngress | Out-Null }
+        } elseif (-not $publication.changed) {
+            $rolledBack = $true
+        } else {
+            $layers.ingress = New-WatchdogLayer $false "previous_ingress_compensation_unavailable"
+            try {
+                Publish-AfpPublicIngressState -Path $IngressStateFile -PublicUrl $publicUrl `
+                    -Provider "tailscale" -RecoveryOwner "tailscale" -CandidateId $candidateId `
+                    -Layers $layers -ExpectedGeneration ([long]$publication.generation) | Out-Null
+            } catch {
+            }
+        }
         $code = if ($rolledBack) { "helper_recovery_failed" } else { "cutover_rollback_failed" }
         Write-FunnelState $code "公网边缘可用，但辅助程序未就绪。" $publicUrl $layers
-        return $false
-    }
-    try {
-        Publish-AfpPublicIngressState -Path $IngressStateFile -PublicUrl $publicUrl `
-            -Provider "tailscale" -RecoveryOwner "tailscale" -CandidateId $candidateId `
-            -Layers $layers -ExpectedGeneration ([long]$publication.generation) | Out-Null
-    } catch {
-        $rolledBack = if ($publication.changed) {
-            Restore-PreviousIngressState $state ([long]$publication.generation) $publicUrl $candidateId
-        } else { $true }
-        if ($candidateStarted -or $crossProviderCutover) { Stop-CandidateIngress | Out-Null }
-        $code = if ($rolledBack) { "ingress_publication_failed" } else { "cutover_rollback_failed" }
-        Write-FunnelState $code "公网入口最终状态发布失败。" $publicUrl $layers
         return $false
     }
     if ($crossProviderCutover -and -not (Retire-PreviousIngress $previousProvider)) {
@@ -587,9 +615,48 @@ function Ensure-Funnel {
         Write-FunnelState $code "旧入口退役失败，已执行切换补偿。" $publicUrl $layers
         return $false
     }
+    if (-not (Release-CutoverReservation)) {
+        $layers.ingress = New-WatchdogLayer $false "cutover_reservation_release_failed"
+        try {
+            Publish-AfpPublicIngressState -Path $IngressStateFile -PublicUrl $publicUrl `
+                -Provider "tailscale" -RecoveryOwner "tailscale" -CandidateId $candidateId `
+                -Layers $layers -ExpectedGeneration ([long]$publication.generation) | Out-Null
+        } catch {
+        }
+        Write-FunnelState "cutover_reservation_release_failed" "切换预约释放失败，入口保持降级状态。" $publicUrl $layers
+        return $false
+    }
+    try {
+        Publish-AfpPublicIngressState -Path $IngressStateFile -PublicUrl $publicUrl `
+            -Provider "tailscale" -RecoveryOwner "tailscale" -CandidateId $candidateId `
+            -Layers $layers -ExpectedGeneration ([long]$publication.generation) | Out-Null
+    } catch {
+        $layers.ingress = New-WatchdogLayer $false "ingress_commit_failed"
+        Write-FunnelState "ingress_publication_failed" "公网入口最终状态发布失败。" $publicUrl $layers
+        return $false
+    }
     Save-FunnelUrlAtomic $publicUrl
     Write-FunnelState "online" "固定公网地址、系统服务和辅助程序均已启动。" $publicUrl $layers
     return $true
+}
+
+function Ensure-Funnel {
+    if (-not (Ensure-Origin)) { return $false }
+    $readiness = Get-CutoverReadiness
+    if ($readiness -and $readiness.PSObject.Properties["reservation_id"]) {
+        $script:CutoverReservationId = [string]$readiness.reservation_id
+    }
+    try {
+        $state = Get-CurrentIngressState
+        return Invoke-FunnelTransaction $state $readiness
+    } catch {
+        Write-FunnelState "cutover_transaction_failed" "公网入口切换事务异常。"
+        return $false
+    } finally {
+        if ($script:CutoverReservationId -and -not (Release-CutoverReservation)) {
+            Write-FunnelState "cutover_reservation_release_failed" "切换预约释放失败，入口保持降级状态。"
+        }
+    }
 }
 
 function Install-Watchdog {

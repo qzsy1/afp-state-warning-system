@@ -87,6 +87,8 @@ class TailscaleFunnelWatchdogContractTests(unittest.TestCase):
             if (-not (Test-WatchdogMutationAllowed $state 'tailscale' 'Cutover' 8 $true $ready).allowed) {{ exit 24 }}
             if ((Test-WatchdogMutationAllowed $owned 'tailscale' 'Run' 0 $false $blocked).allowed) {{ exit 27 }}
             if (-not (Test-WatchdogMutationAllowed $owned 'tailscale' 'Run' 0 $false $ready).allowed) {{ exit 28 }}
+            $stale = [pscustomobject]@{{ allowed = $true; generation = 9 }}
+            if ((Test-WatchdogMutationAllowed $owned 'tailscale' 'Run' 0 $false $stale).allowed) {{ exit 29 }}
             exit 0
             """
         )
@@ -101,6 +103,33 @@ class TailscaleFunnelWatchdogContractTests(unittest.TestCase):
         self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
 
     @unittest.skipUnless(shutil.which("powershell.exe"), "Windows PowerShell required")
+    def test_denied_transaction_releases_reservation_outside_status_writer(self):
+        source = str(self.source.resolve()).replace("'", "''")
+        harness = textwrap.dedent(
+            f"""
+            $source=Get-Content -LiteralPath '{source}' -Raw
+            $tokens=$null;$errors=$null
+            $ast=[System.Management.Automation.Language.Parser]::ParseInput($source,[ref]$tokens,[ref]$errors)
+            foreach($name in @('Ensure-Funnel','Invoke-FunnelTransaction')){{
+              $definition=$ast.FindAll({{param($node)$node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}},$true)|Select-Object -First 1
+              Invoke-Expression $definition.Extent.Text
+            }}
+            $TailscaleExe='tailscale.exe';$Mode='Run';$ExpectedGeneration=-1;$ApproveOwnerCutover=$false
+            function Ensure-Origin{{$true}};function Get-CurrentIngressState{{[pscustomobject]@{{generation=1;recovery_owner='cloudflare'}}}}
+            function Get-CutoverReadiness{{[pscustomobject]@{{allowed=$true;generation=1;reservation_id='lease'}}}}
+            function Test-WatchdogMutationAllowed{{[pscustomobject]@{{allowed=$false;reason='non_owner_observe_only'}}}}
+            $script:code='';function Write-FunnelState{{param([string]$Code,[string]$Message)$script:code=$Code}}
+            $script:released=0;function Release-CutoverReservation{{$script:released++;$false}}
+            if(Ensure-Funnel){{exit 21}};if($script:released -ne 1 -or $script:code -ne 'cutover_reservation_release_failed'){{exit 22}};exit 0
+            """
+        )
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "-"],
+            input=harness, text=True, capture_output=True, timeout=15, check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "Windows PowerShell required")
     def test_failed_retirement_keeps_candidate_when_previous_edge_is_unavailable(self):
         source = str(self.source.resolve()).replace("'", "''")
         harness = textwrap.dedent(
@@ -108,7 +137,7 @@ class TailscaleFunnelWatchdogContractTests(unittest.TestCase):
             $source = Get-Content -LiteralPath '{source}' -Raw
             $tokens = $null; $errors = $null
             $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
-            foreach ($name in @('Ensure-Funnel','New-WatchdogLayer')) {{
+            foreach ($name in @('Ensure-Funnel','Invoke-FunnelTransaction','New-WatchdogLayer')) {{
                 $definition = $ast.FindAll({{
                     param($node)
                     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -157,6 +186,39 @@ class TailscaleFunnelWatchdogContractTests(unittest.TestCase):
         self.assertIn("function Test-Funnel", text)
         self.assertIn("function Test-PublicFunnel", text)
         self.assertIn('/api/health', text)
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "Windows PowerShell required")
+    def test_public_probe_requires_health_and_static_identity(self):
+        source = str(self.source.resolve()).replace("'", "''")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            asset = root / "app" / "ui" / "app.js"
+            asset.parent.mkdir(parents=True)
+            asset.write_text("current-candidate", encoding="utf-8")
+            delivery = str(root).replace("'", "''")
+            harness = textwrap.dedent(
+                f"""
+                $source=Get-Content -LiteralPath '{source}' -Raw
+                $tokens=$null;$errors=$null
+                $ast=[System.Management.Automation.Language.Parser]::ParseInput($source,[ref]$tokens,[ref]$errors)
+                foreach($name in @('Test-PublicFunnel','Get-WatchdogFileSha256')){{
+                  $definition=$ast.FindAll({{param($node)$node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}},$true)|Select-Object -First 1
+                  Invoke-Expression $definition.Extent.Text
+                }}
+                $DeliveryRoot='{delivery}'
+                function Resolve-AfpPublicEdgeAddresses{{'203.0.113.10'}}
+                $script:hashes=@()
+                $probe={{param($Uri,$Address,[string]$ExpectedSha256)$script:hashes+=,$ExpectedSha256;$true}}
+                if(-not(Test-PublicFunnel 'https://public.example' $probe)){{exit 21}}
+                if($script:hashes.Count -ne 2 -or $script:hashes[0] -ne '' -or $script:hashes[1] -notmatch '^[0-9A-F]{{64}}$'){{exit 22}}
+                exit 0
+                """
+            )
+            completed = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "-"],
+                input=harness, text=True, capture_output=True, timeout=15, check=False,
+            )
+        self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
 
     def test_watchdog_keeps_app_helper_and_funnel_available_after_logon(self):
         text = self.source.read_text(encoding="utf-8-sig")

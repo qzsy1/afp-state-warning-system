@@ -5533,7 +5533,8 @@ class AppHandler(BaseHTTPRequestHandler):
                         payload.get("payload") if isinstance(payload.get("payload"), dict) else {},
                         ingress_generation=payload.get("ingress_generation"),
                     )
-                self._send_json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.UNAUTHORIZED)
+                acknowledged = result.get("ok") or result.get("terminal")
+                self._send_json(result, HTTPStatus.OK if acknowledged else HTTPStatus.UNAUTHORIZED)
                 return
             if parsed.path in {
                 "/api/real/control/acquire",

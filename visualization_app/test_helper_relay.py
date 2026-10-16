@@ -374,12 +374,61 @@ class HelperRelayTests(unittest.TestCase):
                 "device-a",
                 paired["pairing_token"],
                 lambda _message: None,
-                capabilities={"command_lifecycle": "isolated_hardware_check"},
+                capabilities={
+                    "command_lifecycle": "isolated_hardware_check",
+                    "paired_server_url": "https://afp.example.test/",
+                },
             )
             readiness = registry.deployment_readiness()
         self.assertTrue(readiness["ready"])
         self.assertEqual(readiness["generation"], 1)
         self.assertEqual(readiness["candidate_id"], "candidate-1")
+
+    def test_deployment_readiness_rejects_helper_on_stale_public_route(self):
+        loader = MutableIngressLoader()
+        registry = self.generation_registry(loader)
+        paired = self.pair(registry)
+        registry.attach(
+            "session-a",
+            "device-a",
+            paired["pairing_token"],
+            lambda _message: None,
+            capabilities={
+                "command_lifecycle": "isolated_hardware_check",
+                "paired_server_url": "https://old.example.test",
+            },
+        )
+        with patch("helper_relay.helper_capability_mismatches", return_value=()):
+            readiness = registry.deployment_readiness()
+        self.assertFalse(readiness["ready"])
+        self.assertEqual(readiness["compatible_helpers"], 0)
+        self.assertEqual(readiness["non_sensitive_error"], "helper_route_mismatch")
+
+    def test_corrupt_persisted_helper_state_blocks_cutover(self):
+        loader = MutableIngressLoader()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "helper_registry.json"
+            path.write_text("{not-json", encoding="utf-8")
+            registry = self.generation_registry(loader, persistence_path=path)
+            readiness = registry.cutover_readiness()
+        self.assertFalse(readiness["allowed"])
+        self.assertIn("helper_state_reconciliation_required", readiness["blocking_request_ids"])
+
+    def test_helper_state_persistence_failure_blocks_cutover(self):
+        loader = MutableIngressLoader()
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory) / "not-a-directory"
+            parent.write_text("occupied", encoding="utf-8")
+            registry = self.generation_registry(
+                loader,
+                persistence_path=parent / "helper_registry.json",
+            )
+            self.pair(registry)
+            readiness = registry.cutover_readiness()
+            blocked = registry.command("session-a", "start_capture", {})
+        self.assertFalse(readiness["allowed"])
+        self.assertIn("helper_state_reconciliation_required", readiness["blocking_request_ids"])
+        self.assertEqual(blocked["error"], "helper_state_reconciliation_required")
 
     def test_terminal_result_is_consumed_once_across_restart(self):
         loader = MutableIngressLoader()

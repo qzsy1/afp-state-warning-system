@@ -755,6 +755,32 @@ class PublicWebHttpTests(unittest.TestCase):
         self.assertEqual(payload["error"], "real_access_required")
         self.assertEqual(self.hardware_start_calls, 0)
 
+    def test_terminal_helper_result_rejection_is_an_http_ack(self):
+        with patch.object(
+            self.server.dashboard.helper_registry,
+            "accept_result",
+            return_value={
+                "ok": False,
+                "error": "command_state_lost",
+                "terminal": True,
+                "request_id": "stale-result",
+            },
+        ):
+            status, payload, _ = self.request_json(
+                "POST",
+                "/api/helper/result",
+                {
+                    "device_id": "helper-a",
+                    "request_id": "stale-result",
+                    "payload": {"ok": True},
+                },
+                headers={"Authorization": "Bearer expired-token"},
+                csrf=False,
+            )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["terminal"])
+        self.assertEqual(payload["error"], "command_state_lost")
+
     def test_paired_helper_samples_feed_authorized_session_status(self):
         self.request_json("GET", "/api/auth/session")
         login_status, _, _ = self.request_json(

@@ -1,4 +1,4 @@
-"""In-memory authorization and command contract for local capture helpers."""
+"""Authorization, persistence, and command contracts for local capture helpers."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit, urlunsplit
 
 from public_ingress_state import PublicIngressState, load_public_ingress_state
 from release_contract import (
@@ -83,6 +84,19 @@ def normalize_pairing_code(value: str) -> str:
     return clean
 
 
+def _normalize_server_url(value: Any) -> str:
+    try:
+        parsed = urlsplit(str(value or "").strip())
+        if parsed.scheme.lower() != "https" or not parsed.hostname:
+            return ""
+        host = parsed.hostname.lower()
+        port = f":{parsed.port}" if parsed.port and parsed.port != 443 else ""
+        path = parsed.path.rstrip("/")
+        return urlunsplit(("https", host + port, path, parsed.query, ""))
+    except (TypeError, ValueError):
+        return ""
+
+
 @dataclass
 class _Pairing:
     session_id: str
@@ -149,6 +163,7 @@ class HelperRegistry:
         self._ingress_state: PublicIngressState | None = None
         self._ingress_generation = 0
         self._ingress_error = ""
+        self._persistence_error = ""
         self._cutover_reservation_id = ""
         self._cutover_reservation_deadline = 0.0
         self._capture_starts_in_progress = 0
@@ -325,81 +340,94 @@ class HelperRegistry:
             return
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-            helpers = payload.get("helpers", {}) if isinstance(payload, dict) else {}
+            if not isinstance(payload, dict):
+                raise ValueError("helper registry root must be an object")
+            helpers = payload.get("helpers", {})
             if not isinstance(helpers, dict):
-                return
+                raise ValueError("helper registry helpers must be an object")
             for session_id, item in helpers.items():
-                if not isinstance(item, dict):
-                    continue
+                if not str(session_id).strip() or not isinstance(item, dict):
+                    raise ValueError("helper registry contains an invalid helper")
                 device_id = str(item.get("device_id") or "").strip()
                 token_hash = str(item.get("token_hash") or "").strip()
                 try:
                     generation = int(item.get("generation", 0))
-                except (TypeError, ValueError):
-                    continue
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("helper registry contains an invalid generation") from exc
                 if (
                     not device_id
                     or len(token_hash) != 64
-                    or generation != self._ingress_generation
-                    or self._ingress_error
                 ):
+                    raise ValueError("helper registry contains an invalid identity")
+                if generation != self._ingress_generation or self._ingress_error:
                     continue
+                capabilities = item.get("capabilities") or {}
+                if not isinstance(capabilities, dict):
+                    raise ValueError("helper registry contains invalid capabilities")
                 self._helpers[str(session_id)] = _Helper(
                     session_id=str(session_id),
                     device_id=device_id,
                     token_hash=token_hash,
                     generation=generation,
-                    capabilities=dict(item.get("capabilities") or {}),
+                    capabilities=dict(capabilities),
                     online=False,
                     last_seen=None,
                 )
             commands = payload.get("commands", {}) if isinstance(payload, dict) else {}
-            if isinstance(commands, dict):
-                for request_id, item in commands.items():
-                    if not isinstance(item, dict):
-                        continue
-                    try:
-                        generation = int(item.get("generation", -1))
-                    except (TypeError, ValueError):
-                        continue
-                    record = _CommandRecord(
-                        request_id=str(request_id),
-                        session_id=str(item.get("session_id") or ""),
-                        command=str(item.get("command") or ""),
-                        generation=generation,
-                        delivery_state=str(item.get("delivery_state") or "terminal"),
-                        terminal_error=str(item.get("terminal_error") or ""),
+            if not isinstance(commands, dict):
+                raise ValueError("helper registry commands must be an object")
+            for request_id, item in commands.items():
+                if not str(request_id).strip() or not isinstance(item, dict):
+                    raise ValueError("helper registry contains an invalid command")
+                try:
+                    generation = int(item.get("generation", -1))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("helper registry contains an invalid command generation") from exc
+                record = _CommandRecord(
+                    request_id=str(request_id),
+                    session_id=str(item.get("session_id") or ""),
+                    command=str(item.get("command") or ""),
+                    generation=generation,
+                    delivery_state=str(item.get("delivery_state") or "terminal"),
+                    terminal_error=str(item.get("terminal_error") or ""),
+                )
+                if not record.session_id or not record.command:
+                    raise ValueError("helper registry contains an incomplete command")
+                if record.delivery_state not in {"terminal", "completed"}:
+                    previous_delivery_state = record.delivery_state
+                    record.delivery_state = "terminal"
+                    record.terminal_error = (
+                        "ingress_generation_changed"
+                        if generation != self._ingress_generation
+                        else "command_state_lost"
                     )
-                    if not record.session_id or not record.command:
-                        continue
-                    if record.delivery_state not in {"terminal", "completed"}:
-                        previous_delivery_state = record.delivery_state
-                        record.delivery_state = "terminal"
-                        record.terminal_error = (
-                            "ingress_generation_changed"
-                            if generation != self._ingress_generation
-                            else "command_state_lost"
-                        )
-                        if (
-                            record.command == "start_capture"
-                            and previous_delivery_state == "delivered"
-                        ):
-                            self._active_captures[
-                                f"unconfirmed-{record.request_id}"
-                            ] = record.session_id
-                    self._commands[record.request_id] = record
-                    if record.delivery_state == "terminal" and record.terminal_error:
-                        self._terminal_results[(record.session_id, record.request_id)] = {
-                            "ok": False,
-                            "error": record.terminal_error,
-                            "terminal": True,
-                        }
+                    if (
+                        record.command == "start_capture"
+                        and previous_delivery_state == "delivered"
+                    ):
+                        self._active_captures[
+                            f"unconfirmed-{record.request_id}"
+                        ] = record.session_id
+                self._commands[record.request_id] = record
+                if record.delivery_state == "terminal" and record.terminal_error:
+                    self._terminal_results[(record.session_id, record.request_id)] = {
+                        "ok": False,
+                        "error": record.terminal_error,
+                        "terminal": True,
+                    }
             try:
                 persisted_generation = int(payload.get("ingress_generation", -1))
-            except (TypeError, ValueError):
-                persisted_generation = -1
+            except (TypeError, ValueError) as exc:
+                raise ValueError("helper registry ingress_generation is invalid") from exc
             active_captures = payload.get("active_captures", {})
-            if persisted_generation == self._ingress_generation and isinstance(active_captures, dict):
+            if not isinstance(active_captures, dict):
+                raise ValueError("helper registry active_captures must be an object")
+            if persisted_generation == self._ingress_generation:
+                if any(
+                    not str(capture_uuid).strip() or not str(session_id).strip()
+                    for capture_uuid, session_id in active_captures.items()
+                ):
+                    raise ValueError("helper registry contains an invalid active capture")
                 self._active_captures.update(
                     {
                         str(capture_uuid): str(session_id)
@@ -408,7 +436,8 @@ class HelperRegistry:
                     }
                 )
             self._persist_helpers_locked()
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            self._persistence_error = str(exc) or "helper registry unavailable"
             return
 
     def _persist_helpers_locked(self) -> None:
@@ -447,9 +476,9 @@ class HelperRegistry:
                 encoding="utf-8",
             )
             os.replace(temporary, path)
-        except OSError:
-            # Pairing remains valid for the running process; a filesystem
-            # failure must not interrupt an active acquisition session.
+            self._persistence_error = ""
+        except (OSError, TypeError, ValueError) as exc:
+            self._persistence_error = str(exc) or "helper registry unavailable"
             return
 
     def start_pairing(self, session_id: str) -> dict[str, Any]:
@@ -721,6 +750,8 @@ class HelperRegistry:
             captures = sorted(self._active_captures)
             if self._capture_starts_in_progress:
                 blocking.append("capture_start_in_progress")
+            if self._persistence_error:
+                blocking.append("helper_state_reconciliation_required")
             reservation_active = self._cutover_reserved_locked()
             owns_reservation = bool(
                 reservation_active
@@ -794,6 +825,7 @@ class HelperRegistry:
         with self._lock:
             if (
                 not self._synchronize_ingress_locked()
+                or bool(self._persistence_error)
                 or self._cutover_reserved_locked()
                 or (
                     self.ingress_state_path is not None
@@ -820,6 +852,10 @@ class HelperRegistry:
             paired = 0
             online = 0
             compatible = 0
+            route_mismatches = 0
+            expected_route = _normalize_server_url(
+                self._ingress_state.public_url if self._ingress_state else ""
+            )
             for helper in self._helpers.values():
                 if helper.generation != self._ingress_generation:
                     continue
@@ -832,8 +868,18 @@ class HelperRegistry:
                 if not is_online:
                     continue
                 online += 1
+                helper_route = _normalize_server_url(
+                    helper.capabilities.get("paired_server_url")
+                )
+                route_matches = bool(
+                    not self.ingress_state_path
+                    or (expected_route and helper_route == expected_route)
+                )
+                if not route_matches:
+                    route_mismatches += 1
                 if (
-                    helper.capabilities.get("command_lifecycle")
+                    route_matches
+                    and helper.capabilities.get("command_lifecycle")
                     == REQUIRED_COMMAND_LIFECYCLE
                     and not helper_capability_mismatches(
                         RELEASE_CONTRACT, helper.capabilities
@@ -841,14 +887,24 @@ class HelperRegistry:
                 ):
                     compatible += 1
             return {
-                "ready": bool(state_ready and compatible > 0),
+                "ready": bool(
+                    state_ready and not self._persistence_error and compatible > 0
+                ),
                 "generation": self._ingress_generation,
                 "candidate_id": self.expected_candidate_id,
                 "paired_helpers": paired,
                 "online_helpers": online,
                 "compatible_helpers": compatible,
-                "non_sensitive_error": "" if state_ready and compatible > 0 else (
-                    "helper_not_ready" if state_ready else "ingress_state_unavailable"
+                "non_sensitive_error": (
+                    ""
+                    if state_ready and not self._persistence_error and compatible > 0
+                    else "helper_state_reconciliation_required"
+                    if self._persistence_error
+                    else "helper_route_mismatch"
+                    if state_ready and route_mismatches > 0
+                    else "helper_not_ready"
+                    if state_ready
+                    else "ingress_state_unavailable"
                 ),
             }
 
@@ -880,6 +936,12 @@ class HelperRegistry:
             if not self._synchronize_ingress_locked():
                 return {"ok": False, "queued": False, "error": "ingress_state_unavailable"}
             if command == "start_capture":
+                if self._persistence_error:
+                    return {
+                        "ok": False,
+                        "queued": False,
+                        "error": "helper_state_reconciliation_required",
+                    }
                 if self._cutover_reserved_locked():
                     return {"ok": False, "queued": False, "error": "ingress_cutover_in_progress"}
                 if (

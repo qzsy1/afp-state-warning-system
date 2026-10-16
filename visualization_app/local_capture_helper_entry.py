@@ -63,13 +63,11 @@ def adaptive_sample_batch_limit(
             measured = max(0.0, float(rtt_ms or 0.0)) / 1000.0
         except (TypeError, ValueError):
             measured = 0.0
-        # A single in-flight batch must contain at least the rows produced
-        # during one ACK round trip.  The previous five-row ceiling could only
-        # move about 4.3 rows/s at 1161 ms RTT, so a 10 Hz source accumulated
-        # delay forever even though local sampling stayed healthy.
+        # A public-route batch covers at least one measured ACK round trip plus
+        # scheduling margin so transmission keeps pace with local sampling.
         target_seconds = max(0.2, measured + 0.2)
     else:
-        # Preserve the proven legacy bound for callers without route metadata.
+        # Callers without route metadata use the conservative default window.
         target_seconds = 0.5
     lower = 2 if route in {"lan", "public"} else 1
     upper = 50 if route == "public" else 200
@@ -1105,7 +1103,7 @@ def _report_helper_response(
     for attempt in range(3):
         try:
             accepted = transport.http_json("api/helper/result", result_payload)
-            if accepted.get("ok"):
+            if accepted.get("ok") or accepted.get("terminal"):
                 outbox.acknowledge(str(response.get("request_id") or ""))
                 return True
         except Exception:
@@ -1355,7 +1353,8 @@ def run_forever(
                 failures = 0
                 delay = 1.0
                 if message.get("type") == "result_ack":
-                    result_outbox.acknowledge(str(message.get("request_id") or ""))
+                    if message.get("ok") or message.get("terminal"):
+                        result_outbox.acknowledge(str(message.get("request_id") or ""))
                     continue
                 if message.get("type") in {"hello_ack", "heartbeat_ack"}:
                     continue

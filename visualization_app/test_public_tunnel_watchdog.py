@@ -1,6 +1,7 @@
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 import textwrap
 import unittest
 
@@ -47,6 +48,74 @@ class PublicTunnelWatchdogContractTests(unittest.TestCase):
             $ready = [pscustomobject]@{{ allowed = $true }}
             if ((Test-WatchdogMutationAllowed $owned 'cloudflare' 'Run' 0 $false $blocked).allowed) {{ exit 21 }}
             if (-not (Test-WatchdogMutationAllowed $owned 'cloudflare' 'Run' 0 $false $ready).allowed) {{ exit 22 }}
+            $stale = [pscustomobject]@{{ allowed = $true; generation = 9 }}
+            if ((Test-WatchdogMutationAllowed $owned 'cloudflare' 'Run' 0 $false $stale).allowed) {{ exit 23 }}
+            exit 0
+            """
+        )
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "-"],
+            input=harness, text=True, capture_output=True, timeout=15, check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "Windows PowerShell required")
+    def test_denied_transaction_releases_reservation_outside_status_writer(self):
+        source = str(Path(__file__).with_name("public_tunnel_watchdog.ps1").resolve()).replace("'", "''")
+        harness = textwrap.dedent(
+            f"""
+            $source = Get-Content -LiteralPath '{source}' -Raw
+            $tokens=$null; $errors=$null
+            $ast=[System.Management.Automation.Language.Parser]::ParseInput($source,[ref]$tokens,[ref]$errors)
+            foreach($name in @('Ensure-Tunnel','Invoke-TunnelTransaction')) {{
+              $definition=$ast.FindAll({{ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }},$true) | Select-Object -First 1
+              Invoke-Expression $definition.Extent.Text
+            }}
+            $Mode='Run'; $ExpectedGeneration=-1; $ApproveOwnerCutover=$false
+            function Ensure-Origin {{ $true }}
+            function Get-CurrentIngressState {{ [pscustomobject]@{{generation=1;recovery_owner='tailscale'}} }}
+            function Get-CutoverReadiness {{ [pscustomobject]@{{allowed=$true;generation=1;reservation_id='lease'}} }}
+            function Test-WatchdogMutationAllowed {{ [pscustomobject]@{{allowed=$false;reason='non_owner_observe_only'}} }}
+            $script:code=''; function Write-TunnelState {{ param([string]$Code) $script:code=$Code }}
+            $script:released=0
+            function Release-CutoverReservation {{ $script:released++; return $false }}
+            if (Ensure-Tunnel) {{ exit 21 }}
+            if ($script:released -ne 1 -or $script:code -ne 'cutover_reservation_release_failed') {{ exit 22 }}
+            exit 0
+            """
+        )
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "-"],
+            input=harness, text=True, capture_output=True, timeout=15, check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "Windows PowerShell required")
+    def test_helper_failure_keeps_candidate_when_previous_edge_is_unavailable(self):
+        source = str(Path(__file__).with_name("public_tunnel_watchdog.ps1").resolve()).replace("'", "''")
+        harness = textwrap.dedent(
+            f"""
+            $source=Get-Content -LiteralPath '{source}' -Raw
+            $tokens=$null; $errors=$null
+            $ast=[System.Management.Automation.Language.Parser]::ParseInput($source,[ref]$tokens,[ref]$errors)
+            foreach($name in @('Ensure-Tunnel','Invoke-TunnelTransaction','New-WatchdogLayer')) {{
+              $definition=$ast.FindAll({{param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}},$true)|Select-Object -First 1
+              Invoke-Expression $definition.Extent.Text
+            }}
+            $Mode='Cutover';$ExpectedGeneration=8;$ApproveOwnerCutover=$true
+            $state=[pscustomobject]@{{generation=8;provider='tailscale';recovery_owner='tailscale';public_url='https://old.example';candidate_id='candidate'}}
+            function Get-CurrentIngressState {{ $state }}; function Ensure-Origin {{ $true }}
+            function Get-CutoverReadiness {{ [pscustomobject]@{{allowed=$true;generation=8;reservation_id='lease'}} }}
+            function Release-CutoverReservation {{ $true }}; function Test-WatchdogMutationAllowed {{ [pscustomobject]@{{allowed=$true}} }}
+            function Test-Tunnel {{ $true }}; function Get-TunnelMetrics {{ '' }}; function Get-TunnelUrl {{ 'https://new.example' }}
+            function Test-PublicTunnel([string]$Url) {{ $Url -eq 'https://new.example' }}
+            function Get-CandidateId {{ 'candidate' }}; function Publish-AfpPublicIngressState {{ [pscustomobject]@{{changed=$true;generation=9}} }}
+            function Restart-Helper {{ $true }}; function Wait-HelperIngressReady {{ $false }}
+            $script:stops=0; function Stop-CandidateIngress {{ $script:stops++;$true }}
+            $script:restores=0; function Restore-PreviousIngressState {{ $script:restores++;$true }}
+            $script:code=''; function Write-TunnelState([string]$Code) {{ $script:code=$Code }}
+            if(Ensure-Tunnel){{exit 21}}
+            if($script:code -ne 'cutover_rollback_failed' -or $script:stops -ne 0 -or $script:restores -ne 0){{exit 22}}
             exit 0
             """
         )
@@ -64,7 +133,7 @@ class PublicTunnelWatchdogContractTests(unittest.TestCase):
             $source = Get-Content -LiteralPath '{source}' -Raw
             $tokens = $null; $errors = $null
             $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
-            foreach ($name in @('Ensure-Tunnel','New-WatchdogLayer')) {{
+            foreach ($name in @('Ensure-Tunnel','Invoke-TunnelTransaction','New-WatchdogLayer')) {{
                 $definition = $ast.FindAll({{
                     param($node)
                     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -168,6 +237,39 @@ class PublicTunnelWatchdogContractTests(unittest.TestCase):
         self.assertIn("function Test-PublicTunnel", text)
         self.assertIn('$PublicUrl.TrimEnd("/") + "/api/health"', text)
         self.assertIn("if (-not (Test-PublicTunnel $url)) { return $false }", text)
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "Windows PowerShell required")
+    def test_public_probe_requires_health_and_static_identity(self):
+        source = str(Path(__file__).with_name("public_tunnel_watchdog.ps1").resolve()).replace("'", "''")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            asset = root / "app" / "ui" / "app.js"
+            asset.parent.mkdir(parents=True)
+            asset.write_text("current-candidate", encoding="utf-8")
+            delivery = str(root).replace("'", "''")
+            harness = textwrap.dedent(
+                f"""
+                $source=Get-Content -LiteralPath '{source}' -Raw
+                $tokens=$null;$errors=$null
+                $ast=[System.Management.Automation.Language.Parser]::ParseInput($source,[ref]$tokens,[ref]$errors)
+                foreach($name in @('Test-PublicTunnel','Get-WatchdogFileSha256')){{
+                  $definition=$ast.FindAll({{param($node)$node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}},$true)|Select-Object -First 1
+                  Invoke-Expression $definition.Extent.Text
+                }}
+                $DeliveryRoot='{delivery}'
+                function Resolve-AfpPublicEdgeAddresses{{'203.0.113.10'}}
+                $script:hashes=@()
+                function Invoke-AfpForcedPublicProbe{{param($Uri,$Address,[string]$ExpectedSha256)$script:hashes+=,$ExpectedSha256;[pscustomobject]@{{ok=$true}}}}
+                if(-not(Test-PublicTunnel 'https://public.example')){{exit 21}}
+                if($script:hashes.Count -ne 2 -or $script:hashes[0] -ne '' -or $script:hashes[1] -notmatch '^[0-9A-F]{{64}}$'){{exit 22}}
+                exit 0
+                """
+            )
+            completed = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "-"],
+                input=harness, text=True, capture_output=True, timeout=15, check=False,
+            )
+        self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
 
     def test_watchdog_keeps_local_helper_running_after_tunnel_recovery(self):
         source = Path(__file__).with_name("public_tunnel_watchdog.ps1")

@@ -118,7 +118,7 @@ foreach ($failure in @('promote','start','edge','ingress','helper','complete')) 
         -IngressPublisher {{ & $throwAt 'ingress'; [pscustomobject]@{{ generation=4 }} }} `
         -HelperReadinessRunner {{ param($Ingress) & $throwAt 'helper'; [pscustomobject]@{{ ready=$true; generation=$Ingress.generation }} }} `
         -CompletionRunner {{ & $throwAt 'complete' }} `
-        -RestoreRunner {{ param($Promotion, $IngressSnapshot) $script:restores++ }}
+        -RestoreRunner {{ param($Promotion, $IngressSnapshot) $script:restores++; [pscustomobject]@{{status='passed'}} }}
     if ($result.status -ne 'rolled_back' -or $script:restores -ne 1) {{ throw ($result | ConvertTo-Json -Depth 8) }}
 }}
 """
@@ -296,12 +296,12 @@ foreach ($helperReady in @($true, $false)) {{
     $inventory = [pscustomobject]@{{ digest = 'approved'; processes = @() }}
     $result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='F:\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
         -CutoverReadinessRunner {{ [pscustomobject]@{{ allowed=$true; reservation_id='lease-1' }} }} `
-        -CutoverReleaseRunner {{ param($ReservationId) $script:released = $ReservationId }} `
+        -CutoverReleaseRunner {{ param($ReservationId) $script:released = $ReservationId; return $true }} `
         -StopRunner {{ }} -PromotionRunner {{ [pscustomobject]@{{ status='switched' }} }} -StartRunner {{ }} `
         -ServiceProbeRunner {{ [pscustomobject]@{{ status='passed' }} }} `
         -IngressPublisher {{ [pscustomobject]@{{ generation=4 }} }} `
         -HelperReadinessRunner {{ param($Ingress) [pscustomobject]@{{ ready=$helperReady; generation=$Ingress.generation }} }} `
-        -CompletionRunner {{ }} -RestoreRunner {{ }}
+        -CompletionRunner {{ }} -RestoreRunner {{ [pscustomobject]@{{ status='passed' }} }}
     if ($script:released -ne 'lease-1') {{ throw 'cutover reservation was not released' }}
     $expected = if ($helperReady) {{ 'completed' }} else {{ 'rolled_back' }}
     if ($result.status -ne $expected) {{ throw ($result | ConvertTo-Json -Depth 8) }}
@@ -309,6 +309,45 @@ foreach ($helperReady in @($true, $false)) {{
 """
         result = _run_ps(script)
         self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+    def test_release_failure_prevents_completion_and_reports_rollback_failure(self) -> None:
+        script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(MODULE)} -Force
+$script:completed = 0
+$inventory = [pscustomobject]@{{ digest='approved'; processes=@() }}
+$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([pscustomobject]@{{RuntimeRoot='F:\runtime'}}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
+    -CutoverReadinessRunner {{ [pscustomobject]@{{allowed=$true;reservation_id='lease-1'}} }} `
+    -CutoverReleaseRunner {{ return $false }} -StopRunner {{ }} `
+    -PromotionRunner {{ [pscustomobject]@{{status='switched'}} }} -StartRunner {{ }} `
+    -ServiceProbeRunner {{ [pscustomobject]@{{status='passed'}} }} `
+    -IngressPublisher {{ [pscustomobject]@{{generation=4}} }} `
+    -HelperReadinessRunner {{ param($Ingress) [pscustomobject]@{{ready=$true;generation=4}} }} `
+    -CompletionRunner {{ $script:completed++ }} `
+    -RestoreRunner {{ [pscustomobject]@{{status='passed'}} }}
+if ($result.status -ne 'rollback_failed' -or $result.rollback_error -ne 'cutover_reservation_release_failed') {{ throw ($result | ConvertTo-Json -Depth 8) }}
+if ($script:completed -ne 0) {{ throw 'completion ran before reservation release' }}
+"""
+        result = _run_ps(script)
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+
+    def test_failed_rollback_probe_cannot_report_rolled_back(self) -> None:
+        script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(MODULE)} -Force
+$inventory = [pscustomobject]@{{ digest='approved'; processes=@() }}
+$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([pscustomobject]@{{RuntimeRoot='F:\runtime'}}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
+    -CutoverReadinessRunner {{ [pscustomobject]@{{allowed=$true;reservation_id='lease-1'}} }} `
+    -CutoverReleaseRunner {{ return $true }} -StopRunner {{ }} `
+    -PromotionRunner {{ [pscustomobject]@{{status='switched'}} }} -StartRunner {{ }} `
+    -ServiceProbeRunner {{ [pscustomobject]@{{status='passed'}} }} `
+    -IngressPublisher {{ [pscustomobject]@{{generation=4}} }} `
+    -HelperReadinessRunner {{ [pscustomobject]@{{ready=$false}} }} `
+    -RestoreRunner {{ [pscustomobject]@{{status='failed'}} }}
+if ($result.status -ne 'rollback_failed' -or $result.rollback_error -ne 'rollback_service_gate_failed') {{ throw ($result | ConvertTo-Json -Depth 8) }}
+"""
+        result = _run_ps(script)
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
 
     def test_rollback_restores_old_candidate_with_higher_generation(self) -> None:
         with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
@@ -348,7 +387,8 @@ $result = Invoke-AfpVerifiedRuntimePromotion -StagingPath {_ps_quote(staging)} -
         $path = Join-Path $paths.RuntimeRoot 'runtime\public-ingress-state.json'
         Publish-AfpPublicIngressState -Path $path -PublicUrl 'https://new.example' -Provider 'cloudflare' -RecoveryOwner 'cloudflare' -CandidateId 'candidate-new' -ExpectedPreviousCandidateId 'candidate-old' -ExpectedGeneration 4 -MinimumGeneration 5 -Layers @{{ edge=@{{ok=$true;code='ready'}} }}
     }} `
-    -HelperReadinessRunner {{ [pscustomobject]@{{ ready=$false }} }} -CompletionRunner {{ }}
+    -HelperReadinessRunner {{ [pscustomobject]@{{ ready=$false }} }} -CompletionRunner {{ }} `
+    -RollbackProbeRunner {{ [pscustomobject]@{{ status='passed' }} }}
 if ($result.status -ne 'rolled_back') {{ throw ($result | ConvertTo-Json -Depth 8) }}
 $restored = Get-Content -LiteralPath (Join-Path $paths.RuntimeRoot 'runtime\public-ingress-state.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($restored.candidate_id -cne 'candidate-old' -or [long]$restored.generation -le 5 -or $restored.status -ne 'degraded') {{ throw ($restored | ConvertTo-Json -Depth 8) }}
@@ -361,7 +401,7 @@ if ([string]$restored.layers.helper.code -ne 'rollback_helper_reconciliation_req
                 msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
 
-    def test_first_publication_failure_keeps_higher_generation_tombstone(self) -> None:
+    def test_failure_without_previous_ingress_reports_unrecoverable_rollback(self) -> None:
         with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
             workspace = Path(temporary) / "workspace"
             runtime = workspace / "AFP_Integrated_System_Modular"
@@ -385,9 +425,7 @@ $result = Invoke-AfpVerifiedRuntimePromotion -StagingPath {_ps_quote(staging)} -
         Publish-AfpPublicIngressState -Path (Join-Path $paths.RuntimeRoot 'runtime\public-ingress-state.json') -PublicUrl 'https://new.example' -Provider 'cloudflare' -RecoveryOwner 'cloudflare' -CandidateId 'candidate-new' -Layers @{{ helper=@{{ok=$false;code='pending'}} }}
     }} `
     -HelperReadinessRunner {{ [pscustomobject]@{{ ready=$false }} }} -CompletionRunner {{ }}
-if ($result.status -ne 'rolled_back') {{ throw ($result | ConvertTo-Json -Depth 8) }}
-$restored = Get-Content -LiteralPath (Join-Path $paths.RuntimeRoot 'runtime\public-ingress-state.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-if ([long]$restored.generation -le 1 -or $restored.status -ne 'degraded') {{ throw ($restored | ConvertTo-Json -Depth 8) }}
+if ($result.status -ne 'rollback_failed' -or $result.rollback_error -ne 'rollback_no_previous_ingress') {{ throw ($result | ConvertTo-Json -Depth 8) }}
 """
             result = _run_ps(script)
             self.assertEqual(

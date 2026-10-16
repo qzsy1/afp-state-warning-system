@@ -200,56 +200,70 @@ if ($Mode -eq "Switchover") {
         } `
         -RestoreRunner {
             param($Promotion, $IngressSnapshot, $FailedIngressGeneration, $FailedIngressState)
+            if ($null -eq $IngressSnapshot) {
+                if ($FailedIngressState) {
+                    Import-Module (Join-Path $paths.RuntimeRoot "PublicIngress.psm1") -Force -ErrorAction Stop
+                    $failedLayers = @{
+                        origin = @{ ok = $false; code = "rollback_no_previous_ingress" }
+                        control_plane = @{ ok = $false; code = "rollback_no_previous_ingress" }
+                        dns = @{ ok = $false; code = "rollback_no_previous_ingress" }
+                        public_edge = @{ ok = $false; code = "rollback_no_previous_ingress" }
+                        ingress = @{ ok = $false; code = "rollback_no_previous_ingress" }
+                        helper = @{ ok = $false; code = "rollback_no_previous_ingress" }
+                    }
+                    Publish-AfpPublicIngressState -Path (Join-Path $paths.RuntimeRoot "runtime\public-ingress-state.json") `
+                        -PublicUrl ([string]$FailedIngressState.public_url) `
+                        -Provider ([string]$FailedIngressState.provider) `
+                        -RecoveryOwner ([string]$FailedIngressState.recovery_owner) `
+                        -CandidateId ([string]$FailedIngressState.candidate_id) `
+                        -ExpectedGeneration ([long]$FailedIngressState.generation) `
+                        -MinimumGeneration ([Math]::Max(1L, [long]$FailedIngressGeneration + 1L)) `
+                        -Layers $failedLayers | Out-Null
+                }
+                return [pscustomobject]@{ status = "failed"; error = "rollback_no_previous_ingress" }
+            }
             $failedInventory = Get-AfpRuntimeInventory -PublicUrl $PublicUrl -FunnelOrigin $FunnelOrigin
             Stop-AfpManagedRuntimeProcesses -Inventory $failedInventory -RuntimeExecutable $exe | Out-Null
             if ($Promotion) { Restore-AfpRuntimePromotion -Promotion $Promotion -Paths $paths }
             $statePath = Join-Path $paths.RuntimeRoot "runtime\public-ingress-state.json"
-            if ($null -ne $IngressSnapshot) {
-                $snapshotText = [Text.Encoding]::UTF8.GetString([byte[]]$IngressSnapshot).TrimStart([char]0xFEFF)
-                $snapshot = $snapshotText | ConvertFrom-Json -ErrorAction Stop
-                Import-Module (Join-Path $paths.RuntimeRoot "PublicIngress.psm1") -Force -ErrorAction Stop
-                $restored = Read-AfpPublicIngressState -Path $statePath
-                $snapshotLayers = @{}
-                foreach ($property in $snapshot.layers.PSObject.Properties) {
-                    $snapshotLayers[$property.Name] = @{
-                        ok = [bool]$property.Value.ok
-                        code = [string]$property.Value.code
-                    }
+            $snapshotText = [Text.Encoding]::UTF8.GetString([byte[]]$IngressSnapshot).TrimStart([char]0xFEFF)
+            $snapshot = $snapshotText | ConvertFrom-Json -ErrorAction Stop
+            Import-Module (Join-Path $paths.RuntimeRoot "PublicIngress.psm1") -Force -ErrorAction Stop
+            $restored = Read-AfpPublicIngressState -Path $statePath
+            $snapshotLayers = @{}
+            foreach ($property in $snapshot.layers.PSObject.Properties) {
+                $snapshotLayers[$property.Name] = @{
+                    ok = [bool]$property.Value.ok
+                    code = [string]$property.Value.code
                 }
-                $snapshotLayers["helper"] = @{
-                    ok = $false
-                    code = "rollback_helper_reconciliation_required"
-                }
-                Publish-AfpPublicIngressState -Path $statePath `
-                    -PublicUrl ([string]$snapshot.public_url) `
-                    -Provider ([string]$snapshot.provider) `
-                    -RecoveryOwner ([string]$snapshot.recovery_owner) `
-                    -CandidateId ([string]$snapshot.candidate_id) `
-                    -ExpectedGeneration ([long]$restored.generation) `
-                    -MinimumGeneration ([Math]::Max([long]$restored.generation + 1L, [long]$FailedIngressGeneration + 1L)) `
-                    -Layers $snapshotLayers | Out-Null
-            } elseif ($FailedIngressState) {
-                Import-Module (Join-Path $paths.RuntimeRoot "PublicIngress.psm1") -Force -ErrorAction Stop
-                $failedLayers = @{
-                    origin = @{ ok = $false; code = "rollback_no_previous_ingress" }
-                    control_plane = @{ ok = $false; code = "rollback_no_previous_ingress" }
-                    dns = @{ ok = $false; code = "rollback_no_previous_ingress" }
-                    public_edge = @{ ok = $false; code = "rollback_no_previous_ingress" }
-                    ingress = @{ ok = $false; code = "rollback_no_previous_ingress" }
-                    helper = @{ ok = $false; code = "rollback_no_previous_ingress" }
-                }
-                Publish-AfpPublicIngressState -Path $statePath `
-                    -PublicUrl ([string]$FailedIngressState.public_url) `
-                    -Provider ([string]$FailedIngressState.provider) `
-                    -RecoveryOwner ([string]$FailedIngressState.recovery_owner) `
-                    -CandidateId ([string]$FailedIngressState.candidate_id) `
-                    -MinimumGeneration ([Math]::Max(1L, [long]$FailedIngressGeneration + 1L)) `
-                    -Layers $failedLayers | Out-Null
             }
-            if ($script:oldProcesses.Count) {
-                Start-AfpManagedRuntimeProcesses -Processes $script:oldProcesses -RuntimeExecutable $exe `
-                    -WorkingDirectory $paths.RuntimeRoot | Out-Null
+            $snapshotLayers["helper"] = @{
+                ok = $false
+                code = "rollback_helper_reconciliation_required"
             }
+            Publish-AfpPublicIngressState -Path $statePath `
+                -PublicUrl ([string]$snapshot.public_url) `
+                -Provider ([string]$snapshot.provider) `
+                -RecoveryOwner ([string]$snapshot.recovery_owner) `
+                -CandidateId ([string]$snapshot.candidate_id) `
+                -ExpectedGeneration ([long]$restored.generation) `
+                -MinimumGeneration ([Math]::Max([long]$restored.generation + 1L, [long]$FailedIngressGeneration + 1L)) `
+                -Layers $snapshotLayers | Out-Null
+            $rollbackPlan = if ($script:oldProcesses.Count) {
+                $script:oldProcesses
+            } else {
+                @([pscustomobject]@{ pid = 0; launch_arguments = "--server-only" })
+            }
+            Start-AfpManagedRuntimeProcesses -Processes $rollbackPlan -RuntimeExecutable $exe `
+                -WorkingDirectory $paths.RuntimeRoot | Out-Null
+            $rollbackServices = Wait-AfpRuntimeServices -RuntimeRoot $paths.RuntimeRoot `
+                -PublicUrl ([string]$snapshot.public_url) -LanIPv4 $LanIPv4 `
+                -ExpectedCandidateId ([string]$snapshot.candidate_id) `
+                -FunnelOrigin $FunnelOrigin -TimeoutSeconds 90 -PollIntervalMilliseconds 1000
+            if ([string]$rollbackServices.status -ne "passed") {
+                throw "rollback_service_gate_failed"
+            }
+            return $rollbackServices
         }
     $transaction | ConvertTo-Json -Depth 12
     if ($transaction.status -eq "completed") { exit 0 }

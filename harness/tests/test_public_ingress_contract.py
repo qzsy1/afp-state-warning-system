@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import tempfile
 import textwrap
 import unittest
 from pathlib import Path
@@ -126,26 +127,36 @@ class TailscalePublicEdgeBehaviorTests(unittest.TestCase):
         self.assert_success(completed)
 
     def test_public_probe_forces_sni_host_to_public_edge_address(self) -> None:
-        completed = self.run_powershell(
-            r"""
-            function Resolve-AfpPublicEdgeAddresses {
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            asset = root / "app" / "ui" / "app.js"
+            asset.parent.mkdir(parents=True)
+            asset.write_text("candidate", encoding="utf-8")
+            delivery = str(root).replace("'", "''")
+            completed = self.run_powershell(
+                rf"""
+            $DeliveryRoot = '{delivery}'
+            function Resolve-AfpPublicEdgeAddresses {{
                 param([string]$HostName)
                 return @('1.1.1.1')
-            }
+            }}
             $script:seenHost = ''
             $script:seenAddress = ''
-            $probe = {
-                param([Uri]$Uri, [string]$Address)
+            $script:seenHash = ''
+            $probe = {{
+                param([Uri]$Uri, [string]$Address, [string]$ExpectedSha256)
                 $script:seenHost = $Uri.DnsSafeHost
                 $script:seenAddress = $Address
+                if ($ExpectedSha256) {{ $script:seenHash = $ExpectedSha256 }}
                 return $true
-            }
-            if (-not (Test-PublicFunnel 'https://device.example/' $probe)) { exit 31 }
-            if ($script:seenHost -ne 'device.example') { exit 32 }
-            if ($script:seenAddress -ne '1.1.1.1') { exit 33 }
+            }}
+            if (-not (Test-PublicFunnel 'https://device.example/' $probe)) {{ exit 31 }}
+            if ($script:seenHost -ne 'device.example') {{ exit 32 }}
+            if ($script:seenAddress -ne '1.1.1.1') {{ exit 33 }}
+            if ($script:seenHash -notmatch '^[0-9A-F]{{64}}$') {{ exit 34 }}
             exit 0
             """
-        )
+            )
         self.assert_success(completed)
 
     def test_install_does_not_retire_existing_ingress_automatically(self) -> None:

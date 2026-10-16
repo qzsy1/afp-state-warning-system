@@ -500,6 +500,7 @@ function Invoke-AfpVerifiedRuntimePromotion {
         [scriptblock]$IngressCommitter,
         [scriptblock]$CompletionRunner,
         [scriptblock]$RestoreRunner,
+        [scriptblock]$RollbackProbeRunner,
         [string]$FailureEvidencePath = "",
         [string]$RollbackEvidencePath = ""
     )
@@ -535,8 +536,30 @@ function Invoke-AfpVerifiedRuntimePromotion {
         try { $ingressSnapshot = [IO.File]::ReadAllBytes($statePath) } catch { $ingressSnapshot = $null }
     }
     $promotion = $null
-    $failed = $false
     $failedIngressGeneration = -1L
+    $transactionResult = $null
+    $reservationProperty = $readiness.PSObject.Properties["reservation_id"]
+    $reservationId = if ($reservationProperty) { [string]$reservationProperty.Value } else { "" }
+    $releaseState = [pscustomobject]@{ released = -not [bool]$reservationId }
+    $releaseReservation = {
+        if ($releaseState.released) { return $true }
+        try {
+            $releaseResult = if ($CutoverReleaseRunner) {
+                & $CutoverReleaseRunner $reservationId
+            } else {
+                $body = @{ reservation_id = $reservationId } | ConvertTo-Json -Compress
+                Invoke-RestMethod -Uri "http://127.0.0.1:8771/api/ingress/cutover-release" `
+                    -Method Post -ContentType "application/json" -Body $body -TimeoutSec 5
+            }
+            $releasedProperty = if ($releaseResult) { $releaseResult.PSObject.Properties["released"] } else { $null }
+            $released = if ($releasedProperty) { [bool]$releasedProperty.Value } else { [bool]$releaseResult }
+            if (-not $released) { return $false }
+            $releaseState.released = $true
+            return $true
+        } catch {
+            return $false
+        }
+    }
     try {
         if ($StopRunner) { & $StopRunner | Out-Null }
         $promotion = if ($PromotionRunner) {
@@ -602,8 +625,11 @@ function Invoke-AfpVerifiedRuntimePromotion {
             if (-not $committedIngress) { throw "ingress_commit_gate_failed" }
             $ingress = $committedIngress
         }
+        if (-not (& $releaseReservation)) {
+            throw "cutover_reservation_release_failed"
+        }
         if ($CompletionRunner) { & $CompletionRunner | Out-Null }
-        return [pscustomobject][ordered]@{
+        $transactionResult = [pscustomobject][ordered]@{
             status = "completed"
             promotion = $promotion
             services = $services
@@ -611,7 +637,6 @@ function Invoke-AfpVerifiedRuntimePromotion {
             helper = $helper
         }
     } catch {
-        $failed = $true
         $failure = $_.Exception.Message
         $failedState = $null
         try {
@@ -621,8 +646,8 @@ function Invoke-AfpVerifiedRuntimePromotion {
                     $failedIngressGeneration = [long]$failedState.generation
                 } catch { $failedIngressGeneration = -1L }
             }
-            if ($RestoreRunner) {
-                & $RestoreRunner $promotion $ingressSnapshot $failedIngressGeneration $failedState | Out-Null
+            $rollbackProbe = if ($RestoreRunner) {
+                & $RestoreRunner $promotion $ingressSnapshot $failedIngressGeneration $failedState
             } elseif ($promotion) {
                 Restore-AfpRuntimePromotion -Promotion $promotion -Paths $Paths
                 if ($null -ne $ingressSnapshot) {
@@ -649,33 +674,25 @@ function Invoke-AfpVerifiedRuntimePromotion {
                         -ExpectedGeneration ([long]$restored.generation) `
                         -MinimumGeneration ([Math]::Max([long]$restored.generation + 1L, $failedIngressGeneration + 1L)) `
                         -Layers $snapshotLayers | Out-Null
-                } elseif ($failedState) {
-                    Import-Module (Join-Path $Paths.RuntimeRoot "PublicIngress.psm1") -Force -ErrorAction Stop
-                    $failedLayers = @{
-                        origin = @{ ok = $false; code = "rollback_no_previous_ingress" }
-                        control_plane = @{ ok = $false; code = "rollback_no_previous_ingress" }
-                        dns = @{ ok = $false; code = "rollback_no_previous_ingress" }
-                        public_edge = @{ ok = $false; code = "rollback_no_previous_ingress" }
-                        ingress = @{ ok = $false; code = "rollback_no_previous_ingress" }
-                        helper = @{ ok = $false; code = "rollback_no_previous_ingress" }
-                    }
-                    Publish-AfpPublicIngressState -Path $statePath `
-                        -PublicUrl ([string]$failedState.public_url) `
-                        -Provider ([string]$failedState.provider) `
-                        -RecoveryOwner ([string]$failedState.recovery_owner) `
-                        -CandidateId ([string]$failedState.candidate_id) `
-                        -MinimumGeneration ([Math]::Max(1L, $failedIngressGeneration + 1L)) `
-                        -Layers $failedLayers | Out-Null
+                } else {
+                    throw "rollback_no_previous_ingress"
                 }
+                if ($RollbackProbeRunner) { & $RollbackProbeRunner }
+                else { [pscustomobject]@{ status = "failed" } }
+            } else {
+                throw "rollback_runtime_unavailable"
             }
-            return [pscustomobject][ordered]@{
+            if (-not $rollbackProbe -or [string]$rollbackProbe.status -ne "passed") {
+                throw "rollback_service_gate_failed"
+            }
+            $transactionResult = [pscustomobject][ordered]@{
                 status = "rolled_back"
                 error = $failure
                 failure_evidence_path = $FailureEvidencePath
                 rollback_evidence_path = $RollbackEvidencePath
             }
         } catch {
-            return [pscustomobject][ordered]@{
+            $transactionResult = [pscustomobject][ordered]@{
                 status = "rollback_failed"
                 error = $failure
                 rollback_error = $_.Exception.Message
@@ -684,21 +701,17 @@ function Invoke-AfpVerifiedRuntimePromotion {
             }
         }
     } finally {
-        $reservationProperty = $readiness.PSObject.Properties["reservation_id"]
-        $reservationId = if ($reservationProperty) { [string]$reservationProperty.Value } else { "" }
-        if ($reservationId) {
-            if ($CutoverReleaseRunner) {
-                & $CutoverReleaseRunner $reservationId | Out-Null
-            } else {
-                try {
-                    $body = @{ reservation_id = $reservationId } | ConvertTo-Json -Compress
-                    Invoke-RestMethod -Uri "http://127.0.0.1:8771/api/ingress/cutover-release" `
-                        -Method Post -ContentType "application/json" -Body $body -TimeoutSec 5 | Out-Null
-                } catch {
-                }
+        if (-not $releaseState.released -and -not (& $releaseReservation)) {
+            $transactionResult = [pscustomobject][ordered]@{
+                status = "rollback_failed"
+                error = if ($transactionResult -and $transactionResult.error) { [string]$transactionResult.error } else { "cutover_reservation_release_failed" }
+                rollback_error = "cutover_reservation_release_failed"
+                failure_evidence_path = $FailureEvidencePath
+                rollback_evidence_path = $RollbackEvidencePath
             }
         }
     }
+    return $transactionResult
 }
 
 function Test-AfpPublicStaticIdentity {

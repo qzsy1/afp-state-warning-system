@@ -589,7 +589,7 @@ class HelperTransportTests(unittest.TestCase):
 
         first = Connection([json.dumps(command)], fail_result_send=True)
         second = Connection(
-            [json.dumps({"type": "result_ack", "request_id": "start-1"}), ""]
+            [json.dumps({"type": "result_ack", "request_id": "start-1", "ok": True}), ""]
         )
         third = Connection([KeyboardInterrupt()])
         transport = Mock()
@@ -999,6 +999,32 @@ class HelperTransportTests(unittest.TestCase):
         self.assertFalse(accepted)
         self.assertEqual(transport.http_json.call_count, 3)
         self.assertEqual(outbox.pending(), [response])
+
+    def test_http_terminal_rejection_acknowledges_command_result(self):
+        response = {
+            "type": "result",
+            "request_id": "start-1",
+            "payload": {"ok": True, "running": True},
+        }
+        outbox = helper_entry.HelperResultOutbox()
+        transport = Mock()
+        transport.http_json.return_value = {
+            "ok": False,
+            "error": "command_state_lost",
+            "terminal": True,
+            "request_id": "start-1",
+        }
+
+        accepted = helper_entry._report_helper_response(
+            transport,
+            "local-helper",
+            response,
+            outbox,
+        )
+
+        self.assertTrue(accepted)
+        self.assertEqual(transport.http_json.call_count, 1)
+        self.assertEqual(outbox.pending(), [])
 
     def test_dispatch_discover_returns_structured_result(self):
         agent = Mock()
