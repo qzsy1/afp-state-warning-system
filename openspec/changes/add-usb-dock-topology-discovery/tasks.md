@@ -65,8 +65,8 @@
 ## 7. 跨电脑 USB 设备归属分类
 
 - [x] 7.1 更新 USB 拓扑 Spec、设计与 Harness 合同，定义 `host|dock|hub` 分类、schema v2、分类证据和跨电脑夹具，并验证 OpenSpec 严格校验及 Harness 单元测试通过，同时确认当前一律将非 Root Hub 归为拓展坞的实现会被阻断
-- [ ] 7.2 在 Windows PnP 枚举中读取并去敏设备容器、移除策略、设备类别和父子关系，验证集成 Hub、普通外接 Hub、未确认附件及多功能拓展坞夹具均能提供分类所需证据
-- [ ] 7.3 实现 schema v2 规范化分类器，确保 VID/PID、名称、端口数量和主机路径不能单独产生拓展坞结论，并以改变主机控制器、Root Hub 与 Location Path 的等价夹具验证分类不变
-- [ ] 7.4 更新传输目录、local helper 和前端分组，保留普通及未确认 USB 扩展设备的端口和实时端点，验证其不显示拓展坞标签且三类 USB 传感器仍共享完整候选池
-- [ ] 7.5 完成 schema v1 安全降级、目标三口一网口拓展坞正向回归、无拓展坞电脑负向回归和跨电脑行为回归，并运行 `usb-dock-topology-contracts`、`frontend-behavior-contracts` 及相关 helper 测试
+- [x] 7.2 在 Windows PnP 枚举中读取并去敏设备容器、移除策略、设备类别和父子关系，验证集成 Hub、普通外接 Hub、未确认附件及多功能拓展坞夹具均能提供分类所需证据
+- [x] 7.3 实现 schema v2 规范化分类器，确保 VID/PID、名称、端口数量和主机路径不能单独产生拓展坞结论，并以改变主机控制器、Root Hub 与 Location Path 的等价夹具验证分类不变
+- [x] 7.4 更新传输目录、local helper 和前端分组，保留普通及未确认 USB 扩展设备的端口和实时端点，验证其不显示拓展坞标签且三类 USB 传感器仍共享完整候选池
+- [x] 7.5 完成 schema v1 安全降级、目标三口一网口拓展坞正向回归、无拓展坞电脑负向回归和跨电脑行为回归，并运行 `usb-dock-topology-contracts`、`frontend-behavior-contracts` 及相关 helper 测试
 - [ ] 7.6 同步唯一发行目录并重建产物，在至少两台硬件拓扑不同的 Windows 电脑上分别验证集成 Hub、普通外接 Hub 和目标拓展坞分类，更新发行哈希后再完成现场验收

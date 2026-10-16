@@ -45,7 +45,14 @@ class AcquisitionTransportCatalogTests(unittest.TestCase):
         self.assertEqual(serial["transport_family"], "usb")
         self.assertEqual(serial["endpoint_kind"], "serial")
         self.assertEqual(serial["parent_port_id"], "dock:1:1")
-        self.assertEqual(serial["dock_id"], "dock:1")
+        self.assertEqual(serial["dock_id"], "")
+        self.assertTrue(serial["hub_id"].startswith("hub:"))
+        self.assertEqual(result["usb_topology"]["schema_version"], 2)
+        self.assertEqual(result["usb_topology"]["docks"], [])
+        self.assertEqual(
+            result["usb_topology"]["hubs"][0]["classification"],
+            "unconfirmed_accessory",
+        )
         catalog = result["interface_transport_catalog"]
         self.assertEqual([item["id"] for item in catalog["usb_ports"]], ["host:1", "dock:1:1"])
         self.assertEqual(catalog["usb_ports"][1]["endpoints"][0]["id"], "serial:COM8")

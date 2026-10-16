@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 PROVIDER_NAME = "windows_usb_hub_ioctl"
 
 _FILE_DEVICE_UNKNOWN = 0x22
@@ -74,6 +74,18 @@ _SPDRP_FRIENDLYNAME = 12
 _SPDRP_LOCATION_INFORMATION = 13
 _SPDRP_ENUMERATOR_NAME = 22
 _SPDRP_LOCATION_PATHS = 35
+_SPDRP_CAPABILITIES = 15
+_SPDRP_REMOVAL_POLICY = 31
+
+_CM_REMOVAL_POLICY_EXPECT_NO_REMOVAL = 1
+_CM_REMOVAL_POLICY_EXPECT_ORDERLY_REMOVAL = 2
+_CM_REMOVAL_POLICY_EXPECT_SURPRISE_REMOVAL = 3
+_CM_DEVCAP_REMOVABLE = 0x00000004
+_CM_DEVCAP_DOCKDEVICE = 0x00000008
+
+_DEVPROP_TYPE_GUID = 0x0000000D
+_DEVPKEY_DEVICE_CONTAINER_ID_GUID = uuid.UUID("8c7ed206-3f8a-4827-b3ab-ae9e1faefc6c")
+_DEVPKEY_DEVICE_CONTAINER_ID_PID = 2
 
 _CR_SUCCESS = 0
 _CM_LOCATE_DEVNODE_NORMAL = 0
@@ -122,6 +134,17 @@ class _SP_DEVINFO_DATA(ctypes.Structure):
         ("DevInst", wintypes.DWORD),
         ("Reserved", ctypes.c_size_t),
     ]
+
+
+class _DEVPROPKEY(ctypes.Structure):
+    _fields_ = [
+        ("fmtid", _GUID),
+        ("pid", wintypes.DWORD),
+    ]
+
+    @classmethod
+    def from_values(cls, fmtid: uuid.UUID, pid: int) -> "_DEVPROPKEY":
+        return cls(_GUID.from_uuid(fmtid), int(pid))
 
 
 class USB_DEVICE_DESCRIPTOR(ctypes.Structure):
@@ -239,6 +262,9 @@ class _DeviceRecord:
     hardware_ids: tuple[str, ...]
     location_paths: tuple[str, ...]
     location_info: str
+    container_id: str = ""
+    removal_policy: int | None = None
+    capabilities: int = 0
     network_name: str = ""
 
 
@@ -249,6 +275,7 @@ def _empty_topology(state: str, provider: str, errors: Iterable[str] = ()) -> di
         "provider": provider,
         "errors": [str(item) for item in errors if str(item)],
         "docks": [],
+        "hubs": [],
         "usb_ports": [],
         "devices": [],
     }
@@ -341,6 +368,124 @@ def _trusted_genesys_companions(raw_hubs: list[dict[str, Any]]) -> None:
             fast_port["trusted_companion"] = {"hub_id": slow["id"], "port_number": number}
 
 
+def _category_tokens(value: object) -> set[str]:
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    result: set[str] = set()
+    for item in values:
+        token = re.sub(r"[^a-z0-9]+", "_", str(item or "").strip().casefold()).strip("_")
+        if token:
+            result.add(token)
+    return result
+
+
+def _removal_policy_name(value: object) -> str:
+    try:
+        policy = int(value)
+    except (TypeError, ValueError):
+        return "unknown"
+    return {
+        _CM_REMOVAL_POLICY_EXPECT_NO_REMOVAL: "non_removable",
+        _CM_REMOVAL_POLICY_EXPECT_ORDERLY_REMOVAL: "orderly_removal",
+        _CM_REMOVAL_POLICY_EXPECT_SURPRISE_REMOVAL: "surprise_removal",
+    }.get(policy, "unknown")
+
+
+def _component_classification(
+    component_hubs: Sequence[Mapping[str, Any]],
+    *,
+    root_container_ids: set[str],
+) -> tuple[str, str, list[str]]:
+    """Classify one physical Hub attachment from portable PnP evidence."""
+
+    containers = {
+        str(hub.get("container_id") or "").strip().casefold()
+        for hub in component_hubs
+        if str(hub.get("container_id") or "").strip()
+    }
+    policies = {
+        int(hub["removal_policy"])
+        for hub in component_hubs
+        if hub.get("removal_policy") is not None
+    }
+    upstream_values = {
+        bool(hub.get("upstream_user_connectable"))
+        for hub in component_hubs
+        if hub.get("upstream_user_connectable") is not None
+    }
+    categories = set().union(*(
+        _category_tokens(hub.get("device_categories") or hub.get("device_category"))
+        for hub in component_hubs
+    ))
+    function_classes = set().union(*(
+        _category_tokens(hub.get("container_function_classes"))
+        for hub in component_hubs
+    ))
+    function_classes.add("hub")
+    for hub in component_hubs:
+        for port in hub.get("ports", []) or []:
+            device = port.get("device") if isinstance(port.get("device"), Mapping) else None
+            if not device or port.get("user_connectable") is not False:
+                continue
+            function_classes.update(_category_tokens(device.get("class")))
+            categories.update(_category_tokens(device.get("device_category")))
+
+    system_container = bool(containers & root_container_ids)
+    internal_upstream = False in upstream_values
+    non_removable = _CM_REMOVAL_POLICY_EXPECT_NO_REMOVAL in policies
+    integrated = bool(
+        system_container
+        or any(bool(hub.get("integrated")) for hub in component_hubs)
+        or (internal_upstream and non_removable)
+    )
+    if integrated:
+        evidence = []
+        if system_container:
+            evidence.append("system_container")
+        if internal_upstream:
+            evidence.append("internal_upstream")
+        if non_removable:
+            evidence.append("non_removable")
+        return "host", "integrated_hub", evidence or ["internal_upstream"]
+
+    evidence: list[str] = []
+    if containers and not system_container:
+        evidence.append("external_container")
+    if policies.intersection({
+        _CM_REMOVAL_POLICY_EXPECT_ORDERLY_REMOVAL,
+        _CM_REMOVAL_POLICY_EXPECT_SURPRISE_REMOVAL,
+    }):
+        evidence.append("removable")
+    if True in upstream_values:
+        evidence.append("user_connectable_upstream")
+
+    dock_category = any(
+        token == "dock" or "docking" in token or "port_replicator" in token
+        for token in categories
+    )
+    role_functions = {
+        token
+        for token in function_classes
+        if token in {
+            "net", "network", "display", "monitor", "audio", "audioendpoint",
+            "media", "bluetooth", "storage", "diskdrive",
+        }
+    }
+    externality = any(
+        token in {"external_container", "removable", "user_connectable_upstream"}
+        for token in evidence
+    )
+    if externality and (dock_category or role_functions):
+        evidence.append("device_category" if dock_category else "multifunction_container")
+        if len(component_hubs) > 1:
+            evidence.append("companion_hubs")
+        return "dock", "confirmed_dock", list(dict.fromkeys(evidence))
+    if externality and not role_functions:
+        evidence.append("hub_only")
+        return "hub", "external_hub", list(dict.fromkeys(evidence))
+    evidence.append("insufficient_identity")
+    return "hub", "unconfirmed_accessory", list(dict.fromkeys(evidence))
+
+
 def normalize_usb_topology(
     raw_hubs: Sequence[Mapping[str, Any]],
     *,
@@ -361,6 +506,16 @@ def normalize_usb_topology(
         for hub in public_hubs
         if hub.get("device_path")
     }
+    for parent_hub in hubs:
+        for port in parent_hub.get("ports", []) or []:
+            child_hub_id = path_to_hub.get(
+                _canonical_link(str(port.get("child_hub_path") or "")), ""
+            )
+            if child_hub_id:
+                child = hub_by_id[child_hub_id]
+                child["upstream_user_connectable"] = port.get("user_connectable")
+                child["upstream_parent_is_root"] = bool(parent_hub.get("is_root"))
+                child["upstream_connector_is_type_c"] = port.get("connector_is_type_c")
     port_keys = [
         (str(hub["id"]), int(port["number"]))
         for hub in public_hubs
@@ -389,6 +544,14 @@ def normalize_usb_topology(
         member_hubs = {hub_id for hub_id, _ in members}
         for hub_id in member_hubs:
             hub_links[hub_id].update(member_hubs - {hub_id})
+    hubs_by_container: dict[str, set[str]] = defaultdict(set)
+    for hub in public_hubs:
+        container_id = str(hub.get("container_id") or "").strip().casefold()
+        if container_id:
+            hubs_by_container[container_id].add(str(hub["id"]))
+    for member_hubs in hubs_by_container.values():
+        for hub_id in member_hubs:
+            hub_links[hub_id].update(member_hubs - {hub_id})
 
     components: list[set[str]] = []
     remaining = set(hub_by_id)
@@ -406,35 +569,73 @@ def normalize_usb_topology(
         components.append(component)
 
     components.sort(key=lambda group: sorted(group))
-    dock_by_hub: dict[str, str] = {}
+    root_container_ids = {
+        str(hub.get("container_id") or "").strip().casefold()
+        for hub in root_hubs
+        if str(hub.get("container_id") or "").strip()
+    }
+    owner_by_hub: dict[str, tuple[str, str]] = {}
     docks: list[dict[str, Any]] = []
+    accessory_hubs: list[dict[str, Any]] = []
     for component in components:
         component_hubs = [hub_by_id[item] for item in sorted(component)]
+        owner_kind, classification, classification_evidence = _component_classification(
+            component_hubs,
+            root_container_ids=root_container_ids,
+        )
         locations = [path for hub in component_hubs for path in hub.get("location_paths", []) if path]
-        identity = _common_location(locations) or "|".join(sorted(component))
+        containers = sorted({
+            str(hub.get("container_id") or "").strip().casefold()
+            for hub in component_hubs
+            if str(hub.get("container_id") or "").strip()
+        })
+        identity = "|".join(containers) or _common_location(locations) or "|".join(sorted(component))
         fingerprint = ",".join(
             f"{int(hub.get('vid') or 0):04x}:{int(hub.get('pid') or 0):04x}"
             for hub in component_hubs
         )
-        dock_id = _stable_id("dock", identity, fingerprint)
+        owner_id = _stable_id(owner_kind, identity, fingerprint)
         for hub_id in component:
-            dock_by_hub[hub_id] = dock_id
-        docks.append({
-            "id": dock_id,
+            owner_by_hub[hub_id] = (owner_kind, owner_id)
+        if owner_kind == "host":
+            continue
+        record = {
+            "id": owner_id,
             "label": "",
             "state": "connected",
-            "upstream_location": _stable_id("location", identity),
+            "classification": classification,
+            "classification_evidence": classification_evidence,
+            "container_key": (
+                _stable_id("container", containers[0]) if len(containers) == 1 else ""
+            ),
             "hub_refs": [_stable_id("hub", item) for item in sorted(component)],
             "hub_vid_pids": [
                 {"vid": hub.get("vid"), "pid": hub.get("pid")}
                 for hub in component_hubs
             ],
-        })
+        }
+        if owner_kind == "dock":
+            docks.append(record)
+        else:
+            accessory_hubs.append(record)
 
     docks.sort(key=lambda item: item["id"])
     for index, dock in enumerate(docks, 1):
         dock["label"] = f"拓展坞 {index}"
-    dock_records = {item["id"]: item for item in docks}
+    accessory_hubs.sort(key=lambda item: item["id"])
+    plain_index = 0
+    unknown_index = 0
+    for hub in accessory_hubs:
+        if hub["classification"] == "external_hub":
+            plain_index += 1
+            hub["label"] = f"USB 集线器 {plain_index}"
+        else:
+            unknown_index += 1
+            hub["label"] = f"未确认 USB 扩展设备 {unknown_index}"
+    owner_records = {
+        **{item["id"]: item for item in docks},
+        **{item["id"]: item for item in accessory_hubs},
+    }
 
     ports: list[dict[str, Any]] = []
     devices: list[dict[str, Any]] = []
@@ -442,10 +643,12 @@ def normalize_usb_topology(
     port_id_by_member: dict[tuple[str, int], str] = {}
     for members in connector_members.values():
         member_hubs = {hub_id for hub_id, _ in members}
-        dock_ids = {dock_by_hub[hub_id] for hub_id in member_hubs if hub_id in dock_by_hub}
-        if len(dock_ids) != 1:
+        owners = {owner_by_hub[hub_id] for hub_id in member_hubs if hub_id in owner_by_hub}
+        if len(owners) != 1:
             continue
-        dock_id = next(iter(dock_ids))
+        owner_kind, owner_id = next(iter(owners))
+        dock_id = owner_id if owner_kind == "dock" else ""
+        accessory_hub_id = owner_id if owner_kind == "hub" else ""
         active = [port for _, port in members if str(port.get("state")) == "occupied"]
         candidate = active[0] if active else members[0][1]
         protocols = sorted({
@@ -468,7 +671,7 @@ def normalize_usb_topology(
             f"{int(hub_by_id[hub].get('pid') or 0):04x}:{int(port['number'])}"
             for hub, port in sorted(members, key=lambda x: (x[0], int(x[1]["number"])))
         )
-        port_id = _stable_id("usbport", dock_id, member_identity)
+        port_id = _stable_id("usbport", owner_kind, owner_id, member_identity)
         for hub_id, member_port in members:
             port_id_by_member[(hub_id, int(member_port["number"]))] = port_id
         user_values = [port.get("user_connectable") for _, port in members if port.get("user_connectable") is not None]
@@ -478,7 +681,8 @@ def normalize_usb_topology(
         component_hubs = [hub_by_id[item] for item in member_hubs]
         hub_pairs = {(hub.get("vid"), hub.get("pid")) for hub in component_hubs}
         if (
-            device
+            owner_kind == "dock"
+            and device
             and (device.get("vid"), device.get("pid")) == (0x0B95, 0x1790)
             and (0x05E3, 0x0610) in hub_pairs
             and (0x05E3, 0x0626) in hub_pairs
@@ -511,6 +715,16 @@ def normalize_usb_topology(
                     "live_interface_id": str(device.get("live_interface_id") or ""),
                     "network_name": str(device.get("network_name") or ""),
                     "instance_key": _stable_id("pnp", device.get("instance_id") or "") if device.get("instance_id") else "",
+                    "container_key": (
+                        _stable_id("container", device.get("container_id"))
+                        if device.get("container_id") else ""
+                    ),
+                    "parent_key": (
+                        _stable_id("pnp", device.get("parent_instance_id"))
+                        if device.get("parent_instance_id") else ""
+                    ),
+                    "removal_policy": _removal_policy_name(device.get("removal_policy")),
+                    "device_category": next(iter(sorted(_category_tokens(device.get("device_category")))), "usb"),
                     "location_keys": [
                         _stable_id("location", path)
                         for path in device.get("location_paths", [])
@@ -530,10 +744,19 @@ def normalize_usb_topology(
             else "type_a" if connector_values
             else "unknown"
         )
+        currently_observed = state == "occupied"
+        companion_confirmed_usb_a = connector_form_factor == "type_a" and len(members) > 1
+        historically_observed = port_id in known_host_ports
+        if owner_kind == "host":
+            if not user_connectable:
+                continue
+            if not currently_observed and not historically_observed and not companion_confirmed_usb_a:
+                continue
         ports.append({
             "id": port_id,
-            "owner_kind": "dock",
+            "owner_kind": owner_kind,
             "dock_id": dock_id,
+            "hub_id": accessory_hub_id,
             "system_port_number": display_number,
             "connector_type": "usb3" if "usb3" in protocols else "usb2",
             "connector_form_factor": connector_form_factor,
@@ -543,6 +766,13 @@ def normalize_usb_topology(
             "device_id": device_id,
             "internal_function": internal_function,
             "merge_state": "companion" if len(members) > 1 else "independent",
+            **({
+                "confirmation": (
+                    "observed_current" if currently_observed
+                    else "observed_history" if historically_observed
+                    else "connector_metadata"
+                )
+            } if owner_kind == "host" else {}),
         })
 
     # Root hubs represent connectors owned by the computer.  Some firmware
@@ -681,6 +911,16 @@ def normalize_usb_topology(
                     "live_interface_id": str(device.get("live_interface_id") or ""),
                     "network_name": str(device.get("network_name") or ""),
                     "instance_key": _stable_id("pnp", device.get("instance_id") or "") if device.get("instance_id") else "",
+                    "container_key": (
+                        _stable_id("container", device.get("container_id"))
+                        if device.get("container_id") else ""
+                    ),
+                    "parent_key": (
+                        _stable_id("pnp", device.get("parent_instance_id"))
+                        if device.get("parent_instance_id") else ""
+                    ),
+                    "removal_policy": _removal_policy_name(device.get("removal_policy")),
+                    "device_category": next(iter(sorted(_category_tokens(device.get("device_category")))), "usb"),
                     "location_keys": [
                         _stable_id("location", path)
                         for path in device.get("location_paths", [])
@@ -692,6 +932,7 @@ def normalize_usb_topology(
             "id": port_id,
             "owner_kind": "host",
             "dock_id": "",
+            "hub_id": "",
             "system_port_number": min(numbers),
             "connector_type": "usb3" if "usb3" in protocols else "usb2",
             "connector_form_factor": connector_form_factor,
@@ -714,12 +955,24 @@ def normalize_usb_topology(
         for raw_port in parent_hub.get("ports", []):
             child_path = _canonical_link(str(raw_port.get("child_hub_path") or ""))
             child_hub_id = path_to_hub.get(child_path, "")
-            child_dock_id = dock_by_hub.get(child_hub_id, "")
+            child_owner = owner_by_hub.get(child_hub_id)
+            parent_owner = owner_by_hub.get(parent_hub_id)
             parent_port_id = port_id_by_member.get((parent_hub_id, int(raw_port["number"])), "")
-            if child_dock_id and parent_port_id and child_dock_id != dock_by_hub.get(parent_hub_id):
-                dock_records[child_dock_id]["parent_port_id"] = parent_port_id
+            if (
+                child_owner
+                and child_owner[0] != "host"
+                and parent_port_id
+                and child_owner != parent_owner
+            ):
+                owner_records[child_owner[1]]["parent_port_id"] = parent_port_id
 
-    ports.sort(key=lambda item: (item.get("owner_kind") != "host", item["dock_id"], not item["user_connectable"], item["system_port_number"], item["id"]))
+    ports.sort(key=lambda item: (
+        item.get("owner_kind") != "host",
+        str(item.get("dock_id") or item.get("hub_id") or ""),
+        not item["user_connectable"],
+        item["system_port_number"],
+        item["id"],
+    ))
     host_counts: dict[str, int] = defaultdict(int)
     external_counts: dict[str, int] = defaultdict(int)
     for port in ports:
@@ -736,15 +989,17 @@ def normalize_usb_topology(
                 f"（系统端口 {port['system_port_number']}）"
             )
         elif port["user_connectable"]:
-            external_counts[port["dock_id"]] += 1
+            owner_id = str(port.get("dock_id") or port.get("hub_id") or "")
+            external_counts[owner_id] += 1
             port["label"] = (
-                f"{dock_records[port['dock_id']]['label']} · "
-                f"{str(port['connector_type']).upper()}-{external_counts[port['dock_id']]}"
+                f"{owner_records[owner_id]['label']} · "
+                f"{str(port['connector_type']).upper()}-{external_counts[owner_id]}"
                 f"（系统端口 {port['system_port_number']}）"
             )
         else:
+            owner_id = str(port.get("dock_id") or port.get("hub_id") or "")
             port["label"] = (
-                f"{dock_records[port['dock_id']]['label']} · 内部"
+                f"{owner_records[owner_id]['label']} · 内部"
                 f"{port.get('internal_function') or '功能'}"
             )
 
@@ -754,6 +1009,7 @@ def normalize_usb_topology(
         "provider": PROVIDER_NAME,
         "errors": error_list,
         "docks": docks,
+        "hubs": accessory_hubs,
         "usb_ports": ports,
         "devices": sorted(devices, key=lambda item: item["id"]),
     }
@@ -854,6 +1110,17 @@ class _WindowsApi:
             ctypes.POINTER(wintypes.DWORD),
         ]
         self.setupapi.SetupDiGetDeviceRegistryPropertyW.restype = wintypes.BOOL
+        self.setupapi.SetupDiGetDevicePropertyW.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_SP_DEVINFO_DATA),
+            ctypes.POINTER(_DEVPROPKEY),
+            ctypes.POINTER(wintypes.ULONG),
+            ctypes.POINTER(ctypes.c_ubyte),
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.DWORD,
+        ]
+        self.setupapi.SetupDiGetDevicePropertyW.restype = wintypes.BOOL
         self.cfgmgr32.CM_Get_Parent.argtypes = [
             ctypes.POINTER(wintypes.DWORD), wintypes.DWORD, wintypes.ULONG
         ]
@@ -932,6 +1199,47 @@ class _WindowsApi:
         text = ctypes.wstring_at(ctypes.addressof(buffer), required.value // ctypes.sizeof(wintypes.WCHAR))
         return tuple(item for item in text.rstrip("\x00").split("\x00") if item)
 
+    def _property_uint32(
+        self, info_set: int, devinfo: _SP_DEVINFO_DATA, prop: int
+    ) -> int | None:
+        required = wintypes.DWORD()
+        data_type = wintypes.DWORD()
+        value = wintypes.DWORD()
+        if not self.setupapi.SetupDiGetDeviceRegistryPropertyW(
+            info_set,
+            ctypes.byref(devinfo),
+            prop,
+            ctypes.byref(data_type),
+            ctypes.cast(ctypes.byref(value), ctypes.POINTER(ctypes.c_ubyte)),
+            ctypes.sizeof(value),
+            ctypes.byref(required),
+        ):
+            return None
+        return int(value.value)
+
+    def _container_id(self, info_set: int, devinfo: _SP_DEVINFO_DATA) -> str:
+        key = _DEVPROPKEY.from_values(
+            _DEVPKEY_DEVICE_CONTAINER_ID_GUID,
+            _DEVPKEY_DEVICE_CONTAINER_ID_PID,
+        )
+        required = wintypes.DWORD()
+        data_type = wintypes.ULONG()
+        value = _GUID()
+        if not self.setupapi.SetupDiGetDevicePropertyW(
+            info_set,
+            ctypes.byref(devinfo),
+            ctypes.byref(key),
+            ctypes.byref(data_type),
+            ctypes.cast(ctypes.byref(value), ctypes.POINTER(ctypes.c_ubyte)),
+            ctypes.sizeof(value),
+            ctypes.byref(required),
+            0,
+        ):
+            return ""
+        if int(data_type.value) != _DEVPROP_TYPE_GUID or required.value < ctypes.sizeof(value):
+            return ""
+        return str(uuid.UUID(bytes_le=bytes(value)))
+
     def _parent_id(self, devinst: int) -> str:
         parent = wintypes.DWORD()
         if self.cfgmgr32.CM_Get_Parent(ctypes.byref(parent), devinst, 0) != _CR_SUCCESS:
@@ -976,6 +1284,14 @@ class _WindowsApi:
                     hardware_ids=self._property(info_set, devinfo, _SPDRP_HARDWAREID),
                     location_paths=self._property(info_set, devinfo, _SPDRP_LOCATION_PATHS),
                     location_info=(self._property(info_set, devinfo, _SPDRP_LOCATION_INFORMATION) or ("",))[0],
+                    container_id=self._container_id(info_set, devinfo),
+                    removal_policy=self._property_uint32(
+                        info_set, devinfo, _SPDRP_REMOVAL_POLICY
+                    ),
+                    capabilities=int(
+                        self._property_uint32(info_set, devinfo, _SPDRP_CAPABILITIES)
+                        or 0
+                    ),
                 )
         finally:
             self.setupapi.SetupDiDestroyDeviceInfoList(info_set)
@@ -1208,6 +1524,16 @@ def _query_port(
             "network_name": pnp.network_name if pnp else "",
             "driver_key": driver_key,
             "location_paths": list(pnp.location_paths) if pnp else [],
+            "container_id": pnp.container_id if pnp else "",
+            "removal_policy": pnp.removal_policy if pnp else None,
+            "device_category": (
+                "dock"
+                if pnp and pnp.capabilities & _CM_DEVCAP_DOCKDEVICE
+                else str(pnp.class_name or "").strip().casefold()
+                if pnp
+                else ""
+            ),
+            "parent_instance_id": pnp.parent_instance_id if pnp else "",
         }
     child_hub_path = ""
     if bool(info.DeviceIsHub):
@@ -1270,6 +1596,14 @@ def _enrich_port_device_from_pnp(
         "network_name": record.network_name,
         "driver_key": record.driver_key,
         "location_paths": list(record.location_paths),
+        "container_id": record.container_id,
+        "removal_policy": record.removal_policy,
+        "device_category": (
+            "dock"
+            if record.capabilities & _CM_DEVCAP_DOCKDEVICE
+            else str(record.class_name or "").strip().casefold()
+        ),
+        "parent_instance_id": record.parent_instance_id,
     })
     tail = record.instance_id.rsplit("\\", 1)[-1]
     if "&" not in tail:
@@ -1320,6 +1654,22 @@ def _read_hub(
     finally:
         api.close_handle(handle)
     vid, pid = _vid_pid(instance_id)
+    container_id = pnp.container_id if pnp else ""
+    container_records = [
+        record
+        for record in devices.values()
+        if container_id and record.container_id.casefold() == container_id.casefold()
+    ]
+    function_classes = sorted({
+        str(record.class_name or "").strip().casefold()
+        for record in container_records
+        if str(record.class_name or "").strip()
+    })
+    device_categories = sorted({
+        "dock"
+        for record in container_records
+        if record.capabilities & _CM_DEVCAP_DOCKDEVICE
+    })
     return ({
         "id": _stable_id("rawhub", instance_id or path),
         "device_path": path,
@@ -1327,6 +1677,16 @@ def _read_hub(
         "parent_instance_id": pnp.parent_instance_id if pnp else "",
         "location_paths": list(pnp.location_paths if pnp else ()),
         "friendly_name": (pnp.friendly_name or pnp.description) if pnp else "USB Hub",
+        "container_id": container_id,
+        "container_key": _stable_id("container", container_id) if container_id else "",
+        "removal_policy": pnp.removal_policy if pnp else None,
+        "device_categories": device_categories,
+        "container_function_classes": function_classes,
+        "parent_key": (
+            _stable_id("pnp", pnp.parent_instance_id)
+            if pnp and pnp.parent_instance_id
+            else ""
+        ),
         "vid": vid,
         "pid": pid,
         "hub_type": hub_type,

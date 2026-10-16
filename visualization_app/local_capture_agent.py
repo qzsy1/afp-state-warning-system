@@ -33,6 +33,10 @@ from remote_mysql_setup import classify_mysql_error
 from real_acquisition import ReadinessSnapshot
 from release_contract import assert_helper_contract, load_release_contract
 from simulation_source_transfer import SimulationSourceCache, inspect_csv_source
+from interface_transport_catalog import (
+    enrich_interface_transports,
+    normalize_usb_topology_contract,
+)
 
 
 _ROLE_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
@@ -109,8 +113,17 @@ class LocalCaptureAgent:
         return candidates[0] if candidates else None
 
     def discover(self) -> dict[str, Any]:
-        discovered = self.manager.discover_interfaces()
-        physical = list(discovered.get("physical_interfaces") or [])
+        discovered = dict(self.manager.discover_interfaces())
+        discovered["usb_topology"] = normalize_usb_topology_contract(
+            discovered.get("usb_topology")
+        )
+        physical = [
+            dict(item) for item in discovered.get("physical_interfaces") or []
+            if isinstance(item, dict)
+        ]
+        discovered["interface_transport_catalog"] = enrich_interface_transports(
+            discovered["usb_topology"], physical
+        )
         bindings: list[dict[str, Any]] = []
         used: set[str] = set()
         for role, kind, protocols in _ROLE_SPECS:
@@ -155,16 +168,17 @@ class LocalCaptureAgent:
             "interfaces": physical,
             "sensor_bindings": bindings,
             "usb_topology": discovered.get("usb_topology") or {
-                "schema_version": 1,
+                "schema_version": 2,
                 "state": "unavailable",
                 "provider": "legacy_discovery",
                 "errors": ["旧版发现结果未提供 USB 物理端口拓扑"],
                 "docks": [],
+                "hubs": [],
                 "usb_ports": [],
                 "devices": [],
             },
             "interface_transport_catalog": discovered.get("interface_transport_catalog") or {
-                "schema_version": 1,
+                "schema_version": 2,
                 "usb_ports": [],
                 "unlocated_usb_interface_ids": [],
                 "native_serial_interface_ids": [],
@@ -173,7 +187,9 @@ class LocalCaptureAgent:
             "capabilities": {
                 "hardware_discovery": True,
                 "usb_topology_v1": bool(discovered.get("usb_topology")),
+                "usb_topology_v2": bool(discovered.get("usb_topology")),
                 "interface_transport_catalog_v1": bool(discovered.get("interface_transport_catalog")),
+                "interface_transport_catalog_v2": bool(discovered.get("interface_transport_catalog")),
                 "real_capture": True,
                 "process_parameter_read": True,
                 "local_csv_save": True,

@@ -9,6 +9,7 @@ same topology.
 from __future__ import annotations
 
 import hashlib
+from copy import deepcopy
 from collections.abc import Mapping, MutableMapping, Sequence
 from typing import Any
 
@@ -16,6 +17,82 @@ from typing import Any
 USB_ENDPOINT_KINDS = {"usb_hid", "usb_uvc"}
 SERIAL_ENDPOINT_KINDS = {"serial", "com"}
 ETHERNET_ENDPOINT_KINDS = {"ethernet", "ethernet_adapter"}
+
+
+def normalize_usb_topology_contract(topology: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return schema v2 without trusting legacy dock identity assertions."""
+
+    source = deepcopy(dict(topology or {}))
+    if source.get("schema_version") == 2:
+        source.setdefault("docks", [])
+        source.setdefault("hubs", [])
+        source.setdefault("usb_ports", [])
+        source.setdefault("devices", [])
+        source.setdefault("errors", [])
+        return source
+
+    legacy_ports = [
+        dict(item) for item in source.get("usb_ports", []) or []
+        if isinstance(item, Mapping)
+    ]
+    group_ids: dict[str, str] = {}
+    hubs: list[dict[str, Any]] = []
+    for port in legacy_ports:
+        owner_kind = str(port.get("owner_kind") or ("dock" if port.get("dock_id") else "host"))
+        if owner_kind == "host":
+            port["owner_kind"] = "host"
+            port["dock_id"] = ""
+            port["hub_id"] = ""
+            port.setdefault(
+                "confirmation",
+                "observed_current" if port.get("state") == "occupied" else "observed_history",
+            )
+        else:
+            legacy_owner = str(port.get("dock_id") or port.get("hub_id") or "legacy-accessory")
+            hub_id = group_ids.get(legacy_owner)
+            if not hub_id:
+                hub_id = _stable_key("hub", f"legacy:{legacy_owner}")
+                group_ids[legacy_owner] = hub_id
+                hubs.append({
+                    "id": hub_id,
+                    "label": f"未确认 USB 扩展设备 {len(hubs) + 1}",
+                    "state": "connected",
+                    "classification": "unconfirmed_accessory",
+                    "classification_evidence": ["insufficient_identity"],
+                    "hub_refs": [],
+                })
+            port["owner_kind"] = "hub"
+            port["dock_id"] = ""
+            port["hub_id"] = hub_id
+            hub_label = next(
+                item["label"] for item in hubs if item["id"] == hub_id
+            )
+            connector_label = str(port.get("connector_type") or "usb").upper()
+            system_port = port.get("system_port_number")
+            port["label"] = (
+                f"{hub_label} · {connector_label}"
+                + (f"（系统端口 {system_port}）" if system_port is not None else "")
+            )
+        port.setdefault("connector_form_factor", "unknown")
+        port.setdefault("connector_type", "usb")
+        port.setdefault("supported_protocols", [str(port.get("connector_type") or "usb")])
+        port.setdefault("user_connectable", True)
+
+    legacy_errors = [str(item) for item in source.get("errors", []) or [] if str(item)]
+    legacy_errors.append("schema v1 拓扑已按未确认 USB 扩展设备安全降级")
+    return {
+        "schema_version": 2,
+        "state": str(source.get("state") or "partial"),
+        "provider": str(source.get("provider") or "legacy_helper_v1"),
+        "errors": list(dict.fromkeys(legacy_errors)),
+        "docks": [],
+        "hubs": hubs,
+        "usb_ports": legacy_ports,
+        "devices": [
+            dict(item) for item in source.get("devices", []) or []
+            if isinstance(item, Mapping)
+        ],
+    }
 
 
 def _stable_key(prefix: str, value: object) -> str:
@@ -119,6 +196,10 @@ def enrich_interface_transports(
 ) -> dict[str, Any]:
     """Enrich live endpoints and return a role-independent transport catalog."""
 
+    normalized = normalize_usb_topology_contract(topology)
+    topology.clear()
+    topology.update(normalized)
+
     ports = {
         str(item.get("id") or ""): item
         for item in topology.get("usb_ports", []) or []
@@ -127,6 +208,11 @@ def enrich_interface_transports(
     docks = {
         str(item.get("id") or ""): item
         for item in topology.get("docks", []) or []
+        if isinstance(item, Mapping) and item.get("id")
+    }
+    hubs = {
+        str(item.get("id") or ""): item
+        for item in topology.get("hubs", []) or []
         if isinstance(item, Mapping) and item.get("id")
     }
     device_by_id = {
@@ -149,11 +235,18 @@ def enrich_interface_transports(
             if port is not None:
                 interface["parent_port_id"] = parent_id
                 interface["dock_id"] = str(port.get("dock_id") or "")
+                interface["hub_id"] = str(port.get("hub_id") or "")
                 interface["owner_kind"] = str(port.get("owner_kind") or ("dock" if port.get("dock_id") else "host"))
                 topology_label = str(port.get("label") or "")
-                if kind in ETHERNET_ENDPOINT_KINDS or port.get("internal_function") == "ethernet":
+                if (
+                    (kind in ETHERNET_ENDPOINT_KINDS or port.get("internal_function") == "ethernet")
+                    and interface["dock_id"]
+                ):
                     dock = docks.get(str(port.get("dock_id") or ""), {})
                     topology_label = f"{dock.get('label', '拓展坞')} · 拓展坞网口"
+                elif interface["hub_id"]:
+                    hub = hubs.get(interface["hub_id"], {})
+                    topology_label = str(port.get("label") or hub.get("label") or "USB 扩展设备")
                 interface["topology_label"] = topology_label
                 base_label = str(interface.get("base_label") or interface.get("label") or interface_id)
                 interface["base_label"] = base_label
@@ -197,14 +290,21 @@ def enrich_interface_transports(
             "id": str(port.get("id") or ""),
             "owner_kind": str(port.get("owner_kind") or ("dock" if port.get("dock_id") else "host")),
             "dock_id": str(port.get("dock_id") or ""),
+            "hub_id": str(port.get("hub_id") or ""),
             "label": str(port.get("label") or "USB 端口"),
             "state": str(port.get("state") or "unknown"),
             "connector_type": str(port.get("connector_type") or "usb"),
+            "connector_form_factor": str(port.get("connector_form_factor") or "unknown"),
             "endpoints": sorted(endpoints_by_port.get(str(port.get("id") or ""), []), key=lambda item: item["id"]),
         })
-    usb_ports.sort(key=lambda item: (item["owner_kind"] != "host", item["dock_id"], item["label"], item["id"]))
+    usb_ports.sort(key=lambda item: (
+        item["owner_kind"] != "host",
+        item["dock_id"] or item["hub_id"],
+        item["label"],
+        item["id"],
+    ))
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "usb_ports": usb_ports,
         "unlocated_usb_interface_ids": sorted(set(unlocated_usb)),
         "native_serial_interface_ids": sorted(set(native_serial)),
