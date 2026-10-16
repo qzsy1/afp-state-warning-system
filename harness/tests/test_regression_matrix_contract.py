@@ -185,6 +185,21 @@ class RegressionMatrixContractTests(unittest.TestCase):
             with self.subTest(module=module):
                 self.assertIn(module, network_command)
 
+    def test_public_ingress_gate_runs_watchdogs_security_and_websocket(self) -> None:
+        check = next(
+            item for item in self.matrix.checks
+            if item.id == "public-ingress-cutover-contracts"
+        )
+        command = " ".join(check.command)
+        for module in (
+            "visualization_app.test_public_web_security",
+            "visualization_app.test_public_tunnel_watchdog",
+            "visualization_app.test_tailscale_funnel_watchdog",
+            "visualization_app.test_helper_websocket",
+        ):
+            with self.subTest(module=module):
+                self.assertIn(module, command)
+
     def test_real_acquisition_requirements_have_stable_ids_and_evidence_levels(self) -> None:
         self.assertTrue(
             {

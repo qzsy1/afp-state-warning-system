@@ -11,7 +11,9 @@ import visualization_app.release_contract as release_contract_module
 from visualization_app.release_contract import (
     ReleaseContractError,
     compare_release_contracts,
+    helper_capability_mismatches,
     load_release_contract,
+    release_manifest_helper_identity,
 )
 
 
@@ -81,6 +83,37 @@ class ReleaseContractTests(unittest.TestCase):
             ):
                 contract = load_release_contract(start=extraction_module)
         self.assertEqual(contract.source_path, candidate / "RELEASE-MANIFEST.json")
+
+    def test_manifest_binds_helper_candidate_and_executable_hash(self) -> None:
+        payload = json.loads(
+            (ROOT / "pre_sensor" / "release-contract.json").read_text(encoding="utf-8")
+        )
+        payload["candidate"] = {"candidate_id": "candidate-1"}
+        payload["runtime_requirements"]["required_executables"][0]["sha256"] = "a" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "RELEASE-MANIFEST.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            contract = load_release_contract(explicit=path)
+            self.assertEqual(
+                release_manifest_helper_identity(contract),
+                ("candidate-1", "a" * 64),
+            )
+            capabilities = {
+                **contract.identity_payload(),
+                "protocol_version": contract.helper_protocol_version,
+                "helper_version": contract.helper_version,
+                "build_id": contract.release_revision,
+                "unified_frame_contract": contract.unified_frame_contract,
+                "configuration_schema_version": contract.configuration_schema_version,
+                "readiness_schema_version": contract.readiness_schema_version,
+                "unified_frame_v1": True,
+                "candidate_id": "candidate-1",
+                "helper_sha256": "b" * 64,
+            }
+            self.assertEqual(
+                helper_capability_mismatches(contract, capabilities),
+                ("helper_sha256",),
+            )
 
 
 if __name__ == "__main__":

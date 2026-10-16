@@ -160,7 +160,13 @@ if ($Mode -eq "Switchover") {
                 CandidateId = $candidateId
                 Layers = $layers
             }
-            if ($current) { $parameters.ExpectedGeneration = [long]$current.generation }
+            if ($current) {
+                $parameters.ExpectedGeneration = [long]$current.generation
+                if ([string]$current.candidate_id -cne $candidateId) {
+                    $parameters.ExpectedPreviousCandidateId = [string]$current.candidate_id
+                    $parameters.MinimumGeneration = [long]$current.generation + 1L
+                }
+            }
             $published = Publish-AfpPublicIngressState @parameters
             Read-AfpPublicIngressState -Path $statePath -ExpectedCandidateId $candidateId | Out-Null
             return $published
@@ -169,17 +175,31 @@ if ($Mode -eq "Switchover") {
             Complete-AfpRuntimePromotion -Promotion $script:activePromotion -Paths $paths
         } `
         -RestoreRunner {
-            param($Promotion, $IngressSnapshot)
+            param($Promotion, $IngressSnapshot, $FailedIngressGeneration)
             $failedInventory = Get-AfpRuntimeInventory -PublicUrl $PublicUrl -FunnelOrigin $FunnelOrigin
             Stop-AfpManagedRuntimeProcesses -Inventory $failedInventory -RuntimeExecutable $exe | Out-Null
             if ($Promotion) { Restore-AfpRuntimePromotion -Promotion $Promotion -Paths $paths }
             $statePath = Join-Path $paths.RuntimeRoot "runtime\public-ingress-state.json"
             if ($null -ne $IngressSnapshot) {
-                $stateDirectory = Split-Path -Parent $statePath
-                if (-not (Test-Path -LiteralPath $stateDirectory -PathType Container)) {
-                    [IO.Directory]::CreateDirectory($stateDirectory) | Out-Null
+                $snapshotText = [Text.Encoding]::UTF8.GetString([byte[]]$IngressSnapshot).TrimStart([char]0xFEFF)
+                $snapshot = $snapshotText | ConvertFrom-Json -ErrorAction Stop
+                Import-Module (Join-Path $paths.RuntimeRoot "PublicIngress.psm1") -Force -ErrorAction Stop
+                $restored = Read-AfpPublicIngressState -Path $statePath
+                $snapshotLayers = @{}
+                foreach ($property in $snapshot.layers.PSObject.Properties) {
+                    $snapshotLayers[$property.Name] = @{
+                        ok = [bool]$property.Value.ok
+                        code = [string]$property.Value.code
+                    }
                 }
-                [IO.File]::WriteAllBytes($statePath, [byte[]]$IngressSnapshot)
+                Publish-AfpPublicIngressState -Path $statePath `
+                    -PublicUrl ([string]$snapshot.public_url) `
+                    -Provider ([string]$snapshot.provider) `
+                    -RecoveryOwner ([string]$snapshot.recovery_owner) `
+                    -CandidateId ([string]$snapshot.candidate_id) `
+                    -ExpectedGeneration ([long]$restored.generation) `
+                    -MinimumGeneration ([Math]::Max([long]$restored.generation + 1L, [long]$FailedIngressGeneration + 1L)) `
+                    -Layers $snapshotLayers | Out-Null
             } elseif (Test-Path -LiteralPath $statePath -PathType Leaf) {
                 Remove-Item -LiteralPath $statePath -Force
             }

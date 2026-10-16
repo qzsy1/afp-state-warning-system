@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import os
 import sys
 from dataclasses import dataclass
@@ -221,12 +222,43 @@ def helper_capability_mismatches(
         "configuration_schema_version": expected.configuration_schema_version,
         "readiness_schema_version": expected.readiness_schema_version,
     }
+    candidate_id, helper_sha256 = release_manifest_helper_identity(expected)
+    if candidate_id:
+        expected_values["candidate_id"] = candidate_id
+    if helper_sha256:
+        expected_values["helper_sha256"] = helper_sha256
     mismatches = [
         name for name, value in expected_values.items() if actual.get(name) != value
     ]
     if actual.get("unified_frame_v1") is not True:
         mismatches.append("unified_frame_v1")
     return tuple(mismatches)
+
+
+def release_manifest_helper_identity(contract: ReleaseContract) -> tuple[str, str]:
+    try:
+        payload = json.loads(contract.source_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return "", ""
+    if not isinstance(payload, Mapping):
+        return "", ""
+    candidate = payload.get("candidate")
+    candidate_id = (
+        str(candidate.get("candidate_id") or "").strip()
+        if isinstance(candidate, Mapping)
+        else ""
+    )
+    runtime = payload.get("runtime_requirements")
+    executables = runtime.get("required_executables") if isinstance(runtime, Mapping) else None
+    helper_sha256 = ""
+    if isinstance(executables, list):
+        for item in executables:
+            if isinstance(item, Mapping) and item.get("id") == "local_capture_helper":
+                value = str(item.get("sha256") or "").strip().lower()
+                if re.fullmatch(r"[0-9a-f]{64}", value):
+                    helper_sha256 = value
+                break
+    return candidate_id, helper_sha256
 
 
 def assert_helper_contract(

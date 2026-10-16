@@ -1,101 +1,21 @@
-# 真实传感器接入前准备收口验证报告
+# 真实传感器接入前准备状态
 
-## 结论
+## 当前结论
 
-仓库内实现、隔离候选装配、本机协议模拟、双模式 30 分钟墙钟耐久和可在第二台电脑直接执行的操作包已经完成。OpenSpec 任务为 **60/60 完成，剩余 0**。
+仓库实现具备候选发行身份、公网入口代次、唯一恢复所有者、公共边缘验证、切换预约、Helper 代次绑定和失败终态。固定运行目录仍是已部署候选，仓库中的后续修复尚未获得新的部署授权，因此本报告不把源码状态描述为在线运行状态。
 
-当前主机的 AC 睡眠、活动 WLAN 节能、USB 选择性挂起和时间同步已经在用户明确授权后修正并通过统一预检；变更前快照和回滚脚本已保留，Codex 防火墙规则未修改。
+`windows_readiness` 保持 `failed`。双机步骤 3 尚未执行，且在当前候选、Helper SHA-256、进程路径、服务器可达、配对、协议和入口代次 readiness 全部匹配前不得执行。物理传感器项目保持 `physical_sensor_pending`。数据库重试、历史未完成文件和目标 MySQL 对账只能由对应持久证据确认，不能根据当前会话状态推断为已解决。
 
-目标 MySQL 已使用真实 `afp_app` 凭据完成连接、schema、权限、写入和回滚零残留探针；历史待重试记录按迁移后的归档 CSV 成功补传 192/192 行，最终恢复扫描为零待处理。本机 `local_direct` 统一预检现为 **9 passed / 0 failed / 0 blocked / 1 physical pending**。
+## 公网入口安全边界
 
-当前仍**不得声明全部传感器前准备已经通过**：第二台 Windows 电脑尚未提供可访问环境，真实双机 Helper 安装/启停/重启、HTTP/WebSocket、断网恢复、睡眠恢复和网络切换仍为传感器无关的外部阻塞。本机协议模拟不能替代该证据。
+- 公网就绪分别验证源站、隧道控制面、公共 DNS、强制公共边缘 HTTPS、权威入口状态和 Helper readiness。
+- 入口状态包含单调代次、URL、提供方、唯一恢复所有者和候选身份，并通过跨 Windows 会话互斥进行原子发布。
+- 切换和候选提升从仅本机管理端口取得有界预约；预约期间拒绝新的本机及 Helper 采集启动。
+- 候选提升保留安全存储、Helper 注册状态、目标采集 journal 和入口状态。失败回滚以高于失败代次的新代次恢复旧入口身份。
+- Helper readiness 要求当前候选、Helper 可执行文件 SHA-256、协议、命令生命周期、配对和入口代次一致；仅有 Helper 进程不构成就绪。
+- 同代次服务器重启后无法证明状态的命令终结为 `command_state_lost`，不会自动重发启动请求。
+- 管理就绪和预约端点只允许通过回环地址访问 8771，公网反向代理入口不能调用。
 
-## OpenSpec实现一致性复核
+## 验收边界
 
-| 维度 | 状态 |
-|---|---|
-| 完整性 | 60/60 任务完成；27/27 条 ADDED requirements 有实现证据 |
-| 正确性 | 27/27 requirements、57/57 scenarios 具有代码、自动测试、实际演练或明确 `blocked` 环境证据 |
-| 一致性 | design 的 8 项决策均得到遵循；未重复实现双模式核心，候选/证据可搬运，正式 delivery 只读 |
-
-- CRITICAL：0。
-- WARNING：0。
-- SUGGESTION：0。
-- 评估：OpenSpec 实现检查全部通过，可在用户决定后归档；本报告没有执行归档。这里的“可归档”仅表示实现与变更文档一致，不会把下述外部环境阻塞升级为运行环境通过。
-
-## 分支、基线与正式发行保护
-
-- 起始 `main`：`2047f358808c50ba8c5f85a036a100e6f738e6eb`，与 `codex/prepare-real-acquisition` 指向同一提交，证明 main 已包含真实采集加固。
-- 实施分支：`codex/complete-pre-sensor-readiness`。
-- 独立工作树：`D:\AFP_Integrated_Modular_v2\.worktrees\complete-pre-sensor-readiness`。
-- 正式 `delivery/` 前后均为 6176 个受管文件，树摘要均为 `8fd1ab9709215101075bdea283b40895d52d107a389eea42e1683d0e0a6cc4d4`。
-- `python -m harness.engine.delivery_readonly`：通过；正式 `delivery/` 未修改。
-
-## 最终候选与全新目录演练
-
-- 当前候选：`2.0.5-rc.1-aaef27614132-20261013T115759Z`。
-- 源提交：`aaef27614132`；候选独立位于 `artifacts/pre-sensor-candidates/`，未覆盖正式发行。旧候选 `2.0.5-rc.1-7ebcc3afa865-20261011T002212Z` 因遗漏 Helper EXE 已被废止，不得用于双机验证或正式提升。
-- 候选规模：6222 个文件、1,079,090,277 bytes；`SHA256SUMS.txt` 6190 项。
-- 发行身份：应用、Helper、启动器均为 `2.0.5-rc.1`；协议 2、统一帧 `unified_frame_v1`、配置/readiness schema 均为 1。
-- 候选验证：包内导入、manifest、8 项静态资源、3 项配置资产、native DLL/SDK/驱动声明均通过；`--self-test`、`--module-status`、`--verify-files` 返回码均为 0。
-- 从全新短路径 `D:\AFP-Drill-7ebcc3a` 在不预设保存、日志、接口或 Helper 环境引用的条件下运行统一预检。一键入口自动建立无秘密的诊断引用并在退出后恢复环境，不再依赖隐含准备步骤；`-PromptForMySQL -RetryPendingMySQL` 可用一次安全密码输入顺序执行目标探针、幂等补传和最终预检。
-- 候选首次无凭据预检正确失败关闭；操作员随后通过本机 SecureString 输入一次真实凭据，目标探针、历史补传和最终预检依次成功。最终 `local_direct` 为 9 passed / 0 failed / 0 blocked / 1 physical pending；唯一 `physical_sensor_pending` 为实物身份/端口。Windows、配置、保存目录、容量、目标 MySQL 和持久恢复均通过。
-
-## RED→GREEN 与自动验证
-
-逐项首次失败和修复命令记录在 `evidence/red-green.md`。最终结果如下：
-
-- OpenSpec：`openspec validate complete-pre-sensor-readiness --strict` 通过。
-- Harness 单元/合同：197/197 通过。
-- 模块化运行时：34/34 通过。
-- Harness quick：11/11 通过。
-- Harness full：21/24 通过。失败的 3 项均为既有、明确超出本变更范围且禁止伪造的模型/历史产物：
-  - `dashboard-runtime-contracts`：缺少 dashboard/model 派生数据和模型目录；
-  - `causal-history-evidence`：缺少 v13.9 历史指标文件；
-  - `model-prediction-contracts`：缺少 `new_collection_hi_artifacts.joblib`。
-- 首次 full 中 `interface-monitor-contracts` 曾发生一次 30 秒启动自检超时，单项复跑 1/1 及最终 full 均通过。
-- Helper 合同/传输/relay/HTTP fallback/WebSocket/journal/remote mirror：107/107 通过。
-- MySQL、采集完整性、质量侧车、重试、恢复和 journal：104/104 通过。
-- 双模式配置、发行门禁、候选、预检、存储、容量、Windows、MySQL、Helper、耐久与现场操作专项均通过；两种模式规范化输出等价。
-- Python `compileall` 通过；候选包内导入通过；PowerShell 脚本 AST 检查通过；`git diff --check` 通过。
-
-本轮新增 RED→GREEN 包括：活动物理网卡不支持标准 cmdlet 时的注册表只读回退、拒绝 Leap Indicator 3 的时间同步判定、按 `capture_uuid` 恢复迁移/归档后的待重试 CSV，以及消除一键预检对保存/日志/接口/Helper 环境引用的隐含依赖。Windows+恢复专项 10/10、现场操作专项 5/5 通过。
-
-本轮最后一个 RED→GREEN：旧公网 Helper 测试仅声明 `real_capture`/`unified_frame_v1`，启动被正确拒绝并返回 `release_contract_mismatch`；测试夹具改为携带权威版本、build、协议、统一帧和 schema 能力后，目标用例 1/1、`frontend-public-contracts` 1/1 以及最终 full 中该检查均通过。生产失败关闭语义未放宽。
-
-2026-10-13 候选 Helper 装配复核发现旧候选虽然带安装与双机脚本，但缺少 `local_helper/AFP_Local_Capture_Helper.exe`。新增合同测试首先以 `KeyError: required_executables` 和装配脚本缺少 `HelperExecutable` 得到 2 项 RED；补入 Helper 构建、复制、manifest SHA-256、候选运行时探针后转为 GREEN。首次真实冻结 EXE 运行又因从 PyInstaller 临时目录寻找发行合同而失败；统一从冻结 EXE 所在候选目录解析后，Helper `--version` 返回 `complete-pre-sensor-readiness-v1 (protocol 2)`。当前候选的主程序 `--verify-files`、`--self-test`、`--module-status` 均返回 0，候选验证器返回零问题，SHA-256 共核验 6191 个受管文件。Harness 单元/合同现为 199/199，modular runtime 34/34，PowerShell AST、Python compileall、OpenSpec strict 与 `git diff --check` 均通过；正式 `delivery` 仍为 6176 个受管文件且只读基线通过。
-
-## 30 分钟双模式耐久
-
-| 模式 | 墙钟时长 | 帧数 | 有效频率 | 最大间隔 | writer 队列峰值 | journal | 对账 |
-|---|---:|---:|---:|---:|---:|---:|---|
-| `local_direct` | 1800.156 s | 18001 | 9.999981 Hz | 119.534 ms | 1 | 不适用 | 通过 |
-| `remote_helper` | 1800.171 s | 18001 | 9.999941 Hz | 112.663 ms | 1 | 20,013,056 bytes / 18001 行 | 通过 |
-
-两者绝对序号均为 0–18000 且连续，CSV/质量侧车均为 18001 行，时间戳单调、逐通道质量完整、最终状态为 `complete`。网络中断重放、Helper 重启重放和重复停止幂等均通过。`mysql_rows=null` 明确表示未使用真实目标 MySQL，未把模拟结果升级为目标实例证据。证据等级为 `endurance_30m`、来源为确定性模拟、`physical_sensor_verified=false`。
-
-## 环境阻塞项
-
-| 阻塞项 | 当前证据 | 解除条件 | 证据等级 |
-|---|---|---|---|
-| 第二台 Windows / 主辅跨机 | 已在当前电脑短路径 `D:\AFP-Validation-aaef276` 核验候选和 Helper，但尚未获得另一台主电脑的服务地址及可调度会话；本机协议演练不能替代跨机 | 以另一台电脑为主程序、当前电脑为 Helper，完成安装/启停/重启、重新配对、HTTP/WebSocket、断网、睡眠恢复和网络切换 | `blocked / remote_integration` |
-
-已解除的 Windows 环境项：AC 睡眠为从不、活动 Intel WLAN 禁止系统断电、AC USB 选择性挂起禁用、W32Time 为有效 Leap 0 同步。最终统一预检 8/8 Windows 状态通过；证据位于 `artifacts/pre-sensor-evidence/current-host-windows-after/`。
-
-已解除的目标 MySQL 与恢复项：真实目标探针 connect/schema/write/rollback 全部通过且 `rollback_verified=true`；补传 `attempted=1`、`succeeded=1`、`failed=0`，迁移源命中 1 个，采集身份 `AFP-20260923T142300-6c1814b0` 的 `sample_count=192` 与 `saved_rows=192` 对账。`D:\AFP_Capture` 最终 `database_pending_retry=0`、`incomplete_files=0`，synced 证据不含明文密码。脱敏导出位于 `D:\AFP-Drill-7ebcc3a\evidence\target-mysql-live-sanitized\evidence.json`，`sanitized=true`、manifest 2 项。
-
-正式发布、防火墙或管理员设置未被自动修改；如需把候选提升为正式 `delivery/`，仍需用户另行授权。
-
-## 真实设备边界
-
-`pre_sensor/real-device-only-checklist.json` 仅保留 9 类物理验证：设备身份/端口、真实通道、单位/量程/倍率/大小端/方向、校准/零点/噪声/漂移/串扰、全设备 10 Hz、USB 供电/带宽/电磁环境、真拔线/断电/重启、真实驱动关闭、接近正式时长的实物耐久。版本、配置、网络、存储、MySQL、Helper 部署和 Windows 设置均不在该清单中。
-
-## OpenSpec完成前复核（2026-10-13）
-
-| 维度 | 结果 |
-|---|---|
-| 完整性 | 60/60 tasks；27/27 ADDED requirements 均有实现与证据映射 |
-| 正确性 | 27/27 requirements、57/57 scenarios 具有代码路径、自动测试或明确的外部 `blocked` 分支；无 REMOVED/RENAMED 项 |
-| 一致性 | 8/8 design decisions 均被遵循；候选构建仍隔离，双模式仍复用既有采集核心，正式 `delivery` 只读 |
-
-未发现 OpenSpec 实现层面的 CRITICAL、WARNING 或 SUGGESTION；`openspec validate complete-pre-sensor-readiness --strict` 通过。实现已满足归档条件，但本变更暂不归档：真实主辅两机部署/网络演练仍缺另一台主电脑的服务地址与协同执行证据，必须继续保留为 `blocked / remote_integration`，不能据此宣称全部传感器前环境已闭环。
+自动化测试用于证明仓库合同和无传感器协议行为，不替代第二台电脑、真实目标 MySQL 或物理传感器证据。任何响应正文、WebSocket 帧、Cookie、Token、配对码、密码、代理凭据和数据库密钥都不得进入证据。

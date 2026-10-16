@@ -117,14 +117,24 @@ function Resolve-AfpPublicEdgeAddresses {
 
     $seen = @{}
     $addresses = [Collections.Generic.List[string]]::new()
+    $resolutionErrors = [Collections.Generic.List[string]]::new()
     foreach ($recordType in @('A', 'AAAA')) {
-        foreach ($answer in @(& $Resolver $normalizedHost $recordType)) {
+        try {
+            $answers = @(& $Resolver $normalizedHost $recordType)
+        } catch {
+            $resolutionErrors.Add("${recordType}:$($_.Exception.Message)")
+            continue
+        }
+        foreach ($answer in $answers) {
             $value = [string]$answer
             if ((Test-AfpGlobalIPAddress -Address $value) -and -not $seen.ContainsKey($value)) {
                 $seen[$value] = $true
                 $addresses.Add($value)
             }
         }
+    }
+    if (-not $addresses.Count -and $resolutionErrors.Count) {
+        throw "Public DNS resolution produced no global addresses."
     }
     return @($addresses)
 }
@@ -307,7 +317,9 @@ function Publish-AfpPublicIngressState {
         [Parameter(Mandatory = $true)][string]$RecoveryOwner,
         [Parameter(Mandatory = $true)][string]$CandidateId,
         [Parameter(Mandatory = $true)][hashtable]$Layers,
-        [long]$ExpectedGeneration
+        [long]$ExpectedGeneration,
+        [string]$ExpectedPreviousCandidateId = '',
+        [long]$MinimumGeneration = -1
     )
 
     $fullPath = [IO.Path]::GetFullPath($Path)
@@ -330,7 +342,7 @@ function Publish-AfpPublicIngressState {
     } finally {
         $sha.Dispose()
     }
-    $mutex = [Threading.Mutex]::new($false, "Local\AFP.PublicIngress.$keyHash")
+    $mutex = [Threading.Mutex]::new($false, "Global\AFP.PublicIngress.$keyHash")
     $acquired = $false
     $tempPath = Join-Path $directory (([IO.Path]::GetFileName($fullPath)) + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
     $backupPath = Join-Path $directory (([IO.Path]::GetFileName($fullPath)) + '.' + [Guid]::NewGuid().ToString('N') + '.bak')
@@ -347,7 +359,13 @@ function Publish-AfpPublicIngressState {
         $existing = $null
         if (Test-Path -LiteralPath $fullPath -PathType Leaf) {
             $existing = Read-AfpPublicIngressState -Path $fullPath
-            if ([string]$existing.candidate_id -cne $normalizedCandidate) {
+            if (
+                [string]$existing.candidate_id -cne $normalizedCandidate -and
+                (
+                    -not $ExpectedPreviousCandidateId -or
+                    [string]$existing.candidate_id -cne $ExpectedPreviousCandidateId.Trim()
+                )
+            ) {
                 throw 'Existing public ingress candidate_id differs from the requested candidate.'
             }
         }
@@ -358,8 +376,14 @@ function Publish-AfpPublicIngressState {
         $changed = $null -eq $existing -or
             ([string]$existing.public_url -cne $normalizedUrl) -or
             ([string]$existing.provider -cne $normalizedProvider) -or
-            ([string]$existing.recovery_owner -cne $normalizedOwner)
-        $generation = if ($changed) { $currentGeneration + 1L } else { $currentGeneration }
+            ([string]$existing.recovery_owner -cne $normalizedOwner) -or
+            ([string]$existing.candidate_id -cne $normalizedCandidate)
+        $generation = if ($changed) {
+            [Math]::Max($currentGeneration + 1L, $MinimumGeneration)
+        } else {
+            [Math]::Max($currentGeneration, $MinimumGeneration)
+        }
+        if ($generation -gt $currentGeneration) { $changed = $true }
         $state = [ordered]@{
             schema_version = 1
             generation = $generation

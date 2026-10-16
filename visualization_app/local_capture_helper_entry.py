@@ -8,6 +8,7 @@ import ctypes
 import ctypes.wintypes as wintypes
 from concurrent.futures import ThreadPoolExecutor
 import json
+import hashlib
 import math
 import multiprocessing
 import os
@@ -23,7 +24,7 @@ from typing import Any
 from acquisition import AcquisitionConfig, MySQLSettings
 from helper_relay import normalize_pairing_code
 from local_capture_agent import HelperTransport, LocalCaptureAgent
-from release_contract import load_release_contract
+from release_contract import load_release_contract, release_manifest_helper_identity
 
 
 RELEASE_CONTRACT = load_release_contract(
@@ -590,6 +591,19 @@ def helper_capabilities(server_url: str = "") -> dict[str, Any]:
         "unified_frame_contract": RELEASE_CONTRACT.unified_frame_contract,
         "local_mysql_profile": local_mysql_profile_metadata(),
     }
+    candidate_id, expected_helper_sha256 = release_manifest_helper_identity(RELEASE_CONTRACT)
+    if candidate_id:
+        result["candidate_id"] = candidate_id
+    if expected_helper_sha256:
+        executable = Path(sys.executable).resolve()
+        if getattr(sys, "frozen", False) and executable.is_file():
+            digest = hashlib.sha256()
+            with executable.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            result["helper_sha256"] = digest.hexdigest()
+        else:
+            result["helper_sha256"] = expected_helper_sha256
     if paired_server_url:
         result["paired_server_url"] = paired_server_url
         result["paired_route_type"] = paired_route_type

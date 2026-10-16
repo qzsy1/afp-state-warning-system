@@ -79,6 +79,9 @@ class TailscaleFunnelWatchdogContractTests(unittest.TestCase):
             $ready = [pscustomobject]@{{ allowed = $true }}
             if ((Test-WatchdogMutationAllowed $state 'tailscale' 'Run' 0 $false $ready).allowed) {{ exit 21 }}
             if ((Test-WatchdogMutationAllowed $state 'tailscale' 'Cutover' 8 $false $ready).allowed) {{ exit 22 }}
+            $owned = [pscustomobject]@{{ generation = 8; provider = 'tailscale'; recovery_owner = 'tailscale' }}
+            if ((Test-WatchdogMutationAllowed $owned 'tailscale' 'Cutover' 8 $false $ready).allowed) {{ exit 25 }}
+            if ((Test-WatchdogMutationAllowed $owned 'tailscale' 'Cutover' 7 $true $ready).allowed) {{ exit 26 }}
             $blocked = [pscustomobject]@{{ allowed = $false; active_capture_uuids = @('capture-a') }}
             if ((Test-WatchdogMutationAllowed $state 'tailscale' 'Cutover' 8 $true $blocked).allowed) {{ exit 23 }}
             if (-not (Test-WatchdogMutationAllowed $state 'tailscale' 'Cutover' 8 $true $ready).allowed) {{ exit 24 }}
@@ -367,6 +370,7 @@ class TailscaleFunnelWatchdogContractTests(unittest.TestCase):
         self.assertIn("funnel-status.json", text)
         self.assertIn("tailscale_login_required", text)
         self.assertIn("funnel_approval_required", text)
+        self.assertNotIn('" + $result.Output', text)
 
     def test_first_funnel_approval_wait_is_bounded(self):
         text = self.source.read_text(encoding="utf-8-sig")

@@ -24,12 +24,14 @@ $FunnelRoot = "F:\softwawre\tailscale"
 $FunnelUrlFile = Join-Path $FunnelRoot "funnel-url.txt"
 $FunnelStatusFile = Join-Path $FunnelRoot "funnel-status.json"
 $OriginUrl = "http://127.0.0.1:8770"
+$ControlUrl = "http://127.0.0.1:8771"
 $FunnelArguments = "funnel --bg --https=443 --yes http://127.0.0.1:8770"
 $OriginLaunchMutexName = "Local\AFP_Tailscale_Funnel_Watchdog_Origin_Start"
 $IngressModule = Join-Path $PSScriptRoot "PublicIngress.psm1"
 Import-Module $IngressModule -Force -ErrorAction Stop
 $IngressStateFile = Join-Path $DeliveryRoot "runtime\public-ingress-state.json"
 $ReleaseManifestFile = Join-Path $DeliveryRoot "RELEASE-MANIFEST.json"
+$script:CutoverReservationId = ""
 
 function Find-TailscaleExe {
     $candidates = @(
@@ -84,6 +86,7 @@ function Write-FunnelState([string]$Code, [string]$Message, [string]$PublicUrl =
         checked_at = (Get-Date).ToString("o")
     }
     $payload | ConvertTo-Json | Set-Content -LiteralPath $FunnelStatusFile -Encoding UTF8
+    Release-CutoverReservation
 }
 
 function Get-CandidateId {
@@ -102,11 +105,40 @@ function Get-CurrentIngressState {
 
 function Get-CutoverReadiness {
     try {
-        return Invoke-RestMethod -Uri ($OriginUrl + "/api/ingress/cutover-readiness") `
-            -Method Get -TimeoutSec 5
+        $result = Invoke-RestMethod -Uri ($ControlUrl + "/api/ingress/cutover-reservation") `
+            -Method Post -ContentType "application/json" -Body '{"ttl_seconds":300}' -TimeoutSec 5
+        $script:CutoverReservationId = [string]$result.reservation_id
+        return $result
     } catch {
         return [pscustomobject]@{ allowed = $false; error = "cutover_readiness_unavailable" }
     }
+}
+
+function Release-CutoverReservation {
+    if (-not $script:CutoverReservationId) { return }
+    try {
+        $body = @{ reservation_id = $script:CutoverReservationId } | ConvertTo-Json -Compress
+        Invoke-RestMethod -Uri ($ControlUrl + "/api/ingress/cutover-release") `
+            -Method Post -ContentType "application/json" -Body $body -TimeoutSec 5 | Out-Null
+    } catch {
+    } finally {
+        $script:CutoverReservationId = ""
+    }
+}
+
+function Wait-HelperIngressReady([long]$Generation, [string]$CandidateId) {
+    $deadline = (Get-Date).AddSeconds(120)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $status = Invoke-RestMethod -Uri ($ControlUrl + "/api/ingress/helper-readiness") `
+                -Method Get -TimeoutSec 5
+            if ([bool]$status.ready -and [long]$status.generation -eq $Generation -and
+                [string]$status.candidate_id -ceq $CandidateId) { return $true }
+        } catch {
+        }
+        Start-Sleep -Seconds 2
+    }
+    return $false
 }
 
 function Test-WatchdogMutationAllowed {
@@ -116,22 +148,22 @@ function Test-WatchdogMutationAllowed {
     if ($RequestedMode -eq "Install") {
         return [pscustomobject]@{ allowed = $false; reason = "install_observe_only" }
     }
+    if ($RequestedMode -eq "Cutover") {
+        if (-not $Approved) {
+            return [pscustomobject]@{ allowed = $false; reason = "owner_cutover_not_approved" }
+        }
+        if ($RequiredGeneration -lt 0 -or $RequiredGeneration -ne $generation) {
+            return [pscustomobject]@{ allowed = $false; reason = "ingress_generation_mismatch" }
+        }
+        if (-not $Readiness -or -not [bool]$Readiness.allowed) {
+            return [pscustomobject]@{ allowed = $false; reason = "active_capture_blocks_cutover" }
+        }
+        return [pscustomobject]@{ allowed = $true; reason = "approved_cutover" }
+    }
     if ($owner -and $owner.Trim().ToLowerInvariant() -eq $Provider.Trim().ToLowerInvariant()) {
         return [pscustomobject]@{ allowed = $true; reason = "current_owner" }
     }
-    if ($RequestedMode -ne "Cutover") {
-        return [pscustomobject]@{ allowed = $false; reason = "non_owner_observe_only" }
-    }
-    if (-not $Approved) {
-        return [pscustomobject]@{ allowed = $false; reason = "owner_cutover_not_approved" }
-    }
-    if ($RequiredGeneration -lt 0 -or $RequiredGeneration -ne $generation) {
-        return [pscustomobject]@{ allowed = $false; reason = "ingress_generation_mismatch" }
-    }
-    if (-not $Readiness -or -not [bool]$Readiness.allowed) {
-        return [pscustomobject]@{ allowed = $false; reason = "active_capture_blocks_cutover" }
-    }
-    return [pscustomobject]@{ allowed = $true; reason = "approved_cutover" }
+    return [pscustomobject]@{ allowed = $false; reason = "non_owner_observe_only" }
 }
 
 function ConvertTo-WatchdogLayerTable($Layers) {
@@ -402,7 +434,7 @@ function Start-Funnel {
     # tailscale funnel --bg --https=443 --yes http://127.0.0.1:8770
     $result = Invoke-TailscaleWithTimeout @("funnel", "--bg", "--https=443", "--yes", "http://127.0.0.1:8770")
     if ($result.ExitCode -ne 0) {
-        Write-FunnelState "funnel_approval_required" ("Tailscale Funnel尚未获准：" + $result.Output)
+        Write-FunnelState "funnel_approval_required" "Tailscale Funnel 尚未获准；请在受控终端完成登录或审批。"
         return $false
     }
     return $true
@@ -410,6 +442,11 @@ function Start-Funnel {
 
 function Ensure-Funnel {
     $state = Get-CurrentIngressState
+    if (-not $TailscaleExe) {
+        Write-FunnelState "tailscale_not_installed" "尚未安装Tailscale。"
+        return $false
+    }
+    if (-not (Ensure-Origin)) { return $false }
     $readiness = Get-CutoverReadiness
     $decision = Test-WatchdogMutationAllowed $state "tailscale" $Mode $ExpectedGeneration ([bool]$ApproveOwnerCutover) $readiness
     if (-not $decision.allowed) {
@@ -419,11 +456,7 @@ function Ensure-Funnel {
     $previousProvider = if ($state) { [string]$state.provider } else { "" }
     $crossProviderCutover = $Mode -eq "Cutover" -and $previousProvider -and
         $previousProvider.Trim().ToLowerInvariant() -ne "tailscale"
-    if (-not $TailscaleExe) {
-        Write-FunnelState "tailscale_not_installed" "尚未安装Tailscale。"
-        return $false
-    }
-    if (-not (Ensure-Origin)) { return $false }
+    $candidateStarted = $false
     $publicUrl = Get-PublicUrl
     if (-not $publicUrl) {
         Write-FunnelState "tailscale_login_required" "Tailscale尚未登录，需先在服务器电脑完成一次账号登录。"
@@ -435,6 +468,7 @@ function Ensure-Funnel {
     }
     if (-not (Test-Funnel)) {
         if (-not (Start-Funnel)) { return $false }
+        $candidateStarted = $true
         $deadline = (Get-Date).AddSeconds(30)
         while ((Get-Date) -lt $deadline) {
             if (Test-Funnel) { break }
@@ -446,6 +480,7 @@ function Ensure-Funnel {
         return $false
     }
     if (-not (Test-PublicFunnel $publicUrl)) {
+        if ($candidateStarted) { Stop-CandidateIngress | Out-Null }
         Write-FunnelState "public_health_failed" "固定公网地址已生成，但公网健康检查未通过。" $publicUrl
         return $false
     }
@@ -473,11 +508,14 @@ function Ensure-Funnel {
         $publication = Publish-AfpPublicIngressState @publishParameters
         $layers.ingress = New-WatchdogLayer $true "ingress_published"
     } catch {
-        if ($crossProviderCutover) { Stop-CandidateIngress | Out-Null }
+        if ($candidateStarted -or $crossProviderCutover) { Stop-CandidateIngress | Out-Null }
         Write-FunnelState "ingress_publication_failed" "公网入口状态发布失败。" $publicUrl $layers
         return $false
     }
-    $helperReady = if ($publication.changed) { Restart-Helper } else { Ensure-Helper }
+    $helperProcessReady = if ($publication.changed) { Restart-Helper } else { Ensure-Helper }
+    $helperReady = $helperProcessReady -and (
+        Wait-HelperIngressReady ([long]$publication.generation) $candidateId
+    )
     $layers.helper = if ($helperReady) {
         New-WatchdogLayer $true "helper_ready"
     } else {
@@ -487,7 +525,7 @@ function Ensure-Funnel {
         $rolledBack = if ($publication.changed) {
             Restore-PreviousIngressState $state ([long]$publication.generation)
         } else { $true }
-        if ($crossProviderCutover) { Stop-CandidateIngress | Out-Null }
+        if ($candidateStarted -or $crossProviderCutover) { Stop-CandidateIngress | Out-Null }
         $code = if ($rolledBack) { "helper_recovery_failed" } else { "cutover_rollback_failed" }
         Write-FunnelState $code "公网边缘可用，但辅助程序未就绪。" $publicUrl $layers
         return $false
@@ -500,7 +538,7 @@ function Ensure-Funnel {
         $rolledBack = if ($publication.changed) {
             Restore-PreviousIngressState $state ([long]$publication.generation)
         } else { $true }
-        if ($crossProviderCutover) { Stop-CandidateIngress | Out-Null }
+        if ($candidateStarted -or $crossProviderCutover) { Stop-CandidateIngress | Out-Null }
         $code = if ($rolledBack) { "ingress_publication_failed" } else { "cutover_rollback_failed" }
         Write-FunnelState $code "公网入口最终状态发布失败。" $publicUrl $layers
         return $false

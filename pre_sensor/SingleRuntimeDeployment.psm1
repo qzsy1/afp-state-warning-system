@@ -409,7 +409,32 @@ function Invoke-AfpRuntimePromotion {
     try {
         if ($hadPrevious) { Move-Item -LiteralPath $runtime -Destination $swap }
         Move-Item -LiteralPath $staging -Destination $runtime
+        if ($hadPrevious) {
+            $sourceState = Join-Path $swap "runtime"
+            $targetState = Join-Path $runtime "runtime"
+            $stateNames = @(
+                "public-ingress-state.json",
+                "public_web_security.sqlite3",
+                "public_web_security.sqlite3-wal",
+                "public_web_security.sqlite3-shm",
+                "helper_registry.json",
+                "server_target_capture_journal.sqlite3",
+                "server_target_capture_journal.sqlite3-wal",
+                "server_target_capture_journal.sqlite3-shm"
+            )
+            foreach ($name in $stateNames) {
+                $source = Join-Path $sourceState $name
+                if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { continue }
+                if (-not (Test-Path -LiteralPath $targetState -PathType Container)) {
+                    [IO.Directory]::CreateDirectory($targetState) | Out-Null
+                }
+                Copy-Item -LiteralPath $source -Destination (Join-Path $targetState $name) -Force -ErrorAction Stop
+            }
+        }
     } catch {
+        if ((Test-Path -LiteralPath $runtime -PathType Container) -and -not (Test-Path -LiteralPath $staging)) {
+            Move-Item -LiteralPath $runtime -Destination $staging
+        }
         if ((Test-Path -LiteralPath $swap -PathType Container) -and -not (Test-Path -LiteralPath $runtime)) {
             Move-Item -LiteralPath $swap -Destination $runtime
         }
@@ -464,11 +489,13 @@ function Invoke-AfpVerifiedRuntimePromotion {
         [Parameter(Mandatory = $true)][string]$ApprovedInventoryDigest,
         [Parameter(Mandatory = $true)][psobject]$CurrentInventory,
         [scriptblock]$CutoverReadinessRunner,
+        [scriptblock]$CutoverReleaseRunner,
         [scriptblock]$StopRunner,
         [scriptblock]$PromotionRunner,
         [scriptblock]$StartRunner,
         [scriptblock]$ServiceProbeRunner,
         [scriptblock]$IngressPublisher,
+        [scriptblock]$HelperReadinessRunner,
         [scriptblock]$CompletionRunner,
         [scriptblock]$RestoreRunner,
         [string]$FailureEvidencePath = "",
@@ -486,7 +513,8 @@ function Invoke-AfpVerifiedRuntimePromotion {
         & $CutoverReadinessRunner
     } else {
         try {
-            Invoke-RestMethod -Uri "http://127.0.0.1:8770/api/ingress/cutover-readiness" -Method Get -TimeoutSec 5
+            Invoke-RestMethod -Uri "http://127.0.0.1:8771/api/ingress/cutover-reservation" `
+                -Method Post -ContentType "application/json" -Body '{"ttl_seconds":600}' -TimeoutSec 5
         } catch {
             [pscustomobject]@{ allowed = $false; error = "cutover_readiness_unavailable" }
         }
@@ -506,6 +534,7 @@ function Invoke-AfpVerifiedRuntimePromotion {
     }
     $promotion = $null
     $failed = $false
+    $failedIngressGeneration = -1L
     try {
         if ($StopRunner) { & $StopRunner | Out-Null }
         $promotion = if ($PromotionRunner) {
@@ -521,27 +550,93 @@ function Invoke-AfpVerifiedRuntimePromotion {
         }
         $ingress = if ($IngressPublisher) { & $IngressPublisher } else { $null }
         if (-not $ingress) { throw "ingress_publication_gate_failed" }
+        $helper = if ($HelperReadinessRunner) {
+            & $HelperReadinessRunner $ingress
+        } else {
+            $deadline = [DateTime]::UtcNow.AddSeconds(120)
+            $current = $null
+            do {
+                try {
+                    $current = Invoke-RestMethod -Uri "http://127.0.0.1:8771/api/ingress/helper-readiness" `
+                        -Method Get -TimeoutSec 5
+                } catch {
+                    $current = $null
+                }
+                if ($current -and [bool]$current.ready) { break }
+                Start-Sleep -Milliseconds 1000
+            } while ([DateTime]::UtcNow -lt $deadline)
+            $current
+        }
+        if (-not $helper -or -not [bool]$helper.ready) {
+            throw "helper_readiness_gate_failed"
+        }
+        $ingressGenerationProperty = $ingress.PSObject.Properties["generation"]
+        $helperGenerationProperty = $helper.PSObject.Properties["generation"]
+        if (
+            $ingressGenerationProperty -and
+            (
+                -not $helperGenerationProperty -or
+                [long]$helperGenerationProperty.Value -ne [long]$ingressGenerationProperty.Value
+            )
+        ) {
+            throw "helper_ingress_generation_mismatch"
+        }
+        $ingressStateProperty = $ingress.PSObject.Properties["state"]
+        $helperCandidateProperty = $helper.PSObject.Properties["candidate_id"]
+        if ($ingressStateProperty -and $ingressStateProperty.Value) {
+            $publishedCandidate = [string]$ingressStateProperty.Value.candidate_id
+            if (
+                $publishedCandidate -and
+                (
+                    -not $helperCandidateProperty -or
+                    [string]$helperCandidateProperty.Value -cne $publishedCandidate
+                )
+            ) {
+                throw "helper_candidate_mismatch"
+            }
+        }
         if ($CompletionRunner) { & $CompletionRunner | Out-Null }
         return [pscustomobject][ordered]@{
             status = "completed"
             promotion = $promotion
             services = $services
             ingress = $ingress
+            helper = $helper
         }
     } catch {
         $failed = $true
         $failure = $_.Exception.Message
         try {
+            if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+                try {
+                    $failedState = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+                    $failedIngressGeneration = [long]$failedState.generation
+                } catch { $failedIngressGeneration = -1L }
+            }
             if ($RestoreRunner) {
-                & $RestoreRunner $promotion $ingressSnapshot | Out-Null
+                & $RestoreRunner $promotion $ingressSnapshot $failedIngressGeneration | Out-Null
             } elseif ($promotion) {
                 Restore-AfpRuntimePromotion -Promotion $promotion -Paths $Paths
                 if ($null -ne $ingressSnapshot) {
-                    $directory = Split-Path -Parent $statePath
-                    if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
-                        [IO.Directory]::CreateDirectory($directory) | Out-Null
+                    $snapshotText = [Text.Encoding]::UTF8.GetString([byte[]]$ingressSnapshot).TrimStart([char]0xFEFF)
+                    $snapshot = $snapshotText | ConvertFrom-Json -ErrorAction Stop
+                    Import-Module (Join-Path $Paths.RuntimeRoot "PublicIngress.psm1") -Force -ErrorAction Stop
+                    $restored = Read-AfpPublicIngressState -Path $statePath
+                    $snapshotLayers = @{}
+                    foreach ($property in $snapshot.layers.PSObject.Properties) {
+                        $snapshotLayers[$property.Name] = @{
+                            ok = [bool]$property.Value.ok
+                            code = [string]$property.Value.code
+                        }
                     }
-                    [IO.File]::WriteAllBytes($statePath, [byte[]]$ingressSnapshot)
+                    Publish-AfpPublicIngressState -Path $statePath `
+                        -PublicUrl ([string]$snapshot.public_url) `
+                        -Provider ([string]$snapshot.provider) `
+                        -RecoveryOwner ([string]$snapshot.recovery_owner) `
+                        -CandidateId ([string]$snapshot.candidate_id) `
+                        -ExpectedGeneration ([long]$restored.generation) `
+                        -MinimumGeneration ([Math]::Max([long]$restored.generation + 1L, $failedIngressGeneration + 1L)) `
+                        -Layers $snapshotLayers | Out-Null
                 }
             }
             return [pscustomobject][ordered]@{
@@ -560,8 +655,19 @@ function Invoke-AfpVerifiedRuntimePromotion {
             }
         }
     } finally {
-        if ($failed) {
-            # Restoration is owned by the catch path so it executes exactly once.
+        $reservationProperty = $readiness.PSObject.Properties["reservation_id"]
+        $reservationId = if ($reservationProperty) { [string]$reservationProperty.Value } else { "" }
+        if ($reservationId) {
+            if ($CutoverReleaseRunner) {
+                & $CutoverReleaseRunner $reservationId | Out-Null
+            } else {
+                try {
+                    $body = @{ reservation_id = $reservationId } | ConvertTo-Json -Compress
+                    Invoke-RestMethod -Uri "http://127.0.0.1:8771/api/ingress/cutover-release" `
+                        -Method Post -ContentType "application/json" -Body $body -TimeoutSec 5 | Out-Null
+                } catch {
+                }
+            }
         }
     }
 }

@@ -492,6 +492,13 @@ class PublicWebHttpTests(unittest.TestCase):
 
     def test_cutover_readiness_is_loopback_only_and_contains_no_secrets(self):
         status, payload, _ = self.request_json("GET", "/api/ingress/cutover-readiness")
+        self.assertEqual(status, 403, payload)
+        handler = self.server.RequestHandlerClass
+        handler.access_context = "local_admin"
+        try:
+            status, payload, _ = self.request_json("GET", "/api/ingress/cutover-readiness")
+        finally:
+            handler.access_context = "public"
         self.assertEqual(status, 200, payload)
         self.assertTrue(payload["allowed"])
         self.assertEqual(payload["generation"], 1)
@@ -499,10 +506,57 @@ class PublicWebHttpTests(unittest.TestCase):
         for forbidden in ("pairing_token", "challenge", "payload", "password", "cookie"):
             self.assertNotIn(forbidden, encoded.lower())
 
-        handler = self.server.RequestHandlerClass
         fake = object.__new__(handler)
         fake.client_address = ("192.168.1.20", 12345)
         self.assertFalse(handler._is_loopback_client(fake))
+
+    def test_cutover_readiness_fails_closed_when_local_status_is_unavailable(self):
+        handler = self.server.RequestHandlerClass
+        handler.access_context = "local_admin"
+        try:
+            with patch.object(
+                self.server.dashboard.acquisition,
+                "status",
+                side_effect=RuntimeError("unavailable"),
+            ):
+                status, payload, _ = self.request_json(
+                    "GET", "/api/ingress/cutover-readiness"
+                )
+        finally:
+            handler.access_context = "public"
+        self.assertEqual(status, 200, payload)
+        self.assertFalse(payload["allowed"])
+        self.assertIn(
+            "local_acquisition_status_unavailable",
+            payload["blocking_request_ids"],
+        )
+
+    def test_cutover_reservation_blocks_capture_and_requires_admin_listener(self):
+        status, payload, _ = self.request_json(
+            "POST", "/api/ingress/cutover-reservation", {}
+        )
+        self.assertEqual(status, 403, payload)
+        handler = self.server.RequestHandlerClass
+        handler.access_context = "local_admin"
+        try:
+            status, reservation, _ = self.request_json(
+                "POST", "/api/ingress/cutover-reservation", {}
+            )
+            self.assertEqual(status, 200, reservation)
+            self.assertTrue(reservation["reservation_id"])
+            blocked = self.server.dashboard.helper_registry.command(
+                "missing", "start_capture", {}
+            )
+            self.assertEqual(blocked["error"], "ingress_cutover_in_progress")
+            status, released, _ = self.request_json(
+                "POST",
+                "/api/ingress/cutover-release",
+                {"reservation_id": reservation["reservation_id"]},
+            )
+            self.assertEqual(status, 200, released)
+            self.assertTrue(released["released"])
+        finally:
+            handler.access_context = "public"
 
     def test_stale_generation_sample_submission_is_rejected(self):
         self.request_json("GET", "/api/auth/session")

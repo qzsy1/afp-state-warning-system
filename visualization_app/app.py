@@ -4487,14 +4487,18 @@ class AppHandler(BaseHTTPRequestHandler):
         except ValueError:
             return peer.lower() == "localhost"
 
-    def _cutover_readiness(self) -> dict[str, Any]:
-        readiness = self.dashboard.helper_registry.cutover_readiness()
+    def _is_local_admin_control(self) -> bool:
+        return self.access_context == "local_admin" and self._is_loopback_client()
+
+    def _cutover_readiness(self, reservation_id: str = "") -> dict[str, Any]:
+        readiness = self.dashboard.helper_registry.cutover_readiness(reservation_id)
         captures = set(str(value) for value in readiness["active_capture_uuids"] if value)
         blockers = set(str(value) for value in readiness["blocking_request_ids"] if value)
         try:
             local_status = self.dashboard.acquisition.status()
         except Exception:
             local_status = {}
+            blockers.add("local_acquisition_status_unavailable")
         if isinstance(local_status, dict) and local_status.get("running"):
             captures.add(str(local_status.get("capture_uuid") or "local_capture"))
 
@@ -4985,13 +4989,22 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         parsed = urlparse(self.path)
         if parsed.path == "/api/ingress/cutover-readiness":
-            if not self._is_loopback_client():
+            if not self._is_local_admin_control():
                 self._send_json(
-                    {"ok": False, "error": "loopback_required"},
+                    {"ok": False, "error": "local_admin_listener_required"},
                     HTTPStatus.FORBIDDEN,
                 )
                 return
             self._send_json(self._cutover_readiness())
+            return
+        if parsed.path == "/api/ingress/helper-readiness":
+            if not self._is_local_admin_control():
+                self._send_json(
+                    {"ok": False, "error": "local_admin_listener_required"},
+                    HTTPStatus.FORBIDDEN,
+                )
+                return
+            self._send_json(self.dashboard.helper_registry.deployment_readiness())
             return
         self._ensure_browser_cookies()
         if parsed.path.startswith("/api/") and not self._require_permission(
@@ -5375,6 +5388,47 @@ class AppHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if self._reject_unsafe_request():
             return
+        if parsed.path in {
+            "/api/ingress/cutover-reservation",
+            "/api/ingress/cutover-release",
+        }:
+            if not self._is_local_admin_control():
+                self._send_json(
+                    {"ok": False, "error": "local_admin_listener_required"},
+                    HTTPStatus.FORBIDDEN,
+                )
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length) if length else b"{}"
+                payload = json.loads(body.decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("request body must be an object")
+            except (ValueError, UnicodeError, json.JSONDecodeError):
+                self._send_json({"ok": False, "error": "invalid_request"}, HTTPStatus.BAD_REQUEST)
+                return
+            if parsed.path.endswith("cutover-reservation"):
+                try:
+                    ttl_seconds = int(payload.get("ttl_seconds") or 180)
+                except (TypeError, ValueError):
+                    ttl_seconds = 180
+                reservation = self.dashboard.helper_registry.reserve_cutover(ttl_seconds)
+                if not reservation.get("allowed"):
+                    self._send_json(reservation, HTTPStatus.CONFLICT)
+                    return
+                reservation_id = str(reservation.get("reservation_id") or "")
+                readiness = self._cutover_readiness(reservation_id)
+                if not readiness.get("allowed"):
+                    self.dashboard.helper_registry.release_cutover(reservation_id)
+                    self._send_json(readiness, HTTPStatus.CONFLICT)
+                    return
+                self._send_json({**readiness, "reservation_id": reservation_id})
+            else:
+                released = self.dashboard.helper_registry.release_cutover(
+                    str(payload.get("reservation_id") or "")
+                )
+                self._send_json({"released": released})
+            return
         self._ensure_browser_cookies()
         if not self._require_permission("POST", parsed.path):
             return
@@ -5648,9 +5702,17 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._send_json({"authenticated": False, "role": "guest"})
                 return
             if parsed.path == "/api/simulation/start":
-                self._send_json(
-                    self.guest_manager.start(self._identity().guest_id, payload)
-                )
+                if not self.dashboard.helper_registry.begin_capture_start():
+                    self._send_json(
+                        {"error": "ingress_cutover_in_progress"},
+                        HTTPStatus.CONFLICT,
+                    )
+                    return
+                try:
+                    result = self.guest_manager.start(self._identity().guest_id, payload)
+                finally:
+                    self.dashboard.helper_registry.end_capture_start()
+                self._send_json(result)
                 return
             if parsed.path == "/api/simulation/process-parameters":
                 self._send_json(
@@ -6406,7 +6468,16 @@ class AppHandler(BaseHTTPRequestHandler):
                     model_validation = self.dashboard.validate_prediction_setup(
                         config, load_model=True
                     )
-                    result = self.guest_manager.start(identity.guest_id, payload, authorized=True)
+                    if not self.dashboard.helper_registry.begin_capture_start():
+                        self._send_json(
+                            {"error": "ingress_cutover_in_progress"},
+                            HTTPStatus.CONFLICT,
+                        )
+                        return
+                    try:
+                        result = self.guest_manager.start(identity.guest_id, payload, authorized=True)
+                    finally:
+                        self.dashboard.helper_registry.end_capture_start()
                     result["prediction_model"] = model_validation
                     self._replay_put(replay_key, HTTPStatus.OK, result)
                     self._send_json(result)
@@ -6426,7 +6497,16 @@ class AppHandler(BaseHTTPRequestHandler):
                 model_validation = self.dashboard.validate_prediction_setup(
                     config, load_model=True
                 )
-                result = self.dashboard.acquisition.start(config)
+                if not self.dashboard.helper_registry.begin_capture_start():
+                    self._send_json(
+                        {"error": "ingress_cutover_in_progress"},
+                        HTTPStatus.CONFLICT,
+                    )
+                    return
+                try:
+                    result = self.dashboard.acquisition.start(config)
+                finally:
+                    self.dashboard.helper_registry.end_capture_start()
                 result["prediction_model"] = model_validation
                 self._replay_put(replay_key, HTTPStatus.OK, result)
                 self._send_json(result)
@@ -6503,20 +6583,28 @@ def create_server(
         },
     )
     active_control_lease = control_lease or RealControlLease()
-    helper_registry = HelperRegistry(
-        persistence_path=runtime_root / "helper_registry.json",
-        ingress_state_path=selected_ingress_state,
-        expected_candidate_id=(
-            str(expected_ingress_candidate_id or "")
-            or release_candidate_id(RELEASE_CONTRACT)
-        ),
-    )
+    helper_registry = getattr(active_dashboard, "helper_registry", None)
+    if not isinstance(helper_registry, HelperRegistry):
+        helper_registry = HelperRegistry(
+            persistence_path=runtime_root / "helper_registry.json",
+            ingress_state_path=selected_ingress_state,
+            expected_candidate_id=(
+                str(expected_ingress_candidate_id or "")
+                or release_candidate_id(RELEASE_CONTRACT)
+            ),
+        )
     active_dashboard.helper_registry = helper_registry
-    active_dashboard.remote_acquisitions = RemoteAcquisitionRegistry()
+    if not isinstance(
+        getattr(active_dashboard, "remote_acquisitions", None),
+        RemoteAcquisitionRegistry,
+    ):
+        active_dashboard.remote_acquisitions = RemoteAcquisitionRegistry()
     target_profiles = ServerTargetProfiles(local_mysql_profile)
-    target_capture_journal = ServerCaptureJournal(
-        runtime_root / "server_target_capture_journal.sqlite3"
-    )
+    target_capture_journal = getattr(active_dashboard, "target_capture_journal", None)
+    if not isinstance(target_capture_journal, ServerCaptureJournal):
+        target_capture_journal = ServerCaptureJournal(
+            runtime_root / "server_target_capture_journal.sqlite3"
+        )
     target_saver = TargetMySQLSaveCoordinator(target_capture_journal, target_profiles)
     simulation_source_transfers = SimulationSourceTicketStore()
     active_dashboard.target_capture_journal = target_capture_journal

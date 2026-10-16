@@ -91,10 +91,11 @@ $result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([ps
     -StartRunner {{ $events.Add('start') }} `
     -ServiceProbeRunner {{ $events.Add('edge'); [pscustomobject]@{{ status='passed' }} }} `
     -IngressPublisher {{ $events.Add('ingress'); [pscustomobject]@{{ generation=4 }} }} `
+    -HelperReadinessRunner {{ param($Ingress) $events.Add('helper'); [pscustomobject]@{{ ready=$true; generation=$Ingress.generation }} }} `
     -CompletionRunner {{ $events.Add('complete') }} `
     -RestoreRunner {{ $events.Add('restore') }}
 if ($result.status -ne 'completed') {{ throw ($result | ConvertTo-Json -Depth 8) }}
-if (($events -join ',') -ne 'stop,promote,start,edge,ingress,complete') {{ throw ($events -join ',') }}
+if (($events -join ',') -ne 'stop,promote,start,edge,ingress,helper,complete') {{ throw ($events -join ',') }}
 """
         result = _run_ps(script)
         self.assertEqual(result.returncode, 0, msg=result.stderr)
@@ -103,7 +104,7 @@ if (($events -join ',') -ne 'stop,promote,start,edge,ingress,complete') {{ throw
         script = rf"""
 $ErrorActionPreference = 'Stop'
 Import-Module {_ps_quote(MODULE)} -Force
-foreach ($failure in @('promote','start','edge','ingress','complete')) {{
+foreach ($failure in @('promote','start','edge','ingress','helper','complete')) {{
     $script:restores = 0
     $inventory = [pscustomobject]@{{ digest = 'approved'; processes = @() }}
     $throwAt = {{ param($name) if ($failure -eq $name) {{ throw "failure:$name" }} }}
@@ -114,6 +115,7 @@ foreach ($failure in @('promote','start','edge','ingress','complete')) {{
         -StartRunner {{ & $throwAt 'start' }} `
         -ServiceProbeRunner {{ & $throwAt 'edge'; [pscustomobject]@{{ status='passed' }} }} `
         -IngressPublisher {{ & $throwAt 'ingress'; [pscustomobject]@{{ generation=4 }} }} `
+        -HelperReadinessRunner {{ param($Ingress) & $throwAt 'helper'; [pscustomobject]@{{ ready=$true; generation=$Ingress.generation }} }} `
         -CompletionRunner {{ & $throwAt 'complete' }} `
         -RestoreRunner {{ param($Promotion, $IngressSnapshot) $script:restores++ }}
     if ($result.status -ne 'rolled_back' -or $script:restores -ne 1) {{ throw ($result | ConvertTo-Json -Depth 8) }}
@@ -253,6 +255,14 @@ if ($migration.disk.free_bytes -ne 123456 -or -not $migration.rollback.ready) {{
             staging.mkdir(parents=True)
             (runtime / "old.txt").write_text("old", encoding="utf-8")
             (staging / "new.txt").write_text("new", encoding="utf-8")
+            state_dir = runtime / "runtime"
+            state_dir.mkdir()
+            (state_dir / "public-ingress-state.json").write_text(
+                '{"generation":7}', encoding="utf-8"
+            )
+            (state_dir / "helper_registry.json").write_text(
+                '{"helpers":{}}', encoding="utf-8"
+            )
             script = rf"""
 $ErrorActionPreference = 'Stop'
 Import-Module {_ps_quote(PATH_MODULE)} -Force
@@ -262,10 +272,85 @@ $inventory = Get-AfpRuntimeInventory -ProcessRecords @() -ListenerRecords @() -S
 $result = Invoke-AfpRuntimePromotion -StagingPath {_ps_quote(staging)} -Paths $paths -ApprovedInventoryDigest $inventory.digest -CurrentInventory $inventory
 if (-not (Test-Path -LiteralPath (Join-Path $paths.RuntimeRoot 'new.txt'))) {{ throw 'new runtime missing' }}
 if (Test-Path -LiteralPath (Join-Path $paths.RuntimeRoot 'old.txt')) {{ throw 'mixed runtime contents' }}
+if ((Get-Content -LiteralPath (Join-Path $paths.RuntimeRoot 'runtime\public-ingress-state.json') -Raw) -notmatch '7') {{ throw 'ingress generation state was not preserved' }}
+if (-not (Test-Path -LiteralPath (Join-Path $paths.RuntimeRoot 'runtime\helper_registry.json'))) {{ throw 'helper registry was not preserved' }}
 if (-not (Test-Path -LiteralPath (Join-Path $result.swap_path 'old.txt'))) {{ throw 'rollback material missing' }}
 Restore-AfpRuntimePromotion -Promotion $result -Paths $paths
 if (-not (Test-Path -LiteralPath (Join-Path $paths.RuntimeRoot 'old.txt'))) {{ throw 'old runtime not restored' }}
 if (Test-Path -LiteralPath (Join-Path $paths.RuntimeRoot 'new.txt')) {{ throw 'new runtime remained after restore' }}
+"""
+            result = _run_ps(script)
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+
+    def test_transaction_releases_cutover_reservation_on_success_and_failure(self) -> None:
+        script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(MODULE)} -Force
+foreach ($helperReady in @($true, $false)) {{
+    $script:released = ''
+    $inventory = [pscustomobject]@{{ digest = 'approved'; processes = @() }}
+    $result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='F:\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
+        -CutoverReadinessRunner {{ [pscustomobject]@{{ allowed=$true; reservation_id='lease-1' }} }} `
+        -CutoverReleaseRunner {{ param($ReservationId) $script:released = $ReservationId }} `
+        -StopRunner {{ }} -PromotionRunner {{ [pscustomobject]@{{ status='switched' }} }} -StartRunner {{ }} `
+        -ServiceProbeRunner {{ [pscustomobject]@{{ status='passed' }} }} `
+        -IngressPublisher {{ [pscustomobject]@{{ generation=4 }} }} `
+        -HelperReadinessRunner {{ param($Ingress) [pscustomobject]@{{ ready=$helperReady; generation=$Ingress.generation }} }} `
+        -CompletionRunner {{ }} -RestoreRunner {{ }}
+    if ($script:released -ne 'lease-1') {{ throw 'cutover reservation was not released' }}
+    $expected = if ($helperReady) {{ 'completed' }} else {{ 'rolled_back' }}
+    if ($result.status -ne $expected) {{ throw ($result | ConvertTo-Json -Depth 8) }}
+}}
+"""
+        result = _run_ps(script)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+    def test_rollback_restores_old_candidate_with_higher_generation(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            workspace = Path(temporary) / "workspace"
+            runtime = workspace / "AFP_Integrated_System_Modular"
+            staging = workspace / ".afp-staging" / "deployment-test"
+            for target in (runtime, staging):
+                (target / "runtime").mkdir(parents=True)
+                (target / "PublicIngress.psm1").write_bytes(
+                    (ROOT / "visualization_app" / "PublicIngress.psm1").read_bytes()
+                )
+            old_state = {
+                "schema_version": 1,
+                "generation": 4,
+                "public_url": "https://old.example",
+                "provider": "tailscale",
+                "recovery_owner": "tailscale",
+                "candidate_id": "candidate-old",
+                "status": "online",
+                "published_at": "2026-10-16T00:00:00Z",
+                "layers": {"edge": {"ok": True, "code": "ready"}},
+            }
+            (runtime / "runtime" / "public-ingress-state.json").write_text(
+                json.dumps(old_state), encoding="utf-8"
+            )
+            script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(PATH_MODULE)} -Force
+Import-Module {_ps_quote(MODULE)} -Force
+$paths = Get-AfpDeploymentPaths -ConfigPath {_ps_quote(PATH_CONFIG)} -WorkspaceRootOverride {_ps_quote(workspace)}
+$inventory = Get-AfpRuntimeInventory -ProcessRecords @() -ListenerRecords @() -StartupRecords @()
+$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath {_ps_quote(staging)} -Paths $paths -ApprovedInventoryDigest $inventory.digest -CurrentInventory $inventory `
+    -CutoverReadinessRunner {{ [pscustomobject]@{{ allowed=$true }} }} -StopRunner {{ }} -StartRunner {{ }} `
+    -ServiceProbeRunner {{ [pscustomobject]@{{ status='passed' }} }} `
+    -IngressPublisher {{
+        Import-Module (Join-Path $paths.RuntimeRoot 'PublicIngress.psm1') -Force
+        $path = Join-Path $paths.RuntimeRoot 'runtime\public-ingress-state.json'
+        Publish-AfpPublicIngressState -Path $path -PublicUrl 'https://new.example' -Provider 'cloudflare' -RecoveryOwner 'cloudflare' -CandidateId 'candidate-new' -ExpectedPreviousCandidateId 'candidate-old' -ExpectedGeneration 4 -MinimumGeneration 5 -Layers @{{ edge=@{{ok=$true;code='ready'}} }}
+    }} `
+    -HelperReadinessRunner {{ [pscustomobject]@{{ ready=$false }} }} -CompletionRunner {{ }}
+if ($result.status -ne 'rolled_back') {{ throw ($result | ConvertTo-Json -Depth 8) }}
+$restored = Get-Content -LiteralPath (Join-Path $paths.RuntimeRoot 'runtime\public-ingress-state.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+if ($restored.candidate_id -cne 'candidate-old' -or [long]$restored.generation -le 5) {{ throw ($restored | ConvertTo-Json -Depth 8) }}
 """
             result = _run_ps(script)
             self.assertEqual(
@@ -342,6 +427,9 @@ if ($same.uri -notmatch '^https://example\.test/app\.js\?afp_identity_check=') {
         self.assertIn("Test-AfpReleaseGate", source)
         self.assertIn("New-AfpApprovalSummary", source)
         self.assertIn("Wait-AfpRuntimeServices", source)
+        self.assertIn("ExpectedPreviousCandidateId", source)
+        self.assertIn("MinimumGeneration", source)
+        self.assertIn("FailedIngressGeneration", source)
         self.assertIn(
             r"F:\AFP_Integrated_Modular_v2\delivery\AFP_Integrated_System_Modular_v2.0.3_Agentic",
             source,

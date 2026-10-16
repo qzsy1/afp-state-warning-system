@@ -77,7 +77,7 @@
       "id": "public-ingress-cutover-contracts",
       "title": "公网公共边缘真实性与入口安全切换合同",
       "kind": "command",
-      "command": ["{python}", "-m", "unittest", "visualization_app.test_public_ingress_module", "visualization_app.test_public_ingress_state", "visualization_app.test_helper_relay", "visualization_app.test_helper_transport", "harness.tests.test_single_runtime_deployment", "visualization_app.test_model_selection_source_contract", "harness.tests.test_public_ingress_contract", "-v"],
+      "command": ["{python}", "-m", "unittest", "visualization_app.test_public_ingress_module", "visualization_app.test_public_ingress_state", "visualization_app.test_public_web_security", "visualization_app.test_public_tunnel_watchdog", "visualization_app.test_tailscale_funnel_watchdog", "visualization_app.test_helper_relay", "visualization_app.test_helper_transport", "visualization_app.test_helper_websocket", "harness.tests.test_single_runtime_deployment", "visualization_app.test_model_selection_source_contract", "harness.tests.test_public_ingress_contract", "-v"],
       "cwd": ".",
       "timeout_seconds": 180,
       "profiles": ["quick", "full", "release"],

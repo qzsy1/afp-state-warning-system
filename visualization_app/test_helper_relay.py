@@ -129,6 +129,68 @@ class HelperRelayTests(unittest.TestCase):
             self.assertIsNone(restarted.authenticate("device-a", paired["pairing_token"]))
             self.assertFalse(restarted.status("session-a")["paired"])
 
+    def test_same_generation_restart_terminalizes_lost_command_once(self):
+        loader = MutableIngressLoader()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "helpers.json"
+            first = self.generation_registry(loader, persistence_path=path)
+            self.pair(first)
+            request = first.command("session-a", "status", {})
+            restarted = self.generation_registry(loader, persistence_path=path)
+            self.assertEqual(
+                restarted.pop_result("session-a", request["request_id"]),
+                {"ok": False, "error": "command_state_lost", "terminal": True},
+            )
+            self.assertIsNone(
+                restarted.pop_result("session-a", request["request_id"])
+            )
+
+    def test_late_result_clears_unconfirmed_restart_blocker(self):
+        loader = MutableIngressLoader()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "helpers.json"
+            first = self.generation_registry(loader, persistence_path=path)
+            paired = self.pair(first)
+            self.assertTrue(
+                first.attach(
+                    "session-a",
+                    "device-a",
+                    paired["pairing_token"],
+                    lambda _message: None,
+                )
+            )
+            with patch("helper_relay.helper_capability_mismatches", return_value=()):
+                request = first.command("session-a", "start_capture", {})
+            restarted = self.generation_registry(loader, persistence_path=path)
+            self.assertFalse(restarted.cutover_readiness()["allowed"])
+            self.assertEqual(
+                restarted.pop_result("session-a", request["request_id"])["error"],
+                "command_state_lost",
+            )
+            self.assertEqual(
+                restarted.authenticate("device-a", paired["pairing_token"]),
+                "session-a",
+            )
+            accepted = restarted.accept_result(
+                "device-a",
+                paired["pairing_token"],
+                request["request_id"],
+                {"ok": True, "running": False},
+                ingress_generation=1,
+            )
+            self.assertTrue(accepted["ok"])
+            self.assertTrue(restarted.cutover_readiness()["allowed"])
+
+    def test_production_result_requires_explicit_generation(self):
+        loader = MutableIngressLoader()
+        registry = self.generation_registry(loader)
+        paired = self.pair(registry)
+        request = registry.command("session-a", "status", {})
+        rejected = registry.accept_result(
+            "device-a", paired["pairing_token"], request["request_id"], {"ok": True}
+        )
+        self.assertEqual(rejected["error"], "ingress_generation_mismatch")
+
     def test_command_and_result_generation_mismatch_are_rejected(self):
         loader = MutableIngressLoader()
         registry = self.generation_registry(loader)
@@ -161,6 +223,55 @@ class HelperRelayTests(unittest.TestCase):
         self.assertFalse(readiness["allowed"])
         self.assertEqual(readiness["generation"], 1)
         self.assertEqual(readiness["active_capture_uuids"], ["capture-1"])
+
+    def test_cutover_reservation_blocks_new_capture_until_released(self):
+        loader = MutableIngressLoader()
+        registry = self.generation_registry(loader)
+        self.pair(registry)
+        reservation = registry.reserve_cutover()
+        self.assertTrue(reservation["allowed"])
+        blocked = registry.command("session-a", "start_capture", {})
+        self.assertEqual(blocked["error"], "ingress_cutover_in_progress")
+        self.assertFalse(registry.release_cutover("wrong"))
+        self.assertTrue(registry.release_cutover(reservation["reservation_id"]))
+        with patch("helper_relay.helper_capability_mismatches", return_value=()):
+            allowed = registry.command("session-a", "start_capture", {})
+        self.assertTrue(allowed["ok"])
+
+    def test_reservation_owner_can_recheck_readiness(self):
+        loader = MutableIngressLoader()
+        registry = self.generation_registry(loader)
+        reservation = registry.reserve_cutover()
+        self.assertTrue(reservation["allowed"])
+        self.assertFalse(registry.cutover_readiness()["allowed"])
+        owned = registry.cutover_readiness(reservation["reservation_id"])
+        self.assertTrue(owned["allowed"])
+        self.assertTrue(owned["reservation_active"])
+
+    def test_deployment_readiness_requires_compatible_online_helper(self):
+        loader = MutableIngressLoader()
+        registry = self.generation_registry(loader)
+        paired = self.pair(registry)
+        registry.attach(
+            "session-a",
+            "device-a",
+            paired["pairing_token"],
+            lambda _message: None,
+            capabilities={"command_lifecycle": "wrong"},
+        )
+        with patch("helper_relay.helper_capability_mismatches", return_value=()):
+            self.assertFalse(registry.deployment_readiness()["ready"])
+            registry.attach(
+                "session-a",
+                "device-a",
+                paired["pairing_token"],
+                lambda _message: None,
+                capabilities={"command_lifecycle": "isolated_hardware_check"},
+            )
+            readiness = registry.deployment_readiness()
+        self.assertTrue(readiness["ready"])
+        self.assertEqual(readiness["generation"], 1)
+        self.assertEqual(readiness["candidate_id"], "candidate-1")
 
     def test_terminal_result_is_consumed_once_across_restart(self):
         loader = MutableIngressLoader()

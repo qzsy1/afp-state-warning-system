@@ -92,7 +92,7 @@
 - **THEN** 项目 MUST 报告 `blocked` 或 `failed`，本机模拟结果只能作为单独的自动化证据
 
 ### Requirement: 预检必须验证Helper和网络合同
-`remote_helper` 预检 SHALL 检查 Helper 进程、发行身份、健康、能力、配对、端口、HTTP/WebSocket 和代理路径，并验证不一致能在启动前失败。
+`remote_helper` 预检 SHALL 检查 Helper 进程、候选身份、可执行文件 SHA-256、发行身份、健康、能力、配对、端口、HTTP/WebSocket 和代理路径，并验证不一致能在启动前失败。
 
 #### Scenario: Helper健康但合同不一致
 - **WHEN** Helper 可连接但发行、协议、配置或统一帧合同不匹配
@@ -123,6 +123,10 @@
 #### Scenario: 同一代次连接暂时中断
 - **WHEN** Helper 与服务器的连接中断但权威 URL、候选身份和入口代次未变化
 - **THEN** Helper MAY 使用保存端点自动重连，并 MUST 清理陈旧连接状态后重新声明同一代次 readiness
+
+#### Scenario: 服务器在同一代次重启且命令状态丢失
+- **WHEN** 持久化记录显示启动命令已排队或投递，但重启后的服务器无法证明其执行状态
+- **THEN** 服务器 MUST 将该命令终结为 `command_state_lost` 且不得自动重发；已投递的启动命令 MUST 在 Helper 返回迟到结果或完成显式对账前阻止入口切换
 
 #### Scenario: Helper收到旧代次命令
 - **WHEN** Helper 收到的采集命令代次与当前会话代次不一致

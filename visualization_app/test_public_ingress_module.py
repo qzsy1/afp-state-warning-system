@@ -92,6 +92,19 @@ class PublicIngressModuleTests(unittest.TestCase):
         self.assert_ps_ok(completed)
         self.assertEqual(json.loads(completed.stdout), ["1.1.1.1", "2606:4700:4700::1111"])
 
+    def test_dns_keeps_a_or_aaaa_when_the_other_record_type_is_absent(self) -> None:
+        completed = run_powershell(
+            "$aOnly={ param($HostName,$RecordType) if($RecordType -eq 'A'){ @('1.1.1.1') } else { throw 'no AAAA' } }; "
+            "$aaaaOnly={ param($HostName,$RecordType) if($RecordType -eq 'AAAA'){ @('2606:4700:4700::1111') } else { throw 'no A' } }; "
+            "[pscustomobject]@{a=@(Resolve-AfpPublicEdgeAddresses -HostName 'a.example' -Resolver $aOnly); "
+            "aaaa=@(Resolve-AfpPublicEdgeAddresses -HostName 'aaaa.example' -Resolver $aaaaOnly)} | ConvertTo-Json -Compress"
+        )
+        self.assert_ps_ok(completed)
+        self.assertEqual(
+            json.loads(completed.stdout),
+            {"a": ["1.1.1.1"], "aaaa": ["2606:4700:4700::1111"]},
+        )
+
     def test_atomic_publish_increments_only_on_url_provider_or_owner_change(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state_path = Path(temporary) / "public-ingress-state.json"
@@ -111,6 +124,23 @@ class PublicIngressModuleTests(unittest.TestCase):
                     {"changed": False, "generation": 1},
                     {"changed": True, "generation": 2},
                 ],
+            )
+
+    def test_candidate_migration_advances_generation_without_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "public-ingress-state.json"
+            escaped = str(state_path).replace("'", "''")
+            completed = run_powershell(
+                f"$path='{escaped}'; $layers=@{{edge=@{{ok=$true}}}}; "
+                "$null=Publish-AfpPublicIngressState -Path $path -PublicUrl 'https://one.example' -Provider 'tailscale' -RecoveryOwner 'tailscale' -CandidateId 'old' -Layers $layers; "
+                "$next=Publish-AfpPublicIngressState -Path $path -PublicUrl 'https://one.example' -Provider 'tailscale' -RecoveryOwner 'tailscale' -CandidateId 'new' -ExpectedPreviousCandidateId 'old' -ExpectedGeneration 1 -MinimumGeneration 8 -Layers $layers; "
+                "$state=Read-AfpPublicIngressState -Path $path -ExpectedCandidateId 'new'; "
+                "[pscustomobject]@{changed=$next.changed; generation=$state.generation; candidate_id=$state.candidate_id} | ConvertTo-Json -Compress"
+            )
+            self.assert_ps_ok(completed)
+            self.assertEqual(
+                json.loads(completed.stdout),
+                {"changed": True, "generation": 8, "candidate_id": "new"},
             )
 
     def test_atomic_publish_preserves_previous_state_on_replace_failure(self) -> None:

@@ -143,6 +143,9 @@ class HelperRegistry:
         self._ingress_state: PublicIngressState | None = None
         self._ingress_generation = 0
         self._ingress_error = ""
+        self._cutover_reservation_id = ""
+        self._cutover_reservation_deadline = 0.0
+        self._capture_starts_in_progress = 0
         with self._lock:
             self._synchronize_ingress_locked()
             self._load_persisted_helpers_locked()
@@ -163,8 +166,15 @@ class HelperRegistry:
             helper.sender = None
             helper.online = False
         self._helpers.clear()
-        self._active_captures.clear()
+        self._cutover_reservation_id = ""
+        self._cutover_reservation_deadline = 0.0
         self._persist_helpers_locked()
+
+    def _cutover_reserved_locked(self) -> bool:
+        if self._cutover_reservation_id and time.time() >= self._cutover_reservation_deadline:
+            self._cutover_reservation_id = ""
+            self._cutover_reservation_deadline = 0.0
+        return bool(self._cutover_reservation_id)
 
     def _synchronize_ingress_locked(self) -> bool:
         if self.ingress_state_path is None:
@@ -255,9 +265,21 @@ class HelperRegistry:
                     )
                     if not record.session_id or not record.command:
                         continue
-                    if generation != self._ingress_generation and record.delivery_state not in {"terminal", "completed"}:
+                    if record.delivery_state not in {"terminal", "completed"}:
+                        previous_delivery_state = record.delivery_state
                         record.delivery_state = "terminal"
-                        record.terminal_error = "ingress_generation_changed"
+                        record.terminal_error = (
+                            "ingress_generation_changed"
+                            if generation != self._ingress_generation
+                            else "command_state_lost"
+                        )
+                        if (
+                            record.command == "start_capture"
+                            and previous_delivery_state == "delivered"
+                        ):
+                            self._active_captures[
+                                f"unconfirmed-{record.request_id}"
+                            ] = record.session_id
                     self._commands[record.request_id] = record
                     if record.delivery_state == "terminal" and record.terminal_error:
                         self._terminal_results[(record.session_id, record.request_id)] = {
@@ -485,6 +507,8 @@ class HelperRegistry:
             record = self._commands.get(str(request_id))
             if record is None or record.session_id != session_id:
                 return {"ok": False, "error": "helper_request_unknown"}
+            if self.ingress_state_path is not None and ingress_generation is None:
+                return {"ok": False, "error": "ingress_generation_mismatch"}
             try:
                 received_generation = (
                     helper.generation
@@ -499,6 +523,7 @@ class HelperRegistry:
             helper.results[str(request_id)] = result
             record.delivery_state = "completed"
             record.terminal_error = ""
+            self._active_captures.pop(f"unconfirmed-{record.request_id}", None)
             capture_uuid = str(result.get("capture_uuid") or "").strip()
             if record.command in {"start_capture", "status"} and result.get("running") is True and capture_uuid:
                 self._active_captures[capture_uuid] = session_id
@@ -563,7 +588,7 @@ class HelperRegistry:
                 "ingress_error": "" if ready else "ingress_state_unavailable",
             }
 
-    def cutover_readiness(self) -> dict[str, Any]:
+    def cutover_readiness(self, reservation_id: str = "") -> dict[str, Any]:
         with self._lock:
             ready = self._synchronize_ingress_locked()
             blocking = sorted(
@@ -573,11 +598,114 @@ class HelperRegistry:
                 and record.delivery_state not in {"completed", "terminal"}
             )
             captures = sorted(self._active_captures)
+            if self._capture_starts_in_progress:
+                blocking.append("capture_start_in_progress")
+            reservation_active = self._cutover_reserved_locked()
+            owns_reservation = bool(
+                reservation_active
+                and reservation_id
+                and hmac.compare_digest(
+                    self._cutover_reservation_id,
+                    str(reservation_id),
+                )
+            )
             return {
-                "allowed": bool(ready and not captures and not blocking),
+                "allowed": bool(
+                    ready
+                    and not captures
+                    and not blocking
+                    and (not reservation_active or owns_reservation)
+                ),
                 "generation": self._ingress_generation,
                 "active_capture_uuids": captures,
                 "blocking_request_ids": blocking,
+                "reservation_active": reservation_active,
+            }
+
+    def reserve_cutover(self, ttl_seconds: int = 180) -> dict[str, Any]:
+        with self._lock:
+            readiness = self.cutover_readiness()
+            if not readiness["allowed"]:
+                return {**readiness, "reservation_id": ""}
+            reservation_id = secrets.token_urlsafe(24)
+            self._cutover_reservation_id = reservation_id
+            self._cutover_reservation_deadline = time.time() + max(
+                30, min(int(ttl_seconds), 600)
+            )
+            return {
+                **readiness,
+                "allowed": True,
+                "reservation_active": True,
+                "reservation_id": reservation_id,
+            }
+
+    def release_cutover(self, reservation_id: str) -> bool:
+        with self._lock:
+            if not self._cutover_reserved_locked():
+                return False
+            if not hmac.compare_digest(
+                self._cutover_reservation_id,
+                str(reservation_id or ""),
+            ):
+                return False
+            self._cutover_reservation_id = ""
+            self._cutover_reservation_deadline = 0.0
+            return True
+
+    def cutover_reserved(self) -> bool:
+        with self._lock:
+            return self._cutover_reserved_locked()
+
+    def begin_capture_start(self) -> bool:
+        with self._lock:
+            if not self._synchronize_ingress_locked() or self._cutover_reserved_locked():
+                return False
+            self._capture_starts_in_progress += 1
+            return True
+
+    def end_capture_start(self) -> None:
+        with self._lock:
+            self._capture_starts_in_progress = max(
+                0, self._capture_starts_in_progress - 1
+            )
+
+    def deployment_readiness(self) -> dict[str, Any]:
+        with self._lock:
+            state_ready = self._synchronize_ingress_locked()
+            now = time.time()
+            paired = 0
+            online = 0
+            compatible = 0
+            for helper in self._helpers.values():
+                if helper.generation != self._ingress_generation:
+                    continue
+                paired += 1
+                is_online = bool(
+                    helper.online
+                    and helper.last_seen is not None
+                    and now - helper.last_seen <= self.heartbeat_ttl_seconds
+                )
+                if not is_online:
+                    continue
+                online += 1
+                if (
+                    helper.capabilities.get("command_lifecycle")
+                    == REQUIRED_COMMAND_LIFECYCLE
+                    and not helper_capability_mismatches(
+                        RELEASE_CONTRACT, helper.capabilities
+                    )
+                ):
+                    compatible += 1
+            return {
+                "ready": bool(state_ready and compatible > 0),
+                "generation": self._ingress_generation,
+                "candidate_id": self.expected_candidate_id,
+                "paired_helpers": paired,
+                "online_helpers": online,
+                "compatible_helpers": compatible,
+                "non_sensitive_error": "" if state_ready and compatible > 0 else (
+                    "helper_not_ready" if state_ready else "ingress_state_unavailable"
+                ),
             }
 
     def authorize_generation(self, session_id: str, generation: Any) -> bool:
@@ -607,6 +735,8 @@ class HelperRegistry:
         with self._lock:
             if not self._synchronize_ingress_locked():
                 return {"ok": False, "queued": False, "error": "ingress_state_unavailable"}
+            if command == "start_capture" and self._cutover_reserved_locked():
+                return {"ok": False, "queued": False, "error": "ingress_cutover_in_progress"}
             helper = self._helpers.get(session_id)
             if helper is None or helper.generation != self._ingress_generation:
                 return {"ok": False, "error": "helper_not_paired"}

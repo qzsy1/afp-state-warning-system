@@ -25,12 +25,14 @@ $CloudflaredRoot = Split-Path -Parent $CloudflaredExe
 $TunnelLog = Join-Path $CloudflaredRoot "quick-tunnel-watchdog.log"
 $TunnelUrlFile = Join-Path $CloudflaredRoot "quick-tunnel-url.txt"
 $OriginUrl = "http://127.0.0.1:8770"
+$ControlUrl = "http://127.0.0.1:8771"
 $MetricsUrl = "http://127.0.0.1:20241/metrics"
 $TunnelStatusFile = Join-Path $CloudflaredRoot "quick-tunnel-status.json"
 $IngressModule = Join-Path $PSScriptRoot "PublicIngress.psm1"
 Import-Module $IngressModule -Force -ErrorAction Stop
 $IngressStateFile = Join-Path $DeliveryRoot "runtime\public-ingress-state.json"
 $ReleaseManifestFile = Join-Path $DeliveryRoot "RELEASE-MANIFEST.json"
+$script:CutoverReservationId = ""
 
 function New-WatchdogLayer([bool]$Ok, [string]$Code) {
     return [ordered]@{ ok = $Ok; code = $Code }
@@ -63,6 +65,7 @@ function Write-TunnelState([string]$Code, [string]$PublicUrl = "", $Layers = $nu
         non_sensitive_error = if ($allReady) { "" } else { $Code }
         checked_at = (Get-Date).ToString("o")
     } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $TunnelStatusFile -Encoding UTF8
+    Release-CutoverReservation
 }
 
 function Get-CandidateId {
@@ -79,10 +82,40 @@ function Get-CurrentIngressState {
 
 function Get-CutoverReadiness {
     try {
-        return Invoke-RestMethod -Uri ($OriginUrl + "/api/ingress/cutover-readiness") -Method Get -TimeoutSec 5
+        $result = Invoke-RestMethod -Uri ($ControlUrl + "/api/ingress/cutover-reservation") `
+            -Method Post -ContentType "application/json" -Body '{"ttl_seconds":300}' -TimeoutSec 5
+        $script:CutoverReservationId = [string]$result.reservation_id
+        return $result
     } catch {
         return [pscustomobject]@{ allowed = $false; error = "cutover_readiness_unavailable" }
     }
+}
+
+function Release-CutoverReservation {
+    if (-not $script:CutoverReservationId) { return }
+    try {
+        $body = @{ reservation_id = $script:CutoverReservationId } | ConvertTo-Json -Compress
+        Invoke-RestMethod -Uri ($ControlUrl + "/api/ingress/cutover-release") `
+            -Method Post -ContentType "application/json" -Body $body -TimeoutSec 5 | Out-Null
+    } catch {
+    } finally {
+        $script:CutoverReservationId = ""
+    }
+}
+
+function Wait-HelperIngressReady([long]$Generation, [string]$CandidateId) {
+    $deadline = (Get-Date).AddSeconds(120)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $status = Invoke-RestMethod -Uri ($ControlUrl + "/api/ingress/helper-readiness") `
+                -Method Get -TimeoutSec 5
+            if ([bool]$status.ready -and [long]$status.generation -eq $Generation -and
+                [string]$status.candidate_id -ceq $CandidateId) { return $true }
+        } catch {
+        }
+        Start-Sleep -Seconds 2
+    }
+    return $false
 }
 
 function Test-WatchdogMutationAllowed {
@@ -90,18 +123,20 @@ function Test-WatchdogMutationAllowed {
     $owner = if ($State) { [string]$State.recovery_owner } else { "" }
     $generation = if ($State) { [long]$State.generation } else { 0L }
     if ($RequestedMode -eq "Install") { return [pscustomobject]@{ allowed = $false; reason = "install_observe_only" } }
+    if ($RequestedMode -eq "Cutover") {
+        if (-not $Approved) { return [pscustomobject]@{ allowed = $false; reason = "owner_cutover_not_approved" } }
+        if ($RequiredGeneration -lt 0 -or $RequiredGeneration -ne $generation) {
+            return [pscustomobject]@{ allowed = $false; reason = "ingress_generation_mismatch" }
+        }
+        if (-not $Readiness -or -not [bool]$Readiness.allowed) {
+            return [pscustomobject]@{ allowed = $false; reason = "active_capture_blocks_cutover" }
+        }
+        return [pscustomobject]@{ allowed = $true; reason = "approved_cutover" }
+    }
     if ($owner -and $owner.Trim().ToLowerInvariant() -eq $Provider.Trim().ToLowerInvariant()) {
         return [pscustomobject]@{ allowed = $true; reason = "current_owner" }
     }
-    if ($RequestedMode -ne "Cutover") { return [pscustomobject]@{ allowed = $false; reason = "non_owner_observe_only" } }
-    if (-not $Approved) { return [pscustomobject]@{ allowed = $false; reason = "owner_cutover_not_approved" } }
-    if ($RequiredGeneration -lt 0 -or $RequiredGeneration -ne $generation) {
-        return [pscustomobject]@{ allowed = $false; reason = "ingress_generation_mismatch" }
-    }
-    if (-not $Readiness -or -not [bool]$Readiness.allowed) {
-        return [pscustomobject]@{ allowed = $false; reason = "active_capture_blocks_cutover" }
-    }
-    return [pscustomobject]@{ allowed = $true; reason = "approved_cutover" }
+    return [pscustomobject]@{ allowed = $false; reason = "non_owner_observe_only" }
 }
 
 function ConvertTo-WatchdogLayerTable($Layers) {
@@ -276,7 +311,7 @@ function Ensure-Origin {
 function Stop-StaleTunnel {
     $processes = @(Get-TunnelProcess)
     foreach ($process in $processes) {
-        Stop-Process -Id $process.ProcessId -Force
+        Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
     }
     if ($processes.Count) { Start-Sleep -Seconds 2 }
 }
@@ -322,6 +357,10 @@ function Start-Tunnel {
 
 function Ensure-Tunnel {
     $state = Get-CurrentIngressState
+    if (-not (Ensure-Origin)) {
+        Write-TunnelState "origin_unavailable"
+        return $false
+    }
     $readiness = Get-CutoverReadiness
     $decision = Test-WatchdogMutationAllowed $state "cloudflare" $Mode $ExpectedGeneration ([bool]$ApproveOwnerCutover) $readiness
     if (-not $decision.allowed) {
@@ -331,16 +370,18 @@ function Ensure-Tunnel {
     $previousProvider = if ($state) { [string]$state.provider } else { "" }
     $crossProviderCutover = $Mode -eq "Cutover" -and $previousProvider -and
         $previousProvider.Trim().ToLowerInvariant() -ne "cloudflare"
-    if (-not (Ensure-Origin)) { return $false }
+    $candidateStarted = $false
     if (-not (Test-Tunnel)) {
         Stop-StaleTunnel
         if (-not (Start-Tunnel)) {
             Write-TunnelState "control_plane_unavailable"
             return $false
         }
+        $candidateStarted = $true
     }
     $publicUrl = Get-TunnelUrl (Get-TunnelMetrics)
     if (-not $publicUrl -or -not (Test-PublicTunnel $publicUrl)) {
+        if ($candidateStarted) { Stop-CandidateIngress | Out-Null }
         Write-TunnelState "public_edge_unavailable" $publicUrl
         return $false
     }
@@ -372,11 +413,14 @@ function Ensure-Tunnel {
         $publication = Publish-AfpPublicIngressState @publishParameters
         $layers.ingress = New-WatchdogLayer $true "ingress_published"
     } catch {
-        if ($crossProviderCutover) { Stop-CandidateIngress | Out-Null }
+        if ($candidateStarted -or $crossProviderCutover) { Stop-CandidateIngress | Out-Null }
         Write-TunnelState "ingress_publication_failed" $publicUrl $layers
         return $false
     }
-    $helperReady = if ($publication.changed) { Restart-Helper } else { Ensure-Helper }
+    $helperProcessReady = if ($publication.changed) { Restart-Helper } else { Ensure-Helper }
+    $helperReady = $helperProcessReady -and (
+        Wait-HelperIngressReady ([long]$publication.generation) $candidateId
+    )
     $layers.helper = if ($helperReady) {
         New-WatchdogLayer $true "helper_ready"
     } else {
@@ -386,7 +430,7 @@ function Ensure-Tunnel {
         $rolledBack = if ($publication.changed) {
             Restore-PreviousIngressState $state ([long]$publication.generation)
         } else { $true }
-        if ($crossProviderCutover) { Stop-CandidateIngress | Out-Null }
+        if ($candidateStarted -or $crossProviderCutover) { Stop-CandidateIngress | Out-Null }
         $code = if ($rolledBack) { "helper_recovery_failed" } else { "cutover_rollback_failed" }
         Write-TunnelState $code $publicUrl $layers
         return $false
@@ -399,7 +443,7 @@ function Ensure-Tunnel {
         $rolledBack = if ($publication.changed) {
             Restore-PreviousIngressState $state ([long]$publication.generation)
         } else { $true }
-        if ($crossProviderCutover) { Stop-CandidateIngress | Out-Null }
+        if ($candidateStarted -or $crossProviderCutover) { Stop-CandidateIngress | Out-Null }
         $code = if ($rolledBack) { "ingress_publication_failed" } else { "cutover_rollback_failed" }
         Write-TunnelState $code $publicUrl $layers
         return $false
