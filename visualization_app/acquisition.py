@@ -712,7 +712,7 @@ def _associate_usb_topology(
 
     if enrich_interface_transports is None:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "usb_ports": [],
             "unlocated_usb_interface_ids": [],
             "native_serial_interface_ids": [
@@ -3066,20 +3066,20 @@ class AcquisitionManager:
         error = ""
         if discover_windows_usb_topology is None:
             usb_topology = {
-                "schema_version": 1, "state": "unavailable",
+                "schema_version": 2, "state": "unavailable",
                 "provider": "module_unavailable",
                 "errors": ["USB physical port topology module is unavailable"],
-                "docks": [], "usb_ports": [], "devices": [],
+                "docks": [], "hubs": [], "usb_ports": [], "devices": [],
             }
         else:
             try:
                 usb_topology = discover_windows_usb_topology()
             except Exception as exc:
                 usb_topology = {
-                    "schema_version": 1, "state": "unavailable",
+                    "schema_version": 2, "state": "unavailable",
                     "provider": "windows_usb_hub_ioctl",
                     "errors": [f"USB topology discovery failed: {exc}"],
-                    "docks": [], "usb_ports": [], "devices": [],
+                    "docks": [], "hubs": [], "usb_ports": [], "devices": [],
                 }
         try:
             from serial.tools import list_ports

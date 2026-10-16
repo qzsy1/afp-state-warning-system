@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import ctypes
+import json
 import os
 import sys
 import tempfile
@@ -47,6 +48,10 @@ def _hub(
     path: str,
     ports: list[dict],
     location: str = "PCIROOT(0)#USBROOT(0)#USB(1)",
+    container_id: str | None = None,
+    removal_policy: int | None = 3,
+    device_categories: list[str] | None = None,
+    container_function_classes: list[str] | None = None,
 ) -> dict:
     return {
         "id": hub_id,
@@ -55,6 +60,10 @@ def _hub(
         "parent_instance_id": "USB\\ROOT_HUB30\\ROOT",
         "location_paths": [location],
         "friendly_name": "USB Hub",
+        "container_id": f"fixture-container-{hub_id}" if container_id is None else container_id,
+        "removal_policy": removal_policy,
+        "device_categories": ["dock"] if device_categories is None else device_categories,
+        "container_function_classes": ["hub"] if container_function_classes is None else container_function_classes,
         "vid": vid,
         "pid": pid,
         "is_root": False,
@@ -94,8 +103,14 @@ def _genesys_fixture(*, mapped: bool = True, asix_pid: int = 0x1790) -> list[dic
             )
         )
     return [
-        _hub("slow", vid=0x05E3, pid=0x0610, path=slow_path, ports=slow_ports),
-        _hub("fast", vid=0x05E3, pid=0x0626, path=fast_path, ports=fast_ports),
+        _hub(
+            "slow", vid=0x05E3, pid=0x0610, path=slow_path, ports=slow_ports,
+            container_id="fixture-genesys-dock",
+        ),
+        _hub(
+            "fast", vid=0x05E3, pid=0x0626, path=fast_path, ports=fast_ports,
+            container_id="fixture-genesys-dock",
+        ),
     ]
 
 
@@ -124,7 +139,9 @@ class WindowsUsbTopologyTests(unittest.TestCase):
         result = topology.normalize_usb_topology(_genesys_fixture())
 
         self.assertEqual(result["state"], "complete")
+        self.assertEqual(result["schema_version"], 2)
         self.assertEqual(len(result["docks"]), 1)
+        self.assertEqual(result["hubs"], [])
         external = [port for port in result["usb_ports"] if port["user_connectable"]]
         internal = [port for port in result["usb_ports"] if not port["user_connectable"]]
         self.assertEqual(len(external), 3)
@@ -139,7 +156,7 @@ class WindowsUsbTopologyTests(unittest.TestCase):
     def test_missing_companion_mapping_does_not_guess_a_merge(self) -> None:
         result = topology.normalize_usb_topology(_genesys_fixture(mapped=False))
 
-        self.assertEqual(len(result["docks"]), 2)
+        self.assertEqual(len(result["docks"]), 1)
         self.assertEqual(len(result["usb_ports"]), 8)
         self.assertTrue(all(port["merge_state"] == "independent" for port in result["usb_ports"]))
 
@@ -149,7 +166,7 @@ class WindowsUsbTopologyTests(unittest.TestCase):
         self.assertEqual(len([port for port in result["usb_ports"] if port["user_connectable"]]), 4)
         self.assertFalse(any(port["internal_function"] == "ethernet" for port in result["usb_ports"]))
 
-    def test_stable_ids_survive_refresh_but_change_with_upstream_location(self) -> None:
+    def test_stable_ids_survive_refresh_and_host_location_changes(self) -> None:
         fixture = _genesys_fixture()
         first = topology.normalize_usb_topology(fixture)
         second = topology.normalize_usb_topology(copy.deepcopy(fixture))
@@ -163,7 +180,7 @@ class WindowsUsbTopologyTests(unittest.TestCase):
             [port["id"] for port in first["usb_ports"]],
             [port["id"] for port in second["usb_ports"]],
         )
-        self.assertNotEqual(first["docks"][0]["id"], third["docks"][0]["id"])
+        self.assertEqual(first["docks"][0]["id"], third["docks"][0]["id"])
 
     def test_nested_hub_records_parent_port_without_raw_path(self) -> None:
         child_path = r"\\?\usb#vid_1234&pid_0002#child#{hub}"
@@ -188,6 +205,7 @@ class WindowsUsbTopologyTests(unittest.TestCase):
             path=child_path,
             ports=[_port(1)],
             location="PCIROOT(0)#USBROOT(0)#USB(1)#USB(1)",
+            container_id="fixture-child-dock",
         )
 
         result = topology.normalize_usb_topology([parent, child])
@@ -244,9 +262,11 @@ class WindowsUsbTopologyTests(unittest.TestCase):
                 _port(4, protocol="usb3", user_connectable=False),
             ],
             location="PCIROOT(0)#USBROOT(0)",
+            container_id="fixture-system",
         )
         root["is_root"] = True
         root["instance_id"] = r"USB\ROOT_HUB30\ROOT"
+        root["container_id"] = "fixture-system"
 
         result = topology.normalize_usb_topology([root, *dock_hubs])
 
@@ -290,9 +310,11 @@ class WindowsUsbTopologyTests(unittest.TestCase):
                 _port(14, protocol="usb3", connector_is_type_c=False, companion={"hub_path": root_path, "port_number": 9}),
             ],
             location="PCIROOT(0)#USBROOT(0)",
+            container_id="fixture-system",
         )
         root["is_root"] = True
         root["instance_id"] = r"USB\ROOT_HUB30\ROOT"
+        root["container_id"] = "fixture-system"
 
         result = topology.normalize_usb_topology([root])
 
@@ -347,9 +369,11 @@ class WindowsUsbTopologyTests(unittest.TestCase):
                 _port(3, protocol="usb3"),
             ],
             location="PCIROOT(0)#USBROOT(0)",
+            container_id="fixture-system",
         )
         root["is_root"] = True
         root["instance_id"] = r"USB\ROOT_HUB30\ROOT"
+        root["container_id"] = "fixture-system"
         empty_root = copy.deepcopy(root)
         empty_root["ports"][0]["state"] = "empty"
         empty_root["ports"][0]["device"] = None
@@ -379,6 +403,149 @@ class WindowsUsbTopologyTests(unittest.TestCase):
             self.assertEqual(first_host[0]["confirmation"], "observed_current")
             self.assertEqual(second_host[0]["confirmation"], "observed_history")
             self.assertTrue(Path(registry_path).is_file())
+
+    def test_integrated_non_root_hub_is_host_owned(self) -> None:
+        child_path = r"\\?\usb#integrated#hub#{fixture}"
+        root = _hub(
+            "root-system",
+            vid=0,
+            pid=0,
+            path=r"\\?\usb#root_hub30#system#{fixture}",
+            ports=[_port(1, state="occupied", user_connectable=False, child_hub_path=child_path)],
+            location="HOST-A#ROOT-A",
+            container_id="system-container",
+            removal_policy=1,
+            device_categories=[],
+        )
+        root["is_root"] = True
+        root["instance_id"] = r"USB\ROOT_HUB30\SYSTEM"
+        integrated = _hub(
+            "integrated",
+            vid=0x1234,
+            pid=0x0001,
+            path=child_path,
+            ports=[_port(1, state="occupied", device={"class": "hid", "vid": 1, "pid": 2})],
+            location="HOST-A#ROOT-A#INTERNAL",
+            container_id="system-container",
+            removal_policy=1,
+            device_categories=[],
+        )
+
+        result = topology.normalize_usb_topology([root, integrated])
+
+        self.assertEqual(result["docks"], [])
+        self.assertEqual(result["hubs"], [])
+        self.assertEqual({port["owner_kind"] for port in result["usb_ports"]}, {"host"})
+
+    def test_external_plain_hub_is_not_dock(self) -> None:
+        hub = _hub(
+            "plain",
+            vid=0x1234,
+            pid=0x5678,
+            path=r"\\?\usb#plain#hub#{fixture}",
+            ports=[_port(1), _port(2, protocol="usb3")],
+            container_id="plain-hub-container",
+            removal_policy=3,
+            device_categories=[],
+            container_function_classes=["hub"],
+        )
+
+        result = topology.normalize_usb_topology([hub])
+
+        self.assertEqual(result["docks"], [])
+        self.assertEqual(result["hubs"][0]["classification"], "external_hub")
+        self.assertNotIn("拓展坞", result["hubs"][0]["label"])
+        self.assertTrue(all(port["owner_kind"] == "hub" for port in result["usb_ports"]))
+
+    def test_multifunction_external_container_is_dock(self) -> None:
+        hub = _hub(
+            "multifunction",
+            vid=0x4321,
+            pid=0x8765,
+            path=r"\\?\usb#multi#hub#{fixture}",
+            ports=[_port(1), _port(2, protocol="usb3")],
+            container_id="multifunction-container",
+            removal_policy=2,
+            device_categories=[],
+            container_function_classes=["hub", "net", "audio"],
+        )
+
+        result = topology.normalize_usb_topology([hub])
+
+        self.assertEqual(result["hubs"], [])
+        self.assertEqual(result["docks"][0]["classification"], "confirmed_dock")
+        self.assertIn("external_container", result["docks"][0]["classification_evidence"])
+        self.assertIn("multifunction_container", result["docks"][0]["classification_evidence"])
+
+    def test_classification_does_not_depend_on_host_controller_or_location(self) -> None:
+        first_fixture = _genesys_fixture()
+        second_fixture = copy.deepcopy(first_fixture)
+        for index, hub in enumerate(second_fixture, 1):
+            hub["id"] = f"other-host-hub-{index}"
+            hub["device_path"] = rf"\\?\usb#other-controller#{index}#{{fixture}}"
+            hub["location_paths"] = [f"HOST-B#ROOT-Z#USB({index + 7})"]
+        for hub in second_fixture:
+            for port in hub["ports"]:
+                port["companion"] = None
+
+        first = topology.normalize_usb_topology(first_fixture)
+        second = topology.normalize_usb_topology(second_fixture)
+
+        self.assertEqual([item["classification"] for item in first["docks"]], ["confirmed_dock"])
+        self.assertEqual([item["classification"] for item in second["docks"]], ["confirmed_dock"])
+        self.assertEqual({port["owner_kind"] for port in first["usb_ports"]}, {"dock"})
+        self.assertEqual({port["owner_kind"] for port in second["usb_ports"]}, {"dock"})
+
+    def test_incomplete_evidence_keeps_ports_as_unconfirmed_hub(self) -> None:
+        hub = _hub(
+            "unknown",
+            vid=0x05E3,
+            pid=0x0626,
+            path=r"\\?\usb#unknown#hub#{fixture}",
+            ports=[_port(1), _port(2), _port(3)],
+            container_id="",
+            removal_policy=None,
+            device_categories=[],
+            container_function_classes=["hub"],
+        )
+        hub["friendly_name"] = "Three Port Dock"
+
+        result = topology.normalize_usb_topology([hub])
+
+        self.assertEqual(result["docks"], [])
+        self.assertEqual(result["hubs"][0]["classification"], "unconfirmed_accessory")
+        self.assertIn("insufficient_identity", result["hubs"][0]["classification_evidence"])
+        self.assertEqual(len(result["usb_ports"]), 3)
+
+    def test_pnp_identity_fields_are_sanitized_in_public_topology(self) -> None:
+        hub = _hub(
+            "privacy",
+            vid=0x1111,
+            pid=0x2222,
+            path=r"\\?\usb#privacy#hub#{fixture}",
+            ports=[_port(1, state="occupied", device={
+                "instance_id": r"USB\VID_1111&PID_2222\MACHINE-SERIAL",
+                "parent_instance_id": r"PCI\HOST-CONTROLLER\PRIVATE",
+                "container_id": "private-container-guid",
+                "location_paths": ["PRIVATE-HOST#ROOT#USB(9)"],
+                "removal_policy": 3,
+                "device_category": "hid",
+                "class": "hid",
+                "vid": 0x1111,
+                "pid": 0x2222,
+            })],
+            container_id="private-container-guid",
+            device_categories=[],
+            container_function_classes=["hub"],
+        )
+
+        serialized = json.dumps(topology.normalize_usb_topology([hub]))
+
+        self.assertNotIn("private-container-guid", serialized)
+        self.assertNotIn("HOST-CONTROLLER", serialized)
+        self.assertNotIn("PRIVATE-HOST", serialized)
+        self.assertIn("container_key", serialized)
+        self.assertIn("parent_key", serialized)
 
 
 if __name__ == "__main__":

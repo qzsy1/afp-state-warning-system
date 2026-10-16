@@ -31,7 +31,10 @@ class LocalCaptureAgentTests(unittest.TestCase):
             "usb_topology": topology,
             "interface_transport_catalog": {
                 "schema_version": 1,
-                "usb_ports": [{"id": "usbport:1", "endpoints": []}],
+                "usb_ports": [{
+                    "id": "usbport:1", "owner_kind": "dock", "dock_id": "dock:1",
+                    "label": "拓展坞 1 · USB3-1", "endpoints": [],
+                }],
                 "unlocated_usb_interface_ids": [],
                 "native_serial_interface_ids": [],
                 "ethernet_interface_ids": [],
@@ -42,11 +45,20 @@ class LocalCaptureAgentTests(unittest.TestCase):
             "error": "",
         }
         payload = LocalCaptureAgent(manager=manager).discover()
-        self.assertEqual(payload["usb_topology"], topology)
+        self.assertEqual(payload["usb_topology"]["schema_version"], 2)
+        self.assertEqual(payload["usb_topology"]["docks"], [])
+        self.assertEqual(payload["usb_topology"]["hubs"][0]["classification"], "unconfirmed_accessory")
+        self.assertEqual(payload["usb_topology"]["usb_ports"][0]["owner_kind"], "hub")
         self.assertEqual(payload["interfaces"], [])
         self.assertTrue(payload["capabilities"]["usb_topology_v1"])
+        self.assertTrue(payload["capabilities"]["usb_topology_v2"])
         self.assertTrue(payload["capabilities"]["interface_transport_catalog_v1"])
+        self.assertTrue(payload["capabilities"]["interface_transport_catalog_v2"])
+        self.assertEqual(payload["interface_transport_catalog"]["schema_version"], 2)
         self.assertEqual(payload["interface_transport_catalog"]["usb_ports"][0]["id"], "usbport:1")
+        self.assertEqual(payload["interface_transport_catalog"]["usb_ports"][0]["owner_kind"], "hub")
+        self.assertEqual(payload["interface_transport_catalog"]["usb_ports"][0]["dock_id"], "")
+        self.assertNotIn("拓展坞", payload["interface_transport_catalog"]["usb_ports"][0]["label"])
 
     def test_sample_batch_reads_only_incremental_rows_when_manager_supports_cursor(self):
         manager = Mock()

@@ -52,6 +52,33 @@ def run_logical_interface_script(assertions: str) -> dict:
 
 
 class UsbInterfaceCandidateTests(unittest.TestCase):
+    def test_unconfirmed_usb_hub_remains_visible_without_dock_label(self) -> None:
+        result = run_candidate_script(
+            r"""
+state.usbTopology = normalizeUsbTopology({
+  schema_version: 1,
+  docks: [{id:"legacy-dock", label:"拓展坞 1"}],
+  usb_ports: [{id:"hub:port:1", owner_kind:"dock", dock_id:"legacy-dock", label:"拓展坞 1 · USB3-1", connector_form_factor:"type_a", state:"empty", user_connectable:true}],
+  devices: [],
+});
+const byRole = Object.fromEntries(["thermocouple", "thermal_uvc", "pressure"].map((role) => [
+  role,
+  physicalCandidatesForRole(role).filter((item) => item.transport_family === "usb"),
+]));
+console.log(JSON.stringify({
+  counts: Object.fromEntries(Object.entries(byRole).map(([role, items]) => [role, items.length])),
+  owner: byRole.thermocouple[0]?.owner_kind,
+  group: byRole.thermocouple[0]?.group_label,
+  topologyDocks: state.usbTopology.docks.length,
+}));
+"""
+        )
+        self.assertEqual(result["counts"], {"thermocouple": 1, "thermal_uvc": 1, "pressure": 1})
+        self.assertEqual(result["owner"], "hub")
+        self.assertIn("USB 扩展设备", result["group"])
+        self.assertNotIn("拓展坞", result["group"])
+        self.assertEqual(result["topologyDocks"], 0)
+
     def test_empty_operator_port_remains_manually_selectable(self) -> None:
         source = APP_JS.read_text(encoding="utf-8")
         start = source.index("const USB_SENSOR_ROLES")

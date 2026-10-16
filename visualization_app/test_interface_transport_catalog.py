@@ -6,13 +6,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from interface_transport_catalog import enrich_interface_transports  # noqa: E402
+from interface_transport_catalog import (  # noqa: E402
+    enrich_interface_transports,
+    normalize_usb_topology_contract,
+)
 
 
 class InterfaceTransportCatalogTests(unittest.TestCase):
     def test_usb_serial_is_nested_under_port_and_native_serial_stays_separate(self) -> None:
         topology = {
-            "docks": [{"id": "dock:1", "label": "拓展坞 1"}],
+            "schema_version": 2,
+            "docks": [{"id": "dock:1", "label": "拓展坞 1", "classification": "confirmed_dock", "classification_evidence": ["external_container", "multifunction_container"]}],
+            "hubs": [],
             "usb_ports": [
                 {"id": "usb:host", "owner_kind": "host", "dock_id": "", "label": "电脑本机 · USB3-1", "state": "empty", "user_connectable": True},
                 {"id": "usb:dock", "owner_kind": "dock", "dock_id": "dock:1", "label": "拓展坞 1 · USB3-1", "state": "occupied", "user_connectable": True, "device_id": "dev:serial"},
@@ -35,6 +40,34 @@ class InterfaceTransportCatalogTests(unittest.TestCase):
         dock = next(item for item in catalog["usb_ports"] if item["id"] == "usb:dock")
         self.assertEqual([item["id"] for item in dock["endpoints"]], ["serial:COM8"])
         self.assertEqual(catalog["native_serial_interface_ids"], ["serial:COM1"])
+
+    def test_schema_v1_dock_identity_is_downgraded_to_unconfirmed_hub(self) -> None:
+        legacy = {
+            "schema_version": 1,
+            "state": "complete",
+            "provider": "old-helper",
+            "errors": [],
+            "docks": [{"id": "dock:legacy", "label": "拓展坞 1"}],
+            "usb_ports": [{
+                "id": "usb:legacy",
+                "owner_kind": "dock",
+                "dock_id": "dock:legacy",
+                "label": "拓展坞 1 · USB3-1",
+                "state": "empty",
+                "user_connectable": True,
+            }],
+            "devices": [],
+        }
+
+        current = normalize_usb_topology_contract(legacy)
+
+        self.assertEqual(current["schema_version"], 2)
+        self.assertEqual(current["docks"], [])
+        self.assertEqual(current["hubs"][0]["classification"], "unconfirmed_accessory")
+        self.assertEqual(current["usb_ports"][0]["owner_kind"], "hub")
+        self.assertEqual(current["usb_ports"][0]["dock_id"], "")
+        self.assertNotIn("拓展坞", current["hubs"][0]["label"])
+        self.assertNotIn("拓展坞", current["usb_ports"][0]["label"])
 
     def test_hid_uvc_and_unlocated_usb_are_preserved_without_duplicates(self) -> None:
         topology = {

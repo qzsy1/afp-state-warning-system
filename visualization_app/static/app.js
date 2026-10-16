@@ -4933,6 +4933,54 @@ function endpointCompatibleWithRole(item, role) {
     || (expected === "serial" && kind === "com");
 }
 
+function normalizeUsbTopology(topology) {
+  if (!topology || typeof topology !== "object") return null;
+  if (Number(topology.schema_version) === 2) {
+    return {...topology, docks: topology.docks || [], hubs: topology.hubs || []};
+  }
+  const groups = new Map();
+  const hubs = [];
+  const ports = (Array.isArray(topology.usb_ports) ? topology.usb_ports : []).map((value) => {
+    const port = {...value};
+    const legacyOwner = String(port.dock_id || port.hub_id || "legacy-accessory");
+    const isHost = String(port.owner_kind || (port.dock_id ? "dock" : "host")) === "host";
+    if (isHost) {
+      port.owner_kind = "host";
+      port.dock_id = "";
+      port.hub_id = "";
+      port.confirmation = port.confirmation
+        || (port.state === "occupied" ? "observed_current" : "observed_history");
+    } else {
+      if (!groups.has(legacyOwner)) {
+        const id = `hub:legacy:${groups.size + 1}`;
+        groups.set(legacyOwner, id);
+        hubs.push({
+          id,
+          label: `未确认 USB 扩展设备 ${hubs.length + 1}`,
+          state: "connected",
+          classification: "unconfirmed_accessory",
+          classification_evidence: ["insufficient_identity"],
+          hub_refs: [],
+        });
+      }
+      port.owner_kind = "hub";
+      port.dock_id = "";
+      port.hub_id = groups.get(legacyOwner);
+      port.label = `${hubs.find((item) => item.id === port.hub_id)?.label || "未确认 USB 扩展设备"} · ${String(port.connector_type || "USB").toUpperCase()}`;
+    }
+    port.connector_form_factor = port.connector_form_factor || "unknown";
+    return port;
+  });
+  return {
+    ...topology,
+    schema_version: 2,
+    docks: [],
+    hubs,
+    usb_ports: ports,
+    errors: [...(Array.isArray(topology.errors) ? topology.errors : []), "schema v1 拓扑已按未确认 USB 扩展设备安全降级"],
+  };
+}
+
 function usbPhysicalCandidatesForRole(role) {
   const topology = state.usbTopology || {};
   const ports = Array.isArray(topology.usb_ports) ? topology.usb_ports : [];
@@ -4971,9 +5019,12 @@ function usbPhysicalCandidatesForRole(role) {
       topology_label: port.label || "USB 端口",
       group_label: ownerKind === "host"
         ? "电脑本机 USB-A 接口"
-        : `${String(port.label || "拓展坞").split(" · ")[0]} USB 接口`,
+        : ownerKind === "dock"
+        ? `${String(port.label || "拓展坞").split(" · ")[0]} USB 接口`
+        : `USB 扩展设备 · ${String(port.label || "未确认附件").split(" · ")[0]}`,
       owner_kind: ownerKind,
       dock_id: port.dock_id || "",
+      hub_id: port.hub_id || "",
       parent_port_id: port.id,
       physical_port_id: port.id,
       physical_interface_id: compatibleLive?.id || "",
@@ -5406,7 +5457,9 @@ async function discoverInterfaces() {
         (helper.sensor_bindings || []).map((item) => [String(item.role || ""), item]),
       );
       state.physicalInterfaces = physical;
-      state.usbTopology = helper.usb_topology || helper.raw_discovery?.usb_topology || null;
+      state.usbTopology = normalizeUsbTopology(
+        helper.usb_topology || helper.raw_discovery?.usb_topology || null,
+      );
       state.interfaceTransportCatalog = helper.interface_transport_catalog
         || helper.raw_discovery?.interface_transport_catalog || null;
       state.availableInterfaces = recognizedInterfacePortsFrom(helper.raw_discovery?.ports || []);
@@ -5480,7 +5533,7 @@ async function discoverInterfaces() {
     state.availableInterfaces = recognizedInterfacePortsFrom(result.ports || []);
     state.physicalInterfaces = Array.isArray(result.physical_interfaces)
       ? result.physical_interfaces : [];
-    state.usbTopology = result.usb_topology || null;
+    state.usbTopology = normalizeUsbTopology(result.usb_topology || null);
     state.interfaceTransportCatalog = result.interface_transport_catalog || null;
     const defaults = result.defaults || [];
     state.interfaceCatalog = autoAssignPhysicalInterfaces(
@@ -5520,7 +5573,7 @@ function restoreCachedRealInterfaceSnapshot() {
   state.interfaceCatalog = snapshot.catalog.map((item) => ({...item}));
   state.physicalInterfaces = (snapshot.physical || []).map((item) => ({...item}));
   state.availableInterfaces = (snapshot.available || []).map((item) => ({...item}));
-  state.usbTopology = snapshot.usbTopology || null;
+  state.usbTopology = normalizeUsbTopology(snapshot.usbTopology || null);
   state.interfaceTransportCatalog = snapshot.interfaceTransportCatalog || null;
   renderInterfacePanel(state.interfaceCatalog);
   return true;
