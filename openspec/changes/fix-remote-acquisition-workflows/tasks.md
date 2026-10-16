@@ -224,4 +224,4 @@
 - [x] 25.1 以临时采集根复现 pending 与 `.partial` 门禁只在启动时扫描、人工处理后内存状态仍需重启刷新的问题，并保存不含正式采集数据和凭据的失败证据
 - [x] 25.2 先增加失败回归，覆盖默认保留、MySQL 重试失败保留、双重确认、精确条目范围、越界与符号链接拒绝、活动采集拒绝、即时状态刷新及完成 CSV/配置不受影响
 - [x] 25.3 实现本机管理专用的恢复状态与显式处理服务/API/界面，保持普通启动、重启、检查和重试不丢数据，并返回脱敏审计结果
-- [ ] 25.4 将恢复合同绑定到 Harness 的存储检查，运行 acquisition、storage/recovery、frontend、OpenSpec 与相关 release gate 回归
+- [x] 25.4 将恢复合同绑定到 Harness 的存储检查，运行 acquisition、storage/recovery、frontend、OpenSpec 与相关 release gate 回归
