@@ -37,4 +37,4 @@
 - [x] 5.2 合同测试调用生产探测、发布、切换、会话和命令入口，替身仅用于 DNS、HTTP、文件和进程外部边界
 - [x] 5.3 公网入口专项、Helper/relay、visualization_app、Harness、modular runtime、OpenSpec strict 和 `git diff --check` 全部通过
 - [x] 5.4 对完整分支执行独立代码审查，修复所有 Critical 和 Important 问题并重新运行相关测试及全量门禁
-- [ ] 5.5 仅在全部门禁通过后提交实现、合并到 `main` 并推送 GitHub；不得自动部署固定运行目录、重启现有服务或执行双机步骤 3
+- [x] 5.5 仅在全部门禁通过后提交实现、合并到 `main` 并推送 GitHub；不得自动部署固定运行目录、重启现有服务或执行双机步骤 3
