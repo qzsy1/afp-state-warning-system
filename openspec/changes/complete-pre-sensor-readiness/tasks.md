@@ -38,3 +38,4 @@
 - [x] 5.3 公网入口专项、Helper/relay、visualization_app、Harness、modular runtime、OpenSpec strict 和 `git diff --check` 全部通过
 - [x] 5.4 对完整分支执行独立代码审查，修复所有 Critical 和 Important 问题并重新运行相关测试及全量门禁
 - [x] 5.5 仅在全部门禁通过后提交实现、合并到 `main` 并推送 GitHub；不得自动部署固定运行目录、重启现有服务或执行双机步骤 3
+- [x] 5.6 Native 部署兼容尚无预约接口的旧运行时，在停服后建立持久预约，并以 `awaiting_helper` 保留回滚材料直至 Helper 就绪后显式收尾

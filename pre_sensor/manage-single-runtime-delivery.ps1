@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("Inventory", "Stage", "Switchover", "StartupPreview", "StartupApply", "Evidence", "CleanupPreview", "Cleanup", "Report", "Rollback")]
+    [ValidateSet("Inventory", "Stage", "Switchover", "FinalizeSwitchover", "StartupPreview", "StartupApply", "Evidence", "CleanupPreview", "Cleanup", "Report", "Rollback")]
     [string]$Mode,
     [string]$WorkspaceRoot = "",
     [string]$ReferenceRelease = "",
@@ -14,7 +14,9 @@ param(
     [string]$GitRef = "HEAD",
     [string]$EvidenceSource = "",
     [string[]]$CleanupTargets = @(),
-    [string]$PreviewPath = ""
+    [string]$PreviewPath = "",
+    [switch]$LegacyBootstrap,
+    [switch]$AllowPendingHelper
 )
 
 $ErrorActionPreference = "Stop"
@@ -95,19 +97,135 @@ if ($Mode -eq "Switchover") {
         if (-not $listenerProcess.Count) { throw "The approved 8770 listener is not a fixed-runtime AFP process." }
     }
     $script:oldProcesses = @()
+    $script:legacyBootstrapStopped = $false
+    $script:watchdogWasRunning = $false
+    $script:stoppedHelperProcesses = @()
     $script:activePromotion = $null
     $script:verifiedServices = $null
     $failureEvidence = Join-Path $evidenceDir "switchover-failure.json"
     $rollbackEvidence = Join-Path $evidenceDir "switchover-rollback.json"
-    $transaction = Invoke-AfpVerifiedRuntimePromotion `
-        -StagingPath $StagingPath `
-        -Paths $paths `
-        -ApprovedInventoryDigest $ApprovedInventoryDigest `
-        -CurrentInventory $inventory `
-        -FailureEvidencePath $failureEvidence `
-        -RollbackEvidencePath $rollbackEvidence `
-        -StopRunner {
+    $legacyBootstrapRunner = if ($LegacyBootstrap) {
+        {
+            $localStatus = try {
+                Invoke-RestMethod -Uri "http://127.0.0.1:8771/api/acquisition/status" -Method Get -TimeoutSec 5
+            } catch {
+                return [pscustomobject]@{ allowed = $false; error = "legacy_local_status_unavailable" }
+            }
+            if ([bool]$localStatus.running) {
+                return [pscustomobject]@{ allowed = $false; error = "legacy_active_local_capture" }
+            }
+
+            $currentManifest = Get-Content -LiteralPath (Join-Path $paths.RuntimeRoot "RELEASE-MANIFEST.json") `
+                -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+            $currentCandidateId = [string]$currentManifest.candidate.candidate_id
+            Import-Module (Join-Path $paths.SourceRoot "visualization_app\PublicIngress.psm1") -Force -ErrorAction Stop
+            $legacyPublicEdgeProbe = {
+                param($Name, $Target, $ExpectedHash)
+                try {
+                    $targetUri = [Uri]$Target
+                    foreach ($address in @(Resolve-AfpPublicEdgeAddresses -HostName $targetUri.DnsSafeHost)) {
+                        $probe = Invoke-AfpForcedPublicProbe -Uri $targetUri -Address $address `
+                            -ExpectedSha256 $ExpectedHash
+                        if ([bool]$probe.ok) {
+                            return [pscustomobject]@{ passed = $true; detail = "ok" }
+                        }
+                    }
+                } catch {}
+                return [pscustomobject]@{ passed = $false; detail = "forced public edge probe failed" }
+            }
+            $currentServices = Test-AfpRuntimeServices -RuntimeRoot $paths.RuntimeRoot `
+                -PublicUrl $PublicUrl -LanIPv4 $LanIPv4 -ExpectedCandidateId $currentCandidateId `
+                -FunnelOrigin $FunnelOrigin -PublicEdgeProbeRunner $legacyPublicEdgeProbe
+            if ([string]$currentServices.status -ne "passed") {
+                return [pscustomobject]@{ allowed = $false; error = "legacy_current_service_gate_failed" }
+            }
+
+            $statePath = Join-Path $paths.RuntimeRoot "runtime\public-ingress-state.json"
+            if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
+                $layers = @{}
+                foreach ($check in @($currentServices.checks)) {
+                    $layers[[string]$check.name] = @{ ok = [bool]$check.passed; code = [string]$check.detail }
+                }
+                $layers.ingress = @{ ok = $true; code = "legacy_ingress_initialized" }
+                $layers.helper = @{ ok = $false; code = "helper_reconciliation_required" }
+                $hostName = ([Uri]$PublicUrl).DnsSafeHost.ToLowerInvariant()
+                $provider = if ($hostName.EndsWith(".ts.net")) { "tailscale" } `
+                    elseif ($hostName.EndsWith(".trycloudflare.com")) { "cloudflare" } `
+                    else { "external" }
+                Publish-AfpPublicIngressState -Path $statePath -PublicUrl $PublicUrl `
+                    -Provider $provider -RecoveryOwner $provider -CandidateId $currentCandidateId `
+                    -Layers $layers | Out-Null
+            }
+
+            $watchdog = Get-ScheduledTask -TaskName "AFP Public Tunnel Watchdog" -ErrorAction SilentlyContinue
+            $script:watchdogWasRunning = $null -ne $watchdog -and [string]$watchdog.State -eq "Running"
+            if ($script:watchdogWasRunning) {
+                Stop-ScheduledTask -TaskName "AFP Public Tunnel Watchdog" -ErrorAction Stop
+            }
+            $runtimePrefix = [IO.Path]::GetFullPath($paths.RuntimeRoot).TrimEnd('\') + '\'
+            $script:stoppedHelperProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+                $_.Name -eq "AFP_Local_Capture_Helper.exe" -and $_.ExecutablePath -and
+                [IO.Path]::GetFullPath([string]$_.ExecutablePath).StartsWith($runtimePrefix, [StringComparison]::OrdinalIgnoreCase)
+            } | Select-Object ProcessId, ExecutablePath, CommandLine)
+            foreach ($helperProcess in $script:stoppedHelperProcesses) {
+                Stop-Process -Id ([int]$helperProcess.ProcessId) -Force -ErrorAction Stop
+                Wait-Process -Id ([int]$helperProcess.ProcessId) -Timeout 15 -ErrorAction SilentlyContinue
+            }
             $script:oldProcesses = @(Stop-AfpManagedRuntimeProcesses -Inventory $inventory -RuntimeExecutable $exe)
+            $script:legacyBootstrapStopped = $true
+
+            $python = Join-Path $paths.SourceRoot ".venv\Scripts\python.exe"
+            $reservationText = @(& $python (Join-Path $paths.SourceRoot "pre_sensor\legacy-cutover-reservation.py") `
+                --runtime-root $paths.RuntimeRoot --candidate-id $currentCandidateId --ttl-seconds 600 2>$null)
+            $reservationExit = $LASTEXITCODE
+            $reservation = if ($reservationText.Count) {
+                ($reservationText -join "`n") | ConvertFrom-Json -ErrorAction Stop
+            } else {
+                $null
+            }
+            if ($reservationExit -ne 0 -or -not $reservation -or -not [bool]$reservation.allowed) {
+                Start-AfpManagedRuntimeProcesses -Processes $script:oldProcesses -RuntimeExecutable $exe `
+                    -WorkingDirectory $paths.RuntimeRoot | Out-Null
+                if ($script:watchdogWasRunning) {
+                    Start-ScheduledTask -TaskName "AFP Public Tunnel Watchdog" -ErrorAction SilentlyContinue
+                }
+                $script:legacyBootstrapStopped = $false
+                return [pscustomobject]@{ allowed = $false; error = "legacy_persisted_readiness_blocked" }
+            }
+            return $reservation
+        }
+    } else {
+        $null
+    }
+    $pendingHelperRunner = if ($AllowPendingHelper) {
+        {
+            param($Ingress)
+            try {
+                Invoke-RestMethod -Uri "http://127.0.0.1:8771/api/ingress/helper-readiness" `
+                    -Method Get -TimeoutSec 5
+            } catch {
+                [pscustomobject]@{ ready = $false; error = "helper_readiness_unavailable" }
+            }
+        }
+    } else {
+        $null
+    }
+    $transactionParameters = @{
+        StagingPath = $StagingPath
+        Paths = $paths
+        ApprovedInventoryDigest = $ApprovedInventoryDigest
+        CurrentInventory = $inventory
+        FailureEvidencePath = $failureEvidence
+        RollbackEvidencePath = $rollbackEvidence
+        AllowPendingHelper = $AllowPendingHelper
+    }
+    if ($legacyBootstrapRunner) { $transactionParameters.LegacyBootstrapRunner = $legacyBootstrapRunner }
+    if ($pendingHelperRunner) { $transactionParameters.HelperReadinessRunner = $pendingHelperRunner }
+    $transaction = Invoke-AfpVerifiedRuntimePromotion @transactionParameters `
+        -StopRunner {
+            if (-not $script:legacyBootstrapStopped) {
+                $script:oldProcesses = @(Stop-AfpManagedRuntimeProcesses -Inventory $inventory -RuntimeExecutable $exe)
+            }
         } `
         -PromotionRunner {
             $script:activePromotion = Invoke-AfpRuntimePromotion -StagingPath $StagingPath -Paths $paths `
@@ -265,10 +383,79 @@ if ($Mode -eq "Switchover") {
             }
             return $rollbackServices
         }
+    if ($script:watchdogWasRunning) {
+        Start-ScheduledTask -TaskName "AFP Public Tunnel Watchdog" -ErrorAction SilentlyContinue
+    }
+    if ($transaction.status -eq "awaiting_helper") {
+        $pendingPath = Write-State "switchover-pending.json" $transaction
+        [pscustomobject]@{ transaction = $transaction; evidence = $pendingPath } | ConvertTo-Json -Depth 12
+        exit 0
+    }
     $transaction | ConvertTo-Json -Depth 12
     if ($transaction.status -eq "completed") { exit 0 }
     if ($transaction.status -eq "blocked") { exit 5 }
     exit 4
+}
+
+if ($Mode -eq "FinalizeSwitchover") {
+    if (-not $ExpectedCandidateId -or -not $PublicUrl) {
+        throw "FinalizeSwitchover requires ExpectedCandidateId and PublicUrl."
+    }
+    if (-not $PreviewPath) { $PreviewPath = Join-Path $evidenceDir "switchover-pending.json" }
+    if (-not (Test-Path -LiteralPath $PreviewPath -PathType Leaf)) {
+        throw "Pending switchover evidence is missing."
+    }
+    $pendingEnvelope = Get-Content -LiteralPath $PreviewPath -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+    $pending = if ($pendingEnvelope.PSObject.Properties["transaction"]) { $pendingEnvelope.transaction } else { $pendingEnvelope }
+    if ([string]$pending.status -ne "awaiting_helper") { throw "Switchover is not awaiting Helper completion." }
+    $manifest = Get-Content -LiteralPath (Join-Path $paths.RuntimeRoot "RELEASE-MANIFEST.json") `
+        -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+    if ([string]$manifest.candidate.candidate_id -cne $ExpectedCandidateId) {
+        throw "Runtime candidate identity mismatch."
+    }
+    $reservationPath = Join-Path $paths.RuntimeRoot "runtime\public-ingress-cutover.json"
+    if (Test-Path -LiteralPath $reservationPath -PathType Leaf) {
+        [pscustomobject]@{ status = "blocked"; error = "cutover_reservation_active" } | ConvertTo-Json
+        exit 5
+    }
+    $services = Wait-AfpRuntimeServices -RuntimeRoot $paths.RuntimeRoot -PublicUrl $PublicUrl `
+        -LanIPv4 $LanIPv4 -ExpectedCandidateId $ExpectedCandidateId -FunnelOrigin $FunnelOrigin `
+        -TimeoutSeconds 30 -PollIntervalMilliseconds 1000
+    if ([string]$services.status -ne "passed") { throw "runtime_service_gate_failed" }
+    $helper = Invoke-RestMethod -Uri "http://127.0.0.1:8771/api/ingress/helper-readiness" `
+        -Method Get -TimeoutSec 5
+    Import-Module (Join-Path $paths.RuntimeRoot "PublicIngress.psm1") -Force -ErrorAction Stop
+    $statePath = Join-Path $paths.RuntimeRoot "runtime\public-ingress-state.json"
+    $state = Read-AfpPublicIngressState -Path $statePath -ExpectedCandidateId $ExpectedCandidateId
+    if (
+        -not [bool]$helper.ready -or
+        [long]$helper.generation -ne [long]$state.generation -or
+        [string]$helper.candidate_id -cne $ExpectedCandidateId
+    ) {
+        [pscustomobject]@{ status = "blocked"; error = "helper_readiness_gate_failed" } | ConvertTo-Json
+        exit 5
+    }
+    $layers = @{}
+    foreach ($property in $state.layers.PSObject.Properties) {
+        $layers[$property.Name] = @{ ok = [bool]$property.Value.ok; code = [string]$property.Value.code }
+    }
+    $layers.ingress = @{ ok = $true; code = "ingress_committed" }
+    $layers.helper = @{ ok = $true; code = "helper_ready" }
+    $committed = Publish-AfpPublicIngressState -Path $statePath -PublicUrl ([string]$state.public_url) `
+        -Provider ([string]$state.provider) -RecoveryOwner ([string]$state.recovery_owner) `
+        -CandidateId ([string]$state.candidate_id) -Layers $layers `
+        -ExpectedGeneration ([long]$state.generation)
+    Complete-AfpRuntimePromotion -Promotion $pending.promotion -Paths $paths
+    $result = [pscustomobject]@{
+        status = "completed"
+        candidate_id = $ExpectedCandidateId
+        generation = [long]$committed.generation
+        services = $services
+        helper = $helper
+    }
+    $completedPath = Write-State "switchover-completed.json" $result
+    [pscustomobject]@{ transaction = $result; evidence = $completedPath } | ConvertTo-Json -Depth 12
+    exit 0
 }
 
 if ($Mode -eq "StartupPreview") {

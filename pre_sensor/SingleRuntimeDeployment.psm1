@@ -490,6 +490,7 @@ function Invoke-AfpVerifiedRuntimePromotion {
         [Parameter(Mandatory = $true)][string]$ApprovedInventoryDigest,
         [Parameter(Mandatory = $true)][psobject]$CurrentInventory,
         [scriptblock]$CutoverReadinessRunner,
+        [scriptblock]$LegacyBootstrapRunner,
         [scriptblock]$CutoverReleaseRunner,
         [scriptblock]$StopRunner,
         [scriptblock]$PromotionRunner,
@@ -501,6 +502,7 @@ function Invoke-AfpVerifiedRuntimePromotion {
         [scriptblock]$CompletionRunner,
         [scriptblock]$RestoreRunner,
         [scriptblock]$RollbackProbeRunner,
+        [switch]$AllowPendingHelper,
         [string]$FailureEvidencePath = "",
         [string]$RollbackEvidencePath = ""
     )
@@ -521,6 +523,14 @@ function Invoke-AfpVerifiedRuntimePromotion {
         } catch {
             [pscustomobject]@{ allowed = $false; error = "cutover_readiness_unavailable" }
         }
+    }
+    if (
+        (-not $readiness -or -not [bool]$readiness.allowed) -and
+        $LegacyBootstrapRunner -and
+        $readiness -and
+        [string]$readiness.error -eq "cutover_readiness_unavailable"
+    ) {
+        $readiness = & $LegacyBootstrapRunner
     }
     if (-not $readiness -or -not [bool]$readiness.allowed) {
         return [pscustomobject][ordered]@{
@@ -593,7 +603,19 @@ function Invoke-AfpVerifiedRuntimePromotion {
             $current
         }
         if (-not $helper -or -not [bool]$helper.ready) {
-            throw "helper_readiness_gate_failed"
+            if (-not $AllowPendingHelper) { throw "helper_readiness_gate_failed" }
+            if (-not (& $releaseReservation)) {
+                throw "cutover_reservation_release_failed"
+            }
+            $transactionResult = [pscustomobject][ordered]@{
+                status = "awaiting_helper"
+                promotion = $promotion
+                services = $services
+                ingress = $ingress
+                helper = $helper
+                completion_required = $true
+            }
+            return $transactionResult
         }
         $ingressGenerationProperty = $ingress.PSObject.Properties["generation"]
         $helperGenerationProperty = $helper.PSObject.Properties["generation"]

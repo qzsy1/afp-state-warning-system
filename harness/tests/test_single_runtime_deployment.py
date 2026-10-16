@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,7 @@ MODULE = ROOT / "pre_sensor" / "SingleRuntimeDeployment.psm1"
 PATH_MODULE = ROOT / "pre_sensor" / "SingleRuntimePaths.psm1"
 PATH_CONFIG = ROOT / "pre_sensor" / "single-runtime-paths.json"
 CLI = ROOT / "pre_sensor" / "manage-single-runtime-delivery.ps1"
+LEGACY_RESERVATION = ROOT / "pre_sensor" / "legacy-cutover-reservation.py"
 
 
 def _ps_quote(value: Path | str) -> str:
@@ -37,6 +39,52 @@ def _run_ps(script: str) -> subprocess.CompletedProcess[str]:
 
 
 class SingleRuntimeDeploymentTests(unittest.TestCase):
+    def test_legacy_reservation_is_persisted_without_plaintext_token(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            runtime = Path(temporary) / "runtime-root"
+            state_root = runtime / "runtime"
+            state_root.mkdir(parents=True)
+            (state_root / "public-ingress-state.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "generation": 1,
+                        "public_url": "https://example.test",
+                        "provider": "external",
+                        "recovery_owner": "external",
+                        "candidate_id": "candidate-old",
+                        "status": "degraded",
+                        "published_at": "2026-10-16T00:00:00+00:00",
+                        "layers": {"helper": {"ok": False, "code": "pending"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(LEGACY_RESERVATION),
+                    "--runtime-root",
+                    str(runtime),
+                    "--candidate-id",
+                    "candidate-old",
+                    "--ttl-seconds",
+                    "60",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["allowed"])
+            self.assertTrue(payload["reservation_id"])
+            persisted = (state_root / "public-ingress-cutover.json").read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn(payload["reservation_id"], persisted)
+
     def test_service_gate_rejects_split_dns_success_without_forced_edge(self) -> None:
         script = rf"""
 $ErrorActionPreference = 'Stop'
@@ -74,6 +122,52 @@ $result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([ps
     -CutoverReadinessRunner {{ [pscustomobject]@{{ allowed = $false; active_capture_uuids = @('capture-a') }} }} `
     -StopRunner {{ $script:stops++ }} -StartRunner {{ }} -ServiceProbeRunner {{ }} -IngressPublisher {{ }} -CompletionRunner {{ }} -RestoreRunner {{ }}
 if ($result.status -ne 'blocked' -or $script:stops -ne 0) {{ throw ($result | ConvertTo-Json -Depth 8) }}
+"""
+        result = _run_ps(script)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+    def test_legacy_bootstrap_runs_only_for_missing_reservation_endpoint(self) -> None:
+        script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(MODULE)} -Force
+$events = [Collections.Generic.List[string]]::new()
+$inventory = [pscustomobject]@{{ digest = 'approved'; processes = @() }}
+$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='F:\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
+    -CutoverReadinessRunner {{ [pscustomobject]@{{ allowed=$false; error='cutover_readiness_unavailable' }} }} `
+    -LegacyBootstrapRunner {{ $events.Add('legacy'); [pscustomobject]@{{ allowed=$false; error='legacy_blocked' }} }} `
+    -StopRunner {{ $events.Add('stop') }}
+if ($result.status -ne 'blocked' -or ($events -join ',') -ne 'legacy') {{ throw ($result | ConvertTo-Json -Depth 8) }}
+
+$events.Clear()
+$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='F:\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
+    -CutoverReadinessRunner {{ [pscustomobject]@{{ allowed=$false; error='active_capture' }} }} `
+    -LegacyBootstrapRunner {{ $events.Add('legacy'); [pscustomobject]@{{ allowed=$true }} }} `
+    -StopRunner {{ $events.Add('stop') }}
+if ($result.status -ne 'blocked' -or $events.Count -ne 0) {{ throw ($result | ConvertTo-Json -Depth 8) }}
+"""
+        result = _run_ps(script)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+    def test_explicit_pending_helper_keeps_verified_runtime_and_skips_completion(self) -> None:
+        script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(MODULE)} -Force
+$events = [Collections.Generic.List[string]]::new()
+$inventory = [pscustomobject]@{{ digest = 'approved'; processes = @() }}
+$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='F:\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory -AllowPendingHelper `
+    -CutoverReadinessRunner {{ [pscustomobject]@{{ allowed=$true; reservation_id='lease' }} }} `
+    -CutoverReleaseRunner {{ param($ReservationId) $events.Add('release'); [pscustomobject]@{{ released=$true }} }} `
+    -StopRunner {{ $events.Add('stop') }} `
+    -PromotionRunner {{ $events.Add('promote'); [pscustomobject]@{{ status='switched'; swap_path='F:\swap' }} }} `
+    -StartRunner {{ $events.Add('start') }} `
+    -ServiceProbeRunner {{ $events.Add('edge'); [pscustomobject]@{{ status='passed' }} }} `
+    -IngressPublisher {{ $events.Add('ingress'); [pscustomobject]@{{ generation=4 }} }} `
+    -HelperReadinessRunner {{ param($Ingress) $events.Add('helper'); [pscustomobject]@{{ ready=$false; generation=$Ingress.generation }} }} `
+    -IngressCommitter {{ $events.Add('commit') }} `
+    -CompletionRunner {{ $events.Add('complete') }} `
+    -RestoreRunner {{ $events.Add('restore') }}
+if ($result.status -ne 'awaiting_helper' -or -not $result.completion_required) {{ throw ($result | ConvertTo-Json -Depth 8) }}
+if (($events -join ',') -ne 'stop,promote,start,edge,ingress,helper,release') {{ throw ($events -join ',') }}
 """
         result = _run_ps(script)
         self.assertEqual(result.returncode, 0, msg=result.stderr)
@@ -505,6 +599,9 @@ if ($same.uri -notmatch '^https://example\.test/app\.js\?afp_identity_check=') {
         self.assertIn("ExpectedPreviousCandidateId", source)
         self.assertIn("MinimumGeneration", source)
         self.assertIn("FailedIngressGeneration", source)
+        self.assertIn('"FinalizeSwitchover"', source)
+        self.assertIn("legacy-cutover-reservation.py", source)
+        self.assertIn("cutover_reservation_active", source)
         self.assertIn(
             r"F:\AFP_Integrated_Modular_v2\delivery\AFP_Integrated_System_Modular_v2.0.3_Agentic",
             source,
