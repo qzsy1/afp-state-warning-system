@@ -4,7 +4,7 @@
 
 参见 `proposal.md` 的动机。当前 `AcquisitionManager.discover_interfaces()` 把串口、SMRF HID、UVC 驱动占位和带 IPv4 地址的网卡放入同一个 `physical_interfaces` 扁平数组；空 USB 端口没有对应 PnP 设备，因此现有枚举无法看到。前端 `physicalCandidatesForRole()` 只接受与逻辑接口完全相同的 `kind`，`refreshPhysicalInterfaceOptions()` 生成单层下拉框。`LocalCaptureAgent.discover()` 复用相同结果为五类逻辑接口分配实时设备。
 
-当前连接的拓展坞由 Windows 表现为 Genesys Logic USB 2.x Hub（VID 05E3、PID 0610）、SuperSpeed Hub（VID 05E3、PID 0626）以及挂在 SuperSpeed Hub 下的 ASIX AX88179B 网卡（VID 0B95、PID 1790）。目标实物有三个用户可连接 USB 3.0 口和一个网口。设计必须避免把两套 Hub 通道计为六个端口，也不能把连接内置网卡的内部端口算作第四个用户 USB 口。当前规范化阶段排除 Root Hub，因此电脑机身的空闲 USB 连接器缺失；前端又把 `physical_kind` 当成物理类型，导致 USB 转串口 COM 与其实际 USB 端口分离。
+Windows 会以相同的 Hub 设备类表示电脑内部 Hub、普通外接 Hub 和拓展坞中的 Hub，且没有覆盖所有 USB、USB-C 与复合设备厂商的统一拓展坞标志。设备容器用于聚合同一物理设备的多个功能节点，端口可移除性和 `PortIsUserConnectable` 用于区分集成与外接路径，伴随端口关系用于合并共享连接器；这些证据必须组合使用。目标实物的 Genesys Logic USB 2.x/SuperSpeed Hub 与 ASIX 网卡继续作为正向兼容样例，但其 VID/PID 不是通用分类规则。
 
 Windows 8 及以后提供用户态 USB Hub IOCTL，可枚举端口连接状态，并通过 `IOCTL_USB_GET_PORT_CONNECTOR_PROPERTIES` 获得共享连接器的伴随 Hub 与端口关系。发行程序为冻结 Python 应用，方案需要避免要求用户安装 Windows SDK、USBView 或额外驱动。
 
@@ -13,6 +13,8 @@ Windows 8 及以后提供用户态 USB Hub IOCTL，可枚举端口连接状态�
 **Goals:**
 
 - 生成能够表达拓展坞、共享物理连接器、实时设备和内置网口的规范化拓扑。
+- 在不同电脑、主机控制器和 Root Hub 路径下，根据设备自身及 Windows 通用属性得到一致的设备归属分类。
+- 普通外接 Hub 和证据不足的 USB 扩展设备保持端口可见，但不得显示为已确认拓展坞。
 - 让 USB 类接口看到所有外部 USB 口，并在空闲、占用、异常和断开之间保持明确状态。
 - 同时纳入能够由 Windows 确认的电脑原生用户可连接 USB 端口，并把 HID、UVC、COM 当作端口下的通信端点。
 - 为热电偶、UVC、M3232、PLC 和 ABB 生成可解释、稳定且尊重手动选择的默认物理绑定。
@@ -54,17 +56,19 @@ Windows 8 及以后提供用户态 USB Hub IOCTL，可枚举端口连接状态�
 
 **替代方案：** 按两套 Hub 端口序号直接一一配对。不同厂商可能改变端口编号或包含内部端口，该方法会错误合并，故不采用。
 
-### 3. 拓展坞使用“用户可连接”属性，本机 Root Hub 还需物理证据
+### 3. 使用设备容器、外接性和功能组成分类设备归属
 
-若连接器属性明确报告是否可供用户连接，以此区分外部端口和固定内部功能。无法获得该属性时，默认保持端口可见，避免隐藏真实接口。针对当前实物建立窄范围、版本化规则：只有 Hub VID/PID、父级关系、端口布局和 ASIX VID/PID 全部匹配时，才将相应端口建模为 `internal_function=ethernet`，并把 ASIX 设备投影到该拓展坞的以太网接口。
+拓扑提供器读取 `DEVPKEY_Device_ContainerId`、移除策略、设备能力、设备类别、父子 devnode、Location Path、端口用户可连接属性和伴随端口关系。ContainerId 和设备类别在返回给页面前转换为稳定摘要或有限枚举，不公开原始系统标识。
 
-Root Hub 的 `PortIsUserConnectable` 在部分电脑上会覆盖同一平台不同配置的预留或未布线端口，不能单独证明机身插孔存在。本机 USB-A 只有在用户可连接属性成立且当前出现设备、稳定端口 ID 已存在于本机观察记录，或系统提供 USB2 与 SuperSpeed 伴随连接器关系时才进入候选；只有 `user_connectable=true` 且没有伴随关系的空逻辑端口仍被排除。观察记录写入本机可变运行目录，不进入发行清单；设备拔出后依靠该记录保留空闲端口。
+分类器先判断设备是否属于电脑本体。Hub 与电脑或 Root Hub 使用相同设备容器、上游端口被系统报告为不可移除或不可供用户连接，均属于电脑集成路径；其中经过当前占用、历史观察或明确伴随关系确认的用户可连接下行口以 `owner_kind=host` 发布，内部固定功能和未确认空逻辑端口不进入候选。
 
-`IOCTL_USB_GET_PORT_CONNECTOR_PROPERTIES` 的 `PortIsTypeC` 单独保存为 `connector_form_factor=type_c|type_a|unknown`，不得再用 `connector_type=usb2|usb3` 代替插座形态。Type-C 仍保留在拓扑中以表达拓展坞上游或当前设备关系，并使用“Type-C”标签；当前传感器使用的 USB-A 候选池排除 Type-C 和 `internal_function=dock_upstream`。因此连接在 Type-C 上的拓展坞或手机不会增加“电脑本机 USB-A 接口”数量，拓展坞三个下行 USB-A 仍单独显示。
+独立于电脑容器且由可移除属性、用户可连接上游或设备自带 ContainerId 确认的物理设备属于外接附件。外接附件只有同时具备外接性证据和拓展坞角色证据时才使用 `owner_kind=dock`：拓展坞角色证据来自设备类别明确声明，或同一物理设备容器内同时存在用户可连接 Hub 端口与网卡、显示、音频等非 Hub 功能。仅包含 Hub 功能或证据不足的附件使用 `owner_kind=hub`，显示为“USB 集线器”或“未确认 USB 扩展设备”，其端口和实时端点继续参与候选。
 
-规则不依赖当前动态 COM 号或 IPv4 地址。规则未完全匹配时不排除端口，并输出原因供测试和诊断。
+VID/PID、友好名称、端口数量、枚举顺序和当前电脑的位置路径均不得单独产生 `dock` 分类。版本化硬件配置只能在已经确认的外接附件中补充端口布局或内部功能，不能绕过外接性和拓展坞角色证据。没有可跨电脑使用的设备属性时，分类降级为未确认附件，而不是根据主机路径猜测。
 
-**替代方案：** 所有网卡设备所在端口都视为内部端口。这会隐藏用户外接的 USB 网卡，故不采用。
+`IOCTL_USB_GET_PORT_CONNECTOR_PROPERTIES` 的 `PortIsTypeC` 单独保存为 `connector_form_factor=type_c|type_a|unknown`，不得用 `connector_type=usb2|usb3` 代替插座形态。Type-C 保留在拓扑中表达上游关系；当前传感器使用的 USB-A 候选池排除 Type-C 和 `internal_function=dock_upstream`。
+
+**替代方案：** 维护特定电脑或 VID/PID 黑名单。该方案更换电脑、主板或相同芯片应用形态后即失效，也会把普通 Hub 与拓展坞混为一类，因此不采用。
 
 ### 4. 拓扑数据与兼容的物理接口投影并存
 
@@ -75,9 +79,11 @@ usb_topology
 ├─ schema_version
 ├─ state / provider / errors
 ├─ docks[]
-│  └─ id, label, state, upstream_location, hub_refs[]
+│  └─ id, label, state, classification_evidence[], hub_refs[]
+├─ hubs[]
+│  └─ id, label, state, classification, classification_evidence[], hub_refs[]
 ├─ usb_ports[]
-│  └─ id, dock_id, system_port_number, connector_type,
+│  └─ id, owner_kind, dock_id, hub_id, system_port_number, connector_type,
 │     connector_form_factor, supported_protocols[], state,
 │     user_connectable, device_id
 └─ devices[]
@@ -85,7 +91,7 @@ usb_topology
       serial, live_interface_id
 ```
 
-`physical_interfaces` 继续承载可被现有驱动打开的实时设备和网卡，并为能够定位的项目补充 `dock_id`、`parent_port_id` 与系统生成的 `topology_label`。`usb_ports` 承载空端口和端口状态，不伪装为已验证设备。
+`schema_version=2`。`docks[]` 只包含证据充分的拓展坞，`hubs[]` 包含普通外接 Hub 和未确认 USB 扩展设备；`owner_kind=host|dock|hub` 与 `dock_id`、`hub_id` 的引用必须一致。`physical_interfaces` 继续承载可被现有驱动打开的实时设备和网卡，并为能够定位的项目补充所属设备引用、`parent_port_id` 与系统生成的 `topology_label`。`usb_ports` 承载空端口和端口状态，不伪装为已验证设备。schema v1 结果只能兼容投影为未确认 USB 扩展设备，不继承其拓展坞结论。
 
 **替代方案：** 用端口记录替换 `physical_interfaces`。这会让驱动失去 HID path、COM 和 UVC 端点并破坏旧 helper，故采用并行扩展契约。
 
@@ -105,11 +111,11 @@ USB 类接口增加可选 `physical_port_id`，表示操作员选择的物理连
 
 后端返回规范化拓扑，前端只执行展示和按逻辑类型筛选：
 
-- 热电偶、UVC 和 M3232 共享 `usb_ports` 中全部用户可连接 USB-A 端口；标签包含电脑或拓展坞归属、系统端口号、连接器能力、状态和当前设备。Type-C 和拓展坞上游连接器保留在拓扑诊断中，但不进入这三个角色的 USB-A 候选池。
+- 热电偶、UVC 和 M3232 共享 `usb_ports` 中全部用户可连接 USB-A 端口；标签包含电脑、拓展坞或 USB 扩展设备归属、系统端口号、连接器能力、状态和当前设备。Type-C 和拓展坞上游连接器保留在拓扑诊断中，但不进入这三个角色的 USB-A 候选池。
 - HID、UVC 和 USB 转串口 COM 是物理 USB 端口下的实时通信端点。M3232 选择 USB 转串口时同时保存 `physical_port_id`、`physical_interface_id` 和 COM `endpoint`。
 - 只有无法关联 USB 父级或 USB 位置路径的真正主机原生 COM 才在 M3232 下显示为独立串口候选。
 - 以太网显示全部实时网卡；已知父级时显示“拓展坞网口”。
-- 通过 `<optgroup>` 或等效结构按“电脑本机 USB-A”“拓展坞 USB”“位置未解析的 USB 设备”“主机原生串口”和“网卡”组织，保持键盘选择和现有表单行为。
+- 通过 `<optgroup>` 或等效结构按“电脑本机 USB-A”“拓展坞 USB”“USB 扩展设备”“位置未解析的 USB 设备”“主机原生串口”和“网卡”组织，保持键盘选择和现有表单行为。
 
 前端不生成用户备注，不将 `USB3-1` 解释为物理左侧第一口。空闲和不兼容端口可作为计划位置选择，但启用真实采集前的校验显示具体阻断原因。真正的主机原生 COM 不进入 HID/UVC 候选列表。
 
@@ -119,7 +125,7 @@ USB 类接口增加可选 `physical_port_id`，表示操作员选择的物理连
 
 USB COM 优先通过 PnP 实例、父级链和 Location Path 定位物理端口；VID/PID/序列号只在结果唯一时回退。无法解析位置的原有 HID/UVC/USB 串口仍保留在“位置未解析的 USB 设备”组，避免拓扑增强删除旧候选。物理端口先按 `physical_port_id` 去重，未定位端点再按实时接口 ID 和 endpoint 去重。
 
-拓扑提供器同时处理 Root Hub 中系统报告为用户可连接且已被当前占用、历史观察或 USB2/SuperSpeed 伴随关系确认的端口。Root Hub 内部功能、未配对且未观察到的预留/未布线空逻辑端口和已确认不可供用户连接的端口不进入候选。拓展坞 Type-C 上游连接只作为拓扑关系保留，拓展坞下行 USB-A 端口单独归入拓展坞候选。Root Hub 属性或物理证据不足时不伪造空端口，但保留已枚举实时设备作为兼容降级。
+拓扑提供器同时处理 Root Hub 和电脑集成 Hub 中系统报告为用户可连接且已被当前占用、历史观察或 USB2/SuperSpeed 伴随关系确认的端口。内部固定功能、未配对且未观察到的预留/未布线空逻辑端口和已确认不可供用户连接的端口不进入候选。外接普通 Hub、未确认 USB 扩展设备和已确认拓展坞的用户可连接 USB-A 端口均保留在候选池中，但分组和标签不得互相冒充。
 
 ### 11. 默认选择使用确定性优先级并记录选择来源
 
@@ -150,9 +156,11 @@ Git LFS 继续承载完整 v2.0.4 中已配置的大文件；实现阶段应校�
 ## Risks / Trade-offs
 
 - [厂商固件不完整或错误报告伴随端口] → 仅接受显式伴随映射或完整匹配的窄范围规则；不确定时保留端口并标记未知。
+- [Windows 没有覆盖全部厂商的统一拓展坞标志] → 组合设备容器、外接性、用户可连接上游、设备类别和多功能组成；证据不足时使用普通或未确认 USB 扩展设备分类，保持端口可用但不宣称为拓展坞。
+- [更换电脑后主机控制器与 Location Path 改变] → 设备类别判断只使用设备自身容器、移除策略、功能组成和连接器关系；主机位置仅参与当前电脑上的端口身份，不参与拓展坞类别判定。
 - [Root Hub 将预留或未布线端口报告为用户可连接] → 仅发布当前实际占用、本机历史观察确认或具有明确 USB2/SuperSpeed 伴随关系的 USB-A；通过稳定 ID 记录使已观察端口在拔出设备后仍保持可见。
 - [Type-C 同样承载 USB 协议而被误计为 USB-A] → 分开保存协议能力与连接器形态，Type-C 只保留在拓扑诊断和上游关系中，不进入当前传感器的 USB-A 候选池。
-- [当前拓展坞内部网卡端口缺少用户可连接标志] → 使用包含 Hub、父级、布局和 ASIX 身份的版本化规则，并以三 USB 加一网口实物验收防止误隐藏。
+- [拓展坞内部网卡端口缺少用户可连接标志] → 使用同一物理设备容器、父子关系和不可外接端口属性确认内部功能，并以三 USB 加一网口实物验收防止误隐藏。
 - [无序列号拓展坞移动到另一上游端口后身份变化] → 使用位置相关 ID 并明确不跨位置继承；避免把另一台同型号拓展坞误认为原设备。
 - [冻结运行时 ctypes 结构体布局错误] → 对齐 Windows SDK 结构定义，增加大小、偏移、二进制夹具和真实 Windows smoke test；API 失败时局部降级。
 - [旧 helper 不理解新增字段] → 新字段只做向后兼容扩展；服务端检测 `schema_version`，旧 helper 仍返回现有扁平接口且页面标记拓扑不可用。
@@ -161,12 +169,10 @@ Git LFS 继续承载完整 v2.0.4 中已配置的大文件；实现阶段应校�
 
 ## Migration Plan
 
-1. 先加入拓扑提供器和纯夹具测试，默认不改变现有 `physical_interfaces` 输出。
-2. 扩展 `discover_interfaces()` 与 helper 契约；旧客户端忽略新增 `usb_topology` 字段。
-3. 增加 `physical_port_id` 的兼容解析和校验，旧配置继续按设备级绑定运行。
-4. 更新前端分组展示和端口预选，在真实采集前保持现有协议与数据门禁。
-5. 使用当前拓展坞逐口插拔，确认三个 USB 口、一个 ASIX 网口、伴随通道合并和重连稳定性。
-6. 同步并重建唯一 v2.0.4 发行目录，执行回归、哈希和 Git LFS 校验后提交。
-7. 更新同一 v2.0.4 的外置代码后重新打开软件，确认旧驻留服务不会被复用，健康接口指纹与当前发行清单一致，并重新检查拓展坞接口下拉列表。
+1. 在拓扑提供器中读取设备容器、移除策略、设备类别和父子关系，并以不包含固定主机标识的夹具验证分类。
+2. 将 `usb_topology` 升级为 schema v2，扩展 `discover_interfaces()`、传输目录和 helper 契约；schema v1 仅降级为未确认 USB 扩展设备。
+3. 更新前端分组展示和端口预选，使普通 Hub 与未确认附件保持可用但不显示为拓展坞，并保持现有协议与数据门禁。
+4. 在至少两组不同主机控制器、Root Hub 和 Location Path 夹具上验证分类一致，再使用目标拓展坞与无拓展坞电脑完成现场检查。
+5. 同步并重建唯一 v2.0.4 发行目录，执行回归、哈希、驻留服务替换和 Git LFS 校验。
 
 回滚时移除前端对 `usb_topology` 和 `physical_port_id` 的使用，保留后端新增字段不会影响旧消费者；如底层提供器有问题，可关闭拓扑提供器并继续使用现有扁平发现路径。

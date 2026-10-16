@@ -11,6 +11,28 @@ from typing import Any
 
 
 TOPOLOGY_STATES = {"complete", "partial", "unavailable"}
+TOPOLOGY_SCHEMA_VERSION = 2
+OWNER_KINDS = {"host", "dock", "hub"}
+HUB_CLASSIFICATIONS = {"external_hub", "unconfirmed_accessory"}
+EXTERNALITY_EVIDENCE = {
+    "external_container",
+    "removable",
+    "user_connectable_upstream",
+}
+DOCK_ROLE_EVIDENCE = {
+    "device_category",
+    "multifunction_container",
+    "user_confirmed",
+}
+CLASSIFICATION_EVIDENCE = EXTERNALITY_EVIDENCE | DOCK_ROLE_EVIDENCE | {
+    "companion_hubs",
+    "hub_only",
+    "insufficient_identity",
+    "internal_upstream",
+    "non_removable",
+    "system_container",
+    "trusted_hardware_profile",
+}
 PORT_STATES = {
     "empty",
     "occupied",
@@ -25,6 +47,20 @@ FRONTEND_BEHAVIOR_TESTS = (
     "test_shared_ethernet_endpoint_keeps_plc_and_abb_logical_interfaces",
     "test_frontend_guest_simulation.GuestSimulationFrontendContractTests."
     "test_interface_check_allows_unverified_port_without_weakening_start_gate",
+    "test_usb_interface_candidates.UsbInterfaceCandidateTests."
+    "test_unconfirmed_usb_hub_remains_visible_without_dock_label",
+)
+TOPOLOGY_CLASSIFICATION_TESTS = (
+    "test_windows_usb_topology.WindowsUsbTopologyTests."
+    "test_integrated_non_root_hub_is_host_owned",
+    "test_windows_usb_topology.WindowsUsbTopologyTests."
+    "test_external_plain_hub_is_not_dock",
+    "test_windows_usb_topology.WindowsUsbTopologyTests."
+    "test_multifunction_external_container_is_dock",
+    "test_windows_usb_topology.WindowsUsbTopologyTests."
+    "test_classification_does_not_depend_on_host_controller_or_location",
+    "test_windows_usb_topology.WindowsUsbTopologyTests."
+    "test_incomplete_evidence_keeps_ports_as_unconfirmed_hub",
 )
 
 
@@ -54,6 +90,28 @@ def _unique_ids(records: Sequence[Mapping[str, Any]], field: str, issues: list[s
     return identifiers
 
 
+def _classification_evidence(
+    record: Mapping[str, Any],
+    field: str,
+    index: int,
+    issues: list[str],
+) -> set[str]:
+    value = record.get("classification_evidence")
+    if not isinstance(value, list) or not value:
+        issues.append(f"usb_topology.{field}[{index}].classification_evidence must be a non-empty list")
+        return set()
+    evidence = {str(item) for item in value if isinstance(item, str) and item}
+    if len(evidence) != len(value):
+        issues.append(f"usb_topology.{field}[{index}].classification_evidence must contain unique strings")
+    unsupported = evidence - CLASSIFICATION_EVIDENCE
+    if unsupported:
+        issues.append(
+            f"usb_topology.{field}[{index}].classification_evidence contains unsupported values: "
+            f"{', '.join(sorted(unsupported))}"
+        )
+    return evidence
+
+
 def validate_discovery_payload(payload: object) -> tuple[str, ...]:
     issues: list[str] = []
     if not isinstance(payload, Mapping):
@@ -63,8 +121,8 @@ def validate_discovery_payload(payload: object) -> tuple[str, ...]:
     if not isinstance(topology, Mapping):
         return ("interface discovery must expose usb_topology",)
 
-    if topology.get("schema_version") != 1:
-        issues.append("usb_topology.schema_version must equal 1")
+    if topology.get("schema_version") != TOPOLOGY_SCHEMA_VERSION:
+        issues.append(f"usb_topology.schema_version must equal {TOPOLOGY_SCHEMA_VERSION}")
     if str(topology.get("state") or "") not in TOPOLOGY_STATES:
         issues.append("usb_topology.state must be complete, partial, or unavailable")
     if not str(topology.get("provider") or "").strip():
@@ -73,25 +131,51 @@ def validate_discovery_payload(payload: object) -> tuple[str, ...]:
         issues.append("usb_topology.errors must be a list")
 
     docks = _records(topology.get("docks"), "docks", issues)
+    hubs = _records(topology.get("hubs"), "hubs", issues)
     ports = _records(topology.get("usb_ports"), "usb_ports", issues)
     devices = _records(topology.get("devices"), "devices", issues)
     dock_ids = _unique_ids(docks, "docks", issues)
+    hub_ids = _unique_ids(hubs, "hubs", issues)
     port_ids = _unique_ids(ports, "usb_ports", issues)
     _unique_ids(devices, "devices", issues)
 
     for index, dock in enumerate(docks):
         if not str(dock.get("label") or "").strip():
             issues.append(f"usb_topology.docks[{index}].label is required")
+        if str(dock.get("classification") or "") != "confirmed_dock":
+            issues.append(f"usb_topology.docks[{index}].classification must be confirmed_dock")
+        evidence = _classification_evidence(dock, "docks", index, issues)
+        if evidence and not evidence.intersection(EXTERNALITY_EVIDENCE):
+            issues.append(f"usb_topology.docks[{index}] requires externality evidence")
+        if evidence and not evidence.intersection(DOCK_ROLE_EVIDENCE):
+            issues.append(f"usb_topology.docks[{index}] requires dock-role evidence")
+
+    for index, hub in enumerate(hubs):
+        label = str(hub.get("label") or "").strip()
+        if not label:
+            issues.append(f"usb_topology.hubs[{index}].label is required")
+        if "拓展坞" in label:
+            issues.append(f"usb_topology.hubs[{index}].label must not claim a dock identity")
+        if str(hub.get("classification") or "") not in HUB_CLASSIFICATIONS:
+            issues.append(
+                f"usb_topology.hubs[{index}].classification must be external_hub or unconfirmed_accessory"
+            )
+        _classification_evidence(hub, "hubs", index, issues)
 
     for index, port in enumerate(ports):
         owner_kind = str(port.get("owner_kind") or "")
         dock_id = str(port.get("dock_id") or "")
-        if owner_kind not in {"host", "dock"}:
-            issues.append(f"usb_topology.usb_ports[{index}].owner_kind must be host or dock")
+        hub_id = str(port.get("hub_id") or "")
+        if owner_kind not in OWNER_KINDS:
+            issues.append(f"usb_topology.usb_ports[{index}].owner_kind must be host, dock, or hub")
         if owner_kind == "dock" and dock_id not in dock_ids:
             issues.append(f"usb_topology.usb_ports[{index}].dock_id must reference a dock")
-        if owner_kind == "host" and dock_id:
-            issues.append(f"usb_topology.usb_ports[{index}] host port must not reference a dock")
+        if owner_kind == "hub" and hub_id not in hub_ids:
+            issues.append(f"usb_topology.usb_ports[{index}].hub_id must reference a hub")
+        if owner_kind != "dock" and dock_id:
+            issues.append(f"usb_topology.usb_ports[{index}] non-dock port must not reference a dock")
+        if owner_kind != "hub" and hub_id:
+            issues.append(f"usb_topology.usb_ports[{index}] non-hub port must not reference a hub")
         if owner_kind == "host" and str(port.get("confirmation") or "") not in {
             "observed_current",
             "observed_history",
@@ -130,12 +214,17 @@ def validate_discovery_payload(payload: object) -> tuple[str, ...]:
             continue
         parent = str(item.get("parent_port_id") or "")
         dock_id = str(item.get("dock_id") or "")
+        hub_id = str(item.get("hub_id") or "")
         kind = str(item.get("kind") or "")
         transport = str(item.get("transport_family") or "")
         if parent and parent not in port_ids:
             issues.append(f"physical_interfaces[{index}].parent_port_id must reference usb_topology")
         if dock_id and dock_id not in dock_ids:
             issues.append(f"physical_interfaces[{index}].dock_id must reference usb_topology")
+        if hub_id and hub_id not in hub_ids:
+            issues.append(f"physical_interfaces[{index}].hub_id must reference usb_topology")
+        if dock_id and hub_id:
+            issues.append(f"physical_interfaces[{index}] must not reference both dock_id and hub_id")
         if kind in {"usb_hid", "usb_uvc"} and transport != "usb":
             issues.append(f"physical_interfaces[{index}] USB endpoint must use transport_family usb")
         if kind in {"serial", "com"}:
@@ -160,6 +249,7 @@ def validate_frontend_source(source: str) -> tuple[str, ...]:
         "empty selected ports must explain that no compatible device is present": ("端口存在", "未检测到兼容设备"),
         "USB sensor roles must share one physical transport pool": ("USB_SENSOR_ROLES", "interfaceTransportFamily"),
         "host USB-A and native serial groups must be explicit": ("电脑本机 USB-A", "主机原生串口"),
+        "ordinary and unconfirmed USB hubs must have a non-dock group": ("USB 扩展设备",),
         "Type-C and dock upstream connectors must be excluded from USB-A candidates": (
             "connector_form_factor",
             "type_c",
@@ -246,6 +336,34 @@ def validate_frontend_behavior(app_dir: Path) -> tuple[str, ...]:
     return (f"production front-end behavior scenarios failed:\n{detail}",)
 
 
+def validate_topology_classification(app_dir: Path) -> tuple[str, ...]:
+    """Execute host-independent USB ownership and dock classification scenarios."""
+    if not app_dir.is_dir():
+        return (f"USB topology application directory does not exist: {app_dir}",)
+    command = [sys.executable, "-m", "unittest", *TOPOLOGY_CLASSIFICATION_TESTS, "-v"]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=app_dir,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=180,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return ("USB topology classification scenarios timed out after 180 seconds",)
+    except OSError as exc:
+        return (f"USB topology classification scenarios could not start: {exc}",)
+    if completed.returncode == 0:
+        return ()
+    detail = (completed.stderr or completed.stdout or "no test output").strip()
+    if len(detail) > 4000:
+        detail = detail[-4000:]
+    return (f"USB topology classification scenarios failed:\n{detail}",)
+
+
 def run_repo_contract(repo_root: Path) -> tuple[str, ...]:
     root = repo_root.resolve()
     app_dir = root / "visualization_app"
@@ -275,6 +393,7 @@ def run_repo_contract(repo_root: Path) -> tuple[str, ...]:
     else:
         issues.extend(validate_acquisition_source(acquisition_path.read_text(encoding="utf-8")))
     issues.extend(validate_frontend_behavior(app_dir))
+    issues.extend(validate_topology_classification(app_dir))
     return tuple(issues)
 
 

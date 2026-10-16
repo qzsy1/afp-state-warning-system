@@ -2,14 +2,16 @@
 
 ## Why
 
-当前接口发现只返回已枚举的串口、HID/UVC 设备和网卡，无法显示 USB Hub 上尚未插入设备的物理端口，也无法说明设备或网卡属于哪个拓展坞。Windows 还会把同一组物理 USB 插口分别暴露为 USB 2.x 与 SuperSpeed 伴随 Hub，若直接枚举会重复计算端口，因此需要建立可合并、可验证的 USB 拓扑模型。
+当前接口发现需要同时表达空闲 USB 物理端口、实时通信端点和设备归属。非 Root Hub 既可能是电脑集成 Hub、普通外接 Hub，也可能是拓展坞的一部分；Windows 没有适用于所有厂商的单一“拓展坞”标志，因此必须根据设备容器、外接性、连接器关系和功能组成建立可跨电脑复现的分类模型，不能把所有非 Root Hub 直接标记为拓展坞。
 
 ## What Changes
 
 - 增加 Windows USB Hub 拓扑发现，识别 Hub、下行物理端口、端口连接状态、所接设备及父子关系。
+- 使用 Windows 设备容器、可移除属性、用户可连接上游、伴随 Hub 关系、设备类别和同一物理设备的功能组成区分电脑集成 Hub、普通外接 Hub、未确认 USB 扩展设备与已确认拓展坞；主机控制器、Root Hub 和位置路径变化不得改变同一类证据的分类结论。
+- VID/PID、友好名称或端口数量只能作为设备指纹和辅助证据，任何一个字段均不得单独把设备判定为拓展坞；证据不足时保留端口和实时设备，但显示为普通或未确认 USB 扩展设备。
 - 将同一拓展坞的 USB 2.x 与 USB 3.x 伴随 Hub 合并为一组逻辑物理端口，避免把三个插口重复显示为六个。
 - 识别拓展坞内置 USB 网卡等固定功能，并将其显示为所属拓展坞的网口，而不是额外的外部 USB 口。
-- 扩展接口发现契约，分别表达电脑原生 USB 端口、拓展坞、拓展坞物理端口和已接设备，并为物理端口提供跨刷新稳定的标识。
+- **BREAKING**：将 `usb_topology` 升级为 schema v2，分别表达电脑原生 USB 端口、普通或未确认 USB 扩展设备、已确认拓展坞、物理端口和已接设备，并为分类证据与物理端口提供稳定标识；schema v1 仅按未确认拓扑兼容降级。
 - 电脑 Root Hub 的 `user_connectable` 只作为候选证据；本机物理口必须由当前实际占用、本机历史观察记录或明确的 USB2/SuperSpeed 伴随连接器关系确认，避免把主板预留、未布线或平台共用设计端口显示为机身插孔。连接拓展坞的 Type-C 上游插孔只保留在拓扑诊断中。
 - 保留 Windows 上报的连接器形态，将 Type-C 与 USB-A 分开建模；传感器的 USB 端口候选只显示 USB-A，连接拓展坞或手机的 Type-C 不得计入电脑本机 USB-A 口数量。具有明确 USB2/USB3 伴随关系的空闲 USB-A 可直接作为机身物理口显示，未配对逻辑端口仍不得发布。
 - 将物理 USB 连接器与 HID、UVC、COM 等 Windows 通信端点分层建模；USB 转串口设备显示在所属电脑或拓展坞 USB 口下，真正不经过 USB 的主机原生串口才保留独立串口候选。
@@ -25,7 +27,7 @@
 
 ### New Capabilities
 
-- `usb-dock-interface-discovery`: 定义 USB Hub 拓扑发现、伴随 Hub 合并、拓展坞端口与内置网口建模、同类型接口显示、远程 helper 边界及真实采集验证行为。
+- `usb-dock-interface-discovery`: 定义 USB Hub 拓扑发现、跨电脑设备归属分类、伴随 Hub 合并、拓展坞端口与内置网口建模、普通 USB 扩展设备显示、远程 helper 边界及真实采集验证行为。
 
 ### Modified Capabilities
 
@@ -34,6 +36,6 @@
 ## Impact
 
 - 主要影响独立 Windows USB 拓扑和传输目录模块、`visualization_app/acquisition.py` 的接口发现契约、前端接口选择与状态展示、`visualization_app/local_capture_agent.py` 的 helper 发现结果，以及对应 Harness、单元测试、前端测试和 helper 边界测试。
-- 预计新增独立的 Windows USB 拓扑模块，使用 Windows SetupAPI、CfgMgr32 和 USB Hub `DeviceIoControl` 查询；不增加必须联网的运行时依赖。
+- 独立 Windows USB 拓扑模块使用 Windows SetupAPI、CfgMgr32 和 USB Hub `DeviceIoControl` 查询，并补充设备容器、移除策略和设备类别等本机只读属性；不增加必须联网的运行时依赖。
 - 源码验证完成后，需要将相关外置文件同步到唯一发行版本 `delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic`，更新缓存键、版本化校验和 `SHA256SUMS.txt`，并按现有 Git LFS 发布流程同步完整 v2.0.4。
 - 非 Windows 平台和不支持拓扑查询的 Windows 环境继续使用现有扁平接口发现结果。

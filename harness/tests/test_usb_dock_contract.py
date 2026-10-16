@@ -8,28 +8,55 @@ from unittest.mock import patch
 
 from harness.engine.usb_dock_contract import (
     FRONTEND_BEHAVIOR_TESTS,
+    TOPOLOGY_CLASSIFICATION_TESTS,
     validate_acquisition_source,
     validate_discovery_payload,
     validate_frontend_behavior,
     validate_frontend_source,
+    validate_topology_classification,
 )
 
 
 def compliant_discovery() -> dict:
     return {
         "usb_topology": {
-            "schema_version": 1,
+            "schema_version": 2,
             "state": "complete",
             "provider": "windows_usb_hub_ioctl",
             "errors": [],
             "docks": [
-                {"id": "dock:a", "label": "拓展坞 1", "state": "connected"},
+                {
+                    "id": "dock:a",
+                    "label": "拓展坞 1",
+                    "state": "connected",
+                    "classification": "confirmed_dock",
+                    "classification_evidence": [
+                        "external_container",
+                        "user_connectable_upstream",
+                        "companion_hubs",
+                        "multifunction_container",
+                    ],
+                },
+            ],
+            "hubs": [
+                {
+                    "id": "hub:a",
+                    "label": "USB 扩展设备 1",
+                    "state": "connected",
+                    "classification": "external_hub",
+                    "classification_evidence": [
+                        "external_container",
+                        "user_connectable_upstream",
+                        "hub_only",
+                    ],
+                },
             ],
             "usb_ports": [
                 {
                     "id": "usbport:host:1",
                     "owner_kind": "host",
                     "dock_id": "",
+                    "hub_id": "",
                     "system_port_number": 2,
                     "connector_type": "usb3",
                     "connector_form_factor": "type_a",
@@ -43,6 +70,7 @@ def compliant_discovery() -> dict:
                     "id": "usbport:a:1",
                     "owner_kind": "dock",
                     "dock_id": "dock:a",
+                    "hub_id": "",
                     "system_port_number": 1,
                     "connector_type": "usb3",
                     "connector_form_factor": "type_a",
@@ -55,6 +83,7 @@ def compliant_discovery() -> dict:
                     "id": "usbport:a:2",
                     "owner_kind": "dock",
                     "dock_id": "dock:a",
+                    "hub_id": "",
                     "system_port_number": 2,
                     "connector_type": "usb3",
                     "connector_form_factor": "type_a",
@@ -67,6 +96,7 @@ def compliant_discovery() -> dict:
                     "id": "usbport:a:4",
                     "owner_kind": "dock",
                     "dock_id": "dock:a",
+                    "hub_id": "",
                     "system_port_number": 4,
                     "connector_type": "internal",
                     "connector_form_factor": "type_a",
@@ -74,6 +104,19 @@ def compliant_discovery() -> dict:
                     "state": "occupied",
                     "user_connectable": False,
                     "device_id": "device:asix",
+                },
+                {
+                    "id": "usbport:hub:1",
+                    "owner_kind": "hub",
+                    "dock_id": "",
+                    "hub_id": "hub:a",
+                    "system_port_number": 1,
+                    "connector_type": "usb3",
+                    "connector_form_factor": "type_a",
+                    "supported_protocols": ["usb2", "usb3"],
+                    "state": "empty",
+                    "user_connectable": True,
+                    "device_id": None,
                 },
             ],
             "devices": [
@@ -137,7 +180,7 @@ def compliant_discovery() -> dict:
 
 
 class UsbDockContractValidatorTests(unittest.TestCase):
-    def test_frontend_behavior_contract_executes_the_two_production_regressions(self) -> None:
+    def test_frontend_behavior_contract_executes_all_production_regressions(self) -> None:
         with tempfile.TemporaryDirectory() as folder, patch(
             "harness.engine.usb_dock_contract.subprocess.run"
         ) as run:
@@ -147,6 +190,18 @@ class UsbDockContractValidatorTests(unittest.TestCase):
 
         command = run.call_args.args[0]
         self.assertTrue(all(name in command for name in FRONTEND_BEHAVIOR_TESTS))
+        self.assertEqual(run.call_args.kwargs["cwd"], Path(folder))
+
+    def test_topology_contract_executes_host_independent_classification_regressions(self) -> None:
+        with tempfile.TemporaryDirectory() as folder, patch(
+            "harness.engine.usb_dock_contract.subprocess.run"
+        ) as run:
+            run.return_value = subprocess.CompletedProcess([], 0, "", "")
+
+            self.assertEqual(validate_topology_classification(Path(folder)), ())
+
+        command = run.call_args.args[0]
+        self.assertTrue(all(name in command for name in TOPOLOGY_CLASSIFICATION_TESTS))
         self.assertEqual(run.call_args.kwargs["cwd"], Path(folder))
 
     def test_frontend_behavior_contract_reports_runtime_failures(self) -> None:
@@ -176,11 +231,12 @@ class UsbDockContractValidatorTests(unittest.TestCase):
     def test_unavailable_provider_still_requires_stable_schema(self) -> None:
         payload = {
             "usb_topology": {
-                "schema_version": 1,
+                "schema_version": 2,
                 "state": "unavailable",
                 "provider": "unsupported_platform",
                 "errors": ["Windows USB topology is unavailable"],
                 "docks": [],
+                "hubs": [],
                 "usb_ports": [],
                 "devices": [],
             },
@@ -195,6 +251,7 @@ class UsbDockContractValidatorTests(unittest.TestCase):
         const group = document.createElement("optgroup");
         group.label = "拓展坞 USB 端口";
         const host = "电脑本机 USB-A";
+        const accessory = "USB 扩展设备";
         const nativeSerial = "主机原生串口";
         const ethernet = "拓展坞网口";
         status.textContent = "端口存在，未检测到兼容设备";
@@ -247,6 +304,7 @@ class UsbDockContractValidatorTests(unittest.TestCase):
         const group = document.createElement("optgroup");
         group.label = "拓展坞 USB 端口";
         const host = "电脑本机 USB-A";
+        const accessory = "USB 扩展设备";
         const nativeSerial = "主机原生串口";
         const ethernet = "拓展坞网口";
         status.textContent = "端口存在，未检测到兼容设备";
@@ -273,7 +331,7 @@ class UsbDockContractValidatorTests(unittest.TestCase):
 
         issues = "\n".join(validate_discovery_payload(payload))
 
-        self.assertIn("owner_kind must be host or dock", issues)
+        self.assertIn("owner_kind must be host, dock, or hub", issues)
         self.assertIn("serial transport_family must be usb", issues)
 
     def test_host_ports_require_physical_observation_evidence(self) -> None:
@@ -283,6 +341,30 @@ class UsbDockContractValidatorTests(unittest.TestCase):
         issues = "\n".join(validate_discovery_payload(payload))
 
         self.assertIn("confirmation must be observed_current, observed_history, or connector_metadata", issues)
+
+    def test_dock_requires_externality_and_role_evidence(self) -> None:
+        payload = compliant_discovery()
+        payload["usb_topology"]["docks"][0]["classification_evidence"] = [
+            "companion_hubs",
+            "trusted_hardware_profile",
+        ]
+
+        issues = "\n".join(validate_discovery_payload(payload))
+
+        self.assertIn("requires externality evidence", issues)
+        self.assertIn("requires dock-role evidence", issues)
+
+    def test_hub_ports_remain_valid_without_claiming_dock_identity(self) -> None:
+        payload = compliant_discovery()
+
+        self.assertEqual(validate_discovery_payload(payload), ())
+
+        payload["usb_topology"]["hubs"][0]["label"] = "拓展坞 2"
+        payload["usb_topology"]["usb_ports"][-1]["dock_id"] = "dock:a"
+        issues = "\n".join(validate_discovery_payload(payload))
+
+        self.assertIn("label must not claim a dock identity", issues)
+        self.assertIn("non-dock port must not reference a dock", issues)
 
     def test_rejects_missing_connector_form_factor(self) -> None:
         payload = compliant_discovery()
