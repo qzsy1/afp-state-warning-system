@@ -6584,14 +6584,22 @@ def create_server(
     )
     active_control_lease = control_lease or RealControlLease()
     helper_registry = getattr(active_dashboard, "helper_registry", None)
-    if not isinstance(helper_registry, HelperRegistry):
+    expected_helper_candidate = (
+        str(expected_ingress_candidate_id or "")
+        or release_candidate_id(RELEASE_CONTRACT)
+    )
+    expected_helper_persistence = (runtime_root / "helper_registry.json").resolve()
+    helper_registry_configured = (
+        isinstance(helper_registry, HelperRegistry)
+        and helper_registry.persistence_path == expected_helper_persistence
+        and helper_registry.ingress_state_path == selected_ingress_state
+        and helper_registry.expected_candidate_id == expected_helper_candidate
+    )
+    if not helper_registry_configured:
         helper_registry = HelperRegistry(
-            persistence_path=runtime_root / "helper_registry.json",
+            persistence_path=expected_helper_persistence,
             ingress_state_path=selected_ingress_state,
-            expected_candidate_id=(
-                str(expected_ingress_candidate_id or "")
-                or release_candidate_id(RELEASE_CONTRACT)
-            ),
+            expected_candidate_id=expected_helper_candidate,
         )
     active_dashboard.helper_registry = helper_registry
     if not isinstance(

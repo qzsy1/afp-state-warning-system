@@ -29,6 +29,79 @@ class PublicTunnelWatchdogContractTests(unittest.TestCase):
         self.assertIn("funnel reset", text)
 
     @unittest.skipUnless(shutil.which("powershell.exe"), "Windows PowerShell required")
+    def test_owner_run_still_requires_capture_readiness(self):
+        source = str(Path(__file__).with_name("public_tunnel_watchdog.ps1").resolve()).replace("'", "''")
+        harness = textwrap.dedent(
+            f"""
+            $source = Get-Content -LiteralPath '{source}' -Raw
+            $tokens = $null; $errors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+            $definition = $ast.FindAll({{
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Test-WatchdogMutationAllowed'
+            }}, $true) | Select-Object -First 1
+            Invoke-Expression $definition.Extent.Text
+            $owned = [pscustomobject]@{{ generation = 8; recovery_owner = 'cloudflare' }}
+            $blocked = [pscustomobject]@{{ allowed = $false; active_capture_uuids = @('capture-a') }}
+            $ready = [pscustomobject]@{{ allowed = $true }}
+            if ((Test-WatchdogMutationAllowed $owned 'cloudflare' 'Run' 0 $false $blocked).allowed) {{ exit 21 }}
+            if (-not (Test-WatchdogMutationAllowed $owned 'cloudflare' 'Run' 0 $false $ready).allowed) {{ exit 22 }}
+            exit 0
+            """
+        )
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "-"],
+            input=harness, text=True, capture_output=True, timeout=15, check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "Windows PowerShell required")
+    def test_failed_retirement_keeps_candidate_when_previous_edge_is_unavailable(self):
+        source = str(Path(__file__).with_name("public_tunnel_watchdog.ps1").resolve()).replace("'", "''")
+        harness = textwrap.dedent(
+            f"""
+            $source = Get-Content -LiteralPath '{source}' -Raw
+            $tokens = $null; $errors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+            foreach ($name in @('Ensure-Tunnel','New-WatchdogLayer')) {{
+                $definition = $ast.FindAll({{
+                    param($node)
+                    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+                }}, $true) | Select-Object -First 1
+                Invoke-Expression $definition.Extent.Text
+            }}
+            $Mode='Cutover'; $ExpectedGeneration=8; $ApproveOwnerCutover=$true
+            $state = [pscustomobject]@{{ generation=8; provider='tailscale'; recovery_owner='tailscale'; public_url='https://old.example'; candidate_id='candidate' }}
+            function Get-CurrentIngressState {{ $state }}
+            function Ensure-Origin {{ $true }}
+            function Get-CutoverReadiness {{ [pscustomobject]@{{ allowed=$true }} }}
+            function Test-WatchdogMutationAllowed {{ [pscustomobject]@{{ allowed=$true }} }}
+            function Test-Tunnel {{ $true }}
+            function Get-TunnelMetrics {{ '' }}
+            function Get-TunnelUrl {{ 'https://new.example' }}
+            function Test-PublicTunnel([string]$Url) {{ $Url -eq 'https://new.example' }}
+            function Get-CandidateId {{ 'candidate' }}
+            function Publish-AfpPublicIngressState {{ [pscustomobject]@{{ changed=$true; generation=9 }} }}
+            function Restart-Helper {{ $true }}
+            function Wait-HelperIngressReady {{ $true }}
+            function Retire-PreviousIngress {{ $false }}
+            $script:stops=0; function Stop-CandidateIngress {{ $script:stops++; $true }}
+            $script:restores=0; function Restore-PreviousIngressState {{ $script:restores++; $true }}
+            $script:code=''; function Write-TunnelState([string]$Code) {{ $script:code=$Code }}
+            function Save-TunnelUrlAtomic {{ throw 'must not commit unavailable compensation' }}
+            if (Ensure-Tunnel) {{ exit 21 }}
+            if ($script:code -ne 'cutover_rollback_failed' -or $script:stops -ne 0 -or $script:restores -ne 0) {{ exit 22 }}
+            exit 0
+            """
+        )
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "-"],
+            input=harness, text=True, capture_output=True, timeout=15, check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "Windows PowerShell required")
     def test_explicit_cutover_retires_only_the_previous_tailscale_provider(self):
         source = str(Path(__file__).with_name("public_tunnel_watchdog.ps1").resolve()).replace("'", "''")
         harness = textwrap.dedent(

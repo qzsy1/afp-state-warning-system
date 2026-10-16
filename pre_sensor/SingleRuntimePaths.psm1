@@ -16,22 +16,35 @@ function Normalize-AfpPath {
 }
 
 function Resolve-AfpPhysicalPath {
-    param([Parameter(Mandatory = $true)][string]$Path)
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [int]$Depth = 0
+    )
 
+    if ($Depth -gt 32) { throw "Too many reparse-point expansions in mutable path." }
     $normalized = Normalize-AfpPath -Path $Path
-    if (-not (Test-Path -LiteralPath $normalized)) {
-        return $normalized
-    }
-
-    $item = Get-Item -LiteralPath $normalized -Force
-    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -and $item.Target) {
-        $target = [string](@($item.Target)[0])
-        if (-not [IO.Path]::IsPathRooted($target)) {
-            $target = Join-Path $item.Parent.FullName $target
+    $root = [IO.Path]::GetPathRoot($normalized)
+    if (-not $root) { throw "Mutable path has no filesystem root: $normalized" }
+    $current = $root
+    $relative = $normalized.Substring($root.Length)
+    foreach ($segment in @($relative -split '[\\/]' | Where-Object { $_ })) {
+        $next = Join-Path $current $segment
+        if (-not (Test-Path -LiteralPath $next)) {
+            $current = $next
+            continue
         }
-        return Normalize-AfpPath -Path $target
+        $item = Get-Item -LiteralPath $next -Force
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -and $item.Target) {
+            $target = [string](@($item.Target)[0])
+            if (-not [IO.Path]::IsPathRooted($target)) {
+                $target = Join-Path $item.Parent.FullName $target
+            }
+            $current = Resolve-AfpPhysicalPath -Path $target -Depth ($Depth + 1)
+        } else {
+            $current = [string]$item.FullName
+        }
     }
-    return Normalize-AfpPath -Path $item.FullName
+    return Normalize-AfpPath -Path $current
 }
 
 function Test-AfpSamePath {

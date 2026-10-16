@@ -42,9 +42,19 @@ class MutableIngressLoader:
 
 
 class HelperRelayTests(unittest.TestCase):
+    def setUp(self):
+        self.runtime_directory = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.runtime_directory.cleanup()
+
     def generation_registry(self, loader, **kwargs):
+        ingress_state_path = kwargs.pop(
+            "ingress_state_path",
+            Path(self.runtime_directory.name) / "public-ingress-state.json",
+        )
         return HelperRegistry(
-            ingress_state_path="public-ingress-state.json",
+            ingress_state_path=ingress_state_path,
             expected_candidate_id="candidate-1",
             ingress_state_loader=loader,
             **kwargs,
@@ -145,7 +155,7 @@ class HelperRelayTests(unittest.TestCase):
                 restarted.pop_result("session-a", request["request_id"])
             )
 
-    def test_late_result_clears_unconfirmed_restart_blocker(self):
+    def test_late_result_cannot_replace_terminal_and_status_reconciles_blocker(self):
         loader = MutableIngressLoader()
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "helpers.json"
@@ -164,10 +174,6 @@ class HelperRelayTests(unittest.TestCase):
             restarted = self.generation_registry(loader, persistence_path=path)
             self.assertFalse(restarted.cutover_readiness()["allowed"])
             self.assertEqual(
-                restarted.pop_result("session-a", request["request_id"])["error"],
-                "command_state_lost",
-            )
-            self.assertEqual(
                 restarted.authenticate("device-a", paired["pairing_token"]),
                 "session-a",
             )
@@ -178,7 +184,24 @@ class HelperRelayTests(unittest.TestCase):
                 {"ok": True, "running": False},
                 ingress_generation=1,
             )
-            self.assertTrue(accepted["ok"])
+            self.assertFalse(accepted["ok"])
+            self.assertEqual(accepted["error"], "command_state_lost")
+            self.assertEqual(
+                restarted.pop_result("session-a", request["request_id"])["error"],
+                "command_state_lost",
+            )
+            self.assertIsNone(
+                restarted.pop_result("session-a", request["request_id"])
+            )
+            status_request = restarted.command("session-a", "status", {})
+            reconciled = restarted.accept_result(
+                "device-a",
+                paired["pairing_token"],
+                status_request["request_id"],
+                {"ok": True, "running": False},
+                ingress_generation=1,
+            )
+            self.assertTrue(reconciled["ok"])
             self.assertTrue(restarted.cutover_readiness()["allowed"])
 
     def test_production_result_requires_explicit_generation(self):
@@ -247,6 +270,91 @@ class HelperRelayTests(unittest.TestCase):
         owned = registry.cutover_readiness(reservation["reservation_id"])
         self.assertTrue(owned["allowed"])
         self.assertTrue(owned["reservation_active"])
+
+    def test_cutover_reservation_survives_registry_restart(self):
+        loader = MutableIngressLoader()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ingress_path = root / "public-ingress-state.json"
+            helper_path = root / "helper_registry.json"
+            first = self.generation_registry(
+                loader,
+                ingress_state_path=ingress_path,
+                persistence_path=helper_path,
+            )
+            reservation = first.reserve_cutover()
+            self.assertTrue(reservation["allowed"])
+            restarted = self.generation_registry(
+                loader,
+                ingress_state_path=ingress_path,
+                persistence_path=helper_path,
+            )
+            self.assertTrue(restarted.cutover_reserved())
+            self.assertFalse(restarted.begin_capture_start())
+            self.assertTrue(
+                restarted.release_cutover(reservation["reservation_id"])
+            )
+            self.assertTrue(restarted.begin_capture_start())
+            restarted.end_capture_start()
+
+    def test_expired_persisted_reservation_is_replaced_under_lock(self):
+        loader = MutableIngressLoader()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ingress_path = root / "public-ingress-state.json"
+            lease_path = root / "public-ingress-cutover.json"
+            lease_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "reservation_hash": "0" * 64,
+                        "expires_at": time.time() - 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry = self.generation_registry(
+                loader,
+                ingress_state_path=ingress_path,
+                persistence_path=root / "helper_registry.json",
+            )
+            self.assertFalse(registry.cutover_reserved())
+            reservation = registry.reserve_cutover()
+            self.assertTrue(reservation["allowed"])
+            persisted = json.loads(lease_path.read_text(encoding="utf-8"))
+            self.assertNotEqual(persisted["reservation_hash"], "0" * 64)
+            self.assertTrue(
+                registry.release_cutover(reservation["reservation_id"])
+            )
+
+    def test_degraded_ingress_blocks_capture_after_reservation_expiry(self):
+        degraded = ingress_state(1)
+        degraded = PublicIngressState(
+            schema_version=degraded.schema_version,
+            generation=degraded.generation,
+            public_url=degraded.public_url,
+            provider=degraded.provider,
+            recovery_owner=degraded.recovery_owner,
+            candidate_id=degraded.candidate_id,
+            status="degraded",
+            published_at=degraded.published_at,
+            layers={"helper": {"ok": False}},
+        )
+        registry = HelperRegistry(
+            ingress_state_path=Path(self.runtime_directory.name) / "degraded-ingress.json",
+            expected_candidate_id="candidate-1",
+            ingress_state_loader=lambda *_args: degraded,
+        )
+        paired = self.pair(registry)
+        registry.attach(
+            "session-a",
+            "device-a",
+            paired["pairing_token"],
+            lambda _message: None,
+        )
+        blocked = registry.command("session-a", "start_capture", {})
+        self.assertEqual(blocked["error"], "ingress_not_online")
+        self.assertFalse(registry.begin_capture_start())
 
     def test_deployment_readiness_requires_compatible_online_helper(self):
         loader = MutableIngressLoader()

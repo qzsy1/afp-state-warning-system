@@ -126,7 +126,7 @@
 
 #### Scenario: 服务器在同一代次重启且命令状态丢失
 - **WHEN** 持久化记录显示启动命令已排队或投递，但重启后的服务器无法证明其执行状态
-- **THEN** 服务器 MUST 将该命令终结为 `command_state_lost` 且不得自动重发；已投递的启动命令 MUST 在 Helper 返回迟到结果或完成显式对账前阻止入口切换
+- **THEN** 服务器 MUST 将该命令终结为 `command_state_lost` 且不得自动重发；迟到结果 MUST NOT 覆盖或新增用户可见终态，已投递的启动命令 MUST 在新的显式状态对账完成前阻止入口切换
 
 #### Scenario: Helper收到旧代次命令
 - **WHEN** Helper 收到的采集命令代次与当前会话代次不一致

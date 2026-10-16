@@ -92,10 +92,11 @@ $result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([ps
     -ServiceProbeRunner {{ $events.Add('edge'); [pscustomobject]@{{ status='passed' }} }} `
     -IngressPublisher {{ $events.Add('ingress'); [pscustomobject]@{{ generation=4 }} }} `
     -HelperReadinessRunner {{ param($Ingress) $events.Add('helper'); [pscustomobject]@{{ ready=$true; generation=$Ingress.generation }} }} `
+    -IngressCommitter {{ param($Ingress, $Helper) $events.Add('commit'); $Ingress }} `
     -CompletionRunner {{ $events.Add('complete') }} `
     -RestoreRunner {{ $events.Add('restore') }}
 if ($result.status -ne 'completed') {{ throw ($result | ConvertTo-Json -Depth 8) }}
-if (($events -join ',') -ne 'stop,promote,start,edge,ingress,helper,complete') {{ throw ($events -join ',') }}
+if (($events -join ',') -ne 'stop,promote,start,edge,ingress,helper,commit,complete') {{ throw ($events -join ',') }}
 """
         result = _run_ps(script)
         self.assertEqual(result.returncode, 0, msg=result.stderr)
@@ -350,7 +351,43 @@ $result = Invoke-AfpVerifiedRuntimePromotion -StagingPath {_ps_quote(staging)} -
     -HelperReadinessRunner {{ [pscustomobject]@{{ ready=$false }} }} -CompletionRunner {{ }}
 if ($result.status -ne 'rolled_back') {{ throw ($result | ConvertTo-Json -Depth 8) }}
 $restored = Get-Content -LiteralPath (Join-Path $paths.RuntimeRoot 'runtime\public-ingress-state.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-if ($restored.candidate_id -cne 'candidate-old' -or [long]$restored.generation -le 5) {{ throw ($restored | ConvertTo-Json -Depth 8) }}
+if ($restored.candidate_id -cne 'candidate-old' -or [long]$restored.generation -le 5 -or $restored.status -ne 'degraded') {{ throw ($restored | ConvertTo-Json -Depth 8) }}
+if ([string]$restored.layers.helper.code -ne 'rollback_helper_reconciliation_required') {{ throw ($restored | ConvertTo-Json -Depth 8) }}
+"""
+            result = _run_ps(script)
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+
+    def test_first_publication_failure_keeps_higher_generation_tombstone(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            workspace = Path(temporary) / "workspace"
+            runtime = workspace / "AFP_Integrated_System_Modular"
+            staging = workspace / ".afp-staging" / "deployment-test"
+            for target in (runtime, staging):
+                (target / "runtime").mkdir(parents=True)
+                (target / "PublicIngress.psm1").write_bytes(
+                    (ROOT / "visualization_app" / "PublicIngress.psm1").read_bytes()
+                )
+            script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(PATH_MODULE)} -Force
+Import-Module {_ps_quote(MODULE)} -Force
+$paths = Get-AfpDeploymentPaths -ConfigPath {_ps_quote(PATH_CONFIG)} -WorkspaceRootOverride {_ps_quote(workspace)}
+$inventory = Get-AfpRuntimeInventory -ProcessRecords @() -ListenerRecords @() -StartupRecords @()
+$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath {_ps_quote(staging)} -Paths $paths -ApprovedInventoryDigest $inventory.digest -CurrentInventory $inventory `
+    -CutoverReadinessRunner {{ [pscustomobject]@{{ allowed=$true }} }} -StopRunner {{ }} -StartRunner {{ }} `
+    -ServiceProbeRunner {{ [pscustomobject]@{{ status='passed' }} }} `
+    -IngressPublisher {{
+        Import-Module (Join-Path $paths.RuntimeRoot 'PublicIngress.psm1') -Force
+        Publish-AfpPublicIngressState -Path (Join-Path $paths.RuntimeRoot 'runtime\public-ingress-state.json') -PublicUrl 'https://new.example' -Provider 'cloudflare' -RecoveryOwner 'cloudflare' -CandidateId 'candidate-new' -Layers @{{ helper=@{{ok=$false;code='pending'}} }}
+    }} `
+    -HelperReadinessRunner {{ [pscustomobject]@{{ ready=$false }} }} -CompletionRunner {{ }}
+if ($result.status -ne 'rolled_back') {{ throw ($result | ConvertTo-Json -Depth 8) }}
+$restored = Get-Content -LiteralPath (Join-Path $paths.RuntimeRoot 'runtime\public-ingress-state.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+if ([long]$restored.generation -le 1 -or $restored.status -ne 'degraded') {{ throw ($restored | ConvertTo-Json -Depth 8) }}
 """
             result = _run_ps(script)
             self.assertEqual(

@@ -85,6 +85,8 @@ class TailscaleFunnelWatchdogContractTests(unittest.TestCase):
             $blocked = [pscustomobject]@{{ allowed = $false; active_capture_uuids = @('capture-a') }}
             if ((Test-WatchdogMutationAllowed $state 'tailscale' 'Cutover' 8 $true $blocked).allowed) {{ exit 23 }}
             if (-not (Test-WatchdogMutationAllowed $state 'tailscale' 'Cutover' 8 $true $ready).allowed) {{ exit 24 }}
+            if ((Test-WatchdogMutationAllowed $owned 'tailscale' 'Run' 0 $false $blocked).allowed) {{ exit 27 }}
+            if (-not (Test-WatchdogMutationAllowed $owned 'tailscale' 'Run' 0 $false $ready).allowed) {{ exit 28 }}
             exit 0
             """
         )
@@ -95,6 +97,50 @@ class TailscaleFunnelWatchdogContractTests(unittest.TestCase):
             capture_output=True,
             timeout=15,
             check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "Windows PowerShell required")
+    def test_failed_retirement_keeps_candidate_when_previous_edge_is_unavailable(self):
+        source = str(self.source.resolve()).replace("'", "''")
+        harness = textwrap.dedent(
+            f"""
+            $source = Get-Content -LiteralPath '{source}' -Raw
+            $tokens = $null; $errors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+            foreach ($name in @('Ensure-Funnel','New-WatchdogLayer')) {{
+                $definition = $ast.FindAll({{
+                    param($node)
+                    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+                }}, $true) | Select-Object -First 1
+                Invoke-Expression $definition.Extent.Text
+            }}
+            $Mode='Cutover'; $ExpectedGeneration=8; $ApproveOwnerCutover=$true; $TailscaleExe='tailscale.exe'
+            $state = [pscustomobject]@{{ generation=8; provider='cloudflare'; recovery_owner='cloudflare'; public_url='https://old.example'; candidate_id='candidate' }}
+            function Get-CurrentIngressState {{ $state }}
+            function Ensure-Origin {{ $true }}
+            function Get-CutoverReadiness {{ [pscustomobject]@{{ allowed=$true }} }}
+            function Test-WatchdogMutationAllowed {{ [pscustomobject]@{{ allowed=$true }} }}
+            function Get-PublicUrl {{ 'https://new.example' }}
+            function Test-Funnel {{ $true }}
+            function Test-PublicFunnel([string]$Url) {{ $Url -eq 'https://new.example' }}
+            function Get-CandidateId {{ 'candidate' }}
+            function Publish-AfpPublicIngressState {{ [pscustomobject]@{{ changed=$true; generation=9 }} }}
+            function Restart-Helper {{ $true }}
+            function Wait-HelperIngressReady {{ $true }}
+            function Retire-PreviousIngress {{ $false }}
+            $script:stops=0; function Stop-CandidateIngress {{ $script:stops++; $true }}
+            $script:restores=0; function Restore-PreviousIngressState {{ $script:restores++; $true }}
+            $script:code=''; function Write-FunnelState([string]$Code) {{ $script:code=$Code }}
+            function Save-FunnelUrlAtomic {{ throw 'must not commit unavailable compensation' }}
+            if (Ensure-Funnel) {{ exit 21 }}
+            if ($script:code -ne 'cutover_rollback_failed' -or $script:stops -ne 0 -or $script:restores -ne 0) {{ exit 22 }}
+            exit 0
+            """
+        )
+        completed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "-"],
+            input=harness, text=True, capture_output=True, timeout=15, check=False,
         )
         self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
 

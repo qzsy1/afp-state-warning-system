@@ -558,6 +558,45 @@ class PublicWebHttpTests(unittest.TestCase):
         finally:
             handler.access_context = "public"
 
+    def test_create_server_replaces_unconfigured_registry_and_reuses_configured_one(self):
+        from app import create_server
+        from helper_relay import HelperRegistry
+
+        dashboard = self.server.dashboard
+        ingress_state_file = dashboard.helper_registry.ingress_state_path
+        dashboard.helper_registry = HelperRegistry()
+        handler = self.server.RequestHandlerClass
+        replacement = create_server(
+            "127.0.0.1",
+            0,
+            dashboard=dashboard,
+            security_store=handler.security_store,
+            guest_manager=handler.guest_manager,
+            control_lease=handler.control_lease,
+            access_context="local_admin",
+            ingress_state_file=ingress_state_file,
+        )
+        try:
+            configured = dashboard.helper_registry
+            self.assertIsNotNone(configured.persistence_path)
+            self.assertEqual(configured.ingress_state_path, ingress_state_file)
+            second = create_server(
+                "127.0.0.1",
+                0,
+                dashboard=dashboard,
+                security_store=handler.security_store,
+                guest_manager=handler.guest_manager,
+                control_lease=handler.control_lease,
+                access_context="public",
+                ingress_state_file=ingress_state_file,
+            )
+            try:
+                self.assertIs(second.dashboard.helper_registry, configured)
+            finally:
+                second.server_close()
+        finally:
+            replacement.server_close()
+
     def test_stale_generation_sample_submission_is_rejected(self):
         self.request_json("GET", "/api/auth/session")
         self.request_json(

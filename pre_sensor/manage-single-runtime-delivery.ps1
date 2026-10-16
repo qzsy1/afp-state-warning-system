@@ -152,6 +152,8 @@ if ($Mode -eq "Switchover") {
             foreach ($check in @($script:verifiedServices.checks)) {
                 $layers[[string]$check.name] = @{ ok = [bool]$check.passed; code = [string]$check.detail }
             }
+            $layers.ingress = @{ ok = $false; code = "ingress_pending_helper" }
+            $layers.helper = @{ ok = $false; code = "helper_not_checked" }
             $parameters = @{
                 Path = $statePath
                 PublicUrl = $PublicUrl
@@ -171,11 +173,33 @@ if ($Mode -eq "Switchover") {
             Read-AfpPublicIngressState -Path $statePath -ExpectedCandidateId $candidateId | Out-Null
             return $published
         } `
+        -IngressCommitter {
+            param($Ingress, $Helper)
+            $modulePath = Join-Path $paths.RuntimeRoot "PublicIngress.psm1"
+            Import-Module $modulePath -Force -ErrorAction Stop
+            $statePath = Join-Path $paths.RuntimeRoot "runtime\public-ingress-state.json"
+            $pending = Read-AfpPublicIngressState -Path $statePath
+            $layers = @{}
+            foreach ($property in $pending.layers.PSObject.Properties) {
+                $layers[$property.Name] = @{
+                    ok = [bool]$property.Value.ok
+                    code = [string]$property.Value.code
+                }
+            }
+            $layers.ingress = @{ ok = $true; code = "ingress_committed" }
+            $layers.helper = @{ ok = $true; code = "helper_ready" }
+            Publish-AfpPublicIngressState -Path $statePath `
+                -PublicUrl ([string]$pending.public_url) `
+                -Provider ([string]$pending.provider) `
+                -RecoveryOwner ([string]$pending.recovery_owner) `
+                -CandidateId ([string]$pending.candidate_id) `
+                -Layers $layers -ExpectedGeneration ([long]$Ingress.generation)
+        } `
         -CompletionRunner {
             Complete-AfpRuntimePromotion -Promotion $script:activePromotion -Paths $paths
         } `
         -RestoreRunner {
-            param($Promotion, $IngressSnapshot, $FailedIngressGeneration)
+            param($Promotion, $IngressSnapshot, $FailedIngressGeneration, $FailedIngressState)
             $failedInventory = Get-AfpRuntimeInventory -PublicUrl $PublicUrl -FunnelOrigin $FunnelOrigin
             Stop-AfpManagedRuntimeProcesses -Inventory $failedInventory -RuntimeExecutable $exe | Out-Null
             if ($Promotion) { Restore-AfpRuntimePromotion -Promotion $Promotion -Paths $paths }
@@ -192,6 +216,10 @@ if ($Mode -eq "Switchover") {
                         code = [string]$property.Value.code
                     }
                 }
+                $snapshotLayers["helper"] = @{
+                    ok = $false
+                    code = "rollback_helper_reconciliation_required"
+                }
                 Publish-AfpPublicIngressState -Path $statePath `
                     -PublicUrl ([string]$snapshot.public_url) `
                     -Provider ([string]$snapshot.provider) `
@@ -200,8 +228,23 @@ if ($Mode -eq "Switchover") {
                     -ExpectedGeneration ([long]$restored.generation) `
                     -MinimumGeneration ([Math]::Max([long]$restored.generation + 1L, [long]$FailedIngressGeneration + 1L)) `
                     -Layers $snapshotLayers | Out-Null
-            } elseif (Test-Path -LiteralPath $statePath -PathType Leaf) {
-                Remove-Item -LiteralPath $statePath -Force
+            } elseif ($FailedIngressState) {
+                Import-Module (Join-Path $paths.RuntimeRoot "PublicIngress.psm1") -Force -ErrorAction Stop
+                $failedLayers = @{
+                    origin = @{ ok = $false; code = "rollback_no_previous_ingress" }
+                    control_plane = @{ ok = $false; code = "rollback_no_previous_ingress" }
+                    dns = @{ ok = $false; code = "rollback_no_previous_ingress" }
+                    public_edge = @{ ok = $false; code = "rollback_no_previous_ingress" }
+                    ingress = @{ ok = $false; code = "rollback_no_previous_ingress" }
+                    helper = @{ ok = $false; code = "rollback_no_previous_ingress" }
+                }
+                Publish-AfpPublicIngressState -Path $statePath `
+                    -PublicUrl ([string]$FailedIngressState.public_url) `
+                    -Provider ([string]$FailedIngressState.provider) `
+                    -RecoveryOwner ([string]$FailedIngressState.recovery_owner) `
+                    -CandidateId ([string]$FailedIngressState.candidate_id) `
+                    -MinimumGeneration ([Math]::Max(1L, [long]$FailedIngressGeneration + 1L)) `
+                    -Layers $failedLayers | Out-Null
             }
             if ($script:oldProcesses.Count) {
                 Start-AfpManagedRuntimeProcesses -Processes $script:oldProcesses -RuntimeExecutable $exe `

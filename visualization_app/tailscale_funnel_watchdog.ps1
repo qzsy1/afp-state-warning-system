@@ -161,6 +161,9 @@ function Test-WatchdogMutationAllowed {
         return [pscustomobject]@{ allowed = $true; reason = "approved_cutover" }
     }
     if ($owner -and $owner.Trim().ToLowerInvariant() -eq $Provider.Trim().ToLowerInvariant()) {
+        if (-not $Readiness -or -not [bool]$Readiness.allowed) {
+            return [pscustomobject]@{ allowed = $false; reason = "active_capture_blocks_cutover" }
+        }
         return [pscustomobject]@{ allowed = $true; reason = "current_owner" }
     }
     return [pscustomobject]@{ allowed = $false; reason = "non_owner_observe_only" }
@@ -179,19 +182,38 @@ function ConvertTo-WatchdogLayerTable($Layers) {
     return $table
 }
 
-function Restore-PreviousIngressState($PreviousState, [long]$PublishedGeneration) {
+function Restore-PreviousIngressState(
+    $PreviousState,
+    [long]$PublishedGeneration,
+    [string]$CandidateUrl,
+    [string]$CandidateId
+) {
     try {
         if (-not $PreviousState) {
-            Remove-Item -LiteralPath $IngressStateFile -Force -ErrorAction Stop
-            return -not (Test-Path -LiteralPath $IngressStateFile -PathType Leaf)
+            $failedLayers = @{
+                origin = New-WatchdogLayer $false "rollback_no_previous_ingress"
+                control_plane = New-WatchdogLayer $false "rollback_no_previous_ingress"
+                dns = New-WatchdogLayer $false "rollback_no_previous_ingress"
+                public_edge = New-WatchdogLayer $false "rollback_no_previous_ingress"
+                ingress = New-WatchdogLayer $false "rollback_no_previous_ingress"
+                helper = New-WatchdogLayer $false "rollback_no_previous_ingress"
+            }
+            Publish-AfpPublicIngressState -Path $IngressStateFile `
+                -PublicUrl $CandidateUrl -Provider "tailscale" -RecoveryOwner "tailscale" `
+                -CandidateId $CandidateId -Layers $failedLayers `
+                -ExpectedGeneration $PublishedGeneration `
+                -MinimumGeneration ($PublishedGeneration + 1L) | Out-Null
+            return $true
         }
         $layers = ConvertTo-WatchdogLayerTable $PreviousState.layers
+        $layers["helper"] = New-WatchdogLayer $false "rollback_helper_reconciliation_required"
         Publish-AfpPublicIngressState -Path $IngressStateFile `
             -PublicUrl ([string]$PreviousState.public_url) `
             -Provider ([string]$PreviousState.provider) `
             -RecoveryOwner ([string]$PreviousState.recovery_owner) `
             -CandidateId ([string]$PreviousState.candidate_id) `
-            -Layers $layers -ExpectedGeneration $PublishedGeneration | Out-Null
+            -Layers $layers -ExpectedGeneration $PublishedGeneration `
+            -MinimumGeneration ($PublishedGeneration + 1L) | Out-Null
         return $true
     } catch {
         return $false
@@ -477,7 +499,7 @@ function Ensure-Funnel {
         }
     }
     if (-not (Test-Funnel)) {
-        if ($candidateStarted) { Stop-CandidateIngress | Out-Null }
+        if ($candidateStarted -or $crossProviderCutover) { Stop-CandidateIngress | Out-Null }
         Write-FunnelState "funnel_unavailable" "Tailscale已登录，但Funnel没有指向本地8770端口。" $publicUrl
         return $false
     }
@@ -525,7 +547,7 @@ function Ensure-Funnel {
     }
     if (-not $helperReady) {
         $rolledBack = if ($publication.changed) {
-            Restore-PreviousIngressState $state ([long]$publication.generation)
+            Restore-PreviousIngressState $state ([long]$publication.generation) $publicUrl $candidateId
         } else { $true }
         if ($candidateStarted -or $crossProviderCutover) { Stop-CandidateIngress | Out-Null }
         $code = if ($rolledBack) { "helper_recovery_failed" } else { "cutover_rollback_failed" }
@@ -538,7 +560,7 @@ function Ensure-Funnel {
             -Layers $layers -ExpectedGeneration ([long]$publication.generation) | Out-Null
     } catch {
         $rolledBack = if ($publication.changed) {
-            Restore-PreviousIngressState $state ([long]$publication.generation)
+            Restore-PreviousIngressState $state ([long]$publication.generation) $publicUrl $candidateId
         } else { $true }
         if ($candidateStarted -or $crossProviderCutover) { Stop-CandidateIngress | Out-Null }
         $code = if ($rolledBack) { "ingress_publication_failed" } else { "cutover_rollback_failed" }
@@ -546,7 +568,23 @@ function Ensure-Funnel {
         return $false
     }
     if ($crossProviderCutover -and -not (Retire-PreviousIngress $previousProvider)) {
-        Write-FunnelState "previous_ingress_retirement_failed" "新入口已就绪，但旧入口需要人工清理。" $publicUrl $layers
+        if (-not (Test-PublicFunnel ([string]$state.public_url))) {
+            $layers.ingress = New-WatchdogLayer $false "previous_ingress_compensation_unavailable"
+            try {
+                Publish-AfpPublicIngressState -Path $IngressStateFile -PublicUrl $publicUrl `
+                    -Provider "tailscale" -RecoveryOwner "tailscale" -CandidateId $candidateId `
+                    -Layers $layers -ExpectedGeneration ([long]$publication.generation) | Out-Null
+            } catch {
+            }
+            Write-FunnelState "cutover_rollback_failed" "旧入口无法验证，已保留候选入口并进入人工故障态。" $publicUrl $layers
+            return $false
+        }
+        $rolledBack = Restore-PreviousIngressState $state ([long]$publication.generation) $publicUrl $candidateId
+        $candidateStopped = Stop-CandidateIngress
+        $code = if ($rolledBack -and $candidateStopped) {
+            "previous_ingress_retirement_failed"
+        } else { "cutover_rollback_failed" }
+        Write-FunnelState $code "旧入口退役失败，已执行切换补偿。" $publicUrl $layers
         return $false
     }
     Save-FunnelUrlAtomic $publicUrl

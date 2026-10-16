@@ -414,6 +414,7 @@ function Invoke-AfpRuntimePromotion {
             $targetState = Join-Path $runtime "runtime"
             $stateNames = @(
                 "public-ingress-state.json",
+                "public-ingress-cutover.json",
                 "public_web_security.sqlite3",
                 "public_web_security.sqlite3-wal",
                 "public_web_security.sqlite3-shm",
@@ -496,6 +497,7 @@ function Invoke-AfpVerifiedRuntimePromotion {
         [scriptblock]$ServiceProbeRunner,
         [scriptblock]$IngressPublisher,
         [scriptblock]$HelperReadinessRunner,
+        [scriptblock]$IngressCommitter,
         [scriptblock]$CompletionRunner,
         [scriptblock]$RestoreRunner,
         [string]$FailureEvidencePath = "",
@@ -595,6 +597,11 @@ function Invoke-AfpVerifiedRuntimePromotion {
                 throw "helper_candidate_mismatch"
             }
         }
+        if ($IngressCommitter) {
+            $committedIngress = & $IngressCommitter $ingress $helper
+            if (-not $committedIngress) { throw "ingress_commit_gate_failed" }
+            $ingress = $committedIngress
+        }
         if ($CompletionRunner) { & $CompletionRunner | Out-Null }
         return [pscustomobject][ordered]@{
             status = "completed"
@@ -606,6 +613,7 @@ function Invoke-AfpVerifiedRuntimePromotion {
     } catch {
         $failed = $true
         $failure = $_.Exception.Message
+        $failedState = $null
         try {
             if (Test-Path -LiteralPath $statePath -PathType Leaf) {
                 try {
@@ -614,7 +622,7 @@ function Invoke-AfpVerifiedRuntimePromotion {
                 } catch { $failedIngressGeneration = -1L }
             }
             if ($RestoreRunner) {
-                & $RestoreRunner $promotion $ingressSnapshot $failedIngressGeneration | Out-Null
+                & $RestoreRunner $promotion $ingressSnapshot $failedIngressGeneration $failedState | Out-Null
             } elseif ($promotion) {
                 Restore-AfpRuntimePromotion -Promotion $promotion -Paths $Paths
                 if ($null -ne $ingressSnapshot) {
@@ -629,6 +637,10 @@ function Invoke-AfpVerifiedRuntimePromotion {
                             code = [string]$property.Value.code
                         }
                     }
+                    $snapshotLayers["helper"] = @{
+                        ok = $false
+                        code = "rollback_helper_reconciliation_required"
+                    }
                     Publish-AfpPublicIngressState -Path $statePath `
                         -PublicUrl ([string]$snapshot.public_url) `
                         -Provider ([string]$snapshot.provider) `
@@ -637,6 +649,23 @@ function Invoke-AfpVerifiedRuntimePromotion {
                         -ExpectedGeneration ([long]$restored.generation) `
                         -MinimumGeneration ([Math]::Max([long]$restored.generation + 1L, $failedIngressGeneration + 1L)) `
                         -Layers $snapshotLayers | Out-Null
+                } elseif ($failedState) {
+                    Import-Module (Join-Path $Paths.RuntimeRoot "PublicIngress.psm1") -Force -ErrorAction Stop
+                    $failedLayers = @{
+                        origin = @{ ok = $false; code = "rollback_no_previous_ingress" }
+                        control_plane = @{ ok = $false; code = "rollback_no_previous_ingress" }
+                        dns = @{ ok = $false; code = "rollback_no_previous_ingress" }
+                        public_edge = @{ ok = $false; code = "rollback_no_previous_ingress" }
+                        ingress = @{ ok = $false; code = "rollback_no_previous_ingress" }
+                        helper = @{ ok = $false; code = "rollback_no_previous_ingress" }
+                    }
+                    Publish-AfpPublicIngressState -Path $statePath `
+                        -PublicUrl ([string]$failedState.public_url) `
+                        -Provider ([string]$failedState.provider) `
+                        -RecoveryOwner ([string]$failedState.recovery_owner) `
+                        -CandidateId ([string]$failedState.candidate_id) `
+                        -MinimumGeneration ([Math]::Max(1L, $failedIngressGeneration + 1L)) `
+                        -Layers $failedLayers | Out-Null
                 }
             }
             return [pscustomobject][ordered]@{

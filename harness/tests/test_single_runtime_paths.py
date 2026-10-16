@@ -96,6 +96,9 @@ if ($resolved -ne [IO.Path]::GetFullPath($allowed).TrimEnd('\')) {{
 $junction = Join-Path $paths.StagingRoot 'outside-link'
 New-Item -ItemType Junction -Path $junction -Target {_ps_quote(outside)} | Out-Null
 Assert-Rejected $junction 'Staging'
+$junctionChild = Join-Path $junction 'nested-candidate'
+New-Item -ItemType Directory -Path $junctionChild -Force | Out-Null
+Assert-Rejected $junctionChild 'Staging'
 """
             result = _run_powershell(script)
             self.assertEqual(

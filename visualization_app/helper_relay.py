@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -132,6 +133,11 @@ class HelperRegistry:
         self.heartbeat_ttl_seconds = max(1, int(heartbeat_ttl_seconds))
         self.persistence_path = Path(persistence_path).resolve() if persistence_path else None
         self.ingress_state_path = Path(ingress_state_path).resolve() if ingress_state_path else None
+        self.cutover_reservation_path = (
+            self.ingress_state_path.with_name("public-ingress-cutover.json")
+            if self.ingress_state_path is not None
+            else None
+        )
         self.expected_candidate_id = str(expected_candidate_id or "")
         self.ingress_state_loader = ingress_state_loader or load_public_ingress_state
         self._lock = threading.RLock()
@@ -166,15 +172,116 @@ class HelperRegistry:
             helper.sender = None
             helper.online = False
         self._helpers.clear()
-        self._cutover_reservation_id = ""
-        self._cutover_reservation_deadline = 0.0
         self._persist_helpers_locked()
 
+    @contextmanager
+    def _cutover_file_lock_locked(self):
+        path = self.cutover_reservation_path
+        if path is None:
+            yield
+            return
+        lock_path = path.with_name(path.name + ".lock")
+        deadline = time.monotonic() + 5.0
+        descriptor: int | None = None
+        while descriptor is None:
+            try:
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                descriptor = os.open(
+                    lock_path,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                )
+            except FileExistsError:
+                try:
+                    if time.time() - lock_path.stat().st_mtime > 30.0:
+                        lock_path.unlink()
+                        continue
+                except FileNotFoundError:
+                    continue
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("cutover reservation lock unavailable")
+                time.sleep(0.025)
+        try:
+            os.write(descriptor, str(os.getpid()).encode("ascii"))
+            yield
+        finally:
+            os.close(descriptor)
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _read_persisted_cutover_locked(self) -> dict[str, Any] | None:
+        path = self.cutover_reservation_path
+        if path is None:
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            token_hash = str(payload.get("reservation_hash") or "")
+            expires_at = float(payload.get("expires_at") or 0.0)
+            if len(token_hash) != 64:
+                raise ValueError("invalid reservation hash")
+            if time.time() >= expires_at:
+                return None
+            return {"reservation_hash": token_hash, "expires_at": expires_at}
+        except FileNotFoundError:
+            return None
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            # An unreadable lease is treated as active so capture cannot start
+            # while cutover ownership is uncertain.
+            return {"reservation_hash": "", "expires_at": float("inf")}
+
+    def _write_persisted_cutover_locked(
+        self,
+        reservation_id: str,
+        expires_at: float,
+    ) -> None:
+        path = self.cutover_reservation_path
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + f".{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "reservation_hash": _hash(reservation_id),
+                        "expires_at": expires_at,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            os.replace(temporary, path)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
     def _cutover_reserved_locked(self) -> bool:
+        persisted = self._read_persisted_cutover_locked()
+        if persisted is not None:
+            self._cutover_reservation_deadline = float(persisted["expires_at"])
+            return True
         if self._cutover_reservation_id and time.time() >= self._cutover_reservation_deadline:
             self._cutover_reservation_id = ""
             self._cutover_reservation_deadline = 0.0
         return bool(self._cutover_reservation_id)
+
+    def _owns_cutover_reservation_locked(self, reservation_id: str) -> bool:
+        candidate = str(reservation_id or "")
+        if not candidate:
+            return False
+        persisted = self._read_persisted_cutover_locked()
+        if persisted is not None:
+            token_hash = str(persisted.get("reservation_hash") or "")
+            return bool(token_hash) and hmac.compare_digest(token_hash, _hash(candidate))
+        return bool(self._cutover_reservation_id) and hmac.compare_digest(
+            self._cutover_reservation_id,
+            candidate,
+        )
 
     def _synchronize_ingress_locked(self) -> bool:
         if self.ingress_state_path is None:
@@ -519,12 +626,26 @@ class HelperRegistry:
                 return {"ok": False, "error": "ingress_generation_mismatch"}
             if received_generation != self._ingress_generation or record.generation != self._ingress_generation:
                 return {"ok": False, "error": "ingress_generation_mismatch"}
+            if record.delivery_state == "terminal":
+                return {
+                    "ok": False,
+                    "error": record.terminal_error or "command_already_terminal",
+                    "terminal": True,
+                }
+            if record.delivery_state == "completed":
+                return {"ok": True, "request_id": str(request_id)}
             result = dict(payload)
             helper.results[str(request_id)] = result
             record.delivery_state = "completed"
             record.terminal_error = ""
             self._active_captures.pop(f"unconfirmed-{record.request_id}", None)
             capture_uuid = str(result.get("capture_uuid") or "").strip()
+            if record.command == "status" and isinstance(result.get("running"), bool):
+                self._active_captures = {
+                    capture_id: owner
+                    for capture_id, owner in self._active_captures.items()
+                    if owner != session_id
+                }
             if record.command in {"start_capture", "status"} and result.get("running") is True and capture_uuid:
                 self._active_captures[capture_uuid] = session_id
             if result.get("running") is False and capture_uuid:
@@ -603,11 +724,7 @@ class HelperRegistry:
             reservation_active = self._cutover_reserved_locked()
             owns_reservation = bool(
                 reservation_active
-                and reservation_id
-                and hmac.compare_digest(
-                    self._cutover_reservation_id,
-                    str(reservation_id),
-                )
+                and self._owns_cutover_reservation_locked(reservation_id)
             )
             return {
                 "allowed": bool(
@@ -624,33 +741,50 @@ class HelperRegistry:
 
     def reserve_cutover(self, ttl_seconds: int = 180) -> dict[str, Any]:
         with self._lock:
-            readiness = self.cutover_readiness()
-            if not readiness["allowed"]:
-                return {**readiness, "reservation_id": ""}
-            reservation_id = secrets.token_urlsafe(24)
-            self._cutover_reservation_id = reservation_id
-            self._cutover_reservation_deadline = time.time() + max(
-                30, min(int(ttl_seconds), 600)
-            )
-            return {
-                **readiness,
-                "allowed": True,
-                "reservation_active": True,
-                "reservation_id": reservation_id,
-            }
+            try:
+                with self._cutover_file_lock_locked():
+                    readiness = self.cutover_readiness()
+                    if not readiness["allowed"]:
+                        return {**readiness, "reservation_id": ""}
+                    reservation_id = secrets.token_urlsafe(24)
+                    deadline = time.time() + max(30, min(int(ttl_seconds), 600))
+                    self._write_persisted_cutover_locked(reservation_id, deadline)
+                    self._cutover_reservation_id = reservation_id
+                    self._cutover_reservation_deadline = deadline
+                    return {
+                        **readiness,
+                        "allowed": True,
+                        "reservation_active": True,
+                        "reservation_id": reservation_id,
+                    }
+            except (OSError, TimeoutError):
+                readiness = self.cutover_readiness()
+                return {
+                    **readiness,
+                    "allowed": False,
+                    "reservation_active": True,
+                    "reservation_id": "",
+                    "error": "cutover_reservation_unavailable",
+                }
 
     def release_cutover(self, reservation_id: str) -> bool:
         with self._lock:
-            if not self._cutover_reserved_locked():
+            try:
+                with self._cutover_file_lock_locked():
+                    if not self._cutover_reserved_locked():
+                        return False
+                    if not self._owns_cutover_reservation_locked(reservation_id):
+                        return False
+                    if self.cutover_reservation_path is not None:
+                        try:
+                            self.cutover_reservation_path.unlink()
+                        except FileNotFoundError:
+                            return False
+                    self._cutover_reservation_id = ""
+                    self._cutover_reservation_deadline = 0.0
+                    return True
+            except (OSError, TimeoutError):
                 return False
-            if not hmac.compare_digest(
-                self._cutover_reservation_id,
-                str(reservation_id or ""),
-            ):
-                return False
-            self._cutover_reservation_id = ""
-            self._cutover_reservation_deadline = 0.0
-            return True
 
     def cutover_reserved(self) -> bool:
         with self._lock:
@@ -658,7 +792,17 @@ class HelperRegistry:
 
     def begin_capture_start(self) -> bool:
         with self._lock:
-            if not self._synchronize_ingress_locked() or self._cutover_reserved_locked():
+            if (
+                not self._synchronize_ingress_locked()
+                or self._cutover_reserved_locked()
+                or (
+                    self.ingress_state_path is not None
+                    and (
+                        self._ingress_state is None
+                        or self._ingress_state.status != "online"
+                    )
+                )
+            ):
                 return False
             self._capture_starts_in_progress += 1
             return True
@@ -735,8 +879,17 @@ class HelperRegistry:
         with self._lock:
             if not self._synchronize_ingress_locked():
                 return {"ok": False, "queued": False, "error": "ingress_state_unavailable"}
-            if command == "start_capture" and self._cutover_reserved_locked():
-                return {"ok": False, "queued": False, "error": "ingress_cutover_in_progress"}
+            if command == "start_capture":
+                if self._cutover_reserved_locked():
+                    return {"ok": False, "queued": False, "error": "ingress_cutover_in_progress"}
+                if (
+                    self.ingress_state_path is not None
+                    and (
+                        self._ingress_state is None
+                        or self._ingress_state.status != "online"
+                    )
+                ):
+                    return {"ok": False, "queued": False, "error": "ingress_not_online"}
             helper = self._helpers.get(session_id)
             if helper is None or helper.generation != self._ingress_generation:
                 return {"ok": False, "error": "helper_not_paired"}
