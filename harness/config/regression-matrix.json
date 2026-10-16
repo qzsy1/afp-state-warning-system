@@ -327,7 +327,7 @@
       "id": "acquisition-storage-contracts",
       "title": "采集状态、CSV和MySQL保存契约",
       "kind": "command",
-      "command": ["{python}", "-m", "unittest", "test_acquisition_integrity", "test_process_parameters", "test_server_capture_journal", "test_mysql_credentials", "test_mysql_identity", "test_mysql_visibility", "test_server_target_mysql", "test_remote_mysql_setup", "-v"],
+      "command": ["{python}", "-m", "unittest", "test_acquisition_integrity", "test_recovery_discard", "test_process_parameters", "test_server_capture_journal", "test_mysql_credentials", "test_mysql_identity", "test_mysql_visibility", "test_server_target_mysql", "test_remote_mysql_setup", "-v"],
       "cwd": "visualization_app",
       "timeout_seconds": 1800,
       "profiles": ["full", "release"],

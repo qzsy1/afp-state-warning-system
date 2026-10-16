@@ -5487,6 +5487,13 @@ class AppHandler(BaseHTTPRequestHandler):
                 )
                 self._send_json(result)
                 return
+            if parsed.path == "/api/admin/acquisition/recovery-discard":
+                result = self.dashboard.acquisition.discard_persistence_recovery(
+                    payload, actor=self._identity().role
+                )
+                result["status"] = self.dashboard.acquisition.status()
+                self._send_json(result)
+                return
             if parsed.path in {
                 "/api/helper/poll",
                 "/api/helper/result",

@@ -636,6 +636,9 @@ const controls = {
   autoHardwareCheck: $("autoHardwareCheckInput"),
   resetSensorCheck: $("resetSensorCheckButton"),
   hardwareCheckStatus: $("hardwareCheckStatus"),
+  persistenceRecoveryPanel: $("persistenceRecoveryPanel"),
+  persistenceRecoveryStatus: $("persistenceRecoveryStatus"),
+  discardPersistenceRecovery: $("discardPersistenceRecoveryButton"),
 };
 
 function syncTargetMysqlSection() {
@@ -1099,6 +1102,21 @@ function renderAcquisitionStatus(status) {
     });
   }
   renderMysqlStatus(status.mysql, status.server_target);
+  const recovery = status.persistence_recovery || {};
+  const recoveryBlocked = Boolean(recovery.blocked);
+  const mayDiscardRecovery = state.accessRole === "local_admin" && recoveryBlocked;
+  controls.persistenceRecoveryPanel?.classList.toggle("hidden", !recoveryBlocked);
+  if (controls.persistenceRecoveryStatus && recoveryBlocked) {
+    const unsafe = Number(recovery.unsafe_files || 0);
+    controls.persistenceRecoveryStatus.textContent =
+      `上一采集仍有 ${Number(recovery.database_pending_retry || 0)} 条数据库待补传和 ` +
+      `${Number(recovery.incomplete_files || 0)} 个未完成文件。默认保留并阻止新正式采集。` +
+      `${unsafe ? ` 其中 ${unsafe} 项路径异常，只能人工核查。` : ""}`;
+  }
+  if (controls.discardPersistenceRecovery) {
+    controls.discardPersistenceRecovery.classList.toggle("hidden", !mayDiscardRecovery);
+    controls.discardPersistenceRecovery.disabled = !mayDiscardRecovery;
+  }
   const healthy = selected.filter((item) => item.ok);
   const captureOnly = status.config?.processing_mode === "capture_only"
     || controls.processingMode.value === "capture_only";
@@ -1178,6 +1196,41 @@ function renderAcquisitionStatus(status) {
     `${status.full_specimen_file ? ` · 完整试样：${status.full_specimen_file}` : ""}` +
     `${status.last_error ? ` · 错误：${status.last_error}` : ""}`;
   synchronizeAcquisitionButtons();
+}
+
+async function discardPersistenceRecovery() {
+  const recovery = state.acquisitionStatus?.persistence_recovery || {};
+  const items = Array.isArray(recovery.files)
+    ? recovery.files.filter((item) => item?.eligible && item?.id)
+    : [];
+  if (state.accessRole !== "local_admin" || !recovery.blocked || !items.length) {
+    toast("当前没有可由本机管理员安全处理的恢复阻塞项。");
+    return;
+  }
+  const confirmation = window.prompt(
+    "该操作只处理当前列出的 MySQL 待补传和 .partial 阻塞项。请输入“重置并丢弃”确认：",
+    "",
+  );
+  if (confirmation !== "重置并丢弃") {
+    toast("确认短语不匹配，未处理任何文件。");
+    return;
+  }
+  const button = controls.discardPersistenceRecovery;
+  if (button) button.disabled = true;
+  try {
+    const result = await postJson("/api/admin/acquisition/recovery-discard", {
+      confirm_discard: true,
+      confirmation,
+      scan_fingerprint: String(recovery.scan_fingerprint || ""),
+      item_ids: items.map((item) => item.id),
+    });
+    renderAcquisitionStatus(result.status);
+    toast(`已处理 ${Number(result.processed_count || 0)} 个阻塞项，恢复状态已刷新。`);
+  } catch (error) {
+    toast(`恢复处理失败：${error.message}`);
+  } finally {
+    if (button) button.disabled = false;
+  }
 }
 
 function describeFirstSampleFailure(helperConnection, helperCaptureStatus) {
@@ -4296,6 +4349,7 @@ controls.readProcessParameters?.addEventListener(
 );
 $("testMysqlButton")?.addEventListener("click", () => testMysqlConnection(false));
 controls.retryTargetMysql?.addEventListener("click", () => retryServerTargetMysql());
+controls.discardPersistenceRecovery?.addEventListener("click", () => discardPersistenceRecovery());
 $("testLocalMysqlButton")?.addEventListener("click", () => testMysqlConnection(true));
 $("refreshLocalRelationMapButton")?.addEventListener("click", () => refreshRelationMap("local"));
 $("refreshTargetRelationMapButton")?.addEventListener("click", () => refreshRelationMap("target"));

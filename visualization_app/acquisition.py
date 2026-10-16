@@ -293,6 +293,91 @@ def _pending_capture_uuid(payload: dict[str, Any]) -> str:
     return ""
 
 
+def _path_has_reparse_point(path: Path, root: Path) -> bool:
+    """Return whether a candidate crosses a link or Windows reparse point."""
+
+    current = path
+    root = root.resolve()
+    while current != root:
+        try:
+            stat_result = current.lstat()
+        except OSError:
+            return True
+        if current.is_symlink() or bool(
+            int(getattr(stat_result, "st_file_attributes", 0)) & 0x400
+        ):
+            return True
+        parent = current.parent
+        if parent == current:
+            return True
+        current = parent
+    return False
+
+
+def _recovery_file_kind(path: Path) -> str:
+    name = path.name
+    if name.endswith(".partial"):
+        return "partial"
+    if name.endswith("_pending.json") and "_mysql" in name:
+        return "mysql_pending"
+    return ""
+
+
+def _recovery_candidates(
+    root: str | Path,
+) -> tuple[Path, list[tuple[Path, dict[str, Any]]]]:
+    capture_root = Path(root).expanduser().resolve()
+    paths = {
+        path
+        for pattern in ("*_mysql*_pending.json", "*.partial")
+        for path in capture_root.rglob(pattern)
+    }
+    candidates: list[tuple[Path, dict[str, Any]]] = []
+    for path in sorted(paths, key=lambda item: item.relative_to(capture_root).as_posix()):
+        relative = path.relative_to(capture_root).as_posix()
+        kind = _recovery_file_kind(path)
+        eligible = bool(kind)
+        reason = ""
+        try:
+            stat_result = path.lstat()
+        except OSError:
+            stat_result = None
+            eligible = False
+            reason = "unreadable"
+        if eligible and _path_has_reparse_point(path, capture_root):
+            eligible = False
+            reason = "reparse_point"
+        if eligible:
+            try:
+                path.resolve(strict=True).relative_to(capture_root)
+            except (OSError, ValueError):
+                eligible = False
+                reason = "outside_capture_root"
+        if eligible and (stat_result is None or not path.is_file()):
+            eligible = False
+            reason = "not_regular_file"
+        size = int(stat_result.st_size) if stat_result is not None else -1
+        modified_ns = int(stat_result.st_mtime_ns) if stat_result is not None else -1
+        identity = hashlib.sha256(
+            f"{kind}\0{relative}\0{size}\0{modified_ns}".encode("utf-8")
+        ).hexdigest()
+        candidates.append(
+            (
+                path,
+                {
+                    "id": identity,
+                    "kind": kind or "unsupported",
+                    "name": path.name,
+                    "path_sha256": hashlib.sha256(relative.encode("utf-8")).hexdigest(),
+                    "eligible": eligible,
+                    "reason": reason,
+                    "size_bytes": size,
+                },
+            )
+        )
+    return capture_root, candidates
+
+
 def _resolve_pending_layer_file(
     pending_path: Path,
     payload: dict[str, Any],
@@ -352,14 +437,18 @@ def scan_persistence_recovery(root: str | Path) -> dict[str, Any]:
     evidence does not disclose the machine's private directory layout.
     """
 
-    capture_root = Path(root).expanduser().resolve()
-    pending_files = sorted(capture_root.rglob("*_mysql*_pending.json"))
-    incomplete_files = sorted(capture_root.rglob("*.partial"))
+    capture_root, candidates = _recovery_candidates(root)
+    pending_files = [path for path, item in candidates if item["kind"] == "mysql_pending"]
+    incomplete_files = [path for path, item in candidates if item["kind"] == "partial"]
     capture_uuids: set[str] = set()
     unreadable_pending = 0
     missing_retry_sources = 0
     relocated_retry_sources = 0
+    candidate_by_path = {path: item for path, item in candidates}
     for path in pending_files:
+        if not candidate_by_path[path]["eligible"]:
+            unreadable_pending += 1
+            continue
         try:
             payload = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, UnicodeError, json.JSONDecodeError):
@@ -378,15 +467,10 @@ def scan_persistence_recovery(root: str | Path) -> dict[str, Any]:
             saved_layer = Path(str(payload.get("layer_file") or "")).expanduser()
             if not saved_layer.is_file():
                 relocated_retry_sources += 1
-    file_evidence = [
-        {
-            "name": path.name,
-            "path_sha256": hashlib.sha256(
-                path.relative_to(capture_root).as_posix().encode("utf-8")
-            ).hexdigest(),
-        }
-        for path in (*pending_files, *incomplete_files)
-    ]
+    file_evidence = [dict(item) for _path, item in candidates]
+    scan_fingerprint = hashlib.sha256(
+        json.dumps(file_evidence, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
     return {
         "blocked": bool(pending_files or incomplete_files),
         "database_pending_retry": len(pending_files),
@@ -394,8 +478,10 @@ def scan_persistence_recovery(root: str | Path) -> dict[str, Any]:
         "unreadable_pending": unreadable_pending,
         "missing_retry_sources": missing_retry_sources,
         "relocated_retry_sources": relocated_retry_sources,
+        "unsafe_files": sum(not item["eligible"] for item in file_evidence),
         "capture_uuids": sorted(capture_uuids),
         "files": file_evidence,
+        "scan_fingerprint": scan_fingerprint,
     }
 
 
@@ -2998,8 +3084,10 @@ class AcquisitionManager:
                 "unreadable_pending": 0,
                 "missing_retry_sources": 0,
                 "relocated_retry_sources": 0,
+                "unsafe_files": 0,
                 "capture_uuids": [],
                 "files": [],
+                "scan_fingerprint": hashlib.sha256(b"[]").hexdigest(),
                 "scan_deferred": True,
             }
         )
@@ -3017,6 +3105,143 @@ class AcquisitionManager:
             else:
                 self.capture_phase = "finalization_failed"
                 self.last_error = "restart_recovery_incomplete_files"
+
+    def _apply_recovery_state_locked(self, recovery: dict[str, Any]) -> None:
+        self.recovery_state = dict(recovery)
+        if recovery.get("blocked"):
+            self.finalization_complete = False
+            if int(recovery.get("database_pending_retry") or 0) > 0:
+                self.capture_phase = "database_pending_retry"
+                self.mysql_status = {
+                    **self.mysql_status,
+                    "enabled": True,
+                    "ok": False,
+                    "state": "pending",
+                    "recovery": dict(recovery),
+                }
+            else:
+                self.capture_phase = "finalization_failed"
+                self.last_error = "restart_recovery_incomplete_files"
+            return
+        if self.capture_phase in {"database_pending_retry", "finalization_failed"}:
+            self.finalization_complete = True
+            self.capture_phase = "completed" if self.capture_uuid else "idle"
+            if self.last_error == "restart_recovery_incomplete_files":
+                self.last_error = ""
+
+    def refresh_persistence_recovery(self) -> dict[str, Any]:
+        """Rescan durable blockers and publish the result without a restart."""
+
+        with self.lifecycle_lock:
+            recovery = scan_persistence_recovery(self.capture_root)
+            with self.lock:
+                self._apply_recovery_state_locked(recovery)
+                return dict(self.recovery_state)
+
+    def discard_persistence_recovery(
+        self, request: dict[str, Any], *, actor: str
+    ) -> dict[str, Any]:
+        """Move explicitly confirmed blockers into an audited recovery area."""
+
+        if str(actor) != "local_admin":
+            raise PermissionError("local_admin_required")
+        if request.get("confirm_discard") is not True:
+            raise ValueError("confirm_discard_required")
+        if str(request.get("confirmation") or "") != "重置并丢弃":
+            raise ValueError("confirmation_phrase_mismatch")
+        requested_ids = request.get("item_ids")
+        if (
+            not isinstance(requested_ids, list)
+            or not requested_ids
+            or any(not isinstance(value, str) or not value for value in requested_ids)
+            or len(set(requested_ids)) != len(requested_ids)
+            or len(requested_ids) > 1000
+        ):
+            raise ValueError("exact_item_ids_required")
+        expected_fingerprint = str(request.get("scan_fingerprint") or "")
+        if not expected_fingerprint:
+            raise ValueError("scan_fingerprint_required")
+
+        with self.lifecycle_lock:
+            with self.lock:
+                active = bool(self.thread is not None and self.thread.is_alive())
+                active = active or self.capture_phase in {
+                    "starting",
+                    "running",
+                    "stopping_sampling",
+                    "finalizing",
+                }
+            if active:
+                raise RuntimeError("active_capture_recovery_forbidden")
+
+            capture_root, candidates = _recovery_candidates(self.capture_root)
+            current = scan_persistence_recovery(capture_root)
+            if current["scan_fingerprint"] != expected_fingerprint:
+                raise ValueError("recovery_scan_changed")
+            by_id = {item["id"]: (path, item) for path, item in candidates}
+            selected: list[tuple[Path, dict[str, Any]]] = []
+            for item_id in requested_ids:
+                candidate = by_id.get(item_id)
+                if candidate is None:
+                    raise ValueError("recovery_item_not_found")
+                path, item = candidate
+                if not item["eligible"]:
+                    raise ValueError(f"recovery_item_unsafe:{item['reason']}")
+                selected.append((path, item))
+
+            operation_id = uuid.uuid4().hex
+            discard_root = capture_root / ".afp-recovery-discarded" / operation_id
+            moved: list[tuple[Path, Path]] = []
+            audit = {
+                "schema_version": 1,
+                "operation_id": operation_id,
+                "action": "discard_recovery_blockers",
+                "actor": "local_admin",
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "scan_fingerprint": expected_fingerprint,
+                "items": [
+                    {
+                        key: item[key]
+                        for key in ("id", "kind", "name", "path_sha256", "size_bytes")
+                    }
+                    for _path, item in selected
+                ],
+            }
+            try:
+                for source, _item in selected:
+                    relative = source.relative_to(capture_root)
+                    destination = discard_root / relative
+                    destination = destination.with_name(destination.name + ".discarded")
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(source, destination)
+                    moved.append((source, destination))
+                _atomic_write_json(
+                    capture_root / ".afp-recovery-audit" / f"{operation_id}.json",
+                    audit,
+                )
+            except Exception:
+                for source, destination in reversed(moved):
+                    if destination.exists() and not source.exists():
+                        source.parent.mkdir(parents=True, exist_ok=True)
+                        os.replace(destination, source)
+                raise
+            recovery = scan_persistence_recovery(capture_root)
+            with self.lock:
+                self._apply_recovery_state_locked(recovery)
+                if any(item["kind"] == "mysql_pending" for _path, item in selected):
+                    self.mysql_status = {
+                        **self.mysql_status,
+                        "enabled": True,
+                        "ok": False,
+                        "state": "discarded",
+                    }
+            return {
+                "ok": True,
+                "operation_id": operation_id,
+                "processed_count": len(selected),
+                "items": audit["items"],
+                "recovery": recovery,
+            }
 
     @staticmethod
     def _public_config(config: AcquisitionConfig) -> dict[str, Any]:
@@ -4768,7 +4993,6 @@ class AcquisitionManager:
             and recovery_after["incomplete_files"] == 0
         )
         with self.lock:
-            self.recovery_state = recovery_after
             self.mysql_status = {
                 **self.mysql_status,
                 "enabled": True,
@@ -4788,6 +5012,7 @@ class AcquisitionManager:
                 self.capture_phase = "completed"
                 if "database" in self.last_error.lower() or "mysql" in self.last_error.lower():
                     self.last_error = ""
+            self._apply_recovery_state_locked(recovery_after)
         return result
 
     @staticmethod

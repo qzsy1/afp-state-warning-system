@@ -57,6 +57,7 @@
 - `remote-simulation-source`: 规定不同访问角色选择、上传、隔离和解析访问电脑模拟 CSV/文件夹的行为。
 - `mysql-scope-portability`: 规定访问电脑本机 MySQL 与服务器/目标 MySQL 的作用域、凭据保护、错误诊断和换机初始化行为。
 - `responsive-agent-diagnosis`: 规定本地诊断即时可用、模型增强异步执行、超时降级和重复结果复用行为。
+- `capture-recovery-safety`: 规定上一采集持久化门禁默认保留、显式确认、精确限域、活动采集拒绝、即时刷新和审计结果。
 
 ### Modified Capabilities
 
@@ -68,6 +69,7 @@
 - 同步更新既定交付目录 `delivery/AFP_Integrated_System_Modular_v2.0.3_Agentic/app/` 的外部业务文件；保持 `AFP_Integrated_System_Modular.exe` 二进制及其 SHA-256 不变，只重建并替换受本变更直接影响的 `local_helper/AFP_Local_Capture_Helper.exe`。
 - 增加针对远程角色、批次积压、会话文件隔离、DPAPI凭据元数据、诊断超时/缓存和回归边界的测试；不引入新的第三方运行时依赖。
 - 不改变传感器协议解析、17通道模型输入、M3232薄膜压力通道、健康指标、预警阈值、CSV目录结构或数据库表结构。
+- 恢复操作只处理采集根目录内当前扫描确认的 MySQL pending 与 `.partial` 阻塞条目；普通重试、启动、重启和接口检查保持数据不丢失。
 - 不以扩大浏览器或 helper 超时掩盖卡死驱动，不让局域网优化改变公网权限、会话隔离或诊断模型调用次数。
 - 不把跨电脑墙钟差与 helper 队列年龄归因于浏览器绘图；浏览器处理耗时使用本机单调计时测量，载荷到达率与实际绘图耗时分别显示。
 - 本轮公网演示改造只同步外置 Python/HTML/JavaScript 与版本化演示资产，不重建主程序或 helper EXE；局域网 helper 模拟、公网真实 helper 采集、五类接口、两个 MySQL 作用域及诊断安全边界保持不变。

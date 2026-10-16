@@ -100,6 +100,14 @@ class RegressionMatrixContractTests(unittest.TestCase):
         self.assertIn("test_app", dashboard.command)
         self.assertNotIn("test_app", acquisition.command)
 
+    def test_acquisition_storage_contracts_bind_explicit_recovery_safety(self) -> None:
+        acquisition = next(
+            item for item in self.matrix.checks if item.id == "acquisition-storage-contracts"
+        )
+        self.assertIn("test_recovery_discard", acquisition.command)
+        self.assertIn("CAPTURE_PERSISTENCE-001", acquisition.requirements)
+        self.assertIn("MYSQL-001", acquisition.requirements)
+
     def test_field_checks_are_explicit_nonblocking_evidence(self) -> None:
         field_checks = [check for check in self.matrix.checks if check.kind == "field"]
         self.assertGreaterEqual(len(field_checks), 2)

@@ -127,6 +127,7 @@ LOCAL_ADMIN_POST = {
     "/api/admin/security/revoke",
     "/api/admin/simulation/cleanup",
     "/api/admin/real-control/takeover",
+    "/api/admin/acquisition/recovery-discard",
 }
 
 

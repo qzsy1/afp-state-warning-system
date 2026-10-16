@@ -217,6 +217,43 @@ const toast = () => {};
         completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
+    def test_recovery_discard_requires_typed_confirmation_and_exact_scan(self):
+        html = (Path(__file__).with_name("static") / "index.html").read_text(encoding="utf-8")
+        self.assertIn('id="discardPersistenceRecoveryButton"', html)
+        text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
+        start = text.index("async function discardPersistenceRecovery()")
+        end = text.index("function describeFirstSampleFailure", start)
+        function = text[start:end]
+        script = r'''
+const calls = [];
+const prompts = ["取消", "重置并丢弃"];
+const state = {accessRole: "local_admin", acquisitionStatus: {persistence_recovery: {
+  blocked: true, scan_fingerprint: "scan-a", files: [
+    {id: "safe-a", eligible: true}, {id: "unsafe-b", eligible: false}
+  ]
+}}};
+const controls = {discardPersistenceRecovery: {disabled: false}};
+const window = {prompt: () => prompts.shift()};
+const toast = () => {};
+const renderAcquisitionStatus = () => {};
+const postJson = async (url, payload) => {
+  calls.push([url, payload]);
+  return {processed_count: 1, status: {persistence_recovery: {blocked: false}}};
+};
+''' + function + r'''
+(async () => {
+  await discardPersistenceRecovery();
+  if (calls.length !== 0) process.exit(1);
+  await discardPersistenceRecovery();
+  if (calls.length !== 1 || calls[0][0] !== "/api/admin/acquisition/recovery-discard") process.exit(2);
+  const body = calls[0][1];
+  if (body.confirm_discard !== true || body.confirmation !== "重置并丢弃" ||
+      body.scan_fingerprint !== "scan-a" || JSON.stringify(body.item_ids) !== '["safe-a"]') process.exit(3);
+})().catch((error) => { console.error(error); process.exit(4); });
+'''
+        completed = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_guest_replay_polls_server_progress_at_most_once_per_second(self):
         text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
         start = text.index("function startLocalSimulationReplay()")
