@@ -752,9 +752,10 @@ class UnifiedFrame:
         channels: dict[str, dict[str, Any]] = {}
         for name, sample in self.channels.items():
             age = _finite(sample.metadata.get("age_seconds"))
+            unit = units.get(str(name), "")
             channels[str(name)] = {
                 "value": sample.value,
-                "unit": units.get(str(name), ""),
+                "unit": unit,
                 "quality": sample.quality.value,
                 "source_timestamp": (
                     sample.device_timestamp
@@ -768,6 +769,11 @@ class UnifiedFrame:
                 "source_sequence": sample.source_sequence,
                 "protocol_ok": sample.protocol_ok,
                 "error": sample.error,
+                "metadata": {
+                    **dict(sample.metadata),
+                    "age_seconds": age,
+                    "unit": unit,
+                },
             }
         return {
             "contract_version": "unified_frame_v1",
@@ -778,6 +784,63 @@ class UnifiedFrame:
             "assembled_monotonic": float(self.assembled_monotonic),
             "deadline_missed": bool(self.deadline_missed),
             "channels": channels,
+        }
+
+    def to_envelope_v2(
+        self,
+        *,
+        session_id: str,
+        mode_id: str,
+        catalog: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Encode a compact positional frame after an explicit catalog handshake."""
+
+        identity = str(session_id or "").strip()
+        if not identity:
+            raise ValueError("session_id is required")
+        catalog_id = str(catalog.get("catalog_id") or "").strip()
+        raw_channels = catalog.get("channels")
+        if not catalog_id or not isinstance(raw_channels, list):
+            raise ValueError("catalog_id and channels are required")
+        channel_names = [
+            str(item.get("name") if isinstance(item, Mapping) else item)
+            for item in raw_channels
+        ]
+        if not channel_names or len(channel_names) != len(set(channel_names)):
+            raise ValueError("catalog channels must be non-empty and unique")
+        values: list[float | None] = []
+        quality: list[str] = []
+        source: dict[str, dict[str, Any]] = {}
+        for index, name in enumerate(channel_names):
+            sample = self.channels.get(name)
+            if sample is None:
+                values.append(None)
+                quality.append(ChannelQuality.MISSING.value)
+                continue
+            values.append(sample.value)
+            quality.append(sample.quality.value)
+            metadata = {
+                "interface_id": sample.interface_id,
+                "source_sequence": sample.source_sequence,
+                "source_timestamp": sample.device_timestamp,
+                "protocol_ok": sample.protocol_ok,
+                "error": sample.error,
+            }
+            if any(value not in (None, "") for value in metadata.values()):
+                source[str(index)] = metadata
+        return {
+            "contract_version": "unified_frame_v2",
+            "session_id": identity,
+            "mode_id": str(mode_id or ""),
+            "catalog_id": catalog_id,
+            "frame_sequence": int(self.capture_sequence),
+            "frame_time": float(self.target_wall_time),
+            "target_monotonic": float(self.target_monotonic),
+            "assembled_monotonic": float(self.assembled_monotonic),
+            "deadline_missed": bool(self.deadline_missed),
+            "values": values,
+            "quality": quality,
+            "source": source,
         }
 
     @classmethod
@@ -825,7 +888,14 @@ class UnifiedFrame:
                 ),
                 protocol_ok=raw_sample.get("protocol_ok"),
                 error=str(raw_sample.get("error") or ""),
-                metadata={"age_seconds": age, "unit": str(raw_sample.get("unit") or "")},
+                metadata=(
+                    dict(raw_sample.get("metadata"))
+                    if isinstance(raw_sample.get("metadata"), Mapping)
+                    else {
+                        "age_seconds": age,
+                        "unit": str(raw_sample.get("unit") or ""),
+                    }
+                ),
             )
         return cls(
             capture_sequence=sequence,
@@ -835,6 +905,117 @@ class UnifiedFrame:
             deadline_missed=bool(payload.get("deadline_missed", False)),
             assembled_monotonic=float(payload.get("assembled_monotonic") or 0.0),
         )
+
+    @classmethod
+    def from_envelope_v2(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        expected_session_id: str,
+        expected_mode_id: str,
+        catalog: Mapping[str, Any],
+        last_sequence: int | None = None,
+    ) -> "UnifiedFrame":
+        if str(payload.get("contract_version") or "") != "unified_frame_v2":
+            raise ValueError("unsupported unified frame contract")
+        if str(payload.get("session_id") or "") != str(expected_session_id):
+            raise ValueError("session_id mismatch")
+        if str(payload.get("mode_id") or "") != str(expected_mode_id):
+            raise ValueError("mode_id mismatch")
+        catalog_id = str(catalog.get("catalog_id") or "")
+        catalog_body = {str(key): value for key, value in catalog.items() if key != "catalog_id"}
+        expected_catalog_id = hashlib.sha256(
+            json.dumps(
+                catalog_body, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        if not catalog_id or catalog_id != expected_catalog_id:
+            raise ValueError("catalog integrity mismatch")
+        if str(payload.get("catalog_id") or "") != catalog_id:
+            raise ValueError("catalog_id mismatch")
+        raw_channels = catalog.get("channels")
+        if not isinstance(raw_channels, list):
+            raise ValueError("catalog channels are required")
+        channel_names = [
+            str(item.get("name") if isinstance(item, Mapping) else item)
+            for item in raw_channels
+        ]
+        values = payload.get("values")
+        qualities = payload.get("quality")
+        if not isinstance(values, list) or len(values) != len(channel_names):
+            raise ValueError("values length does not match catalog")
+        if not isinstance(qualities, list) or len(qualities) != len(channel_names):
+            raise ValueError("quality length does not match catalog")
+        sequence = int(payload.get("frame_sequence", -1))
+        if sequence < 0:
+            raise ValueError("frame_sequence must be non-negative")
+        if last_sequence is not None and sequence <= int(last_sequence):
+            raise ValueError("duplicate or out-of-order frame_sequence")
+        source = payload.get("source")
+        if source is None:
+            source = {}
+        if not isinstance(source, Mapping):
+            raise ValueError("source must be an object")
+        target_monotonic = float(payload.get("target_monotonic") or 0.0)
+        frame_time = float(payload.get("frame_time") or 0.0)
+        channels: dict[str, ChannelSample] = {}
+        for index, (name, raw_value, raw_quality) in enumerate(
+            zip(channel_names, values, qualities)
+        ):
+            quality = ChannelQuality(str(raw_quality))
+            value = _finite(raw_value)
+            if raw_value is not None and value is None:
+                raise ValueError(f"non-finite value at catalog index {index}")
+            if value is None and quality in VALID_MODEL_QUALITIES:
+                raise ValueError(f"valid quality without value at catalog index {index}")
+            item = source.get(str(index), {})
+            if not isinstance(item, Mapping):
+                raise ValueError(f"source metadata at catalog index {index} must be an object")
+            channels[name] = ChannelSample(
+                interface_id=str(item.get("interface_id") or ""),
+                channel_name=name,
+                value=value,
+                quality=quality,
+                device_timestamp=item.get("source_timestamp"),
+                received_wall_time=frame_time,
+                received_monotonic=target_monotonic,
+                source_sequence=(
+                    int(item["source_sequence"])
+                    if item.get("source_sequence") is not None
+                    else None
+                ),
+                protocol_ok=item.get("protocol_ok"),
+                error=str(item.get("error") or ""),
+            )
+        return cls(
+            capture_sequence=sequence,
+            target_monotonic=target_monotonic,
+            target_wall_time=frame_time,
+            channels=channels,
+            deadline_missed=bool(payload.get("deadline_missed", False)),
+            assembled_monotonic=float(payload.get("assembled_monotonic") or 0.0),
+        )
+
+
+class UnifiedFrameV2Receiver:
+    """Reject invalid frames before exposing them to persistence consumers."""
+
+    def __init__(self, session_id: str, mode_id: str, catalog: Mapping[str, Any]) -> None:
+        self.session_id = str(session_id)
+        self.mode_id = str(mode_id)
+        self.catalog = dict(catalog)
+        self.last_sequence: int | None = None
+
+    def accept(self, payload: Mapping[str, Any]) -> UnifiedFrame:
+        frame = UnifiedFrame.from_envelope_v2(
+            payload,
+            expected_session_id=self.session_id,
+            expected_mode_id=self.mode_id,
+            catalog=self.catalog,
+            last_sequence=self.last_sequence,
+        )
+        self.last_sequence = frame.capture_sequence
+        return frame
 
 
 class FrameAssembler:

@@ -264,7 +264,7 @@ class GuestSimulationTests(unittest.TestCase):
             authorized=True,
         )
 
-        self.assertEqual(len(config.interfaces), 6)
+        self.assertEqual(len(config.interfaces), 7)
         self.assertEqual(config.interfaces[-1]["id"], "custom_aux")
         self.assertFalse(config.interfaces[-1]["enabled"])
         self.assertEqual(config.interfaces[-1]["physical_interface_id"], "")

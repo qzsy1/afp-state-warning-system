@@ -230,8 +230,13 @@ def helper_capability_mismatches(
     mismatches = [
         name for name, value in expected_values.items() if actual.get(name) != value
     ]
-    if actual.get("unified_frame_v1") is not True:
-        mismatches.append("unified_frame_v1")
+    required_frame_capability = (
+        "unified_frame_v2"
+        if expected.unified_frame_contract == "unified_frame_v2"
+        else "unified_frame_v1"
+    )
+    if actual.get(required_frame_capability) is not True:
+        mismatches.append(required_frame_capability)
     return tuple(mismatches)
 
 

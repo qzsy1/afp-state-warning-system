@@ -19,6 +19,17 @@ CONFIG_ROOT = ROOT / "pre_sensor" / "config"
 SECRET_KEY = re.compile(r"password|token|secret|credential|api[_-]?key", re.I)
 
 
+def _hardware_facts() -> dict:
+    return {
+        "manufacturer": "fixture manufacturer", "model": "fixture model",
+        "manual_source": "fixture manual revision", "nameplate_identity": "fixture device identity",
+        "protocol_version": "confirmed fixture protocol", "interface_type": "fixture interface",
+        "electrical_topology": "fixture topology", "sampling_rate_hz": 10,
+        "measurement_range_c": "0..500", "cold_junction_compensation": "fixture CJC method",
+        "fault_codes": "fixture fault code table", "vendor_channel_mapping": "fixture mapping for channels 1..64",
+    }
+
+
 def _walk(value, path=""):
     if isinstance(value, dict):
         for key, item in value.items():
@@ -37,10 +48,11 @@ class PreSensorConfigurationTemplateTests(unittest.TestCase):
         expected_channels = {
             "温度", "压力", "薄膜压力", "ROI平均温度", "张力", "线速度",
             "ABB_X", "ABB_Y", "ABB_Z",
-            *{f"温度{index}" for index in range(1, 9)},
+            *{f"温度{index}" for index in range(1, 65)},
+            *{f"应变{index}" for index in range(1, 5)},
         }
         required_sections = {
-            "schema_version", "release_revision", "mode", "channels", "interfaces",
+            "schema_version", "release_revision", "dataset_schema", "mode", "channels", "interfaces",
             "storage", "timeouts", "reconnect", "queues", "logging", "capacity",
         }
         local = self._load("local_direct.json")
@@ -50,6 +62,7 @@ class PreSensorConfigurationTemplateTests(unittest.TestCase):
             with self.subTest(template=name):
                 self.assertTrue(required_sections.issubset(payload))
                 self.assertEqual(payload["schema_version"], 1)
+                self.assertEqual(payload["dataset_schema"], "new_collection_v13_0")
                 self.assertEqual(payload["mode"], name)
                 channels = {item["name"]: item for item in payload["channels"]}
                 self.assertEqual(set(channels), expected_channels)
@@ -94,6 +107,8 @@ class PreSensorConfigurationValidationTests(unittest.TestCase):
         cls.remote = json.loads(
             (CONFIG_ROOT / "remote_helper.json").read_text(encoding="utf-8")
         )
+        cls.local["interfaces"][0]["hardware_facts"] = _hardware_facts()
+        cls.remote["interfaces"][0]["hardware_facts"] = _hardware_facts()
 
     def assert_invalid_without_side_effect(self, payload: dict, pattern: str) -> None:
         local_start = Mock()
@@ -158,23 +173,44 @@ class PreSensorConfigurationValidationTests(unittest.TestCase):
                 self.assert_invalid_without_side_effect(payload, pattern)
 
     def test_valid_templates_map_to_existing_acquisition_config(self) -> None:
+        payload = deepcopy(self.local)
+        payload["interfaces"][0]["hardware_facts"] = _hardware_facts()
         local = validate_pre_sensor_config(
-            self.local,
+            payload,
             references={
                 "AFP_SAVE_ROOT": "capture-output",
                 "AFP_LOG_ROOT": "capture-logs",
-                "AFP_INTERFACE_THERMOCOUPLE": "SMRFCT08B",
+                "AFP_INTERFACE_THERMOCOUPLE64": "fixture-device",
                 "AFP_INTERFACE_PLC": "plc-host:502",
                 "AFP_INTERFACE_UVC": "uvc-device",
                 "AFP_INTERFACE_ABB": "abb-host",
                 "AFP_INTERFACE_M3232": "COM9",
+                "AFP_INTERFACE_ESR1001": "COM10",
             },
         )
         self.assertEqual(local.real_acquisition_mode, "local_direct")
         self.assertEqual(local.sample_rate_hz, 10.0)
         self.assertEqual(set(local.selected_sensors), {item["name"] for item in self.local["channels"]})
 
+    def test_missing_thermocouple_hardware_facts_block_real_config(self) -> None:
+        for field in _hardware_facts():
+            payload = deepcopy(self.local)
+            payload["interfaces"][0]["hardware_facts"] = _hardware_facts()
+            payload["interfaces"][0]["hardware_facts"][field] = None
+            with self.subTest(field=field), self.assertRaisesRegex(PreSensorConfigError, field):
+                validate_pre_sensor_config(
+                    payload,
+                    references={
+                        "AFP_SAVE_ROOT": "capture-output", "AFP_LOG_ROOT": "capture-logs",
+                        "AFP_INTERFACE_THERMOCOUPLE64": "fixture-device",
+                        "AFP_INTERFACE_PLC": "plc-host:502", "AFP_INTERFACE_UVC": "uvc-device",
+                        "AFP_INTERFACE_ABB": "abb-host", "AFP_INTERFACE_M3232": "COM9",
+                        "AFP_INTERFACE_ESR1001": "COM10",
+                    },
+                )
+
     def test_remote_helper_contract_is_checked_before_dispatch(self) -> None:
+        remote = deepcopy(self.remote)
         contract = json.loads(
             (ROOT / "pre_sensor" / "release-contract.json").read_text(encoding="utf-8")
         )
@@ -187,9 +223,11 @@ class PreSensorConfigurationValidationTests(unittest.TestCase):
             "unified_frame_contract": contracts["unified_frame_contract"],
             "configuration_schema_version": contracts["configuration_schema_version"],
             "readiness_schema_version": contracts["readiness_schema_version"],
-            "unified_frame_v1": True,
+            "unified_frame_v2": True,
+            "thermocouple64_hardware_gate": True,
             "real_capture": True,
             "local_csv_save": True,
+            "esr1001_modbus_rtu": True,
         }
         references = {
             "AFP_HELPER_SAVE_ROOT": "helper-output",
@@ -199,17 +237,18 @@ class PreSensorConfigurationValidationTests(unittest.TestCase):
                 "session_id": "paired-test-session",
                 "capabilities": capabilities,
             },
-            "AFP_INTERFACE_THERMOCOUPLE": "SMRFCT08B",
+            "AFP_INTERFACE_THERMOCOUPLE64": "fixture-device",
             "AFP_INTERFACE_PLC": "plc-host:502",
             "AFP_INTERFACE_UVC": "uvc-device",
             "AFP_INTERFACE_ABB": "abb-host",
             "AFP_INTERFACE_M3232": "COM9",
+            "AFP_INTERFACE_ESR1001": "COM10",
         }
         local_start = Mock()
         remote_start = Mock(return_value="started")
         self.assertEqual(
             prepare_pre_sensor_start(
-                self.remote,
+                remote,
                 references=references,
                 local_start=local_start,
                 remote_start=remote_start,
@@ -223,7 +262,7 @@ class PreSensorConfigurationValidationTests(unittest.TestCase):
         remote_start.reset_mock()
         with self.assertRaisesRegex(PreSensorConfigError, "release_contract_mismatch"):
             prepare_pre_sensor_start(
-                self.remote,
+                remote,
                 references=references,
                 local_start=local_start,
                 remote_start=remote_start,

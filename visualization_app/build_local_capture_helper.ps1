@@ -19,7 +19,8 @@ $delivery = if ($OutputDirectory) {
     Join-Path $DeliveryRoot "local_helper"
 }
 $watchdogSource = Join-Path $PSScriptRoot "tailscale_funnel_watchdog.ps1"
-$staging = Join-Path ([System.IO.Path]::GetTempPath()) ("afp-local-helper-build-" + [guid]::NewGuid().ToString("N"))
+$stagingRoot = [IO.Path]::GetFullPath("F:\new_AFP_exam\.afp-staging").TrimEnd('\')
+$staging = Join-Path $stagingRoot ("afp-local-helper-build-" + [guid]::NewGuid().ToString("N"))
 
 if (-not (Test-Path -LiteralPath $entry)) {
     throw "找不到本地辅助程序入口：$entry"
@@ -34,7 +35,10 @@ if ($LASTEXITCODE -ne 0) {
     throw "当前Python环境未安装PyInstaller；先安装后再构建本地辅助程序"
 }
 
+New-Item -ItemType Directory -Path $stagingRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $staging | Out-Null
+$previousPyInstallerConfig = $env:PYINSTALLER_CONFIG_DIR
+$env:PYINSTALLER_CONFIG_DIR = Join-Path $staging "pyinstaller-config"
 try {
     & $pythonCommand @pythonPrefix -m PyInstaller --noconfirm --clean --onefile --console `
         --hidden-import websocket --name "AFP_Local_Capture_Helper" --distpath $staging --workpath (Join-Path $staging "build") `
@@ -71,9 +75,13 @@ try {
     Write-Output $target
 }
 finally {
-    $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+    if ($null -eq $previousPyInstallerConfig) {
+        Remove-Item Env:PYINSTALLER_CONFIG_DIR -ErrorAction SilentlyContinue
+    } else {
+        $env:PYINSTALLER_CONFIG_DIR = $previousPyInstallerConfig
+    }
     $resolvedStaging = [IO.Path]::GetFullPath($staging)
-    if ($resolvedStaging.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -and
+    if ($resolvedStaging.StartsWith($stagingRoot + '\', [StringComparison]::OrdinalIgnoreCase) -and
         (Split-Path -Leaf $resolvedStaging).StartsWith("afp-local-helper-build-", [StringComparison]::OrdinalIgnoreCase) -and
         (Test-Path -LiteralPath $resolvedStaging)) {
         Remove-Item -LiteralPath $resolvedStaging -Recurse -Force

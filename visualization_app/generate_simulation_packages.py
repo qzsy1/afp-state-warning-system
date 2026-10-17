@@ -4,7 +4,7 @@ import csv
 import math
 from pathlib import Path
 
-from acquisition import NEW_COLLECTION_SENSOR_COLUMNS, PROCESS_PARAMETER_COLUMNS
+from acquisition import LATEST_COLLECTION_SENSOR_COLUMNS, PROCESS_PARAMETER_COLUMNS
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parent / "simulation_packages"
@@ -33,6 +33,11 @@ def _row(index: int) -> dict[str, object]:
         "replicate": 1,
         "layer_id": 0,
     }
+    for strain_index in range(1, 5):
+        values[f"应变{strain_index}"] = round(
+            450.0 * strain_index + 35.0 * math.sin(phase + strain_index * 0.3),
+            5,
+        )
     for sensor_index in range(1, 9):
         values[f"温度{sensor_index}"] = round(
             350.0 + sensor_index + 1.2 * math.sin(phase + sensor_index / 10.0),
@@ -45,7 +50,7 @@ def generate() -> None:
     PACKAGE_ROOT.mkdir(parents=True, exist_ok=True)
     columns = [
         "时间",
-        *NEW_COLLECTION_SENSOR_COLUMNS,
+        *LATEST_COLLECTION_SENSOR_COLUMNS,
         *PROCESS_PARAMETER_COLUMNS,
         "run_id",
         "specimen_id",

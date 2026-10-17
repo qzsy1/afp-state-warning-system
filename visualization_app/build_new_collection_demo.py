@@ -15,12 +15,25 @@ import pandas as pd
 
 APP_DIR = Path(__file__).resolve().parent
 WORKSPACE_DIR = APP_DIR.parents[1]
-OUTPUT_ROOT = APP_DIR / "new_collection_demo_v11_3"
+OUTPUT_ROOT = APP_DIR / "new_collection_demo_v12_0"
 CONDITION_FILE = WORKSPACE_DIR / "工艺参数状态标签_v11_2.csv"
 MANIFEST_TEMPLATE = WORKSPACE_DIR / "计划数据集" / "采集清单模板_v11_3.csv"
 XJU_ROOT = Path(r"F:\program\XJUsorceopen")
 
 SENSOR_COLUMNS = [
+    "温度",
+    "压力",
+    "薄膜压力",
+    "ROI平均温度",
+    "张力",
+    "线速度",
+    "ABB_X",
+    "ABB_Y",
+    "ABB_Z",
+    *[f"温度{index}" for index in range(1, 9)],
+    *[f"应变{index}" for index in range(1, 5)],
+]
+MODEL_SENSOR_COLUMNS = [
     "温度",
     "压力",
     "ROI平均温度",
@@ -30,9 +43,6 @@ SENSOR_COLUMNS = [
     "ABB_Y",
     "ABB_Z",
     *[f"温度{index}" for index in range(1, 9)],
-    "转速",
-    "位移",
-    "振动",
 ]
 PROCESS_COLUMNS = [
     "initial_compaction_force_N",
@@ -40,7 +50,7 @@ PROCESS_COLUMNS = [
     "pid_angle_deg",
     "temperature_setpoint_C",
 ]
-MODEL_COLUMNS = [*SENSOR_COLUMNS, *PROCESS_COLUMNS]
+MODEL_COLUMNS = [*MODEL_SENSOR_COLUMNS, *PROCESS_COLUMNS]
 
 
 @dataclass(frozen=True)
@@ -168,6 +178,7 @@ def simulate_layer(
         "ABB_X": abb_x,
         "ABB_Y": abb_y,
         "ABB_Z": abb_z,
+        "薄膜压力": np.maximum(pressure * 0.0011, 0.0),
     }
     spatial_offsets = np.linspace(-3.5, 3.5, 8)
     for index, offset in enumerate(spatial_offsets, start=1):
@@ -179,9 +190,10 @@ def simulate_layer(
         )
     data.update(
         {
-            "转速": rotation,
-            "位移": displacement,
-            "振动": vibration,
+            "应变1": pressure * 1.4 + rng.normal(0.0, 1.0, count),
+            "应变2": pressure * 1.1 + rng.normal(0.0, 1.0, count),
+            "应变3": pressure * 0.9 + rng.normal(0.0, 1.0, count),
+            "应变4": pressure * 0.7 + rng.normal(0.0, 1.0, count),
             "initial_compaction_force_N": force,
             "placement_speed_mm_s": speed,
             "pid_angle_deg": angle,
@@ -432,8 +444,8 @@ def train_model(
                 model(x_tensor, mark, decoder, mark).cpu().numpy()
             )
         prediction = prediction_standardized * scale + mean
-        sensor_prediction = prediction[:, :, : len(SENSOR_COLUMNS)]
-        sensor_truth = y_raw[:, :, : len(SENSOR_COLUMNS)]
+        sensor_prediction = prediction[:, :, : len(MODEL_SENSOR_COLUMNS)]
+        sensor_truth = y_raw[:, :, : len(MODEL_SENSOR_COLUMNS)]
         error = sensor_prediction - sensor_truth
         metrics[split] = {
             "window_count": int(len(x_raw)),
@@ -443,7 +455,7 @@ def train_model(
                 name: float(
                     np.sqrt(np.mean(np.square(error[:, :, index])))
                 )
-                for index, name in enumerate(SENSOR_COLUMNS)
+                for index, name in enumerate(MODEL_SENSOR_COLUMNS)
             },
         }
     pd.DataFrame(history).to_csv(
@@ -467,8 +479,8 @@ def train_model(
         "seq_len": 24,
         "pred_len": 24,
         "dropout": 0.05,
-        "input_sensors": SENSOR_COLUMNS,
-        "output_sensors": SENSOR_COLUMNS,
+        "input_sensors": MODEL_SENSOR_COLUMNS,
+        "output_sensors": MODEL_SENSOR_COLUMNS,
         "model_columns": MODEL_COLUMNS,
         "scaler_mean": mean.astype(float).tolist(),
         "scaler_scale": scale.astype(float).tolist(),

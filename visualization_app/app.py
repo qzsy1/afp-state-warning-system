@@ -78,6 +78,7 @@ from simulation_source_transfer import (
     MAX_TRANSFER_CHUNK_BYTES,
     SimulationSourceTicketStore,
     SimulationSourceTransferError,
+    inspect_csv_file,
 )
 from simulation_packages import (
     resolve_simulation_package,
@@ -115,6 +116,15 @@ from websocket_live import (
     websocket_handshake_headers,
 )
 from release_contract import load_release_contract
+from thermocouple64 import (
+    THERMOCOUPLE64_CHANNELS,
+    THERMOCOUPLE64_DERIVED_CHANNELS,
+    THERMOCOUPLE64_MODE_ID,
+    derived_catalog,
+    raw_catalog,
+    strict_group_means,
+    validate_group_mean_model_contract,
+)
 
 
 APP_DIR = Path(os.environ.get("AFP_LEGACY_APP_DIR") or Path(__file__).resolve().parent).resolve()
@@ -127,6 +137,79 @@ def health_payload() -> dict[str, str]:
         "version": APP_VERSION,
         "build_id": BUILD_ID,
         "runtime_revision": str(os.environ.get("AFP_RUNTIME_REVISION") or ""),
+    }
+
+
+def build_thermocouple64_live_payload(
+    channels: list[dict],
+    *,
+    dataset_schema: str,
+    scope: str = "causal_so_far",
+    model_input_sensors: list[str] | None = None,
+    model_metadata: dict | None = None,
+    quality_history: list[dict[str, str]] | None = None,
+) -> dict | None:
+    """Split the v13 live response into raw, derived and non-thermocouple views."""
+
+    if dataset_schema != THERMOCOUPLE64_MODE_ID:
+        return None
+    by_name = {str(item.get("name") or ""): item for item in channels}
+    raw_channels = [by_name[name] for name in THERMOCOUPLE64_CHANNELS if name in by_name]
+    if not raw_channels:
+        return None
+    history_length = max((len(item.get("actual") or []) for item in raw_channels), default=0)
+    time_axis = list(raw_channels[0].get("x_observed") or [])
+    raw_history: list[list[float | None]] = []
+    derived_history: list[list[float | None]] = []
+    derived_latest: dict[str, dict] = {}
+    for row_index in range(history_length):
+        values = {
+            name: (
+                (by_name[name].get("actual") or [])[row_index]
+                if row_index < len(by_name[name].get("actual") or [])
+                else None
+            )
+            for name in THERMOCOUPLE64_CHANNELS
+            if name in by_name
+        }
+        raw_history.append([values.get(name) for name in THERMOCOUPLE64_CHANNELS])
+        derived_latest = strict_group_means(values, scope=scope)
+        derived_history.append(
+            [derived_latest[name]["value"] for name in THERMOCOUPLE64_DERIVED_CHANNELS]
+        )
+    if not derived_latest:
+        derived_latest = strict_group_means({}, scope=scope)
+    units = {name: "°C" for name in THERMOCOUPLE64_CHANNELS}
+    raw_directory = raw_catalog(THERMOCOUPLE64_CHANNELS, units)
+    derived_directory = derived_catalog(scope)
+    model_contract = dict(model_metadata or {})
+    model_inputs = set(model_input_sensors or model_contract.get("input_sensors") or [])
+    model_contract["input_sensors"] = list(model_inputs)
+    model_support = (
+        not validate_group_mean_model_contract(model_contract)
+        and set(THERMOCOUPLE64_DERIVED_CHANNELS).issubset(
+            set(model_contract.get("output_sensors") or [])
+        )
+    )
+    return {
+        "snapshot_version": 1,
+        "sequence": history_length,
+        "time_axis": time_axis,
+        "raw_directory": raw_directory,
+        "derived_directory": derived_directory,
+        "raw_history": raw_history,
+        "derived_history": derived_history,
+        "raw_latest_quality": [
+            ((quality_history[-1] or {}).get(name) if quality_history else None)
+            or "quality_unavailable"
+            for name in THERMOCOUPLE64_CHANNELS
+        ],
+        "derived_latest": derived_latest,
+        "other_channels": [
+            item for item in channels if str(item.get("name") or "") not in THERMOCOUPLE64_CHANNELS
+        ],
+        "model_support": model_support,
+        "scope": scope,
     }
 
 
@@ -655,10 +738,32 @@ NEW_DEMO_ROOT = Path(
 SUPPLIED_SIMULATION_SOURCE = Path(
     r"F:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv"
 ).resolve()
+THERMOCOUPLE64_SIMULATION_SOURCE = (
+    APP_DIR / "simulation_packages" / "thermocouple64_v13_0" / "quick_240.csv"
+).resolve()
+
+
+def _supports_latest_simulation_schema(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        inspected = inspect_csv_file(path)
+    except (OSError, UnicodeError, ValueError):
+        return False
+    numeric_channels = set(inspected.get("numeric_channels") or [])
+    return bool(inspected.get("valid_rows")) and set(
+        ACQUISITION_SCHEMAS[THERMOCOUPLE64_MODE_ID]["sensors"]
+    ).issubset(numeric_channels)
+
+
 NEW_DEMO_SOURCE = (
     SUPPLIED_SIMULATION_SOURCE
-    if SUPPLIED_SIMULATION_SOURCE.is_file()
-    else NEW_DEMO_ROOT / "simulator_stream.csv"
+    if _supports_latest_simulation_schema(SUPPLIED_SIMULATION_SOURCE)
+    else (
+        THERMOCOUPLE64_SIMULATION_SOURCE
+        if _supports_latest_simulation_schema(THERMOCOUPLE64_SIMULATION_SOURCE)
+        else resolve_simulation_package("quick_240")
+    )
 )
 NEW_DEMO_CHECKPOINT = RUNTIME_MODEL_DIR / "new" / "i_T_G" / "checkpoint.pth"
 
@@ -734,6 +839,12 @@ PROCESS_PARAMETER_SCHEMAS = {
         {"key": "temperature_setpoint_C", "label": "设定温度", "unit": "°C"},
     ],
 }
+PROCESS_PARAMETER_SCHEMAS["new_collection_v12_0"] = deepcopy(
+    PROCESS_PARAMETER_SCHEMAS["new_collection_v11_3"]
+)
+PROCESS_PARAMETER_SCHEMAS[THERMOCOUPLE64_MODE_ID] = deepcopy(
+    PROCESS_PARAMETER_SCHEMAS["new_collection_v11_3"]
+)
 
 INDICATOR_VARIANTS = {
     "legacy_original": {
@@ -768,6 +879,9 @@ INDICATOR_VARIANTS["new_collection_v11_3"]["TC-HI"].update(
         "label": "新数据热－压实耦合指标（模型16路＋独立薄膜压力通道＋4工艺参数）",
         "construction": "模型保持原16路实际传感器响应；独立薄膜压力通道单独采集保存，可在后续重训时纳入耦合特征",
     }
+)
+INDICATOR_VARIANTS["new_collection_v12_0"] = deepcopy(
+    INDICATOR_VARIANTS["new_collection_v11_3"]
 )
 
 
@@ -809,7 +923,9 @@ def build_process_payload(
         for item in PROCESS_PARAMETER_SCHEMAS["legacy_original"]
     )
     schema_id = (
-        "new_collection_v11_3"
+        declared_schema
+        if observed_new and declared_schema in {"new_collection_v11_3", "new_collection_v12_0", THERMOCOUPLE64_MODE_ID}
+        else "new_collection_v11_3"
         if observed_new
         else "legacy_original"
         if observed_legacy
@@ -862,7 +978,7 @@ def indicator_variant(dataset_schema: str, indicator: str) -> dict:
         return dict(variant)
     outputs = (
         NEW_INDICATOR_REQUIRED_OUTPUTS
-        if dataset_schema == "new_collection_v11_3"
+        if dataset_schema in {"new_collection_v11_3", "new_collection_v12_0", THERMOCOUPLE64_MODE_ID}
         else INDICATOR_REQUIRED_OUTPUTS
     ).get(indicator, [])
     return {
@@ -1197,7 +1313,9 @@ class DashboardData:
             "indicators": indicators,
             "indicator_schemas": {
                 "legacy_original": indicators,
-                "new_collection_v11_3": new_indicators,
+            "new_collection_v11_3": new_indicators,
+            "new_collection_v12_0": new_indicators,
+            THERMOCOUPLE64_MODE_ID: new_indicators,
             },
             "indicator_variants": INDICATOR_VARIANTS,
             "specimens": specimens,
@@ -1237,7 +1355,7 @@ class DashboardData:
                 "prediction_model": self.online_predictor.profile,
                 "prediction_models": model_catalog(),
                 "best_prediction_models": {
-                    schema_id: self.best_prediction_profile(schema_id)
+                    schema_id: self.best_prediction_profile_status(schema_id)
                     for schema_id in ACQUISITION_SCHEMAS
                 },
                 "new_collection_demo": {
@@ -1258,6 +1376,8 @@ class DashboardData:
                 "indicator_required_outputs_by_schema": {
                     "legacy_original": INDICATOR_REQUIRED_OUTPUTS,
                     "new_collection_v11_3": NEW_INDICATOR_REQUIRED_OUTPUTS,
+                    "new_collection_v12_0": NEW_INDICATOR_REQUIRED_OUTPUTS,
+                    THERMOCOUPLE64_MODE_ID: NEW_INDICATOR_REQUIRED_OUTPUTS,
                 },
                 "new_collection_health_ready": bool(
                     self.new_collection_health_engine is not None
@@ -1285,13 +1405,13 @@ class DashboardData:
 
     def best_prediction_profile(self, dataset_schema: str) -> dict:
         schema_id = (
-            "new_collection_v11_3"
-            if dataset_schema == "new_collection_v11_3"
+            dataset_schema
+            if dataset_schema in {"new_collection_v11_3", "new_collection_v12_0", THERMOCOUPLE64_MODE_ID}
             else "legacy_original"
         )
         candidates = []
         for entry in model_catalog():
-            scope = "new" if schema_id == "new_collection_v11_3" else "legacy"
+            scope = "new" if schema_id.startswith("new_collection_") else "legacy"
             packaged_checkpoint = (
                 RUNTIME_MODEL_DIR / scope / str(entry["id"]) / "checkpoint.pth"
             )
@@ -1322,6 +1442,25 @@ class DashboardData:
             ),
             "registry_scope": schema_id,
         }
+
+    def best_prediction_profile_status(self, dataset_schema: str) -> dict:
+        try:
+            return self.best_prediction_profile(dataset_schema)
+        except FileNotFoundError:
+            schema_id = (
+                dataset_schema
+                if dataset_schema in {
+                    "new_collection_v11_3",
+                    "new_collection_v12_0",
+                    THERMOCOUPLE64_MODE_ID,
+                }
+                else "legacy_original"
+            )
+            return {
+                "available": False,
+                "registry_scope": schema_id,
+                "reason": "该采集方案尚无带验证记录的兼容预测模型；可使用仅采集模式。",
+            }
 
     def validate_prediction_setup(
         self,
@@ -1413,14 +1552,14 @@ class DashboardData:
             )
         indicator_outputs = (
             NEW_INDICATOR_REQUIRED_OUTPUTS
-            if config.dataset_schema == "new_collection_v11_3"
+            if config.dataset_schema in {"new_collection_v11_3", "new_collection_v12_0", THERMOCOUPLE64_MODE_ID}
             else INDICATOR_REQUIRED_OUTPUTS
         )
         required_outputs = indicator_outputs.get(
             config.health_indicator,
             (
                 NEW_COLLECTION_SENSOR_COLUMNS
-                if config.dataset_schema == "new_collection_v11_3"
+                if config.dataset_schema in {"new_collection_v11_3", "new_collection_v12_0", THERMOCOUPLE64_MODE_ID}
                 else SENSOR_COLUMNS
             ),
         )
@@ -1725,7 +1864,7 @@ class DashboardData:
             "condition_id": str(config.get("condition_id", "LIVE")),
             "replicate": int(config.get("replicate", 1) or 1),
         }
-        if schema == "new_collection_v11_3":
+        if schema in {"new_collection_v11_3", "new_collection_v12_0", THERMOCOUPLE64_MODE_ID}:
             common.update(
                 {
                     "initial_force": float(config.get("initial_compaction_force_N", 0) or 0),
@@ -2347,6 +2486,14 @@ class DashboardData:
             },
             "channels": channels,
             "selected_channel": channels[sensor_id],
+            "thermocouple64": build_thermocouple64_live_payload(
+                channels,
+                dataset_schema=dataset_schema,
+                scope="causal_so_far",
+                model_input_sensors=list(active_profile.get("input_sensors") or []),
+                model_metadata=active_profile,
+                quality_history=[],
+            ),
             "window": realtime_window,
             "layer": current_layer_aggregate,
             "specimen": specimen_realtime,
@@ -2711,6 +2858,7 @@ class DashboardData:
         history: int,
         step: int,
         prediction_horizon: int,
+        quality_rows: list[dict[str, str]] | None = None,
     ) -> dict:
         config = status.get("config") or {}
         sample_rate = _finite(config.get("sample_rate_hz"), 10.0)
@@ -2743,6 +2891,12 @@ class DashboardData:
                     "prediction_enabled": False,
                     "x_observed": observed_time.tolist(),
                     "actual": values,
+                    "quality_history": [
+                        (quality_rows[int(row_index)] or {}).get(name, "quality_unavailable")
+                        if quality_rows and int(row_index) < len(quality_rows)
+                        else "quality_unavailable"
+                        for row_index in indices
+                    ],
                     "prediction_observed": [],
                     "x_future": [],
                     "prediction_future": [],
@@ -2834,6 +2988,14 @@ class DashboardData:
             },
             "channels": channels,
             "selected_channel": channels[sensor_id],
+            "thermocouple64": build_thermocouple64_live_payload(
+                channels,
+                dataset_schema=str(config.get("dataset_schema") or "legacy_original"),
+                scope="causal_so_far",
+                model_input_sensors=[],
+                model_metadata=None,
+                quality_history=quality_rows,
+            ),
             "window": {
                 "id": "DISABLED",
                 "complete": False,
@@ -2936,8 +3098,9 @@ class DashboardData:
                 history=history,
                 step=step,
                 prediction_horizon=prediction_horizon,
+                quality_rows=list(getattr(active_acquisition, "frame_quality", []) or []),
             )
-        new_schema = config.get("dataset_schema") == "new_collection_v11_3"
+        new_schema = config.get("dataset_schema") in {"new_collection_v11_3", "new_collection_v12_0", THERMOCOUPLE64_MODE_ID}
         abnormal_states = (
             NEW_ABNORMAL_STATES if new_schema else ABNORMAL_STATES
         )
@@ -3058,7 +3221,7 @@ class DashboardData:
         )
         latest_process_row = rows[-1] if rows else {}
         process_payload = build_process_payload(
-            "new_collection_v11_3" if new_schema else "legacy_original",
+            str(config.get("dataset_schema")) if new_schema else "legacy_original",
             observed=latest_process_row,
             fallback=config,
         )
@@ -3920,7 +4083,7 @@ class DashboardData:
                 "mode": "realtime_from_actual_and_live_prediction",
                 "feature_key": feature_key,
                 "indicator_variant": indicator_variant(
-                    "new_collection_v11_3" if new_schema else "legacy_original",
+                    str(config.get("dataset_schema")) if new_schema else "legacy_original",
                     indicator,
                 ),
                 "all_12_indicators_supported": True,
@@ -4435,7 +4598,21 @@ class AppHandler(BaseHTTPRequestHandler):
             return {"ok": False, "error": "ingress_generation_mismatch"}
         helper_status = self.dashboard.helper_registry.status(session_id)
         capabilities = dict(helper_status.get("capabilities") or {})
-        if capabilities.get("unified_frame_v1"):
+        frame_catalog = trusted_batch.get("frame_catalog")
+        catalog_mode = (
+            str(frame_catalog.get("mode_id") or "")
+            if isinstance(frame_catalog, dict)
+            else ""
+        )
+        if (
+            capabilities.get("unified_frame_v2")
+            and (
+                str(trusted_batch.get("frame_contract") or "") == "unified_frame_v2"
+                or catalog_mode == "new_collection_v13_0"
+            )
+        ):
+            trusted_batch["required_frame_contract"] = "unified_frame_v2"
+        elif capabilities.get("unified_frame_v1"):
             trusted_batch["required_frame_contract"] = "unified_frame_v1"
         capture_uuid = str(trusted_batch.get("capture_uuid") or "")
         if self.target_capture_journal.manages(session_id, capture_uuid):
@@ -5710,7 +5887,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._send_json({"authenticated": False, "role": "guest"})
                 return
             if parsed.path == "/api/simulation/start":
-                if not self.dashboard.helper_registry.begin_capture_start():
+                if not self.dashboard.helper_registry.begin_capture_start(
+                    require_ingress_ready=False,
+                    require_cutover_clear=False,
+                ):
                     self._send_json(
                         {"error": "ingress_cutover_in_progress"},
                         HTTPStatus.CONFLICT,
@@ -6166,9 +6346,17 @@ class AppHandler(BaseHTTPRequestHandler):
                             )
                             return
                     else:
-                        if not helper_capabilities.get("unified_frame_v1"):
+                        requested_schema = str(
+                            command_payload.get("dataset_schema") or "legacy_original"
+                        )
+                        required_frame = (
+                            "unified_frame_v2"
+                            if requested_schema == "new_collection_v13_0"
+                            else "unified_frame_v1"
+                        )
+                        if not helper_capabilities.get(required_frame):
                             self._send_json(
-                                {"ok": False, "error": "helper_capability_missing: unified_frame_v1"}
+                                {"ok": False, "error": f"helper_capability_missing: {required_frame}"}
                             )
                             return
                         helper_payload = helper_real_capture_payload(
@@ -6476,7 +6664,10 @@ class AppHandler(BaseHTTPRequestHandler):
                     model_validation = self.dashboard.validate_prediction_setup(
                         config, load_model=True
                     )
-                    if not self.dashboard.helper_registry.begin_capture_start():
+                    if not self.dashboard.helper_registry.begin_capture_start(
+                        require_ingress_ready=False,
+                        require_cutover_clear=False,
+                    ):
                         self._send_json(
                             {"error": "ingress_cutover_in_progress"},
                             HTTPStatus.CONFLICT,
@@ -6505,7 +6696,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 model_validation = self.dashboard.validate_prediction_setup(
                     config, load_model=True
                 )
-                if not self.dashboard.helper_registry.begin_capture_start():
+                if not self.dashboard.helper_registry.begin_capture_start(
+                    require_ingress_ready=False,
+                    require_cutover_clear=False,
+                ):
                     self._send_json(
                         {"error": "ingress_cutover_in_progress"},
                         HTTPStatus.CONFLICT,
@@ -6572,12 +6766,7 @@ def create_server(
     active_security_store = security_store or SecurityStore(
         runtime_root / "public_web_security.sqlite3"
     )
-    simulation_candidates = [
-        Path(r"F:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv"),
-        APP_DIR / "new_collection_demo_v11_3" / "simulator_stream.csv",
-        DATA_DIR / "dashboard_candidate_catalog.csv",
-    ]
-    simulation_source = next((item for item in simulation_candidates if item.is_file()), simulation_candidates[-1])
+    simulation_source = NEW_DEMO_SOURCE
     capture_root = Path(
         getattr(active_dashboard.acquisition, "capture_root", runtime_root / "capture")
     ).resolve()

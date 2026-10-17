@@ -2,8 +2,8 @@
 
 The agent deliberately stays thin: protocol readers, channel normalization,
 capture timing, and persistence remain in the existing acquisition modules.
-This module only adds a stable local-helper contract and deterministic mapping
-from the five logical AFP sensors to discovered physical interfaces.
+This module adds a stable local-helper contract and deterministic mapping from
+the six logical AFP interfaces to discovered physical resources.
 """
 
 from __future__ import annotations
@@ -40,11 +40,12 @@ from interface_transport_catalog import (
 
 
 _ROLE_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("thermocouple_8ch", "usb_hid", ("smrf_hid",)),
+    ("thermocouple64", "unconfirmed", ("thermocouple64_protocol_pending",)),
     ("plc_process", "ethernet", ("ethernet",)),
     ("uvc_temperature", "usb_uvc", ("uvc",)),
     ("abb_motion", "ethernet", ("ethernet",)),
     ("m3232_pressure", "serial", ("serial",)),
+    ("esr1001_strain", "serial", ("serial",)),
 )
 RELEASE_CONTRACT = load_release_contract(start=__file__)
 
@@ -143,7 +144,14 @@ class LocalCaptureAgent:
                     "physical_interface_id": physical_id or None,
                     "physical_port_id": (candidate or {}).get("parent_port_id") or None,
                     "physical_kind": kind,
-                    "protocol": protocols[0],
+                    "protocol": (
+                        "modbus_rtu" if role == "esr1001_strain" else protocols[0]
+                    ),
+                    "driver": (
+                        "modbus_rtu_esr1001"
+                        if role == "esr1001_strain"
+                        else None
+                    ),
                     "interface_detected": detected,
                     "driver_available": driver_available,
                     "sensor_data_state": "unknown",
@@ -194,6 +202,12 @@ class LocalCaptureAgent:
                 "process_parameter_read": True,
                 "local_csv_save": True,
                 "local_mysql_save": True,
+                "esr1001_modbus_rtu": True,
+                "interface_roles": [item[0] for item in _ROLE_SPECS],
+                "drivers": [
+                    "smrf_hid", "modbus_tcp", "uvc_thermal", "abb_robot",
+                    "m3232_pressure", "modbus_rtu_esr1001",
+                ],
             },
             "warnings": [discovered["error"]] if discovered.get("error") else [],
             "raw_discovery": discovered,
@@ -363,22 +377,29 @@ class LocalCaptureAgent:
         ):
             capabilities = getattr(config, "helper_capabilities", None) or {}
             assert_helper_contract(capabilities, RELEASE_CONTRACT)
-            if not capabilities.get("unified_frame_v1"):
-                raise RuntimeError("helper_capability_missing: unified_frame_v1")
-            contract = str(
-                capabilities.get("unified_frame_contract") or "unified_frame_v1"
+            required_contract = (
+                "unified_frame_v2"
+                if str(getattr(config, "dataset_schema", "")) == "new_collection_v13_0"
+                else "unified_frame_v1"
             )
-            if contract != "unified_frame_v1":
+            if not capabilities.get(required_contract):
+                raise RuntimeError(f"helper_capability_missing: {required_contract}")
+            contract = str(
+                capabilities.get("unified_frame_contract") or required_contract
+            )
+            if required_contract == "unified_frame_v2" and contract != required_contract:
                 raise RuntimeError(
-                    f"helper_capability_mismatch: expected unified_frame_v1, got {contract}"
+                    f"helper_capability_mismatch: expected {required_contract}, got {contract}"
                 )
+            if required_contract == "unified_frame_v1" and not capabilities.get("unified_frame_v1"):
+                raise RuntimeError("helper_capability_missing: unified_frame_v1")
             snapshot = self._readiness_snapshot
             if snapshot is None:
                 raise RuntimeError("remote_readiness_required")
             try:
                 snapshot.validate(
                     config,
-                    required_capabilities=("unified_frame_v1",),
+                    required_capabilities=(required_contract,),
                 )
             except ValueError as exc:
                 raise RuntimeError(f"remote_readiness_required: {exc}") from exc
@@ -426,6 +447,7 @@ class LocalCaptureAgent:
                 rows = list(incremental.get("rows") or [])
                 timestamps = list(incremental.get("timestamps") or [])
                 frames = list(incremental.get("frames") or [])
+                frame_catalog = incremental.get("frame_catalog")
                 end_cursor = int(incremental.get("next_cursor", self._stream_cursor))
                 total_count = int(incremental.get("total_count", end_cursor))
                 if bool(incremental.get("truncated")):
@@ -439,13 +461,19 @@ class LocalCaptureAgent:
                 rows = all_rows[self._stream_cursor:end_cursor]
                 timestamps = all_timestamps[self._stream_cursor:end_cursor]
                 frames = []
+                frame_catalog = None
                 total_count = len(all_rows)
             if end_cursor <= self._stream_cursor and not self._status_dirty:
                 return None
+            frame_contract = str(
+                (frames[0] if frames else {}).get("contract_version")
+                or "unified_frame_v1"
+            )
             pending = {
                 "capture_uuid": self._capture_uuid,
                 "sequence": self._stream_sequence,
-                "frame_contract": "unified_frame_v1",
+                "frame_contract": frame_contract,
+                "frame_catalog": json_safe_value(frame_catalog),
                 "cursor_start": self._stream_cursor,
                 "cursor_end": end_cursor,
                 "rows": [json_safe_value(dict(row)) for row in rows],
@@ -562,7 +590,9 @@ class LocalCaptureAgent:
             capabilities={
                 **dict(getattr(config, "helper_capabilities", None) or {}),
                 "unified_frame_v1": True,
-                "unified_frame_contract": "unified_frame_v1",
+                "unified_frame_v2": True,
+                "thermocouple64_hardware_gate": True,
+                "unified_frame_contract": "unified_frame_v2",
             },
         )
         self._readiness_snapshot = snapshot

@@ -8,7 +8,7 @@
   },
   "contracts": {
     "helper_protocol_version": 2,
-    "unified_frame_contract": "unified_frame_v1",
+    "unified_frame_contract": "unified_frame_v2",
     "configuration_schema_version": 1,
     "readiness_schema_version": 1
   },
@@ -41,7 +41,7 @@
   },
   "runtime_requirements": {
     "python_runtime": "bundled",
-    "required_modules": ["numpy", "pandas", "joblib", "mysql.connector"],
+    "required_modules": ["numpy", "pandas", "joblib", "mysql.connector", "serial"],
     "required_executables": [
       {"id": "local_capture_helper", "path": "local_helper/AFP_Local_Capture_Helper.exe"}
     ],
@@ -57,8 +57,9 @@
       }
     ],
     "drivers": [
-      {"id": "smrf_hid", "required_for": "thermocouple_8ch"},
+      {"id": "thermocouple64_protocol_pending", "required_for": "thermocouple64", "release_gate": "hardware_facts_and_protocol_required"},
       {"id": "serial_port", "required_for": "m3232_pressure"},
+      {"id": "modbus_rtu_esr1001", "required_for": "esr1001_strain"},
       {"id": "ethernet", "required_for": "plc_process_and_abb_motion"},
       {"id": "uvc", "required_for": "uvc_temperature"}
     ]

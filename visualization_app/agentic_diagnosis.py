@@ -254,6 +254,28 @@ def _diagnosis_content(
         unknowns = ["尚未确认设备未连接、串口选择错误还是当前没有发送数据"]
         confidence = 0.82
         fault_type = "目标串口设备身份或协议未确认"
+    elif interface_id == "esr1001_strain":
+        message = str(event.get("message") or "")
+        classifications = {
+            "port_missing": "串口不存在",
+            "port_occupied": "串口被占用",
+            "serial_parameter_error": "串口参数错误",
+            "no_response": "设备无响应",
+            "wrong_slave": "从站地址不匹配",
+            "crc_error": "CRC校验失败",
+            "length_error": "响应长度错误",
+            "modbus_exception": "设备返回Modbus异常",
+            "firmware_incompatible": "固件不支持实数寄存器0x0030",
+        }
+        matched = next((label for key, label in classifications.items() if key in message or state == key), None)
+        cause = matched or "当前RS485链路没有返回完整且协议有效的四通道应变帧"
+        actions = [
+            ("核对ESR1001-A独立COM口、9600 8N1、从站地址与RS485 A/B接线", "串口存在不能证明设备身份或接线正确"),
+            ("重新执行受控协议探针并保留错误分类", "只有从站、功能码、长度、CRC和四通道数值均有效才能报告正常"),
+        ]
+        unknowns = ["尚未取得协议有效帧，不能确认四个应变通道正常"]
+        confidence = 0.84 if matched else 0.72
+        fault_type = matched or "ESR1001-A协议状态未确认"
     else:
         cause = "接口未返回能够确认目标传感器的有效数据"
         actions = [("检查接口映射并取得有效协议样本", "当前证据不足")]

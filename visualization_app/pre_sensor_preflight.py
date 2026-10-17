@@ -481,6 +481,7 @@ def detect_runtime_driver_statuses(
                 hid_available = False
     return {
         "serial_port": platform == "nt",
+        "modbus_rtu_esr1001": platform == "nt",
         "ethernet": True,
         "uvc": (candidate_root / "native_dll" / "BsvUvcNative.dll").is_file(),
         # SMRF uses the Windows HID API through ctypes; it does not import the

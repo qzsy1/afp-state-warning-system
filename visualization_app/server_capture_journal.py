@@ -276,6 +276,11 @@ class ServerCaptureJournal:
         }
         if frames is not None:
             journal_payload["frames"] = frames
+        frame_catalog = batch.get("frame_catalog")
+        if frame_catalog is not None:
+            if not isinstance(frame_catalog, dict) or _without_secrets(frame_catalog) != frame_catalog:
+                return {"ok": False, "error": "frame_catalog_invalid"}
+            journal_payload["frame_catalog"] = frame_catalog
         required_frame_contract = str(
             batch.get("required_frame_contract") or ""
         ).strip()
@@ -290,7 +295,7 @@ class ServerCaptureJournal:
             safe_status = {}
         byte_count = len(body.encode("utf-8"))
         with self._lock:
-            if required_frame_contract == "unified_frame_v1":
+            if required_frame_contract in {"unified_frame_v1", "unified_frame_v2"}:
                 configured = self._configure_mirror_contract(
                     session_id, capture_uuid, mirrors
                 )

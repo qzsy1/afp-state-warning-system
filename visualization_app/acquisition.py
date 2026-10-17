@@ -43,6 +43,18 @@ from real_acquisition import (
 )
 from local_direct_acquisition import LocalDirectAdapter, minimum_poll_interval
 from release_contract import assert_config_contract, load_release_contract
+from thermocouple64 import (
+    THERMOCOUPLE64_CHANNELS,
+    THERMOCOUPLE64_DRIVER,
+    THERMOCOUPLE64_INTERFACE_ID,
+    THERMOCOUPLE64_MODE_ID,
+    THERMOCOUPLE64_ROLE,
+    THERMOCOUPLE64_DERIVED_CHANNELS,
+    Thermocouple64Snapshot,
+    hardware_release_readiness,
+    project_specimen_layers,
+    raw_catalog,
+)
 try:
     from windows_usb_topology import discover_windows_usb_topology
 except ImportError:  # Compatibility with older modular runtimes.
@@ -95,6 +107,7 @@ NEW_CORE_SENSOR_COLUMNS = [
 NEW_OPTIONAL_SENSOR_COLUMNS = [
     *[f"温度{index}" for index in range(1, 9)],
 ]
+STRAIN_SENSOR_COLUMNS = [f"应变{index}" for index in range(1, 5)]
 # These legacy channels are intentionally excluded from the new collection
 # plan.  New-schema checkpoints must not request them: missing physical sensor
 # inputs are never replaced with a synthetic baseline during live inference.
@@ -102,8 +115,19 @@ NEW_EXCLUDED_SENSOR_COLUMNS = {"转速", "位移", "振动"}
 NEW_COLLECTION_SENSOR_COLUMNS = list(
     dict.fromkeys([*NEW_CORE_SENSOR_COLUMNS, *NEW_OPTIONAL_SENSOR_COLUMNS])
 )
+LATEST_COLLECTION_SENSOR_COLUMNS = [
+    *NEW_COLLECTION_SENSOR_COLUMNS,
+    *STRAIN_SENSOR_COLUMNS,
+]
+CURRENT_COLLECTION_SENSOR_COLUMNS = [
+    *NEW_CORE_SENSOR_COLUMNS,
+    *THERMOCOUPLE64_CHANNELS,
+    *STRAIN_SENSOR_COLUMNS,
+]
 ALL_SENSOR_COLUMNS = list(
-    dict.fromkeys([*LEGACY_SENSOR_COLUMNS, *NEW_COLLECTION_SENSOR_COLUMNS])
+    dict.fromkeys(
+        [*LEGACY_SENSOR_COLUMNS, *LATEST_COLLECTION_SENSOR_COLUMNS, *CURRENT_COLLECTION_SENSOR_COLUMNS]
+    )
 )
 PROCESS_PARAMETER_COLUMNS = [
     "initial_compaction_force_N",
@@ -143,6 +167,26 @@ NEW_COLLECTION_COLUMNS = [
     "replicate",
     "layer_id",
 ]
+LATEST_COLLECTION_COLUMNS = [
+    "时间",
+    *LATEST_COLLECTION_SENSOR_COLUMNS,
+    *PROCESS_PARAMETER_COLUMNS,
+    "run_id",
+    "specimen_id",
+    "condition_id",
+    "replicate",
+    "layer_id",
+]
+CURRENT_COLLECTION_COLUMNS = [
+    "时间",
+    *CURRENT_COLLECTION_SENSOR_COLUMNS,
+    *PROCESS_PARAMETER_COLUMNS,
+    "run_id",
+    "specimen_id",
+    "condition_id",
+    "replicate",
+    "layer_id",
+]
 ACQUISITION_SCHEMAS = {
     "legacy_original": {
         "label": "旧数据兼容方案（原12传感器）",
@@ -154,7 +198,20 @@ ACQUISITION_SCHEMAS = {
         "sensors": NEW_COLLECTION_SENSOR_COLUMNS,
         "raw_columns": NEW_COLLECTION_COLUMNS,
     },
+    "new_collection_v12_0": {
+        "label": "完整采集方案（21采集通道＋4工艺参数；含四通道微应变）",
+        "sensors": LATEST_COLLECTION_SENSOR_COLUMNS,
+        "raw_columns": LATEST_COLLECTION_COLUMNS,
+    },
+    THERMOCOUPLE64_MODE_ID: {
+        "label": "64路热电偶完整采集方案（77采集通道＋4工艺参数）",
+        "sensors": CURRENT_COLLECTION_SENSOR_COLUMNS,
+        "raw_columns": CURRENT_COLLECTION_COLUMNS,
+    },
 }
+MODERN_COLLECTION_SCHEMAS = frozenset(
+    {"new_collection_v11_3", "new_collection_v12_0", THERMOCOUPLE64_MODE_ID}
+)
 
 ALIASES = {
     "rotation": "转速",
@@ -174,6 +231,8 @@ ALIASES = {
     "abb_x": "ABB_X",
     "abb_y": "ABB_Y",
     "abb_z": "ABB_Z",
+    **{f"strain_{index}": f"应变{index}" for index in range(1, 5)},
+    **{f"strain{index}": f"应变{index}" for index in range(1, 5)},
     **{f"temperature_{index}": f"温度{index}" for index in range(1, 9)},
     **{f"temp{index}": f"温度{index}" for index in range(1, 9)},
 }
@@ -592,10 +651,22 @@ DEFAULT_RTSP_URL = "rtsp://192.168.125.2:554/"
 # simulator/probe path and still needs one raw hardware capture for final
 # protocol validation.
 M3232_BAUDRATE = 115200
+ESR1001_BAUDRATE = 9600
+ESR1001_BYTESIZE = 8
+ESR1001_PARITY = "N"
+ESR1001_STOPBITS = 1
+ESR1001_DEFAULT_SLAVE_ID = 0x01
+ESR1001_READ_FUNCTION = 0x04
+ESR1001_FLOAT_REGISTER = 0x0030
+ESR1001_FLOAT_REGISTER_COUNT = 8
+ESR1001_CHANNEL_COUNT_REGISTER = 0x0015
+ESR1001_ACQUISITION_COIL = 0x0009
+ESR1001_CHANNELS = tuple(STRAIN_SENSOR_COLUMNS)
+ESR1001_DEVICE_ORDER = ("应变4", "应变1", "应变2", "应变3")
+ESR1001_RESPONSE_TIMEOUT_SECONDS = 0.25
+ESR1001_FRESHNESS_SECONDS = 0.25
 
-# The 16-channel collection plan remains authoritative.  This metadata only
-# restores the verified physical source, unit and decoder contract used by the
-# 2026-08-18 interface-mapped build.
+# Canonical acquisition metadata is shared by the API, storage and interfaces.
 SENSOR_CHANNEL_METADATA: dict[str, dict[str, str]] = {
     "温度": {"unit": "°C", "dtype": "float32", "source": "松下PLC DT28/DT29"},
     "压力": {"unit": "N", "dtype": "float32", "source": "松下PLC DT37/DT38（过程压力）"},
@@ -608,9 +679,22 @@ SENSOR_CHANNEL_METADATA: dict[str, dict[str, str]] = {
     "ABB_Z": {"unit": "mm", "dtype": "float32", "source": "ABB RWS robtarget.z"},
     **{
         f"温度{index}": {
-            "unit": "°C", "dtype": "float32", "source": f"八通道热电偶 CH{index}"
+            "unit": "°C",
+            "dtype": "float32",
+            "source": f"64路热电偶适配器规范通道 CH{index}（设备协议待确认）",
+            "alias": f"temperature_{index}",
+            "display_group": f"TC-G{((index - 1) // 8) + 1:02d}",
         }
-        for index in range(1, 9)
+        for index in range(1, 65)
+    },
+    **{
+        f"应变{index}": {
+            "unit": "με",
+            "dtype": "float32",
+            "source": f"ESR1001-A CH{index}（独立RS485接口）",
+            "alias": f"strain_{index}",
+        }
+        for index in range(1, 5)
     },
 }
 
@@ -619,7 +703,7 @@ SENSOR_CHANNEL_METADATA: dict[str, dict[str, str]] = {
 # custom JSON profile permits manual driver/channel-map editing.
 SENSOR_INTERFACE_PROFILES: dict[str, dict[str, Any]] = {
     "thermocouple": {
-        "label": "八通道热电偶",
+        "label": "历史八通道热电偶（只读兼容）",
         "driver": "smrf_hid",
         "protocol": "smrf_hid",
         "physical_kind": "usb_hid",
@@ -630,6 +714,16 @@ SENSOR_INTERFACE_PROFILES: dict[str, dict[str, Any]] = {
             "USB HID；SMRF型号/序列号识别；SSPEED+HIDREAD；异或校验；"
             "CH1～CH8按K型热电偶和冷端温度换算"
         ),
+        "historical_only": True,
+    },
+    THERMOCOUPLE64_ROLE: {
+        "label": "64路热电偶（硬件协议待确认）",
+        "driver": THERMOCOUPLE64_DRIVER,
+        "protocol": "unconfirmed",
+        "physical_kind": "unconfirmed",
+        "endpoint": "",
+        "channels": list(THERMOCOUPLE64_CHANNELS),
+        "processing": "厂商无关64路适配合同；设备协议确认前禁止真实采集发布",
     },
     "plc": {
         "label": "松下PLC过程传感器",
@@ -677,6 +771,17 @@ SENSOR_INTERFACE_PROFILES: dict[str, dict[str, Any]] = {
         "channels": ["薄膜压力"],
         "processing": "串口矩阵（行列自动识别）→有效像素合计→中值滤波（N）；坐标/零点按设备校准",
     },
+    "esr1001_strain": {
+        "label": "ESR1001-A四通道应变",
+        "driver": "modbus_rtu_esr1001",
+        "protocol": "modbus_rtu",
+        "physical_kind": "serial",
+        "endpoint": "",
+        "baudrate": ESR1001_BAUDRATE,
+        "slave_id": ESR1001_DEFAULT_SLAVE_ID,
+        "channels": list(ESR1001_CHANNELS),
+        "processing": "Modbus RTU FC04读取0x0030的8个寄存器；CH4、CH1、CH2、CH3重排为应变1～应变4",
+    },
     "custom": {
         "label": "自定义JSON传感器",
         "driver": "serial_json",
@@ -692,18 +797,17 @@ SENSOR_INTERFACE_PROFILES: dict[str, dict[str, Any]] = {
 
 
 def default_capture_interfaces() -> list[dict[str, Any]]:
-    """Restore the five interfaces used by the 16-channel plan.
-
-    Interface 5 is the dedicated M3232 thin-film pressure sensor.  Keeping it
-    in the defaults makes the physical sensor visible in the UI and prevents
-    pressure from silently falling back to the PLC interface.
-    """
+    """Return the six logical interfaces in the complete acquisition plan."""
     return [
         {
-            "id": "thermocouple_8ch", "enabled": True,
-            "role": "thermocouple", "driver": "smrf_hid",
-            "endpoint": "SMRFCT08B", "channel_types": ["K"] * 8,
+            "id": THERMOCOUPLE64_INTERFACE_ID,
+            "enabled": True,
+            "role": THERMOCOUPLE64_ROLE,
+            "driver": THERMOCOUPLE64_DRIVER,
+            "endpoint": "",
+            "channels": list(THERMOCOUPLE64_CHANNELS),
             "channel_map": {},
+            "hardware_facts": {},
         },
         {
             "id": "plc_process", "enabled": True,
@@ -730,6 +834,14 @@ def default_capture_interfaces() -> list[dict[str, Any]]:
             "matrix_rows": 0, "matrix_cols": 0,
             "channels": ["薄膜压力"], "channel_map": {},
         },
+        {
+            "id": "esr1001_strain", "enabled": True,
+            "role": "esr1001_strain", "driver": "modbus_rtu_esr1001",
+            "endpoint": "", "baudrate": ESR1001_BAUDRATE,
+            "slave_id": ESR1001_DEFAULT_SLAVE_ID,
+            "freshness_seconds": ESR1001_FRESHNESS_SECONDS,
+            "channels": list(ESR1001_CHANNELS), "channel_map": {},
+        },
     ]
 
 
@@ -753,6 +865,7 @@ def sensor_interface_profiles() -> list[dict[str, Any]]:
             },
         }
         for profile_id, profile in SENSOR_INTERFACE_PROFILES.items()
+        if not profile.get("historical_only")
     ]
 
 
@@ -782,6 +895,13 @@ def _apply_sensor_interface_profile(interface: dict[str, Any]) -> dict[str, Any]
             interface["register_map"] = dict(PLC_DEFAULT_REGISTER_MAP)
         interface["slave_id"] = int(
             interface.get("slave_id") or DEFAULT_PLC_SLAVE_ID
+        )
+    elif sensor_type == "esr1001_strain":
+        interface["slave_id"] = int(
+            interface.get("slave_id") or ESR1001_DEFAULT_SLAVE_ID
+        )
+        interface["freshness_seconds"] = float(
+            interface.get("freshness_seconds") or ESR1001_FRESHNESS_SECONDS
         )
     return interface
 
@@ -832,6 +952,7 @@ def _physical_interface_binding_issues(
         return []
     issues: list[dict[str, Any]] = []
     seen: dict[str, dict[str, Any]] = {}
+    serial_endpoints: dict[str, dict[str, Any]] = {}
     for item in interfaces:
         if not item.get("enabled", True):
             continue
@@ -854,6 +975,28 @@ def _physical_interface_binding_issues(
                 f"{actual_kind}，应为{expected_kind}"
             )
             issues.append({"code": "physical_kind_mismatch", "message": message, "interface_ids": [str(item.get("id") or role)]})
+        if expected_kind == "serial":
+            serial_endpoint = _physical_interface_key(item.get("endpoint"))
+            if serial_endpoint:
+                previous_serial = serial_endpoints.get(serial_endpoint)
+                if previous_serial is not None:
+                    message = (
+                        f"独占串口“{item.get('endpoint')}”重复绑定："
+                        f"{previous_serial.get('id', '前一接口')}与{item.get('id', role)}"
+                    )
+                    issues.append(
+                        {
+                            "code": "duplicate_serial_endpoint",
+                            "message": message,
+                            "resource_id": serial_endpoint,
+                            "interface_ids": [
+                                str(previous_serial.get("id") or ""),
+                                str(item.get("id") or role),
+                            ],
+                        }
+                    )
+                else:
+                    serial_endpoints[serial_endpoint] = item
         physical_id = _physical_interface_key(item.get("physical_interface_id"))
         physical_port_id = _physical_interface_key(item.get("physical_port_id"))
         if acquisition_mode == "real" and not physical_id and not physical_port_id:
@@ -956,10 +1099,9 @@ def normalize_sample(payload: dict[str, Any]) -> dict[str, float]:
     """Normalize one interface payload into the canonical AFP channel names.
 
     Hardware gateways are allowed to send either a flat JSON object or a
-    ``channels``/``values`` object.  A thermocouple interface may also send an
-    array; its values are mapped to 温度1..温度8 in order.  ``channel_map`` is
-    intentionally explicit so a user can rename vendor channels without
-    changing the saved/displayed schema.
+    ``channels``/``values`` object.  The historical thermocouple role accepts
+    exactly its eight positions; the current 64-channel role accepts exactly
+    64 positions.  Other roles cannot claim 64-channel thermocouple names.
     """
     return _normalize_interface_sample(payload)
 
@@ -980,13 +1122,25 @@ def _normalize_interface_sample(
         elif isinstance(nested, (list, tuple)):
             flattened.pop(nested_key, None)
             if role == "thermocouple":
-                for index, value in enumerate(nested[:8], start=1):
+                if len(nested) != 8:
+                    raise ValueError("historical thermocouple array must contain exactly 8 values")
+                for index, value in enumerate(nested, start=1):
+                    flattened[f"temperature_{index}"] = value
+            elif role == THERMOCOUPLE64_ROLE:
+                if len(nested) != 64:
+                    raise ValueError("thermocouple64 array must contain exactly 64 values")
+                for index, value in enumerate(nested, start=1):
                     flattened[f"temperature_{index}"] = value
     # Common vendor spelling for a temperature array.
     for array_key in ("thermocouples", "thermocouple", "temperatures", "tc"):
         values = payload.get(array_key)
         if isinstance(values, (list, tuple)):
-            for index, value in enumerate(values[:8], start=1):
+            expected = 64 if role == THERMOCOUPLE64_ROLE else 8 if role == "thermocouple" else 0
+            if not expected:
+                continue
+            if len(values) != expected:
+                raise ValueError(f"thermocouple array must contain exactly {expected} values")
+            for index, value in enumerate(values, start=1):
                 flattened[f"temperature_{index}"] = value
     normalized: dict[str, float] = {}
     for key, value in flattened.items():
@@ -999,15 +1153,68 @@ def _normalize_interface_sample(
         # Generic CH1/CH2 names on a thermocouple adapter are interpreted in
         # channel order.  Other interfaces must use an explicit map or a
         # canonical/aliased name to prevent accidental column mislabelling.
-        if role == "thermocouple" and target == source:
+        if role in {"thermocouple", THERMOCOUPLE64_ROLE} and target == source:
             match = re.fullmatch(r"(?:ch|channel|tc|t)[_ -]?(\d+)", source, re.I)
             if match:
                 target = f"温度{int(match.group(1))}"
+        if role == THERMOCOUPLE64_ROLE:
+            match = re.fullmatch(r"(?:temperature|temp)[_ -]?(\d+)", source, re.I)
+            if match:
+                target = f"温度{int(match.group(1))}"
+        if target in THERMOCOUPLE64_CHANNELS:
+            channel_number = int(target.removeprefix("温度"))
+            if role == THERMOCOUPLE64_ROLE:
+                pass
+            elif role == "thermocouple" and channel_number <= 8:
+                pass
+            elif source in channel_map or source.lower() in channel_map:
+                pass
+            else:
+                continue
         if target in ALL_SENSOR_COLUMNS:
             number = _finite(value)
             if number is not None:
                 normalized[target] = number
     return normalized
+
+
+def publish_thermocouple64_snapshot(
+    cache: ChannelSampleCache,
+    snapshot: Thermocouple64Snapshot,
+    *,
+    interface_id: str = THERMOCOUPLE64_INTERFACE_ID,
+    received_wall_time: float | None = None,
+    received_monotonic: float | None = None,
+) -> None:
+    """Publish all 64 adapter results into the per-channel frame cache."""
+
+    wall_time = float(received_wall_time if received_wall_time is not None else time.time())
+    monotonic = float(
+        received_monotonic if received_monotonic is not None else time.monotonic()
+    )
+    quality_map = {
+        "measured_new": ChannelQuality.MEASURED_NEW,
+        "missing": ChannelQuality.MISSING,
+        "stale": ChannelQuality.STALE,
+        "invalid": ChannelQuality.INVALID,
+    }
+    for channel in THERMOCOUPLE64_CHANNELS:
+        raw_quality = str(snapshot.quality.get(channel) or "invalid")
+        cache.publish(
+            ChannelSample(
+                interface_id=interface_id,
+                channel_name=channel,
+                value=snapshot.values.get(channel),
+                quality=quality_map.get(raw_quality, ChannelQuality.INVALID),
+                device_timestamp=snapshot.source_timestamp,
+                received_wall_time=wall_time,
+                received_monotonic=monotonic,
+                source_sequence=snapshot.source_sequence,
+                protocol_ok=True,
+                error=str(snapshot.errors.get(channel) or ""),
+                metadata={"device_identity": snapshot.device_identity},
+            )
+        )
 
 
 @dataclass
@@ -1246,7 +1453,12 @@ class AcquisitionConfig:
                 if isinstance(register_map, dict) else {}
             )
             interface["slave_id"] = int(
-                interface.get("slave_id") or DEFAULT_PLC_SLAVE_ID
+                interface.get("slave_id")
+                or (
+                    ESR1001_DEFAULT_SLAVE_ID
+                    if role_hint == "esr1001_strain"
+                    else DEFAULT_PLC_SLAVE_ID
+                )
             )
             _apply_sensor_interface_profile(interface)
             interface["physical_interface_id"] = str(
@@ -1291,6 +1503,35 @@ class AcquisitionConfig:
                     self.configuration_issues.append({
                         "code": "simulation_driver_in_real_mode", "message": message,
                         "interface_ids": [str(item.get("id") or "") for item in normalized_interfaces if item.get("enabled", True) and item.get("driver") == "simulator"],
+                    })
+                else:
+                    raise ValueError(message)
+            historical_thermocouples = [
+                item for item in enabled if item.get("role") == "thermocouple"
+            ]
+            if historical_thermocouples:
+                message = "旧8路热电偶仅支持历史文件只读回放，不能用于新的真实采集"
+                if diagnostic_validation:
+                    self.configuration_issues.append({
+                        "code": "historical_thermocouple_read_only",
+                        "message": message,
+                        "interface_ids": [str(item.get("id") or "") for item in historical_thermocouples],
+                    })
+                else:
+                    raise ValueError(message)
+            for item in enabled:
+                if item.get("role") != THERMOCOUPLE64_ROLE:
+                    continue
+                readiness = hardware_release_readiness(item.get("hardware_facts"))
+                if readiness["ready"]:
+                    continue
+                message = str(readiness["message"])
+                if diagnostic_validation:
+                    self.configuration_issues.append({
+                        "code": "thermocouple64_hardware_facts_missing",
+                        "message": message,
+                        "interface_ids": [str(item.get("id") or THERMOCOUPLE64_INTERFACE_ID)],
+                        "missing_facts": list(readiness["missing_facts"]),
                     })
                 else:
                     raise ValueError(message)
@@ -1536,7 +1777,7 @@ def _parameter_token(config: AcquisitionConfig) -> str:
     # mixed accidentally.
     condition = _safe_component(config.condition_id or "LIVE", max_length=24)
     replicate = max(1, int(config.replicate or 1))
-    if config.dataset_schema == "new_collection_v11_3":
+    if config.dataset_schema in MODERN_COLLECTION_SCHEMAS:
         return (
             f"C{condition}_R{replicate}_"
             f"F{config.initial_compaction_force_N:g}_"
@@ -1778,6 +2019,407 @@ class SampleDriver:
         return
 
 
+class Esr1001ProtocolError(IOError):
+    """A classified ESR1001-A Modbus RTU protocol failure."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        function_code: int | None = None,
+        exception_code: int | None = None,
+    ) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = str(code)
+        self.function_code = function_code
+        self.exception_code = exception_code
+
+
+class Esr1001FirmwareIncompatibleError(Esr1001ProtocolError):
+    """The device firmware does not expose the required float registers."""
+
+
+def classify_esr1001_probe_error(error: Any) -> str:
+    """Map a probe failure to the stable hardware-check state catalog."""
+
+    lowered = str(error or "").lower()
+    classifications = (
+        ("firmware_incompatible", "firmware_incompatible"),
+        ("wrong_slave", "wrong_slave"),
+        ("wrong_function", "wrong_function"),
+        ("byte_count", "length_error"),
+        ("length", "length_error"),
+        ("crc", "crc_error"),
+        ("modbus_exception", "modbus_exception"),
+        ("timeout", "no_response"),
+        ("access is denied", "port_occupied"),
+        ("permission", "port_occupied"),
+        ("cannot find", "port_missing"),
+        ("file not found", "port_missing"),
+        ("filenotfound", "port_missing"),
+        ("no such file", "port_missing"),
+    )
+    return next(
+        (value for token, value in classifications if token in lowered),
+        "serial_parameter_error",
+    )
+
+
+def crc16_modbus(payload: bytes) -> int:
+    """Return the Modbus CRC integer whose low byte is transmitted first."""
+
+    crc = 0xFFFF
+    for value in bytes(payload):
+        crc ^= value
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+    return crc & 0xFFFF
+
+
+def esr1001_append_crc(payload: bytes) -> bytes:
+    crc = crc16_modbus(payload)
+    return bytes(payload) + bytes((crc & 0xFF, (crc >> 8) & 0xFF))
+
+
+def esr1001_crc_valid(frame: bytes) -> bool:
+    raw = bytes(frame)
+    if len(raw) < 4:
+        return False
+    expected = crc16_modbus(raw[:-2])
+    return raw[-2:] == bytes((expected & 0xFF, (expected >> 8) & 0xFF))
+
+
+def esr1001_read_request(slave_id: int = ESR1001_DEFAULT_SLAVE_ID) -> bytes:
+    payload = struct.pack(
+        ">BBHH",
+        int(slave_id) & 0xFF,
+        ESR1001_READ_FUNCTION,
+        ESR1001_FLOAT_REGISTER,
+        ESR1001_FLOAT_REGISTER_COUNT,
+    )
+    return esr1001_append_crc(payload)
+
+
+def _esr1001_write_register_request(
+    slave_id: int, register: int, value: int
+) -> bytes:
+    return esr1001_append_crc(
+        struct.pack(">BBHH", int(slave_id) & 0xFF, 0x06, register, value)
+    )
+
+
+def _esr1001_write_coil_request(
+    slave_id: int, register: int, enabled: bool
+) -> bytes:
+    return esr1001_append_crc(
+        struct.pack(
+            ">BBHH",
+            int(slave_id) & 0xFF,
+            0x05,
+            register,
+            0xFF00 if enabled else 0x0000,
+        )
+    )
+
+
+def _raise_esr1001_exception(frame: bytes) -> None:
+    function_code = frame[1]
+    exception_code = frame[2] if len(frame) >= 3 else None
+    if function_code == (ESR1001_READ_FUNCTION | 0x80) and exception_code == 0x02:
+        raise Esr1001FirmwareIncompatibleError(
+            "firmware_incompatible",
+            "设备固件不支持0x0030实数输入寄存器",
+            function_code=function_code,
+            exception_code=exception_code,
+        )
+    raise Esr1001ProtocolError(
+        "modbus_exception",
+        f"功能码0x{function_code:02X}，异常码0x{int(exception_code or 0):02X}",
+        function_code=function_code,
+        exception_code=exception_code,
+    )
+
+
+def _validate_esr1001_frame(
+    frame: bytes,
+    *,
+    slave_id: int,
+    expected_function: int,
+) -> bytes:
+    raw = bytes(frame)
+    if len(raw) < 5:
+        raise Esr1001ProtocolError("length", f"响应长度不足：{len(raw)}")
+    if not esr1001_crc_valid(raw):
+        raise Esr1001ProtocolError("crc", "响应CRC16/MODBUS校验失败")
+    if raw[0] != (int(slave_id) & 0xFF):
+        raise Esr1001ProtocolError(
+            "wrong_slave", f"期望从站{slave_id}，收到{raw[0]}"
+        )
+    if raw[1] & 0x80:
+        _raise_esr1001_exception(raw)
+    if raw[1] != expected_function:
+        raise Esr1001ProtocolError(
+            "wrong_function",
+            f"期望功能码0x{expected_function:02X}，收到0x{raw[1]:02X}",
+            function_code=raw[1],
+        )
+    return raw
+
+
+def parse_esr1001_read_response(
+    frame: bytes, *, slave_id: int = ESR1001_DEFAULT_SLAVE_ID
+) -> dict[str, float]:
+    raw = _validate_esr1001_frame(
+        frame, slave_id=slave_id, expected_function=ESR1001_READ_FUNCTION
+    )
+    if raw[2] != 16:
+        raise Esr1001ProtocolError(
+            "byte_count", f"期望16个数据字节，收到{raw[2]}"
+        )
+    if len(raw) != 21:
+        raise Esr1001ProtocolError(
+            "length", f"期望21字节响应，收到{len(raw)}"
+        )
+    device_values = [
+        struct.unpack(">f", raw[offset : offset + 4])[0]
+        for offset in range(3, 19, 4)
+    ]
+    if not all(math.isfinite(value) for value in device_values):
+        raise Esr1001ProtocolError("non_finite", "响应包含非有限float32")
+    by_name = dict(zip(ESR1001_DEVICE_ORDER, device_values))
+    return {name: float(by_name[name]) for name in ESR1001_CHANNELS}
+
+
+class Esr1001StrainDriver(SampleDriver):
+    """Strict single-device Modbus RTU driver for ESR1001-A."""
+
+    def __init__(
+        self,
+        endpoint: str,
+        baudrate: int = ESR1001_BAUDRATE,
+        slave_id: int = ESR1001_DEFAULT_SLAVE_ID,
+        timeout: float = ESR1001_RESPONSE_TIMEOUT_SECONDS,
+        *,
+        serial_factory: Any = None,
+    ) -> None:
+        self.endpoint = str(endpoint or "").strip()
+        self.baudrate = int(baudrate or ESR1001_BAUDRATE)
+        self.slave_id = int(slave_id or ESR1001_DEFAULT_SLAVE_ID)
+        if not 1 <= self.slave_id <= 247:
+            raise ValueError("ESR1001-A从站地址必须在1到247之间")
+        self.timeout = max(0.01, min(float(timeout), 2.0))
+        self.serial_factory = serial_factory
+        self.serial = None
+        self._rx_buffer = bytearray()
+        self._reset_before_request = True
+        self.protocol_verified = False
+        self.error_counts: dict[str, int] = {}
+        self.last_error = ""
+        self.last_valid_time: float | None = None
+        self.observation_count = 0
+        self.quality_metadata: dict[str, Any] = self._quality_metadata()
+
+    def _quality_metadata(self) -> dict[str, Any]:
+        return {
+            "protocol": "modbus_rtu",
+            "driver": "modbus_rtu_esr1001",
+            "slave_id": self.slave_id,
+            "observation_count": self.observation_count,
+            "last_valid_time": self.last_valid_time,
+            "protocol_error_counts": dict(self.error_counts),
+            "last_error": self.last_error,
+        }
+
+    def _record_error(self, error: Exception) -> None:
+        code = getattr(error, "code", error.__class__.__name__)
+        self.error_counts[str(code)] = self.error_counts.get(str(code), 0) + 1
+        self.last_error = str(error)
+        self.quality_metadata = self._quality_metadata()
+
+    @staticmethod
+    def _default_serial_factory(**kwargs: Any):
+        import serial
+
+        return serial.Serial(**kwargs)
+
+    def _expected_frame_length(self, buffer: bytearray) -> int | None:
+        if len(buffer) < 2:
+            return None
+        function_code = buffer[1]
+        if function_code & 0x80:
+            return 5
+        if function_code in {0x05, 0x06}:
+            return 8
+        if function_code in {0x01, 0x02, 0x03, 0x04}:
+            if len(buffer) < 3:
+                return None
+            byte_count = int(buffer[2])
+            if byte_count > 250:
+                raise Esr1001ProtocolError(
+                    "byte_count", f"响应字节数无效：{byte_count}"
+                )
+            return 5 + byte_count
+        raise Esr1001ProtocolError(
+            "wrong_function", f"无法识别功能码0x{function_code:02X}"
+        )
+
+    def _read_rtu_frame(
+        self, *, expected_function: int, deadline_seconds: float
+    ) -> bytes:
+        if self.serial is None:
+            raise Esr1001ProtocolError("port_closed", "串口尚未打开")
+        deadline = time.monotonic() + max(0.001, float(deadline_seconds))
+        last_error: Esr1001ProtocolError | None = None
+        while time.monotonic() < deadline:
+            slave_byte = self.slave_id & 0xFF
+            while self._rx_buffer and self._rx_buffer[0] != slave_byte:
+                del self._rx_buffer[0]
+            try:
+                frame_length = self._expected_frame_length(self._rx_buffer)
+            except Esr1001ProtocolError as exc:
+                last_error = exc
+                if self._rx_buffer:
+                    del self._rx_buffer[0]
+                continue
+            if frame_length is not None and len(self._rx_buffer) >= frame_length:
+                candidate = bytes(self._rx_buffer[:frame_length])
+                del self._rx_buffer[:frame_length]
+                try:
+                    _validate_esr1001_frame(
+                        candidate,
+                        slave_id=self.slave_id,
+                        expected_function=expected_function,
+                    )
+                    return candidate
+                except Esr1001ProtocolError as exc:
+                    last_error = exc
+                    if exc.code not in {"crc", "wrong_function"}:
+                        raise
+                    continue
+            chunk = self.serial.read(256)
+            if chunk:
+                self._rx_buffer.extend(chunk)
+                continue
+            time.sleep(0.001)
+        if last_error is not None:
+            raise last_error
+        raise Esr1001ProtocolError("timeout", "在响应期限内未收到完整RTU帧")
+
+    def _transact(
+        self,
+        request: bytes,
+        *,
+        expected_function: int,
+        deadline_seconds: float | None = None,
+    ) -> bytes:
+        if self.serial is None:
+            raise Esr1001ProtocolError("port_closed", "串口尚未打开")
+        if self._reset_before_request:
+            reset = getattr(self.serial, "reset_input_buffer", None)
+            if callable(reset):
+                reset()
+            self._rx_buffer.clear()
+        written = self.serial.write(bytes(request))
+        if written != len(request):
+            raise Esr1001ProtocolError(
+                "write_incomplete", f"请求写入{written}/{len(request)}字节"
+            )
+        flush = getattr(self.serial, "flush", None)
+        if callable(flush):
+            flush()
+        return self._read_rtu_frame(
+            expected_function=expected_function,
+            deadline_seconds=(
+                self.timeout if deadline_seconds is None else deadline_seconds
+            ),
+        )
+
+    def _validate_write_echo(self, response: bytes, request: bytes) -> None:
+        raw = _validate_esr1001_frame(
+            response, slave_id=self.slave_id, expected_function=request[1]
+        )
+        if len(raw) != 8 or raw[:-2] != request[:-2]:
+            raise Esr1001ProtocolError("write_echo", "写操作应答与请求不一致")
+
+    def open(self) -> None:
+        if not self.endpoint:
+            raise ValueError("ESR1001-A必须明确选择串口，不能硬编码现场COM号")
+        factory = self.serial_factory or self._default_serial_factory
+        self.serial = factory(
+            port=self.endpoint,
+            baudrate=self.baudrate,
+            bytesize=ESR1001_BYTESIZE,
+            parity=ESR1001_PARITY,
+            stopbits=ESR1001_STOPBITS,
+            timeout=min(0.02, self.timeout),
+            write_timeout=self.timeout,
+        )
+        try:
+            probe = self._transact(
+                esr1001_read_request(self.slave_id),
+                expected_function=ESR1001_READ_FUNCTION,
+            )
+            parse_esr1001_read_response(probe, slave_id=self.slave_id)
+            enable = _esr1001_write_register_request(
+                self.slave_id, ESR1001_CHANNEL_COUNT_REGISTER, 4
+            )
+            self._validate_write_echo(
+                self._transact(enable, expected_function=0x06), enable
+            )
+            start = _esr1001_write_coil_request(
+                self.slave_id, ESR1001_ACQUISITION_COIL, True
+            )
+            self._validate_write_echo(
+                self._transact(start, expected_function=0x05), start
+            )
+            self.protocol_verified = True
+            self.last_error = ""
+            self.quality_metadata = self._quality_metadata()
+        except Exception as exc:
+            self._record_error(exc)
+            self.close()
+            raise
+
+    def read_sample(self) -> dict[str, float] | None:
+        try:
+            frame = self._transact(
+                esr1001_read_request(self.slave_id),
+                expected_function=ESR1001_READ_FUNCTION,
+            )
+            values = parse_esr1001_read_response(frame, slave_id=self.slave_id)
+        except Exception as exc:
+            self._record_error(exc)
+            raise
+        self.observation_count += 1
+        self.last_valid_time = time.time()
+        self.last_error = ""
+        self.protocol_verified = True
+        self.quality_metadata = self._quality_metadata()
+        return values
+
+    def close(self) -> None:
+        serial_port = self.serial
+        if serial_port is None:
+            return
+        try:
+            stop = _esr1001_write_coil_request(
+                self.slave_id, ESR1001_ACQUISITION_COIL, False
+            )
+            response = self._transact(
+                stop, expected_function=0x05, deadline_seconds=self.timeout
+            )
+            self._validate_write_echo(response, stop)
+        except Exception as exc:
+            self._record_error(exc)
+        finally:
+            try:
+                serial_port.close()
+            finally:
+                self.serial = None
+                self._rx_buffer.clear()
+
+
 class SimulatorDriver(SampleDriver):
     def __init__(self, path: Path, sensor_columns: list[str]) -> None:
         self.path = path
@@ -1844,8 +2486,9 @@ class SimulatorDriver(SampleDriver):
                 self._open_current()
                 continue
             self.index += 1
-            return normalize_sample(
-                {name: record.get(name) for name in self.sensor_columns}
+            return _normalize_interface_sample(
+                {name: record.get(name) for name in self.sensor_columns},
+                role=THERMOCOUPLE64_ROLE,
             )
         return None
 
@@ -2641,9 +3284,13 @@ class MultiInterfaceDriver(SampleDriver):
         self.drivers: list[SampleDriver] = []
         self.cache = ChannelSampleCache(max_events=max(128, len(selected_sensors) * 64))
         self.workers: list[LocalDirectAdapter] = []
+        self.final_worker_status: list[dict[str, Any]] = []
+        self.interface_quality_metadata: dict[str, dict[str, Any]] = {}
 
     def open(self) -> None:
         self.drivers = []
+        self.final_worker_status = []
+        self.interface_quality_metadata = {}
         try:
             for item in self.configs:
                 driver_name = str(item.get("driver") or "serial_json")
@@ -2693,6 +3340,13 @@ class MultiInterfaceDriver(SampleDriver):
                         int(item.get("baudrate") or M3232_BAUDRATE),
                         int(item.get("matrix_rows") or 0),
                         int(item.get("matrix_cols") or 0),
+                    )
+                elif driver_name == "modbus_rtu_esr1001":
+                    driver = Esr1001StrainDriver(
+                        str(item.get("endpoint") or ""),
+                        int(item.get("baudrate") or ESR1001_BAUDRATE),
+                        int(item.get("slave_id") or ESR1001_DEFAULT_SLAVE_ID),
+                        float(item.get("timeout") or ESR1001_RESPONSE_TIMEOUT_SECONDS),
                     )
                 elif driver_name == "simulator":
                     driver = SimulatorDriver(Path(self.source_file or DEFAULT_SIMULATOR_FILE), self.selected_sensors)
@@ -2760,6 +3414,13 @@ class MultiInterfaceDriver(SampleDriver):
     def close(self) -> None:
         for worker in self.workers:
             worker.stop(timeout_seconds=0.5)
+        self.final_worker_status = [worker.status() for worker in self.workers]
+        self.interface_quality_metadata = {
+            worker.interface_id: dict(metadata)
+            for worker in self.workers
+            for metadata in [getattr(worker.driver, "quality_metadata", {})]
+            if isinstance(metadata, dict)
+        }
         self.workers = []
         self.drivers = []
 
@@ -2817,6 +3478,12 @@ def build_driver(config: AcquisitionConfig) -> SampleDriver:
             config.baudrate or M3232_BAUDRATE,
             int(getattr(config, "matrix_rows", 0) or 0),
             int(getattr(config, "matrix_cols", 0) or 0),
+        )
+    if config.driver == "modbus_rtu_esr1001":
+        return Esr1001StrainDriver(
+            config.endpoint,
+            config.baudrate or ESR1001_BAUDRATE,
+            ESR1001_DEFAULT_SLAVE_ID,
         )
     raise ValueError(f"不支持的采集驱动：{config.driver}")
 
@@ -3023,6 +3690,7 @@ class AcquisitionManager:
         self.timestamps: deque[float] = deque(maxlen=200000)
         self.frame_quality: deque[dict[str, str]] = deque(maxlen=200000)
         self.frame_envelopes: deque[dict[str, Any]] = deque(maxlen=200000)
+        self.frame_catalog: dict[str, Any] | None = None
         self.quality_metrics: AcquisitionQualityMetrics | None = None
         self.total_sample_count = 0
         self.sensor_received = {name: 0 for name in ALL_SENSOR_COLUMNS}
@@ -3268,6 +3936,7 @@ class AcquisitionManager:
             {"id": "uvc_thermal", "label": "BSV UVC热像仪（ROI温度）"},
             {"id": "rtsp_thermal", "label": "IP热像仪 RTSP"},
             {"id": "m3232_pressure", "label": "M3232薄膜压力（115200，矩阵自动识别）"},
+            {"id": "modbus_rtu_esr1001", "label": "ESR1001-A应变（Modbus RTU 9600-8-N-1）"},
         ]
 
     def read_process_parameters(self, config: AcquisitionConfig) -> dict[str, Any]:
@@ -3334,6 +4003,8 @@ class AcquisitionManager:
                     "hwid": str(getattr(item, "hwid", "") or ""),
                     "location": str(getattr(item, "location", "") or ""),
                     "detected": True,
+                    "identity_confirmed": False,
+                    "compatible_roles": ["pressure", "esr1001_strain", "custom"],
                 })
         except Exception as exc:
             error = str(exc)
@@ -3370,7 +4041,8 @@ class AcquisitionManager:
                                 "label": f"串口 {endpoint}",
                                 "description": str(value_name or "Windows serial interface"),
                                 "manufacturer": "", "vid": None, "pid": None,
-                                "detected": True,
+                                "detected": True, "identity_confirmed": False,
+                                "compatible_roles": ["pressure", "esr1001_strain", "custom"],
                             })
                             index += 1
                 except Exception as registry_exc:
@@ -3485,6 +4157,8 @@ class AcquisitionManager:
                 "id": "serial:auto", "kind": "serial", "protocol": "serial",
                 "endpoint": "COM8", "label": "串口（待识别，启动后检查）",
                 "detected": False, "auto_assignable": True,
+                "identity_confirmed": False,
+                "compatible_roles": ["pressure", "esr1001_strain", "custom"],
             })
         rtsp_reachable = False
         try:
@@ -3728,7 +4402,12 @@ class AcquisitionManager:
                 if not physical_verified:
                     message += "；物理端口尚未与该实时设备关联，不能启动真实采集"
             elif probe_errors:
-                state, message = "not_connected", f"接口无法打开或读取：{'；'.join(probe_errors)}"
+                error_text = "；".join(probe_errors)
+                if role == "esr1001_strain":
+                    state = classify_esr1001_probe_error(error_text)
+                    message = f"ESR1001-A协议探针失败（{state}）：{error_text}"
+                else:
+                    state, message = "not_connected", f"接口无法打开或读取：{error_text}"
             elif invalid_channels:
                 state, message = "invalid_data", f"收到非数值数据：{'、'.join(invalid_channels)}"
             else:
@@ -3861,6 +4540,11 @@ class AcquisitionManager:
             candidates.append(combined)
         candidates.extend(
             path
+            for path in self.session_dir.glob(f"{specimen_folder_name}_完整试样_派生.*")
+            if path.is_file()
+        )
+        candidates.extend(
+            path
             for path in self.session_dir.glob(f"{specimen_folder_name}_*.partial")
             if path.is_file()
         )
@@ -3935,18 +4619,6 @@ class AcquisitionManager:
         }
         active_layers = self._layer_files(specimen_folder_name)
         combined = self.session_dir / f"{specimen_folder_name}_完整试样.CSV"
-        if config.layer > 0 and active_layers:
-            expected_columns = config.raw_columns
-            mismatched = [
-                path.name
-                for path in active_layers
-                if self._layer_columns(path) != expected_columns
-            ]
-            if mismatched:
-                raise ValueError(
-                    "同一试样的后续铺层必须使用与已保存铺层相同的采集通道；"
-                    "请将铺层数设为1开始新的试样，或恢复原采集通道。"
-                )
         self.pending_previous_archive = bool(
             config.layer == 0 and (active_layers or combined.exists())
         )
@@ -3985,6 +4657,10 @@ class AcquisitionManager:
             or datetime.now().isoformat(timespec="milliseconds"),
             "last_started_at": datetime.now().isoformat(timespec="milliseconds"),
             "completed_layers": identity_previous.get("completed_layers", []),
+            "layer_sensor_channels": {
+                **dict(identity_previous.get("layer_sensor_channels") or {}),
+                str(config.layer + 1): list(config.selected_sensors or []),
+            },
         }
         # Commit this identity only after at least one valid sample has been
         # finalized.  Until then, the previous specimen remains authoritative.
@@ -4077,7 +4753,7 @@ class AcquisitionManager:
         )
         sample_count = int(self.total_sample_count)
         selected = list(self.config.selected_sensors or []) if self.config else []
-        return {
+        summary = {
             "sample_count": sample_count,
             "duration_seconds": round(max(0.0, duration), 6),
             "configured_sample_rate_hz": (
@@ -4106,6 +4782,70 @@ class AcquisitionManager:
             "online_buffer_rows": len(self.rows),
             "online_buffer_truncated": sample_count > len(self.rows),
         }
+        if self.quality_metrics is not None:
+            summary["unified_frame_quality"] = self.quality_metrics.summary()
+        strain_channels = [
+            name for name in STRAIN_SENSOR_COLUMNS if name in selected
+        ]
+        if strain_channels:
+            missing_or_stale_intervals: dict[str, list[dict[str, int]]] = {}
+            for channel in strain_channels:
+                intervals_for_channel: list[dict[str, int]] = []
+                interval_start: int | None = None
+                for index, quality in enumerate(self.frame_quality):
+                    state = str(quality.get(channel) or ChannelQuality.MISSING.value)
+                    unavailable = state in {
+                        ChannelQuality.MISSING.value,
+                        ChannelQuality.STALE.value,
+                        ChannelQuality.INVALID.value,
+                    }
+                    if unavailable and interval_start is None:
+                        interval_start = index
+                    elif not unavailable and interval_start is not None:
+                        intervals_for_channel.append(
+                            {"start_frame": interval_start, "end_frame": index - 1}
+                        )
+                        interval_start = None
+                if interval_start is not None:
+                    intervals_for_channel.append(
+                        {
+                            "start_frame": interval_start,
+                            "end_frame": max(interval_start, len(self.frame_quality) - 1),
+                        }
+                    )
+                missing_or_stale_intervals[channel] = intervals_for_channel
+
+            interface_id = next(
+                (
+                    str(item.get("id") or "")
+                    for item in (self.config.interfaces or [])
+                    if item.get("role") == "esr1001_strain"
+                ),
+                "esr1001_strain",
+            ) if self.config else "esr1001_strain"
+            interface_metadata = {}
+            if isinstance(self.driver, MultiInterfaceDriver):
+                interface_metadata = dict(
+                    self.driver.interface_quality_metadata.get(interface_id) or {}
+                )
+            protocol_error_counts = dict(
+                interface_metadata.get("protocol_error_counts") or {}
+            )
+            summary["esr1001_strain"] = {
+                "interface_id": interface_id,
+                "observation_counts": {
+                    name: int(self.sensor_received.get(name, 0))
+                    for name in strain_channels
+                },
+                "last_valid_time": {
+                    name: self.sensor_last_time.get(name)
+                    for name in strain_channels
+                },
+                "missing_or_stale_intervals": missing_or_stale_intervals,
+                "protocol_error_counts": protocol_error_counts,
+                "last_protocol_error": str(interface_metadata.get("last_error") or ""),
+            }
+        return summary
 
     def start(self, config: AcquisitionConfig) -> dict:
         """Start one capture while safely replacing an active simulation.
@@ -4183,6 +4923,7 @@ class AcquisitionManager:
             self.timestamps.clear()
             self.frame_quality.clear()
             self.frame_envelopes.clear()
+            self.frame_catalog = None
             self.quality_metrics = AcquisitionQualityMetrics(
                 config.selected_sensors or [], config.sample_rate_hz
             )
@@ -4473,17 +5214,25 @@ class AcquisitionManager:
         temporary = combined_path.with_name(
             f".{combined_path.name}.{self.session_stamp}.tmp"
         )
+        headers = [self._layer_columns(path) for _, path in available]
+        observed = {name for header in headers for name in header}
+        canonical = list(ACQUISITION_SCHEMAS[self.config.dataset_schema]["raw_columns"])
+        union_columns = [name for name in canonical if name in observed]
+        union_columns.extend(
+            name
+            for header in headers
+            for name in header
+            if name not in union_columns
+        )
         try:
             with temporary.open("w", encoding="gb18030", newline="") as output_file:
-                writer = csv.DictWriter(output_file, fieldnames=self.config.raw_columns)
+                writer = csv.DictWriter(
+                    output_file, fieldnames=union_columns, extrasaction="ignore"
+                )
                 writer.writeheader()
                 for _, layer_path in available:
                     with layer_path.open("r", encoding="gb18030", newline="") as layer_file:
                         reader = csv.DictReader(layer_file)
-                        if reader.fieldnames != self.config.raw_columns:
-                            raise ValueError(
-                                f"Layer file columns do not match the raw schema: {layer_path.name}"
-                            )
                         writer.writerows(reader)
                 output_file.flush()
                 os.fsync(output_file.fileno())
@@ -4492,6 +5241,56 @@ class AcquisitionManager:
             if temporary.exists():
                 temporary.unlink(missing_ok=True)
         self.full_specimen_path = combined_path
+        if self.config.dataset_schema == THERMOCOUPLE64_MODE_ID:
+            layer_payloads: list[dict[str, Any]] = []
+            for layer_index, layer_path in available:
+                with layer_path.open("r", encoding="gb18030", newline="") as layer_file:
+                    layer_payloads.append(
+                        {
+                            "layer_id": layer_index + 1,
+                            "completed": True,
+                            "rows": list(csv.DictReader(layer_file)),
+                        }
+                    )
+            sensor_union = [
+                name
+                for name in ACQUISITION_SCHEMAS[THERMOCOUPLE64_MODE_ID]["sensors"]
+                if name in observed
+            ]
+            projection = project_specimen_layers(
+                layer_payloads,
+                sensor_columns=sensor_union,
+                scope="completed_specimen",
+            )
+            derived_path = combined_path.with_name(
+                f"{specimen_folder_name}_完整试样_派生.CSV"
+            )
+            derived_temporary = derived_path.with_name(
+                f".{derived_path.name}.{self.session_stamp}.tmp"
+            )
+            derived_columns = [*union_columns, *THERMOCOUPLE64_DERIVED_CHANNELS]
+            try:
+                with derived_temporary.open(
+                    "w", encoding="gb18030", newline=""
+                ) as output_file:
+                    writer = csv.DictWriter(
+                        output_file,
+                        fieldnames=derived_columns,
+                        extrasaction="ignore",
+                    )
+                    writer.writeheader()
+                    for layer in projection["derived_layers"]:
+                        writer.writerows(layer["rows"])
+                    output_file.flush()
+                    os.fsync(output_file.fileno())
+                os.replace(derived_temporary, derived_path)
+            finally:
+                if derived_temporary.exists():
+                    derived_temporary.unlink(missing_ok=True)
+            _atomic_write_json(
+                derived_path.with_suffix(".manifest.json"), projection["manifest"]
+            )
+            self.derived_specimen_path = derived_path
         return combined_path
 
     def _run(self) -> None:
@@ -4644,7 +5443,7 @@ class AcquisitionManager:
                             name: sample.get(name, "")
                             for name in config.selected_sensors
                         }
-                        if config.dataset_schema == "new_collection_v11_3":
+                        if config.dataset_schema in MODERN_COLLECTION_SCHEMAS:
                             row.update(
                                 {
                                     "时间": datetime.fromtimestamp(now).isoformat(
@@ -4738,16 +5537,26 @@ class AcquisitionManager:
                                 },
                                 assembled_monotonic=target_monotonic,
                             )
-                        envelope = frame.to_envelope(
-                            self.capture_uuid or config.capture_uuid,
-                            {
-                                name: str(
-                                    (SENSOR_CHANNEL_METADATA.get(name) or {}).get("unit")
-                                    or ""
-                                )
-                                for name in config.selected_sensors
-                            },
-                        )
+                        channel_units = {
+                            name: str(
+                                (SENSOR_CHANNEL_METADATA.get(name) or {}).get("unit")
+                                or ""
+                            )
+                            for name in config.selected_sensors
+                        }
+                        if config.dataset_schema == THERMOCOUPLE64_MODE_ID:
+                            catalog = raw_catalog(config.selected_sensors, channel_units)
+                            envelope = frame.to_envelope_v2(
+                                session_id=self.capture_uuid or config.capture_uuid,
+                                mode_id=config.dataset_schema,
+                                catalog=catalog,
+                            )
+                            self.frame_catalog = catalog
+                        else:
+                            envelope = frame.to_envelope(
+                                self.capture_uuid or config.capture_uuid,
+                                channel_units,
+                            )
                         with self.lock:
                             self.total_sample_count += 1
                             self.rows.append(row)
@@ -5786,6 +6595,7 @@ class AcquisitionManager:
                 "rows": row_values,
                 "timestamps": timestamp_values,
                 "frames": frame_values,
+                "frame_catalog": deepcopy(self.frame_catalog),
                 "next_cursor": end,
                 "total_count": total,
                 "buffer_base": base,

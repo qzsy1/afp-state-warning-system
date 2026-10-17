@@ -6,5 +6,5 @@
   "entrypoint": "plugin.py",
   "enabled": true,
   "dependencies": [],
-  "capabilities": ["serial", "smrf_hid", "modbus_tcp", "abb_rws", "uvc", "rtsp", "m3232"]
+  "capabilities": ["serial", "smrf_hid", "modbus_tcp", "modbus_rtu_esr1001", "abb_rws", "uvc", "rtsp", "m3232"]
 }

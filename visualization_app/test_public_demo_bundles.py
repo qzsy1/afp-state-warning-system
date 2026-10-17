@@ -24,12 +24,17 @@ class PublicDemoBundleTests(unittest.TestCase):
             self.assertTrue(bundle["precomputed"])
             self.assertEqual(bundle["sample_rate_hz"], 10.0)
             self.assertEqual(bundle["points"], expected_points)
-            self.assertEqual(len(bundle["interfaces"]), 5)
+            self.assertEqual(len(bundle["interfaces"]), 6)
             self.assertEqual(
                 {item["role"] for item in bundle["interfaces"]},
-                {"thermocouple", "plc", "thermal_uvc", "robot", "pressure"},
+                {"thermocouple64", "plc", "thermal_uvc", "robot", "pressure", "esr1001_strain"},
             )
-            self.assertEqual(len(bundle["channels"]), 17)
+            self.assertEqual(len(bundle["channels"]), 77)
+            temperatures = [item for item in bundle["channels"] if item["name"].startswith("温度") and item["name"][-1].isdigit()]
+            self.assertEqual([item["name"] for item in temperatures if int(item["name"][2:]) <= 64], [f"温度{i}" for i in range(1, 65)])
+            self.assertEqual(bundle["process"]["schema_id"], "new_collection_v13_0")
+            self.assertEqual(len(bundle["thermocouple64"]["raw_directory"]["channels"]), 64)
+            self.assertEqual(len(bundle["thermocouple64"]["derived_directory"]["channels"]), 8)
             for channel in bundle["channels"]:
                 self.assertEqual(len(channel["actual"]), expected_points)
                 self.assertEqual(len(channel["predicted"]), expected_points)
@@ -44,11 +49,15 @@ class PublicDemoBundleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as first_dir, tempfile.TemporaryDirectory() as second_dir:
             first = Path(first_dir)
             second = Path(second_dir)
+            stale = first / "unrelated.json"
+            stale.write_text("preserve", encoding="utf-8")
             first_manifest = module.write_demo_assets(first)
             second_manifest = module.write_demo_assets(second)
+            self.assertEqual(stale.read_text(encoding="utf-8"), "preserve")
             self.assertEqual(first_manifest, second_manifest)
             self.assertEqual(first_manifest["schema_version"], "afp-public-demo-manifest-v1")
             self.assertEqual(len(first_manifest["packages"]), 2)
+            self.assertTrue(all(item["channels"] == 77 for item in first_manifest["packages"]))
             for item in first_manifest["packages"]:
                 filename = Path(item["url"]).name
                 raw = (first / filename).read_bytes()

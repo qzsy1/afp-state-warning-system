@@ -82,7 +82,7 @@ class RemainingPhysicalChecklistTests(unittest.TestCase):
             (ROOT / "pre_sensor" / "real-device-only-checklist.json").read_text(encoding="utf-8")
         )
         validated = validate_physical_checklist(checklist)
-        self.assertEqual(len(validated), 9)
+        self.assertEqual(len(validated), 17)
         for forbidden in ("version", "config", "network", "storage", "mysql", "helper", "windows"):
             changed = json.loads(json.dumps(checklist))
             changed["items"].append({"id": f"forbidden.{forbidden}", "title": forbidden})

@@ -32,6 +32,8 @@ class RegressionMatrixContractTests(unittest.TestCase):
                 "PRE_SENSOR_PUBLIC_INGRESS",
                 "PRE_SENSOR_INGRESS_GENERATION", "PRE_SENSOR_INGRESS_CUTOVER",
                 "PRE_SENSOR_HELPER_GENERATION", "PRE_SENSOR_MODEL_PROVENANCE",
+                "ESR1001",
+                "THERMOCOUPLE64",
             },
         )
 
@@ -52,7 +54,7 @@ class RegressionMatrixContractTests(unittest.TestCase):
         for check in checks:
             with self.subTest(check=check.id):
                 self.assertEqual(check.kind, "command")
-                self.assertEqual(check.evidence_tier, "automated")
+                self.assertIn(check.evidence_tier, {"automated", "protocol_simulation"})
                 joined = " ".join(check.command).lower()
                 self.assertNotIn("password", joined)
                 self.assertNotIn("api_key", joined)
@@ -146,9 +148,10 @@ class RegressionMatrixContractTests(unittest.TestCase):
         self.assertIn("test_frontend_guest_simulation", command)
         self.assertIn("test_usb_interface_candidates", command)
         self.assertIn("INTERFACES-001", check.requirements)
+        self.assertIn("MODE_ISOLATION-001", check.requirements)
         self.assertIn("USB_TOPOLOGY-001", check.requirements)
 
-    def test_delivery_simulation_start_lifecycle_is_blocking_in_every_profile(self) -> None:
+    def test_esr1001_protocol_contract_is_blocking_in_every_profile(self) -> None:
         check = next(
             item for item in self.matrix.checks
             if item.id == "real-acquisition-protocol-contracts"
@@ -157,10 +160,8 @@ class RegressionMatrixContractTests(unittest.TestCase):
 
         self.assertTrue(check.blocking)
         self.assertEqual(check.profiles, ("quick", "full", "release"))
-        self.assertIn(
-            r"F:\new_AFP_exam\AFP_Integrated_System_Modular\verification\test_real_acquisition_pipeline.py",
-            command,
-        )
+        self.assertIn("visualization_app.test_esr1001_strain", command)
+        self.assertIn("ESR1001-001", check.requirements)
         self.assertIn("STARTUP-001", check.requirements)
         self.assertIn("SIMULATION-001", check.requirements)
         self.assertIn("MODE_ISOLATION-001", check.requirements)
@@ -168,6 +169,20 @@ class RegressionMatrixContractTests(unittest.TestCase):
             "visualization_app/real_acquisition.py",
             check.change_patterns,
         )
+
+    def test_thermocouple64_checks_cover_protocol_layers_and_frontend(self) -> None:
+        expectations = {
+            "thermocouple64-protocol-contracts": "THERMOCOUPLE64-PROTOCOL-001",
+            "thermocouple64-layer-projection-contracts": "THERMOCOUPLE64-LAYERS-001",
+            "thermocouple64-frontend-contracts": "THERMOCOUPLE64-FRONTEND-001",
+        }
+        for check_id, requirement_id in expectations.items():
+            with self.subTest(check=check_id):
+                check = next(item for item in self.matrix.checks if item.id == check_id)
+                self.assertTrue(check.blocking)
+                self.assertEqual(check.profiles, ("quick", "full", "release"))
+                self.assertIn(requirement_id, check.requirements)
+                self.assertIn("visualization_app.test_thermocouple64", " ".join(check.command))
 
     def test_lan_and_public_access_are_explicit_blocking_checks(self) -> None:
         runtime = next(

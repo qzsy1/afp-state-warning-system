@@ -6,7 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from acquisition import NEW_COLLECTION_SENSOR_COLUMNS
+from acquisition import CURRENT_COLLECTION_SENSOR_COLUMNS, NEW_COLLECTION_SENSOR_COLUMNS
 from simulation_source_transfer import inspect_csv_file
 
 
@@ -23,6 +23,22 @@ PACKAGE_SPECS = (
         "filename": "afp_synthetic_endurance_6000.csv",
         "label": "十分钟耐久数据（6000点 / 600秒）",
         "points": 6000,
+    },
+    {
+        "package_id": "thermocouple64_quick_240",
+        "filename": "thermocouple64_v13_0/quick_240.csv",
+        "label": "64路热电偶快速验证数据（240点 / 24秒）",
+        "points": 240,
+        "dataset_schema": "new_collection_v13_0",
+        "channels": CURRENT_COLLECTION_SENSOR_COLUMNS,
+    },
+    {
+        "package_id": "thermocouple64_endurance_6000",
+        "filename": "thermocouple64_v13_0/endurance_6000.csv",
+        "label": "64路热电偶耐久数据（6000点 / 600秒）",
+        "points": 6000,
+        "dataset_schema": "new_collection_v13_0",
+        "channels": CURRENT_COLLECTION_SENSOR_COLUMNS,
     },
 )
 
@@ -55,11 +71,8 @@ def _catalog_cached() -> tuple[dict[str, Any], ...]:
         points = int(spec["points"])
         if int(inspected["valid_rows"]) != points:
             raise ValueError(f"模拟数据包点数不一致：{spec['package_id']}")
-        missing = [
-            channel
-            for channel in NEW_COLLECTION_SENSOR_COLUMNS
-            if channel not in inspected["numeric_channels"]
-        ]
+        channels = list(spec.get("channels") or NEW_COLLECTION_SENSOR_COLUMNS)
+        missing = [channel for channel in channels if channel not in inspected["numeric_channels"]]
         if missing:
             raise ValueError(f"模拟数据包缺少新采集通道：{missing}")
         result.append(
@@ -71,7 +84,8 @@ def _catalog_cached() -> tuple[dict[str, Any], ...]:
                 "sample_rate_hz": 10.0,
                 "points": points,
                 "duration_seconds": points / 10.0,
-                "channels": list(NEW_COLLECTION_SENSOR_COLUMNS),
+                "channels": channels,
+                "dataset_schema": str(spec.get("dataset_schema") or "new_collection_v12_0"),
                 "bytes": int(path.stat().st_size),
                 "sha256": _sha256(path),
             }

@@ -22,11 +22,19 @@ _URL = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 
 PHYSICAL_CHECKLIST_IDS = frozenset(
     {
+        "physical.thermocouple64_identity_protocol",
+        "physical.thermocouple64_topology_mapping",
+        "physical.thermocouple64_cold_junction",
+        "physical.thermocouple64_disconnect_recovery",
+        "physical.thermocouple64_storage_reconciliation",
         "physical.identity_ports",
         "physical.channel_integrity",
+        "physical.esr1001_register",
+        "physical.esr1001_rs485",
+        "physical.esr1001_channel_order",
         "physical.units_ranges_encoding_direction",
         "physical.calibration_zero_noise_drift_crosstalk",
-        "physical.all_devices_10hz",
+        "physical.all_devices_target_rate",
         "physical.usb_power_bandwidth_emi",
         "physical.unplug_powercycle_restart",
         "physical.driver_close",

@@ -7,51 +7,42 @@ import math
 from pathlib import Path
 from typing import Any
 
-from acquisition import NEW_COLLECTION_SENSOR_COLUMNS, SENSOR_CHANNEL_METADATA
-from simulation_packages import PACKAGE_SPECS, resolve_simulation_package
+from acquisition import CURRENT_COLLECTION_SENSOR_COLUMNS, SENSOR_CHANNEL_METADATA
+from thermocouple64 import (
+    THERMOCOUPLE64_CHANNELS,
+    THERMOCOUPLE64_DERIVED_CHANNELS,
+    derived_catalog,
+    raw_catalog,
+)
 
 
 SCHEMA_VERSION = "afp-public-demo-v1"
 MANIFEST_SCHEMA_VERSION = "afp-public-demo-manifest-v1"
-GENERATOR_VERSION = "synthetic-rule-20260930-v1"
+GENERATOR_VERSION = "synthetic-rule-20261017-tc64-v1"
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "static" / "demo"
+THERMOCOUPLE64_SOURCE_ROOT = Path(__file__).resolve().parent / "simulation_packages" / "thermocouple64_v13_0"
+PUBLIC_DEMO_PACKAGE_SPECS = (
+    {"package_id": "quick_240", "filename": "quick_240.csv", "label": "快速验证数据（240点 / 24秒）", "points": 240},
+    {"package_id": "endurance_6000", "filename": "endurance_6000.csv", "label": "十分钟耐久数据（6000点 / 600秒）", "points": 6000},
+)
+
+CORE_INTERFACES: tuple[dict[str, Any], ...] = (
+    {"id": "plc_process", "role": "plc", "label": "松下PLC过程传感器", "protocol": "modbus_tcp", "channels": ["温度", "压力", "张力"]},
+    {"id": "uvc_temperature", "role": "thermal_uvc", "label": "BSV UVC测温热像仪", "protocol": "uvc", "channels": ["ROI平均温度"]},
+    {"id": "abb_motion", "role": "robot", "label": "ABB机器人", "protocol": "abb_rws", "channels": ["线速度", "ABB_X", "ABB_Y", "ABB_Z"]},
+    {"id": "m3232_pressure", "role": "pressure", "label": "M3232薄膜压力", "protocol": "m3232_serial", "channels": ["薄膜压力"]},
+    {"id": "esr1001_strain", "role": "esr1001_strain", "label": "ESR1001-A四通道应变", "protocol": "modbus_rtu", "channels": [f"应变{index}" for index in range(1, 5)]},
+)
 
 INTERFACES: tuple[dict[str, Any], ...] = (
     {
-        "id": "thermocouple_8ch",
-        "role": "thermocouple",
-        "label": "八通道热电偶",
-        "protocol": "smrf_hid",
-        "channels": [f"温度{index}" for index in range(1, 9)],
+        "id": "thermocouple_64ch",
+        "role": "thermocouple64",
+        "label": "64路热电偶（合成演示）",
+        "protocol": "simulation_only",
+        "channels": list(THERMOCOUPLE64_CHANNELS),
     },
-    {
-        "id": "plc_process",
-        "role": "plc",
-        "label": "松下PLC过程传感器",
-        "protocol": "modbus_tcp",
-        "channels": ["温度", "压力", "张力"],
-    },
-    {
-        "id": "uvc_temperature",
-        "role": "thermal_uvc",
-        "label": "BSV UVC测温热像仪",
-        "protocol": "uvc",
-        "channels": ["ROI平均温度"],
-    },
-    {
-        "id": "abb_motion",
-        "role": "robot",
-        "label": "ABB机器人",
-        "protocol": "abb_rws",
-        "channels": ["ABB_X", "ABB_Y", "ABB_Z", "线速度"],
-    },
-    {
-        "id": "m3232_pressure",
-        "role": "pressure",
-        "label": "M3232薄膜压力",
-        "protocol": "m3232_serial",
-        "channels": ["薄膜压力"],
-    },
+    *CORE_INTERFACES,
 )
 
 CHANNEL_INTERFACE = {
@@ -73,20 +64,24 @@ def _json_bytes(payload: dict[str, Any]) -> bytes:
 
 def _package_spec(package_id: str) -> dict[str, Any]:
     clean = str(package_id or "").strip()
-    for item in PACKAGE_SPECS:
+    for item in PUBLIC_DEMO_PACKAGE_SPECS:
         if item["package_id"] == clean:
             return dict(item)
     raise ValueError("公网演示数据包不存在")
 
 
 def _read_rows(package_id: str) -> list[dict[str, float]]:
-    source = resolve_simulation_package(package_id)
+    spec = _package_spec(package_id)
+    filename = "quick_240.csv" if int(spec["points"]) == 240 else "endurance_6000.csv"
+    source = (THERMOCOUPLE64_SOURCE_ROOT / filename).resolve()
+    if THERMOCOUPLE64_SOURCE_ROOT.resolve() not in source.parents or not source.is_file():
+        raise ValueError("64路合成演示数据尚未生成")
     rows: list[dict[str, float]] = []
     with source.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         for source_row in reader:
             parsed: dict[str, float] = {}
-            for channel in NEW_COLLECTION_SENSOR_COLUMNS:
+            for channel in CURRENT_COLLECTION_SENSOR_COLUMNS:
                 value = float(source_row[channel])
                 if not math.isfinite(value):
                     raise ValueError(f"演示数据通道包含非有限数值：{channel}")
@@ -146,7 +141,7 @@ def build_demo_bundle(package_id: str) -> dict[str, Any]:
     rows = _read_rows(package_id)
     points = len(rows)
     channels: list[dict[str, Any]] = []
-    for channel_index, name in enumerate(NEW_COLLECTION_SENSOR_COLUMNS):
+    for channel_index, name in enumerate(CURRENT_COLLECTION_SENSOR_COLUMNS):
         actual = [round(row[name], 6) for row in rows]
         metadata = SENSOR_CHANNEL_METADATA.get(name, {})
         channels.append(
@@ -154,7 +149,7 @@ def build_demo_bundle(package_id: str) -> dict[str, Any]:
                 "id": channel_index,
                 "name": name,
                 "unit": str(metadata.get("unit") or ""),
-                "interface_id": CHANNEL_INTERFACE[name],
+                "interface_id": "thermocouple_64ch" if name in THERMOCOUPLE64_CHANNELS else CHANNEL_INTERFACE[name],
                 "actual": actual,
                 "predicted": _predicted(actual, channel_index),
             }
@@ -174,6 +169,10 @@ def build_demo_bundle(package_id: str) -> dict[str, Any]:
         "points": points,
         "duration_seconds": points / 10.0,
         "interfaces": [dict(item) for item in INTERFACES],
+        "thermocouple64": {
+            "raw_directory": raw_catalog(THERMOCOUPLE64_CHANNELS, {name: "°C" for name in THERMOCOUPLE64_CHANNELS}),
+            "derived_directory": derived_catalog("causal_so_far"),
+        },
         "channels": channels,
         "window_evidence": windows,
         "aggregate": {
@@ -191,7 +190,7 @@ def build_demo_bundle(package_id: str) -> dict[str, Any]:
             },
         },
         "process": {
-            "schema_id": "new_collection_v11_3",
+            "schema_id": "new_collection_v13_0",
             "parameter_source": "precomputed_synthetic",
             "display_parameters": [
                 {"label": "初始压实力", "unit": "N", "value": 400.0},
@@ -207,7 +206,7 @@ def build_demo_bundle(package_id: str) -> dict[str, Any]:
             "evidence_sources": [
                 "批准的 synthetic 演示数据",
                 f"{len(windows)} 个预计算 24 点窗口",
-                "五类逻辑接口映射（未连接物理设备）",
+                "六类逻辑接口映射（未连接物理设备）",
             ],
         },
     }
@@ -217,14 +216,12 @@ def write_demo_assets(output_dir: Path | str = DEFAULT_OUTPUT_DIR) -> dict[str, 
     target = Path(output_dir).resolve()
     target.mkdir(parents=True, exist_ok=True)
     packages: list[dict[str, Any]] = []
-    keep: set[str] = {"manifest-v1.json"}
-    for spec in PACKAGE_SPECS:
+    for spec in PUBLIC_DEMO_PACKAGE_SPECS:
         bundle = build_demo_bundle(str(spec["package_id"]))
         raw = _json_bytes(bundle)
         digest = hashlib.sha256(raw).hexdigest()
         filename = f"{spec['package_id']}.{digest[:16]}.json"
         (target / filename).write_bytes(raw)
-        keep.add(filename)
         packages.append(
             {
                 "package_id": str(spec["package_id"]),
@@ -235,7 +232,7 @@ def write_demo_assets(output_dir: Path | str = DEFAULT_OUTPUT_DIR) -> dict[str, 
                 "sample_rate_hz": 10.0,
                 "points": int(spec["points"]),
                 "duration_seconds": int(spec["points"]) / 10.0,
-                "channels": len(NEW_COLLECTION_SENSOR_COLUMNS),
+                "channels": len(CURRENT_COLLECTION_SENSOR_COLUMNS),
                 "interfaces": len(INTERFACES),
                 "bytes": len(raw),
                 "sha256": digest,
@@ -249,9 +246,6 @@ def write_demo_assets(output_dir: Path | str = DEFAULT_OUTPUT_DIR) -> dict[str, 
         "packages": packages,
     }
     (target / "manifest-v1.json").write_bytes(_json_bytes(manifest))
-    for old in target.glob("*.json"):
-        if old.name not in keep:
-            old.unlink()
     return manifest
 
 

@@ -30,16 +30,21 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertEqual(contract.application_version, contract.launcher_version)
         self.assertTrue(contract.release_revision)
         self.assertEqual(contract.helper_protocol_version, 2)
-        self.assertEqual(contract.unified_frame_contract, "unified_frame_v1")
+        self.assertEqual(contract.unified_frame_contract, "unified_frame_v2")
         self.assertEqual(contract.configuration_schema_version, 1)
         payload = json.loads(
             (ROOT / "pre_sensor" / "release-contract.json").read_text(encoding="utf-8")
         )
         required_modules = payload["runtime_requirements"]["required_modules"]
         self.assertIn("mysql.connector", required_modules)
+        self.assertIn("serial", required_modules)
         self.assertNotIn("pymysql", required_modules)
         self.assertEqual(contract.readiness_schema_version, 1)
         self.assertIn("app/ui/app.js", contract.required_static_assets)
+        self.assertIn(
+            "modbus_rtu_esr1001",
+            {item["id"] for item in payload["runtime_requirements"]["drivers"]},
+        )
         self.assertEqual(contract.managed_file_manifest, "SHA256SUMS.txt")
         self.assertEqual(contract.digest_algorithm, "sha256")
 
@@ -106,7 +111,7 @@ class ReleaseContractTests(unittest.TestCase):
                 "unified_frame_contract": contract.unified_frame_contract,
                 "configuration_schema_version": contract.configuration_schema_version,
                 "readiness_schema_version": contract.readiness_schema_version,
-                "unified_frame_v1": True,
+                "unified_frame_v2": True,
                 "candidate_id": "candidate-1",
                 "helper_sha256": "b" * 64,
             }

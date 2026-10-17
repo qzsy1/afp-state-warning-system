@@ -28,6 +28,8 @@
 
 开始采集后勾选目标保存。采集停止并完成一层保存后，软件会把该层上传到目标数据库。目标数据库不可用时，仍保留本地 CSV，并生成待补传记录。
 
+当前 `new_collection_v12_0` 的21个采集通道进入 `afp_sensor_sample` 和 `afp_sample_all` 的 `sensor_json`；应变1–4不要求修改固定数值列。平面导出按 `schema_id` 展开JSON，旧 `new_collection_v11_3` 记录不会补出虚假应变值。补传后应核对CSV、两个样本表和每个启用目标的同一 `capture_uuid` 行数及抽样值。
+
 ## 错误判断
 
 | 错误码 | 含义 | 处理 |

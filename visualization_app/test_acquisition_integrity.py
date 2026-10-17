@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import csv
+import http.client
 import json
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -14,9 +16,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import acquisition  # noqa: E402
 from generate_pressure_simulation import generate as generate_pressure_simulation  # noqa: E402
+from generate_thermocouple64_simulation import generate as generate_thermocouple64_simulation  # noqa: E402
 from acquisition import (  # noqa: E402
     AcquisitionConfig,
     AcquisitionManager,
+    CURRENT_COLLECTION_SENSOR_COLUMNS,
+    LATEST_COLLECTION_SENSOR_COLUMNS,
     MySQLSettings,
     NEW_COLLECTION_SENSOR_COLUMNS,
     SimulatorDriver,
@@ -31,21 +36,22 @@ class AcquisitionIntegrityTests(unittest.TestCase):
         interfaces = acquisition.default_capture_interfaces()
         config = acquisition.AcquisitionConfig(
             acquisition_mode="simulation",
-            dataset_schema="new_collection_v11_3",
+            dataset_schema="new_collection_v13_0",
             simulation_source_type="single_csv",
             simulation_source_path="simulation.csv",
             interfaces=interfaces,
-            selected_sensors=acquisition.NEW_COLLECTION_SENSOR_COLUMNS.copy(),
+            selected_sensors=CURRENT_COLLECTION_SENSOR_COLUMNS.copy(),
         )
 
         self.assertEqual(
             config.interface_channel_assignments,
             {
-                "thermocouple_8ch": [f"温度{index}" for index in range(1, 9)],
+                "thermocouple_64ch": [f"温度{index}" for index in range(1, 65)],
                 "plc_process": ["温度", "压力", "张力"],
                 "uvc_temperature": ["ROI平均温度"],
                 "abb_motion": ["线速度", "ABB_X", "ABB_Y", "ABB_Z"],
                 "m3232_pressure": ["薄膜压力"],
+                "esr1001_strain": ["应变1", "应变2", "应变3", "应变4"],
             },
         )
 
@@ -89,26 +95,26 @@ class AcquisitionIntegrityTests(unittest.TestCase):
     def test_simulation_check_reports_each_mapped_interface_as_available(self) -> None:
         interfaces = default_capture_interfaces()
         assignments = {
-            "thermocouple_8ch": [f"温度{index}" for index in range(1, 9)],
+            "thermocouple_64ch": [f"温度{index}" for index in range(1, 65)],
             "plc_process": ["温度", "压力", "张力"],
             "uvc_temperature": ["ROI平均温度"],
             "abb_motion": ["线速度", "ABB_X", "ABB_Y", "ABB_Z"],
             "m3232_pressure": ["薄膜压力"],
+            "esr1001_strain": ["应变1", "应变2", "应变3", "应变4"],
         }
         with tempfile.TemporaryDirectory() as temporary:
-            source = generate_pressure_simulation(
-                Path(temporary) / "SIM_PRESSURE_M3232_new_collection.csv",
-                rows=8,
-            )
+            simulation_root = Path(temporary) / "thermocouple64"
+            generate_thermocouple64_simulation(simulation_root)
+            source = simulation_root / "quick_240.csv"
             config = AcquisitionConfig(
                 driver="simulator",
                 acquisition_mode="simulation",
-                dataset_schema="new_collection_v11_3",
+                dataset_schema="new_collection_v13_0",
                 simulation_source_path=str(source),
                 source_file=str(source),
                 interfaces=interfaces,
                 interface_channel_assignments=assignments,
-                selected_sensors=NEW_COLLECTION_SENSOR_COLUMNS.copy(),
+                selected_sensors=CURRENT_COLLECTION_SENSOR_COLUMNS.copy(),
             )
             result = AcquisitionManager().test_connection(config, timeout_seconds=0.1)
         self.assertEqual(
@@ -118,7 +124,89 @@ class AcquisitionIntegrityTests(unittest.TestCase):
         self.assertTrue(all(item["enabled"] for item in result["interfaces"]))
         self.assertTrue(all(item["ok"] for item in result["interfaces"]))
         self.assertEqual(
-            result["interfaces"][-1]["detected_channels"], ["薄膜压力"]
+            result["interfaces"][-1]["detected_channels"],
+            ["应变1", "应变2", "应变3", "应变4"],
+        )
+
+    def test_published_default_v12_simulation_source_passes_backend_readiness(self) -> None:
+        from app import NEW_DEMO_SOURCE, create_server
+
+        interfaces = default_capture_interfaces()
+        assignments = {
+            "thermocouple_64ch": [f"温度{index}" for index in range(1, 65)],
+            "plc_process": ["温度", "压力", "张力"],
+            "uvc_temperature": ["ROI平均温度"],
+            "abb_motion": ["线速度", "ABB_X", "ABB_Y", "ABB_Z"],
+            "m3232_pressure": ["薄膜压力"],
+            "esr1001_strain": ["应变1", "应变2", "应变3", "应变4"],
+        }
+        request = {
+            "driver": "simulator",
+            "acquisition_mode": "simulation",
+            "dataset_schema": "new_collection_v13_0",
+            "simulation_source_type": "single_csv",
+            "simulation_source_path": str(NEW_DEMO_SOURCE),
+            "source_file": str(NEW_DEMO_SOURCE),
+            "interfaces": interfaces,
+            "interface_channel_assignments": assignments,
+            "selected_sensors": CURRENT_COLLECTION_SENSOR_COLUMNS.copy(),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            manager = AcquisitionManager(Path(temporary) / "capture")
+            dashboard = SimpleNamespace(
+                acquisition=manager,
+                validate_prediction_setup=lambda config, load_model=False: {},
+            )
+            server = create_server(
+                "127.0.0.1",
+                0,
+                dashboard=dashboard,
+                access_context="local_admin",
+                ingress_state_file=Path(temporary) / "public-ingress-state.json",
+            )
+            guest_source = server.guest_manager.source_status(
+                "published_default_source_contract"
+            )
+            self.assertTrue(
+                set(LATEST_COLLECTION_SENSOR_COLUMNS).issubset(
+                    set(guest_source["channels"])
+                ),
+                guest_source,
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with patch.object(
+                    acquisition,
+                    "MultiInterfaceDriver",
+                    side_effect=AssertionError("模拟检查不得构造物理多接口驱动"),
+                ):
+                    connection = http.client.HTTPConnection(
+                        "127.0.0.1", server.server_port, timeout=10
+                    )
+                    try:
+                        connection.request(
+                            "POST",
+                            "/api/acquisition/test",
+                            json.dumps(request).encode("utf-8"),
+                            {"Content-Type": "application/json"},
+                        )
+                        response = connection.getresponse()
+                        result = json.loads(response.read().decode("utf-8"))
+                    finally:
+                        connection.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+        self.assertEqual(response.status, 200, result)
+        self.assertTrue(result["ok"], result.get("errors"))
+        self.assertEqual(len(result["interfaces"]), 6)
+        self.assertTrue(all(item["ok"] for item in result["interfaces"]))
+        self.assertEqual(
+            [item["name"] for item in result["sensors"] if not item["ok"]],
+            [],
         )
 
     def test_save_root_status_requires_existing_writable_nonempty_directory(self) -> None:
@@ -172,11 +260,6 @@ class AcquisitionIntegrityTests(unittest.TestCase):
     def test_physical_binding_allows_plc_and_abb_to_share_one_ethernet_adapter(self) -> None:
         interfaces = [
             {
-                "id": "thermocouple_8ch", "enabled": True, "role": "thermocouple",
-                "driver": "smrf_hid", "endpoint": "SMRFCT08B",
-                "physical_interface_id": "hid:smrf-01", "physical_interface_kind": "usb_hid",
-            },
-            {
                 "id": "plc_process", "enabled": True, "role": "plc",
                 "driver": "modbus_tcp", "endpoint": "192.168.125.5:502",
                 "physical_interface_id": "ethernet:工控网卡1", "physical_interface_kind": "ethernet",
@@ -199,18 +282,17 @@ class AcquisitionIntegrityTests(unittest.TestCase):
         ]
         config = AcquisitionConfig(
             acquisition_mode="real", dataset_schema="new_collection_v11_3",
-            selected_sensors=["温度", "压力", "薄膜压力", "ROI平均温度", "张力", "线速度", "ABB_X", "ABB_Y", "ABB_Z", "温度1"],
+            selected_sensors=["温度", "压力", "薄膜压力", "ROI平均温度", "张力", "线速度", "ABB_X", "ABB_Y", "ABB_Z"],
             interfaces=interfaces,
             interface_channel_assignments={
-                "thermocouple_8ch": ["温度1"],
                 "plc_process": ["温度", "压力", "张力"],
                 "uvc_temperature": ["ROI平均温度"],
                 "abb_motion": ["线速度", "ABB_X", "ABB_Y", "ABB_Z"],
                 "m3232_pressure": ["薄膜压力"],
             },
         )
-        self.assertEqual(config.interfaces[1]["physical_interface_id"], config.interfaces[3]["physical_interface_id"])
-        self.assertEqual(config.interfaces[1]["physical_interface_kind"], "ethernet")
+        self.assertEqual(config.interfaces[0]["physical_interface_id"], config.interfaces[2]["physical_interface_id"])
+        self.assertEqual(config.interfaces[0]["physical_interface_kind"], "ethernet")
 
     def test_physical_binding_rejects_duplicate_non_shared_interface(self) -> None:
         with self.assertRaisesRegex(ValueError, "物理接口.*重复"):
@@ -224,24 +306,22 @@ class AcquisitionIntegrityTests(unittest.TestCase):
                 interface_channel_assignments={"a": ["温度"]},
             )
 
-    def test_usb_port_binding_can_be_saved_but_empty_port_cannot_start_real_capture(self) -> None:
-        config = AcquisitionConfig(
-            acquisition_mode="real", dataset_schema="new_collection_v11_3",
-            selected_sensors=["温度1"],
-            interfaces=[
-                {
-                    "id": "thermocouple_8ch", "enabled": True,
-                    "role": "thermocouple", "driver": "smrf_hid",
-                    "endpoint": "", "physical_port_id": "usbport:test",
-                    "physical_interface_id": "", "physical_interface_kind": "usb_hid",
-                    "physical_verified": False,
-                },
-            ],
-            interface_channel_assignments={"thermocouple_8ch": ["温度1"]},
-        )
-        self.assertEqual(config.interfaces[0]["physical_port_id"], "usbport:test")
-        with self.assertRaisesRegex(RuntimeError, "端口存在，未检测到兼容设备"):
-            AcquisitionManager().start(config)
+    def test_historical_thermocouple_cannot_be_enabled_for_real_capture(self) -> None:
+        with self.assertRaisesRegex(ValueError, "历史文件只读回放"):
+            AcquisitionConfig(
+                acquisition_mode="real", dataset_schema="new_collection_v11_3",
+                selected_sensors=["温度1"],
+                interfaces=[
+                    {
+                        "id": "thermocouple_8ch", "enabled": True,
+                        "role": "thermocouple", "driver": "smrf_hid",
+                        "endpoint": "", "physical_port_id": "usbport:test",
+                        "physical_interface_id": "", "physical_interface_kind": "usb_hid",
+                        "physical_verified": False,
+                    },
+                ],
+                interface_channel_assignments={"thermocouple_8ch": ["温度1"]},
+            )
 
     def test_simulation_allows_shared_logical_source_for_multiple_interfaces(self) -> None:
         """An uploaded file is one logical source, not a real adapter binding."""
@@ -282,15 +362,15 @@ class AcquisitionIntegrityTests(unittest.TestCase):
             )
 
     def test_physical_binding_allows_explicit_serial_fallback_for_testing(self) -> None:
-        config = AcquisitionConfig(
-            acquisition_mode="real", dataset_schema="new_collection_v11_3",
-            selected_sensors=["温度1"],
-            interfaces=[
-                {"id": "thermocouple_8ch", "enabled": True, "role": "thermocouple", "driver": "smrf_hid", "endpoint": "COM1", "physical_interface_id": "serial:COM1", "physical_interface_kind": "serial", "physical_fallback": True},
-            ],
-            interface_channel_assignments={"thermocouple_8ch": ["温度1"]},
-        )
-        self.assertTrue(config.interfaces[0]["physical_fallback"])
+        with self.assertRaisesRegex(ValueError, "历史文件只读回放"):
+            AcquisitionConfig(
+                acquisition_mode="real", dataset_schema="new_collection_v11_3",
+                selected_sensors=["温度1"],
+                interfaces=[
+                    {"id": "thermocouple_8ch", "enabled": True, "role": "thermocouple", "driver": "smrf_hid", "endpoint": "COM1", "physical_interface_id": "serial:COM1", "physical_interface_kind": "serial", "physical_fallback": True},
+                ],
+                interface_channel_assignments={"thermocouple_8ch": ["温度1"]},
+            )
 
     def test_connection_skips_unverified_protocol_driver_on_serial_fallback(self) -> None:
         """A temporary COM fallback must not invoke a blocking USB/UVC driver."""

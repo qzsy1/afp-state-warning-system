@@ -36,6 +36,7 @@ class CandidateRuntimeProbeTests(unittest.TestCase):
         self.assertTrue(statuses["smrf_hid"])
         self.assertEqual(loaded, ["hid.dll"])
         self.assertTrue(statuses["serial_port"])
+        self.assertTrue(statuses["modbus_rtu_esr1001"])
         self.assertTrue(statuses["uvc"])
     def _candidate(self, root: Path, *, native: bytes | None = None) -> dict:
         runtime = root / "_internal" / "python311.dll"

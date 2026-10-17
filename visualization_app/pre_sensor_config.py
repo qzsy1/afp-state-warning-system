@@ -21,6 +21,7 @@ if str(_APP_DIR) not in sys.path:
     sys.path.insert(0, str(_APP_DIR))
 
 from acquisition import (  # noqa: E402
+    ACQUISITION_SCHEMAS,
     AcquisitionConfig,
     SENSOR_CHANNEL_METADATA,
     SENSOR_INTERFACE_PROFILES,
@@ -30,6 +31,7 @@ from release_contract import (  # noqa: E402
     assert_helper_contract,
     load_release_contract,
 )
+from thermocouple64 import hardware_release_readiness  # noqa: E402
 
 
 class PreSensorConfigError(ValueError):
@@ -37,11 +39,12 @@ class PreSensorConfigError(ValueError):
 
 
 _ROLE_MAP = {
-    "thermocouple_8ch": "thermocouple",
+    "thermocouple64": "thermocouple64",
     "plc_process": "plc",
     "uvc_temperature": "thermal_uvc",
     "abb_motion": "robot",
     "m3232_pressure": "pressure",
+    "esr1001_strain": "esr1001_strain",
 }
 _REFERENCE_NAME = re.compile(r"^AFP_[A-Z0-9_]+$")
 _SECRET_KEY = re.compile(r"password|token|secret|credential|api[_-]?key", re.I)
@@ -207,6 +210,8 @@ def validate_pre_sensor_config(
         raise PreSensorConfigError("schema_version does not match the release contract")
     if str(payload.get("release_revision") or "") != contract.release_revision:
         raise PreSensorConfigError("release_revision does not match the release contract")
+    if str(payload.get("dataset_schema") or "") != "new_collection_v13_0":
+        raise PreSensorConfigError("dataset_schema must be new_collection_v13_0")
 
     mode = str(payload.get("mode") or "").strip()
     if mode not in {"local_direct", "remote_helper"}:
@@ -221,7 +226,7 @@ def validate_pre_sensor_config(
     if not isinstance(interfaces_value, list) or not interfaces_value:
         raise PreSensorConfigError("interfaces must be a non-empty list")
     expected_location = "local" if mode == "local_direct" else "remote_helper"
-    interface_specs: list[dict[str, str]] = []
+    interface_specs: list[dict[str, Any]] = []
     interface_ids: set[str] = set()
     for index, raw in enumerate(interfaces_value):
         if not isinstance(raw, Mapping):
@@ -254,6 +259,9 @@ def validate_pre_sensor_config(
                 "role": role,
                 "driver": driver,
                 "endpoint_ref": endpoint_ref,
+                "baudrate": int(raw.get("baudrate") or 0),
+                "slave_id": int(raw.get("slave_id") or 1),
+                "hardware_facts": dict(raw.get("hardware_facts") or {}),
             }
         )
 
@@ -281,9 +289,22 @@ def validate_pre_sensor_config(
             )
         channels.append(name)
         assignments[interface_id].append(name)
-    if set(channels) != set(SENSOR_CHANNEL_METADATA):
-        missing = sorted(set(SENSOR_CHANNEL_METADATA) - set(channels))
+    required_channels = set(
+        (ACQUISITION_SCHEMAS.get("new_collection_v13_0") or {}).get("sensors", [])
+    )
+    if set(channels) != required_channels:
+        missing = sorted(required_channels - set(channels))
         raise PreSensorConfigError(f"channel contract is incomplete: {missing}")
+    thermocouple_specs = [
+        item for item in interface_specs if item["role"] == "thermocouple64"
+    ]
+    if len(thermocouple_specs) != 1:
+        raise PreSensorConfigError("exactly one thermocouple64 interface is required")
+    thermocouple_readiness = hardware_release_readiness(
+        thermocouple_specs[0]["hardware_facts"]
+    )
+    if not thermocouple_readiness["ready"]:
+        raise PreSensorConfigError(str(thermocouple_readiness["message"]))
 
     _validate_operational_limits(payload)
     storage = _object(payload, "storage")
@@ -302,8 +323,7 @@ def validate_pre_sensor_config(
             spec["endpoint_ref"],
             field=f"interface {spec['id']} endpoint_ref",
         )
-        interfaces.append(
-            {
+        interface = {
                 "id": spec["id"],
                 "enabled": True,
                 "role": spec["role"],
@@ -312,8 +332,13 @@ def validate_pre_sensor_config(
                 # Real hardware identity is intentionally pending until the
                 # device is physically connected and selected on site.
                 "physical_verified": False,
+                "hardware_facts": dict(spec["hardware_facts"]),
             }
-        )
+        if spec["baudrate"]:
+            interface["baudrate"] = spec["baudrate"]
+        if spec["driver"] == "modbus_rtu_esr1001":
+            interface["slave_id"] = spec["slave_id"]
+        interfaces.append(interface)
 
     mysql_args: dict[str, Any] = {"mysql_enabled": False}
     if storage.get("mysql_enabled"):
@@ -384,7 +409,7 @@ def validate_pre_sensor_config(
             acquisition_mode="real",
             real_acquisition_mode=mode,
             processing_mode="capture_only",
-            dataset_schema="new_collection_v11_3",
+            dataset_schema="new_collection_v13_0",
             interfaces=interfaces,
             interface_channel_assignments=assignments,
             selected_sensors=channels,

@@ -14,8 +14,8 @@ from statistics import fmean
 from typing import Any
 
 
-TARGET_INTERFACE_COUNT = 5
-TARGET_CHANNEL_COUNT = 17
+TARGET_INTERFACE_COUNT = 6
+TARGET_CHANNEL_COUNT = 21
 
 
 class DiagnosticToolError(ValueError):
@@ -472,6 +472,16 @@ _DEVICE_KNOWLEDGE: dict[str, dict[str, Any]] = {
     "m3232_pressure": {
         "facts": ["普通COM口存在不等于M3232身份或协议已确认"],
         "checks": ["核对实际串口和通信参数", "捕获真实M3232帧后核对矩阵包装与尺寸"],
+    },
+    "esr1001_strain": {
+        "facts": [
+            "ESR1001-A仅在从站地址、FC04字节数、CRC和四个有限float32全部有效时确认数据",
+            "设备顺序CH4、CH1、CH2、CH3必须原子重排为应变1至应变4",
+        ],
+        "checks": [
+            "核对独立RS485串口、9600 8N1、从站地址和A/B接线",
+            "按错误分类复查超时、从站、CRC、长度、Modbus异常或固件寄存器兼容性",
+        ],
     },
 }
 

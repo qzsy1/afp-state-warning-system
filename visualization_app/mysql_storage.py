@@ -61,7 +61,7 @@ def _number_token(value: Any) -> str:
 def process_condition_key(config: Any) -> str:
     """Return a process-parameter identity shared by conditions and specimens."""
     schema = str(getattr(config, "dataset_schema", "legacy_original"))
-    if schema == "new_collection_v11_3":
+    if schema in {"new_collection_v11_3", "new_collection_v12_0"}:
         parts = (
             ("F", getattr(config, "initial_compaction_force_N", None)),
             ("V", getattr(config, "placement_speed_mm_s", None)),

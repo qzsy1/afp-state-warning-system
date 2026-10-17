@@ -28,9 +28,14 @@
     if (!Number.isInteger(points) || points <= 0 || !Number.isFinite(rate) || rate <= 0) {
       throw new Error("预计算演示包的点数或采样率无效");
     }
-    if (!Array.isArray(bundle.channels) || bundle.channels.length !== 17
-        || !Array.isArray(bundle.interfaces) || bundle.interfaces.length !== 5) {
+    const thermocouples = (bundle.channels || []).filter((channel) => /^温度(?:[1-9]|[1-5]\d|6[0-4])$/.test(channel.name));
+    if (!Array.isArray(bundle.channels) || bundle.channels.length !== 77 || thermocouples.length !== 64
+        || !Array.isArray(bundle.interfaces) || bundle.interfaces.length !== 6) {
       throw new Error("预计算演示包的接口或通道数量无效");
+    }
+    if (!bundle.thermocouple64?.raw_directory?.catalog_id
+        || !bundle.thermocouple64?.derived_directory?.catalog_id) {
+      throw new Error("预计算演示包缺少64路热电偶目录");
     }
     for (const channel of bundle.channels) {
       if (!Array.isArray(channel.actual) || channel.actual.length !== points
@@ -122,6 +127,44 @@
         display_range: displayRanges.get(String(source.id || source.name || channelIndex)),
       };
     });
+    const rawNames = Array.from({length: 64}, (_item, channelIndex) => `温度${channelIndex + 1}`);
+    const channelByName = new Map(channels.map((channel) => [channel.name, channel]));
+    const rawChannels = rawNames.map((name) => channelByName.get(name));
+    const rawHistory = Array.from({length: cursor - historyStart}, (_item, index) =>
+      rawChannels.map((channel) => channel?.actual?.[index] ?? null));
+    const derivedLatest = {};
+    const derivedHistory = rawHistory.map((row) => {
+      const means = [];
+      for (let group = 0; group < 8; group += 1) {
+        const values = row.slice(group * 8, group * 8 + 8).map(finite);
+        const valid = values.filter(Number.isFinite);
+        const name = `热电偶均值${group + 1}`;
+        const usable = valid.length === 8;
+        const value = usable ? valid.reduce((sum, item) => sum + item, 0) / 8 : null;
+        derivedLatest[name] = {
+          value, quality: usable ? "derived_valid" : "derived_unavailable",
+          model_usable: usable, valid_count: valid.length,
+          group_id: `TC-G${String(group + 1).padStart(2, "0")}`,
+          source_channels: rawNames.slice(group * 8, group * 8 + 8),
+          source_range: [rawNames[group * 8], rawNames[group * 8 + 7]],
+          invalid_channels: rawNames.slice(group * 8, group * 8 + 8).filter((_name, offset) => !Number.isFinite(row[group * 8 + offset])),
+          imputed_channels: [], scope: "causal_so_far", aggregation_version: "tc64-contiguous-mean-v1",
+        };
+        means.push(value);
+      }
+      return means;
+    });
+    const thermocouple64 = {
+      snapshot_version: 1, sequence: cursor,
+      time_axis: rawChannels[0]?.x_observed || [],
+      raw_directory: bundle.thermocouple64.raw_directory,
+      derived_directory: bundle.thermocouple64.derived_directory,
+      raw_history: rawHistory, derived_history: derivedHistory,
+      raw_latest_quality: rawNames.map(() => "measured_new"),
+      derived_latest: derivedLatest,
+      other_channels: channels.filter((channel) => !rawNames.includes(channel.name)),
+      model_support: false, scope: "causal_so_far",
+    };
     const selected = channels.find((channel) => channel.id === selectedKey
       || channel.name === selectedKey) || channels[0];
     const totalWindows = Math.max(1, Math.ceil(bundle.points / WINDOW_SIZE));
@@ -201,6 +244,7 @@
         best_prediction_override: false,
       },
       channels,
+      thermocouple64,
       selected_channel: selected,
       window: currentWindow,
       layer: aggregate,

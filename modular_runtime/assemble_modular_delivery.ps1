@@ -212,7 +212,7 @@ $legacyFiles = @(
     "public_demo_bundles.py",
     "remote_mysql_setup.py", "server_target_mysql.py", "server_capture_journal.py", "generate_pressure_simulation.py",
     "web_auth.py", "web_access.py", "public_status.py", "guest_simulation.py", "control_lease.py", "json_safety.py",
-    "diagnosis_jobs.py", "simulation_packages.py"
+    "diagnosis_jobs.py", "simulation_packages.py", "thermocouple64.py"
 )
 foreach ($name in $legacyFiles) {
     $source = Join-Path $LegacySource $name

@@ -110,6 +110,29 @@ class DashboardTests(unittest.TestCase):
         self.assertTrue(math.isfinite(payload["preview"]["specimen"]["health"]))
         self.assertEqual(len(payload["sensor_stats"]), 12)
 
+    def test_bootstrap_keeps_model_missing_for_one_schema_nonfatal(self) -> None:
+        original_profile = self.dashboard.best_prediction_profile
+
+        def profile_for_schema(schema_id: str) -> dict:
+            if schema_id == "new_collection_v13_0":
+                raise FileNotFoundError("no validated 64-channel checkpoint")
+            return original_profile(schema_id)
+
+        with patch.object(
+            self.dashboard,
+            "best_prediction_profile",
+            side_effect=profile_for_schema,
+        ):
+            bootstrap = self.dashboard.bootstrap()
+
+        missing = bootstrap["acquisition"]["best_prediction_models"][
+            "new_collection_v13_0"
+        ]
+        self.assertFalse(missing["available"])
+        self.assertEqual(missing["registry_scope"], "new_collection_v13_0")
+        self.assertIn("仅采集模式", missing["reason"])
+        self.assertEqual(bootstrap["application"]["build_id"], app_module.BUILD_ID)
+
     def test_prediction_model_input_output_compatibility(self) -> None:
         bootstrap = self.dashboard.bootstrap()
         profile = bootstrap["acquisition"]["prediction_model"]

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import json
+import re
 import subprocess
 import sys
 import threading
@@ -11,6 +13,8 @@ import webbrowser
 from pathlib import Path
 from tkinter import Button, Label, Tk, messagebox
 
+from release_contract import load_release_contract
+
 
 APP_DIR = (
     Path(getattr(sys, "_MEIPASS"))
@@ -19,6 +23,34 @@ APP_DIR = (
 )
 APP_SCRIPT = APP_DIR / "app.py"
 URL = "http://127.0.0.1:8765/"
+RELEASE = load_release_contract(start=APP_DIR / "app.py")
+
+
+def _service_matches_this_build() -> bool:
+    try:
+        with urllib.request.urlopen(URL + "api/health", timeout=0.5) as response:
+            if response.status != 200:
+                return False
+            payload = json.loads(response.read().decode("utf-8"))
+        with urllib.request.urlopen(URL, timeout=0.5) as response:
+            page = response.read()
+        if page != (APP_DIR / "static" / "index.html").read_bytes():
+            return False
+        asset_paths = re.findall(
+            rb'(?:src|href)="(/(?:app\.js|styles\.css|public_demo\.js|mysql_visibility\.js|process_parameters\.js)\?v=[^"]+)"',
+            page,
+        )
+        for asset_path in asset_paths:
+            asset_name = asset_path.split(b"?", 1)[0].rsplit(b"/", 1)[-1].decode("ascii")
+            with urllib.request.urlopen(URL.rstrip("/") + asset_path.decode("ascii"), timeout=1.5) as response:
+                if response.read() != (APP_DIR / "static" / asset_name).read_bytes():
+                    return False
+    except Exception:
+        return False
+    return (
+        payload.get("version") == RELEASE.application_version
+        and payload.get("build_id") == RELEASE.release_revision
+    )
 
 
 def _write_server_trace(message: str) -> None:
@@ -85,21 +117,25 @@ class DesktopLauncher:
 
     def start_server(self) -> None:
         try:
+            if _service_matches_this_build():
+                self.root.after(
+                    0,
+                    lambda: self.status.config(
+                        text="当前项目服务已运行。可以打开桌面主界面。"
+                    ),
+                )
+                self.root.after(0, self.open_app)
+                return
             try:
-                with urllib.request.urlopen(
-                    URL + "api/health", timeout=0.5
-                ) as response:
-                    if response.status == 200:
-                        self.root.after(
-                            0,
-                            lambda: self.status.config(
-                                text="服务已运行。可以打开桌面主界面。"
-                            ),
-                        )
-                        self.root.after(0, self.open_app)
-                        return
+                with urllib.request.urlopen(URL + "api/health", timeout=0.5) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
             except Exception:
-                pass
+                payload = None
+            if payload is not None:
+                raise RuntimeError(
+                    "127.0.0.1:8765 已由其他版本的服务占用。为避免打开旧页面，"
+                    "请先确认并停止该 AFP 服务后，再启动本项目。"
+                )
             creationflags = (
                 subprocess.CREATE_NO_WINDOW
                 if os.name == "nt"
@@ -121,18 +157,15 @@ class DesktopLauncher:
                 if self.process.poll() is not None:
                     raise RuntimeError("本地服务启动失败")
                 try:
-                    with urllib.request.urlopen(
-                        URL + "api/health", timeout=0.4
-                    ) as response:
-                        if response.status == 200:
-                            self.root.after(
-                                0,
-                                lambda: self.status.config(
-                                    text="服务启动成功。真实采集数据会自动保存到 captured_data。"
-                                ),
-                            )
-                            self.root.after(0, self.open_app)
-                            return
+                    if _service_matches_this_build():
+                        self.root.after(
+                            0,
+                            lambda: self.status.config(
+                                text="服务启动成功。真实采集数据会自动保存到 captured_data。"
+                            ),
+                        )
+                        self.root.after(0, self.open_app)
+                        return
                 except Exception:
                     time.sleep(0.25)
             raise TimeoutError("等待本地服务启动超时")

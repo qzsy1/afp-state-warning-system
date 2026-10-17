@@ -16,6 +16,7 @@ import pandas as pd
 SENSOR_COLUMNS = [
     "温度", "压力", "薄膜压力", "ROI平均温度", "张力", "线速度", "ABB_X", "ABB_Y", "ABB_Z",
     *[f"温度{i}" for i in range(1, 9)],
+    "应变1", "应变2", "应变3", "应变4",
     "转速", "位移", "振动",
 ]
 PROCESS_COLUMNS = [
@@ -60,6 +61,7 @@ def generate(output: Path, rows: int = 240, seed: int = 20260910) -> Path:
     rotation = speed_series * 5.7 + rng.normal(0, 1.3, rows)
     displacement = 0.42 + 0.00075 * pressure + rng.normal(0, 0.006, rows)
     vibration = 0.08 + 0.0013 * speed_series + 0.00012 * pressure + rng.normal(0, 0.008, rows)
+    strain_base = 0.52 * tension + 0.018 * pressure
     matrices = [_pressure_matrix(float(value), int(layer[idx]), rng) for idx, value in enumerate(t)]
     film_pressure = []
     for matrix in matrices:
@@ -82,6 +84,10 @@ def generate(output: Path, rows: int = 240, seed: int = 20260910) -> Path:
         "转速": rotation,
         "位移": displacement,
         "振动": vibration,
+        "应变1": strain_base + rng.normal(0, 0.03, rows),
+        "应变2": strain_base * 0.94 + 0.06 * np.sin(t * 0.9) + rng.normal(0, 0.03, rows),
+        "应变3": strain_base * 1.05 - 0.04 * np.cos(t * 0.7) + rng.normal(0, 0.03, rows),
+        "应变4": strain_base * 0.98 + 0.03 * np.sin(t * 1.1) + rng.normal(0, 0.03, rows),
         "initial_compaction_force_N": force,
         "placement_speed_mm_s": speed,
         "pid_angle_deg": angle,

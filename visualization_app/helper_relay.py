@@ -821,12 +821,18 @@ class HelperRegistry:
         with self._lock:
             return self._cutover_reserved_locked()
 
-    def begin_capture_start(self) -> bool:
+    def begin_capture_start(
+        self,
+        *,
+        require_ingress_ready: bool = True,
+        require_cutover_clear: bool = True,
+    ) -> bool:
         with self._lock:
-            if (
+            if require_cutover_clear and self._cutover_reserved_locked():
+                return False
+            if require_ingress_ready and (
                 not self._synchronize_ingress_locked()
                 or bool(self._persistence_error)
-                or self._cutover_reserved_locked()
                 or (
                     self.ingress_state_path is not None
                     and (

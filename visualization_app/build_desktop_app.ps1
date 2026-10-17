@@ -5,6 +5,7 @@ param(
 $ErrorActionPreference = "Stop"
 $AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $StateMonitorDir = Split-Path -Parent $AppDir
+$ReleaseContract = Join-Path $StateMonitorDir "pre_sensor\release-contract.json"
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $StateMonitorDir))
 $WorkspaceRoot = Split-Path -Parent $ProjectRoot
 $Python = $PythonExecutable
@@ -36,6 +37,7 @@ $WorkDir = Join-Path $BuildRoot "work"
 foreach ($Required in @($LegacyCheckpoint, $LegacyReplayDir, $CausalArtifact, $LegacySource, $ModelRuntimeShijie, $ModelRuntimeModernTCN, $TrainingCore)) {
     if (-not (Test-Path -LiteralPath $Required)) { throw "Required runtime asset is missing: $Required" }
 }
+if (-not (Test-Path -LiteralPath $ReleaseContract)) { throw "Required runtime asset is missing: $ReleaseContract" }
 
 if (Test-Path -LiteralPath $BuildRoot) {
     Remove-Item -LiteralPath $BuildRoot -Recurse -Force
@@ -52,6 +54,7 @@ New-Item -ItemType Directory -Force -Path $BuildRoot, $ReleaseDir | Out-Null
     --noconsole `
     --name "AFP_State_Warning_System" `
     --add-data "$AppDir\static;static" `
+    --add-data "$ReleaseContract;pre_sensor" `
     --add-data "$AppDir\data;data" `
     --add-data "$AppDir\new_collection_demo_v11_3;new_collection_demo_v11_3" `
     --add-data "$LegacyReplayDir;data\legacy_replay" `

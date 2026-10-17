@@ -587,6 +587,15 @@ def helper_capabilities(server_url: str = "") -> dict[str, Any]:
         "simulation_prefetch_v1": True,
         "unified_frame_v1": True,
         "unified_frame_contract": RELEASE_CONTRACT.unified_frame_contract,
+        "esr1001_modbus_rtu": True,
+        "interface_roles": [
+            "thermocouple_8ch", "plc_process", "uvc_temperature",
+            "abb_motion", "m3232_pressure", "esr1001_strain",
+        ],
+        "drivers": [
+            "smrf_hid", "modbus_tcp", "uvc_thermal", "abb_robot",
+            "m3232_pressure", "modbus_rtu_esr1001",
+        ],
         "local_mysql_profile": local_mysql_profile_metadata(),
     }
     candidate_id, expected_helper_sha256 = release_manifest_helper_identity(RELEASE_CONTRACT)

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AFP 实时预测与状态预警系统</title>
-  <link rel="stylesheet" href="/styles.css?v=20261007-interface-check-v6">
+  <link rel="stylesheet" href="/styles.css?v=20261017-thermocouple64-v6">
 </head>
 <body>
   <div class="app-shell">
@@ -237,13 +237,19 @@
               <summary class="sensor-settings-summary">传感器设置与接口映射</summary>
               <div class="collapsible-subsection-content">
               <div class="sensor-selector-title">采集保存、模型输入与模型输出</div>
+              <fieldset class="thermocouple64-view-switch interface-view-switch" aria-label="热电偶显示模式">
+                <legend>热电偶显示模式（仅改变页面展示）</legend>
+                <label><input type="radio" name="thermocouple64View" value="raw" checked>完整模式（完整64通道）</label>
+                <label><input type="radio" name="thermocouple64View" value="average">平均模式（8组均值）</label>
+                <span id="thermocouple64ViewStatus" class="muted" role="status">当前模式：完整模式（完整64通道）</span>
+              </fieldset>
               <div class="interface-toolbar">
               <button id="discoverInterfacesButton" class="secondary-button compact-button" type="button">自动识别接口</button>
               <button id="addInterfaceButton" class="secondary-button compact-button" type="button">＋ 增加接口</button>
               <span id="interfaceDiscoveryStatus" class="muted">默认启用热电偶接口和其它传感器接口</span>
               </div>
               <div id="interfacePanel" class="interface-panel"></div>
-              <p class="control-note">温度1～温度8均可独立选择。停止采集时可自由勾选、取消或使用全选/清空；采集中为保证同一文件通道定义不变会暂时锁定。接口勾选、角色和通道映射同时作用于显示、CSV和MySQL。</p>
+              <p class="control-note">各传感器通道均可独立选择。停止采集时可自由勾选、取消或使用全选/清空；采集中为保证同一文件通道定义不变会暂时锁定。接口勾选、角色和通道映射同时作用于显示、CSV和MySQL。</p>
               <div id="liveSensorChecklist" class="sensor-checklist"></div>
               <div id="sensorChecklistResizer" class="sensor-checklist-resizer" role="separator"
                  aria-label="调整传感器通道区域高度" aria-orientation="horizontal" tabindex="0"
@@ -282,7 +288,7 @@
                 <span id="agentAutoStatus" class="control-note">未配置时使用内置离线测试诊断；配置正确时由模型按现象选择只读取证工具。</span>
                 <button id="agentDiagnoseButton" class="secondary-button" type="button" disabled>重新诊断全部异常</button>
               </div>
-              <p class="agent-scope-note">覆盖 SMRF 热电偶、PLC、UVC、ABB 与 M3232 薄膜压力传感器接口。只展示诊断结论和证据来源，不展示调用轨迹；异常失败时保留本地规则兜底。Key 不保存、不写日志。</p>
+              <p class="agent-scope-note">覆盖 64 路热电偶、PLC、UVC、ABB、M3232 薄膜压力与 ESR1001-A 应变传感器接口。只展示诊断结论和证据来源，不展示调用轨迹；异常失败时保留本地规则兜底。Key 不保存、不写日志。</p>
               </div>
             </details>
             <details id="acquisitionParameterPanel" class="acquisition-parameter-panel collapsible-subsection" aria-labelledby="acquisitionParameterTitle">
@@ -407,7 +413,7 @@
       </div>
 
       <main class="main-content">
-        <details class="panel chart-panel primary-workbench collapsible-panel">
+        <details id="sensorSharedDetail" class="panel chart-panel primary-workbench collapsible-panel">
           <summary class="panel-header collapsible-panel-summary">
             <div><p class="panel-kicker">LIVE I-MODERNTCN FORECAST</p><h1 id="seriesTitle">实测值与未来预测值</h1></div>
             <div class="legend">
@@ -418,22 +424,69 @@
             </div>
           </summary>
           <div class="collapsible-panel-content">
-            <canvas id="seriesChart" height="300"></canvas>
-            <div class="chart-footer"><span>竖线左侧为已采集时刻，右侧为尚未到达的未来预测</span><span id="displayRange">—</span></div>
+            <div id="sensorSingleDetail">
+              <canvas id="seriesChart" height="220"></canvas>
+              <div class="chart-footer"><span>竖线左侧为已采集时刻，右侧为尚未到达的未来预测</span><span id="displayRange">—</span></div>
+            </div>
+            <section id="thermocouple64GroupDetail" class="thermocouple64-group-detail hidden" aria-labelledby="thermocouple64GroupDetailTitle">
+              <div class="thermocouple64-group-detail-head">
+                <strong id="thermocouple64GroupDetailTitle">TC-G01 组详情：温度1～温度8</strong>
+                <span id="thermocouple64GroupDetailStatus">当前组 TC-G01 · 8 条曲线</span>
+              </div>
+              <div id="thermocouple64GroupLegend" class="thermocouple64-group-legend" aria-label="当前组曲线显隐"></div>
+              <canvas id="thermocouple64GroupCanvas" height="170" aria-label="当前热电偶组共享放大曲线"></canvas>
+              <div id="thermocouple64DetailMembers" class="thermocouple64-detail-members" aria-label="当前组8个原始成员与单通道放大"></div>
+            </section>
           </div>
         </details>
 
-        <section class="panel channel-panel">
-          <div class="panel-header compact">
-            <div><p class="panel-kicker">ALL ACQUIRED & PREDICTED CHANNELS</p><h2>全部传感器实时采集与预测</h2></div>
-            <span id="allChannelHint" class="muted">所有通道按统一方式显示</span>
-          </div>
-          <div class="channel-panel-content">
-            <div id="sensorCardsViewport" class="sensor-cards-viewport">
-              <div id="sensorCards" class="sensor-grid"></div>
+        <div id="sensorMonitorSplit" class="sensor-monitor-split thermocouple-unavailable">
+          <section id="thermocouple64Panel" class="panel thermocouple64-panel hidden" aria-labelledby="thermocouple64Title">
+            <div class="panel-header compact thermocouple64-header">
+              <div><p class="panel-kicker">THERMOCOUPLE 64</p><h2 id="thermocouple64Title">64 路热电偶</h2></div>
+              <div class="thermocouple64-panel-modes" role="group" aria-label="热电偶展示模式">
+                <button type="button" data-thermocouple-view="raw" aria-pressed="true">完整模式</button>
+                <button type="button" data-thermocouple-view="average" aria-pressed="false">平均模式（8组均值）</button>
+              </div>
+              <span id="thermocouple64CurrentMode" class="thermocouple64-current-mode hidden">当前模式：完整模式（完整64通道）</span>
             </div>
+            <div class="thermocouple64-panel-content">
+              <div class="thermocouple64-toolbar">
+                <label><input id="thermocouple64UniformScale" type="checkbox">跨组统一量程</label>
+                <label><input id="thermocouple64AbnormalOnly" type="checkbox">只看异常通道</label>
+                <span id="thermocouple64Status" role="status">等待 64 路快照</span>
+              </div>
+              <div id="thermocouple64RawView" class="thermocouple64-raw-view">
+                <nav id="thermocouple64GroupSelector" class="thermocouple64-group-selector hidden" aria-label="热电偶组快速选择"></nav>
+                <div class="thermocouple64-overview-shell">
+                  <div id="thermocouple64OverviewViewport" class="thermocouple64-overview-viewport" tabindex="0" aria-label="8张热电偶组图，温度1至温度64原始曲线">
+                    <div id="thermocouple64RawGroups" class="thermocouple64-groups"></div>
+                  </div>
+                  <div id="thermocouple64ScrollHint" class="thermocouple64-scroll-hint" role="status">↓ 下方还有通道，可在此面板内滚动</div>
+                </div>
+              </div>
+              <div id="thermocouple64AverageGroups" class="thermocouple64-average-grid hidden"></div>
+            </div>
+          </section>
+
+          <div id="sensorPanelResizer" class="sensor-panel-resizer" role="separator"
+               aria-label="调整热电偶与其他传感器面板高度" aria-orientation="horizontal" tabindex="0"
+               title="上下拖动调整两个传感器面板高度；方向键调整；双击恢复默认比例">
+            <span class="sensor-panel-resizer-grip" aria-hidden="true">•••</span>
           </div>
-        </section>
+
+          <section id="otherSensorsPanel" class="panel channel-panel">
+            <div class="panel-header compact">
+              <div><p class="panel-kicker">OTHER ACQUIRED & PREDICTED CHANNELS</p><h2>其他传感器实时采集与预测</h2></div>
+              <span id="allChannelHint" class="muted">一行4个通道 · 内部滚动 · 点击放大</span>
+            </div>
+            <div class="channel-panel-content">
+              <div id="sensorCardsViewport" class="sensor-cards-viewport">
+                <div id="sensorCards" class="sensor-grid"></div>
+              </div>
+            </div>
+          </section>
+        </div>
       </main>
 
       <div id="rightColumnResizer" class="column-resizer right-resizer" role="separator"
@@ -517,7 +570,7 @@
   </div>
   <script src="/mysql_visibility.js?v=20260909-mysql-toggle-2"></script>
   <script src="/process_parameters.js?v=20260916-auto-process-1"></script>
-  <script src="/public_demo.js?v=20261001-stable-public-demo-v2"></script>
-  <script src="/app.js?v=20261014-model-path-relocation-v1"></script>
+  <script src="/public_demo.js?v=20261017-thermocouple64-v2"></script>
+  <script src="/app.js?v=20261017-thermocouple64-v13"></script>
 </body>
 </html>

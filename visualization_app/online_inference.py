@@ -13,6 +13,11 @@ from types import SimpleNamespace
 import numpy as np
 
 from release_contract import load_release_contract, managed_model_paths
+from thermocouple64 import (
+    THERMOCOUPLE64_DERIVED_CHANNELS,
+    THERMOCOUPLE64_MODE_ID,
+    validate_group_mean_model_contract,
+)
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -96,8 +101,16 @@ NEW_MODEL_SENSOR_COLUMNS = [
     "ABB_Z",
     *[f"温度{index}" for index in range(1, 9)],
 ]
+STRAIN_SENSOR_COLUMNS = [f"应变{index}" for index in range(1, 5)]
 SUPPORTED_SENSOR_COLUMNS = list(
-    dict.fromkeys([*MODEL_SENSOR_COLUMNS, *NEW_MODEL_SENSOR_COLUMNS])
+    dict.fromkeys(
+        [
+            *MODEL_SENSOR_COLUMNS,
+            *NEW_MODEL_SENSOR_COLUMNS,
+            *STRAIN_SENSOR_COLUMNS,
+            *THERMOCOUPLE64_DERIVED_CHANNELS,
+        ]
+    )
 )
 DEFAULT_MODEL_METADATA = {
     "name": "I-ModernTCN AFP 24→24（默认模型）",
@@ -178,7 +191,12 @@ def model_catalog() -> list[dict]:
     for model_type, definition in MODEL_REGISTRY.items():
         availability = {}
         validation_loss = {}
-        for schema_id in ("legacy_original", "new_collection_v11_3"):
+        for schema_id in (
+            "legacy_original",
+            "new_collection_v11_3",
+            "new_collection_v12_0",
+            THERMOCOUPLE64_MODE_ID,
+        ):
             checkpoint = _registered_checkpoint(model_type, schema_id)
             availability[schema_id] = bool(
                 checkpoint is not None and Path(checkpoint).is_file()
@@ -204,7 +222,14 @@ def model_catalog() -> list[dict]:
 
 
 def _schema_key(schema_mode: str = "") -> str:
-    return "new" if str(schema_mode or "").strip() == "new_collection_v11_3" else "legacy"
+    if str(schema_mode or "").strip() == THERMOCOUPLE64_MODE_ID:
+        return "thermocouple64"
+    return (
+        "new"
+        if str(schema_mode or "").strip()
+        in {"new_collection_v11_3", "new_collection_v12_0"}
+        else "legacy"
+    )
 
 
 def _selection_history_path() -> Path:
@@ -518,6 +543,14 @@ def inspect_prediction_model(
         raise ValueError(
             f"模型元数据包含未知传感器：输入{unknown_inputs}，输出{unknown_outputs}"
         )
+    if str(schema_mode or "").strip() == THERMOCOUPLE64_MODE_ID:
+        contract_issues = validate_group_mean_model_contract(
+            {**metadata, "input_sensors": input_sensors}
+        )
+        if contract_issues:
+            raise ValueError(
+                "64路热电偶模型聚合合同不兼容：" + "；".join(contract_issues)
+            )
     if not set(output_sensors).issubset(input_sensors):
         raise ValueError("预测模型输出传感器必须同时属于模型输入传感器")
     missing_input_columns = [

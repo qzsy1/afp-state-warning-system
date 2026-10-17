@@ -26,7 +26,8 @@ class PublicDemoFrontendTests(unittest.TestCase):
 const fs = require("fs");
 const path = require("path");
 const demo = require("./static/public_demo.js");
-const filename = fs.readdirSync("./static/demo").find((name) => name.startsWith("quick_240."));
+const manifest = JSON.parse(fs.readFileSync("./static/demo/manifest-v1.json", "utf8"));
+const filename = path.basename(manifest.packages.find((item) => item.package_id === "quick_240").url);
 const bundle = JSON.parse(fs.readFileSync(path.join("./static/demo", filename), "utf8"));
 for (const index of [0, 23, 24, 239]) {
   const payload = demo.buildRealtimePayload(bundle, index, {
@@ -38,7 +39,27 @@ for (const index of [0, 23, 24, 239]) {
   });
   if (payload.mode !== "public_precomputed_demo") process.exit(1);
   if (payload.progress.cursor !== index + 1) process.exit(2);
-  if (payload.channels.length !== 17 || !payload.selected_channel) process.exit(3);
+  if (payload.channels.length !== 77 || !payload.selected_channel) process.exit(3);
+  if (payload.thermocouple64?.raw_history?.length !== index + 1) process.exit(9);
+  if (payload.thermocouple64?.derived_history?.length !== index + 1
+      || payload.thermocouple64.derived_directory.channels.length !== 8) process.exit(10);
+  if (payload.thermocouple64.raw_history.at(-1).length !== 64) process.exit(11);
+  if (payload.thermocouple64.derived_history.at(-1).some((value) => !Number.isFinite(value))) process.exit(12);
+  for (let group = 0; group < 8; group += 1) {
+    const firstChannel = group * 8 + 1;
+    const lastChannel = firstChannel + 7;
+    const expectedNames = Array.from({length: 8}, (_item, offset) => `温度${firstChannel + offset}`);
+    const channelNames = payload.thermocouple64.raw_directory.channels
+      .slice(group * 8, group * 8 + 8).map((channel) => channel.name);
+    const actualValues = payload.thermocouple64.raw_history.at(-1).slice(group * 8, group * 8 + 8);
+    const expectedMean = actualValues.reduce((sum, value) => sum + value, 0) / 8;
+    const groupMetadata = payload.thermocouple64.derived_latest[`热电偶均值${group + 1}`];
+    if (JSON.stringify(channelNames) !== JSON.stringify(expectedNames)) process.exit(13);
+    if (Math.abs(payload.thermocouple64.derived_history.at(-1)[group] - expectedMean) > 1e-9) process.exit(14);
+    if (groupMetadata.valid_count !== 8 || groupMetadata.group_id !== `TC-G${String(group + 1).padStart(2, "0")}`) process.exit(15);
+    if (groupMetadata.source_range[0] !== `温度${firstChannel}`
+        || groupMetadata.source_range[1] !== `温度${lastChannel}`) process.exit(16);
+  }
   if (payload.selected_channel.actual.length !== index + 1) process.exit(4);
   if (!payload.window || !payload.timeline || !payload.acquisition) process.exit(5);
   if (payload.acquisition.execution_host !== "browser_precomputed_demo") process.exit(6);
@@ -55,12 +76,13 @@ if (!finalPayload.progress.finished || finalPayload.acquisition.running) process
 const fs = require("fs");
 const path = require("path");
 const demo = require("./static/public_demo.js");
-const filename = fs.readdirSync("./static/demo").find((name) => name.startsWith("quick_240."));
+const manifest = JSON.parse(fs.readFileSync("./static/demo/manifest-v1.json", "utf8"));
+const filename = path.basename(manifest.packages.find((item) => item.package_id === "quick_240").url);
 const bundle = JSON.parse(fs.readFileSync(path.join("./static/demo", filename), "utf8"));
 const first = demo.buildRealtimePayload(bundle, 0, {});
 const later = demo.buildRealtimePayload(bundle, 180, {});
-if (first.acquisition.interfaces.length !== 5) process.exit(1);
-if (first.acquisition.sensors.length !== 17) process.exit(2);
+if (first.acquisition.interfaces.length !== 6) process.exit(1);
+if (first.acquisition.sensors.length !== 77) process.exit(2);
 if (!first.acquisition.interfaces.every((item) => item.ok && item.state === "precomputed_success")) process.exit(3);
 if (!first.acquisition.sensors.every((item) => item.ok && item.state === "precomputed_success")) process.exit(4);
 if (!first.diagnosis?.ok || first.diagnosis.state !== "precomputed_success") process.exit(5);

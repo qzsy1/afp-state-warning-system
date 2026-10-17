@@ -57,7 +57,12 @@ class SingleRuntimeDocumentationTests(unittest.TestCase):
             settings["baseline_exe"],
             FIXED_RUNTIME + r"\AFP_Integrated_System_Modular.exe",
         )
-        self.assertIn(FIXED_RUNTIME.replace("\\", "\\\\"), matrix_text)
+        self.assertIn('"{baseline_exe}"', matrix_text)
+        self.assertNotIn(
+            FIXED_RUNTIME.replace("\\", "\\\\")
+            + r"\\verification\\test_real_acquisition_pipeline.py",
+            matrix_text,
+        )
         for marker in LEGACY_MARKERS:
             self.assertNotIn(marker, matrix_text)
 

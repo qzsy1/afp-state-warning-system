@@ -56,7 +56,8 @@ $helperCapabilities = @{
     unified_frame_v1 = $true
     real_capture = $true
     local_csv_save = $true
-    features = @("unified_frame_v1", "real_capture", "local_csv_save")
+    esr1001_modbus_rtu = $true
+    features = @("unified_frame_v1", "real_capture", "local_csv_save", "esr1001_modbus_rtu")
 }
 $diagnosticPairingProfile = @{
     session_id = "preflight-unpaired"
@@ -70,6 +71,7 @@ $temporaryDefaults = [ordered]@{
     "AFP_INTERFACE_UVC" = "physical-sensor-pending://uvc-temperature"
     "AFP_INTERFACE_ABB" = "physical-sensor-pending://abb-motion"
     "AFP_INTERFACE_M3232" = "physical-sensor-pending://m3232-pressure"
+    "AFP_INTERFACE_ESR1001" = "physical-sensor-pending://esr1001-strain"
 }
 if ($Mode -eq "remote_helper") {
     $temporaryDefaults["AFP_HELPER_SERVER_URL"] = "http://127.0.0.1:8765"

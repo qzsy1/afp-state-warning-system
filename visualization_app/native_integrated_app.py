@@ -311,7 +311,7 @@ class AcquisitionPanel(ttk.Frame):
         basic.grid(row=0, column=0, sticky="ew", pady=4)
         basic.columnconfigure(1, weight=1); basic.columnconfigure(3, weight=1)
         ttk.Label(basic, text="数据方案").grid(row=0, column=0, sticky="w", padx=3, pady=3)
-        self.schema_combo = ttk.Combobox(basic, textvariable=self._v("dataset_schema", "new_collection_v11_3"), state="readonly", values=("new_collection_v11_3", "legacy_original"), width=20)
+        self.schema_combo = ttk.Combobox(basic, textvariable=self._v("dataset_schema", "new_collection_v13_0"), state="readonly", values=("new_collection_v13_0", "new_collection_v12_0", "new_collection_v11_3", "legacy_original"), width=20)
         self.schema_combo.grid(row=0, column=1, columnspan=3, sticky="ew", padx=3, pady=3)
         self.schema_info = tk.StringVar(value="")
         ttk.Label(basic, textvariable=self.schema_info, foreground=COLORS["blue"]).grid(row=0, column=4, sticky="w", padx=4)
@@ -323,22 +323,28 @@ class AcquisitionPanel(ttk.Frame):
         ttk.Label(basic, text="连接方式").grid(row=2, column=0, sticky="w", padx=3, pady=3)
         self.driver_combo = ttk.Combobox(basic, textvariable=self._v("driver", "simulator"), state="readonly", values=("simulator", "serial_json", "tcp_json"), width=15)
         self.driver_combo.grid(row=2, column=1, sticky="ew", padx=3, pady=3)
-        interfaces = ttk.LabelFrame(basic, text="多接口采集（默认热电偶 + 其它传感器）", padding=5)
+        interfaces = ttk.LabelFrame(basic, text="六接口采集（含 ESR1001-A 四通道应变）", padding=5)
         interfaces.grid(row=5, column=0, columnspan=4, sticky="ew", padx=3, pady=4)
         interfaces.columnconfigure(3, weight=1)
         ttk.Button(interfaces, text="自动识别接口", command=self._discover_interfaces).grid(row=0, column=0, sticky="ew", padx=2)
         ttk.Label(interfaces, text="勾选 / 角色 / 类型 / 地址 / 映射(JSON)").grid(row=0, column=1, columnspan=4, sticky="w")
         self.interface_vars: list[dict[str, tk.Variable]] = []
-        for index, (role, endpoint) in enumerate((("thermocouple", "COM3"), ("other", "COM4")), start=1):
+        interface_defaults = default_capture_interfaces()
+        role_values = tuple(item["role"] for item in interface_defaults)
+        driver_values = tuple(item["driver"] for item in interface_defaults)
+        for index, item in enumerate(interface_defaults, start=1):
             values = {
-                "enabled": self._v(f"interface_{index}_enabled", True), "role": self._v(f"interface_{index}_role", role),
-                "driver": self._v(f"interface_{index}_driver", "serial_json"), "endpoint": self._v(f"interface_{index}_endpoint", endpoint),
+                "id": self._v(f"interface_{index}_id", item["id"]),
+                "enabled": self._v(f"interface_{index}_enabled", True), "role": self._v(f"interface_{index}_role", item["role"]),
+                "driver": self._v(f"interface_{index}_driver", item["driver"]), "endpoint": self._v(f"interface_{index}_endpoint", item.get("endpoint", "")),
+                "baudrate": self._v(f"interface_{index}_baudrate", int(item.get("baudrate") or 0)),
+                "slave_id": self._v(f"interface_{index}_slave_id", int(item.get("slave_id") or 1)),
                 "map": self._v(f"interface_{index}_map", "{}"),
             }
             self.interface_vars.append(values)
             ttk.Checkbutton(interfaces, variable=values["enabled"]).grid(row=index, column=0)
-            ttk.Combobox(interfaces, textvariable=values["role"], values=("thermocouple", "other"), state="readonly", width=14).grid(row=index, column=1, padx=2)
-            ttk.Combobox(interfaces, textvariable=values["driver"], values=("serial_json", "tcp_json", "simulator"), state="readonly", width=12).grid(row=index, column=2, padx=2)
+            ttk.Combobox(interfaces, textvariable=values["role"], values=role_values, state="readonly", width=14).grid(row=index, column=1, padx=2)
+            ttk.Combobox(interfaces, textvariable=values["driver"], values=driver_values, state="readonly", width=20).grid(row=index, column=2, padx=2)
             ttk.Entry(interfaces, textvariable=values["endpoint"], width=15).grid(row=index, column=3, sticky="ew", padx=2)
             ttk.Entry(interfaces, textvariable=values["map"], width=22).grid(row=index, column=4, sticky="ew", padx=2)
         self._entry(basic, "采样Hz", "sample_rate_hz", 10.0, 2, 2)
@@ -397,10 +403,7 @@ class AcquisitionPanel(ttk.Frame):
             ttk.Label(channels, text=title, foreground=COLORS["navy"]).grid(row=0, column=col, pady=(0, 3))
         self.sensor_lists: list[tk.Listbox] = []
         for col in range(3):
-            # The new collection plan has 16 physical sensor channels.  Keep
-            # all channels visible in the native window instead of clipping
-            # the lower half of the checklist at the historical height of 8.
-            box = tk.Listbox(channels, selectmode="multiple", exportselection=False, height=16, width=15)
+            box = tk.Listbox(channels, selectmode="multiple", exportselection=False, height=21, width=15)
             box.grid(row=1, column=col, sticky="nsew", padx=2)
             self.sensor_lists.append(box)
             channels.columnconfigure(col, weight=1)
@@ -548,7 +551,7 @@ class AcquisitionPanel(ttk.Frame):
         sensors = list(ACQUISITION_SCHEMAS[schema]["sensors"])
         self.schema_info.set(
             f"{len(sensors)} 个传感器通道"
-            if schema == "new_collection_v11_3"
+            if schema.startswith("new_collection_")
             else f"{len(sensors)} 个传感器通道"
         )
         for box in self.sensor_lists:
@@ -557,7 +560,7 @@ class AcquisitionPanel(ttk.Frame):
             box.select_set(0, "end")
         self.sensor_combo["values"] = sensors
         if sensors: self.sensor_display.set(sensors[0])
-        if schema == "new_collection_v11_3" and self.bootstrap:
+        if schema.startswith("new_collection_") and self.bootstrap:
             demo = self.bootstrap.get("acquisition", {}).get("new_collection_demo", {})
             self.vars["endpoint"].set(demo.get("source_file") or str(DEFAULT_SIMULATOR_FILE))
         elif schema == "legacy_original":
@@ -595,7 +598,13 @@ class AcquisitionPanel(ttk.Frame):
         for values, item in zip(self.interface_vars, defaults):
             values["endpoint"].set(item.get("endpoint", ""))
             values["role"].set(item.get("role", "other"))
-        self.status_text.set(f"发现 {len(ports)} 个串口；已填入前两个接口，可继续修改角色和通道映射")
+            if item.get("driver"):
+                values["driver"].set(item["driver"])
+            if item.get("baudrate"):
+                values["baudrate"].set(int(item["baudrate"]))
+            if item.get("slave_id"):
+                values["slave_id"].set(int(item["slave_id"]))
+        self.status_text.set(f"发现 {len(ports)} 个串口；六个逻辑接口配置已更新，可继续核对端点和通道映射")
 
     def _pick_endpoint(self) -> None:
         selected = filedialog.askopenfilename(title="选择模拟采集CSV", filetypes=[("CSV", "*.csv"), ("所有文件", "*.*")])
@@ -640,12 +649,18 @@ class AcquisitionPanel(ttk.Frame):
                 channel_map = json.loads(str(values["map"].get() or "{}"))
             except json.JSONDecodeError:
                 channel_map = {}
-            interfaces.append({
-                "id": f"interface_{index}", "enabled": bool(values["enabled"].get()),
+            interface = {
+                "id": str(values["id"].get()), "enabled": bool(values["enabled"].get()),
                 "role": str(values["role"].get()), "driver": str(values["driver"].get()),
-                "endpoint": str(values["endpoint"].get()).strip(), "baudrate": _safe_int(self.vars["baudrate"].get(), 115200, 1),
+                "endpoint": str(values["endpoint"].get()).strip(),
                 "channel_map": channel_map,
-            })
+            }
+            baudrate = _safe_int(values["baudrate"].get(), 0, 0)
+            if baudrate:
+                interface["baudrate"] = baudrate
+            if interface["driver"] in {"modbus_tcp", "modbus_rtu_esr1001"}:
+                interface["slave_id"] = _safe_int(values["slave_id"].get(), 1, 1)
+            interfaces.append(interface)
         simulation_source_type = str(self.vars["simulation_source_type"].get() or "single_csv")
         simulation_source_path = str(self.vars["simulation_source_path"].get()).strip()
         acquisition_mode = "simulation" if str(self.vars["driver"].get()) == "simulator" else "real"

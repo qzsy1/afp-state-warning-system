@@ -19,6 +19,7 @@ _MINIMUM_POLL_SECONDS = {
     "uvc_thermal": 0.03,
     "rtsp_thermal": 0.03,
     "m3232_pressure": 0.005,
+    "modbus_rtu_esr1001": 0.05,
 }
 
 

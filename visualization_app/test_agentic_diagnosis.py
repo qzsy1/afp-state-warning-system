@@ -131,7 +131,7 @@ def no_sensor_hardware_result() -> dict:
 
 
 class NoSensorTruthTests(unittest.TestCase):
-    def test_no_sensor_truth_has_five_failed_interfaces_and_seventeen_channels(self) -> None:
+    def test_no_sensor_truth_has_six_failed_interfaces_and_twenty_one_channels(self) -> None:
         result = no_sensor_hardware_result()
 
         self.assertEqual(len(result["interfaces"]), 5)
@@ -148,7 +148,7 @@ class NoSensorTruthTests(unittest.TestCase):
         self.assertEqual(sum(bool(item["ok"]) for item in normalized["interfaces"]), 0)
         self.assertEqual(
             normalized["summary"],
-            "检查未通过：0/5 个目标传感器接口已由有效数据确认，0/17 个通道正常",
+            "检查未通过：0/6 个目标传感器接口已由有效数据确认，0/21 个通道正常",
         )
         self.assertNotIn("传感器损坏", json.dumps(normalized, ensure_ascii=False))
 

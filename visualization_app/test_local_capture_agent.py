@@ -250,7 +250,7 @@ class LocalCaptureAgentTests(unittest.TestCase):
             public.connect_once()
 
     @patch("local_capture_agent.AcquisitionManager.discover_interfaces")
-    def test_discover_returns_five_logical_sensor_bindings(self, discover):
+    def test_discover_returns_six_logical_sensor_bindings_without_legacy_thermocouple(self, discover):
         discover.return_value = {
             "physical_interfaces": [
                 {"id": "hid:smrf", "kind": "usb_hid", "protocol": "smrf_hid", "detected": True},
@@ -264,11 +264,17 @@ class LocalCaptureAgentTests(unittest.TestCase):
         result = LocalCaptureAgent().discover()
         self.assertEqual(
             [item["role"] for item in result["sensor_bindings"]],
-            ["thermocouple_8ch", "plc_process", "uvc_temperature", "abb_motion", "m3232_pressure"],
+            [
+                "thermocouple64", "plc_process", "uvc_temperature",
+                "abb_motion", "m3232_pressure", "esr1001_strain",
+            ],
         )
+        self.assertNotIn("thermocouple_8ch", [item["role"] for item in result["sensor_bindings"]])
         self.assertEqual(result["sensor_bindings"][1]["physical_interface_id"], "ethernet:工控网卡")
         self.assertEqual(result["sensor_bindings"][3]["physical_interface_id"], "ethernet:工控网卡")
         self.assertEqual(result["sensor_bindings"][4]["physical_interface_id"], "serial:COM3")
+        self.assertIsNone(result["sensor_bindings"][5]["physical_interface_id"])
+        self.assertEqual(result["sensor_bindings"][5]["protocol"], "modbus_rtu")
 
     @patch("local_capture_agent.AcquisitionManager")
     def test_capture_methods_delegate_to_existing_manager(self, manager_cls):

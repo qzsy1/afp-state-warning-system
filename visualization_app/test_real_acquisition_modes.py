@@ -58,6 +58,7 @@ def compatible_helper_capabilities(**overrides):
         "configuration_schema_version": RELEASE_CONTRACT.configuration_schema_version,
         "readiness_schema_version": RELEASE_CONTRACT.readiness_schema_version,
         "unified_frame_v1": True,
+        "unified_frame_v2": True,
         "unified_frame_contract": RELEASE_CONTRACT.unified_frame_contract,
     }
     values.update(overrides)
@@ -289,6 +290,7 @@ class AcquisitionModeEquivalenceTests(unittest.TestCase):
                 "source_sequence": 9,
                 "protocol_ok": True,
                 "error": "",
+                "metadata": {"age_seconds": 0.1, "unit": "°C"},
             },
         )
 
@@ -1273,12 +1275,12 @@ class RemoteHelperNoHardwareIntegrationTests(unittest.TestCase):
             helper_capabilities=incompatible_capabilities
         )
         agent.import_readiness_snapshot(snapshot.to_dict())
-        with self.assertRaisesRegex(ReleaseContractError, "unified_frame_v1"):
+        with self.assertRaisesRegex(RuntimeError, "unified_frame_v1"):
             agent.start_capture(incompatible)
 
         wrong_revision = self.remote_config(
             helper_capabilities=compatible_helper_capabilities(
-                unified_frame_contract="unified_frame_v2"
+                unified_frame_contract="unified_frame_v1"
             )
         )
         agent.import_readiness_snapshot(snapshot.to_dict())

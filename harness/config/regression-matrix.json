@@ -5,9 +5,10 @@
     {"id": "HARNESS-001", "title": "质量门禁配置、执行、报告和退出码可靠", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "STARTUP-001", "title": "软件启动、服务探测和前端加载保持可用", "mandatory": true, "profiles": ["full", "release"]},
     {"id": "SIMULATION-001", "title": "模拟采集导入、运行和结果链路保持可用", "mandatory": true, "profiles": ["full", "release"]},
-    {"id": "SIMULATION-002", "title": "模拟五类逻辑接口显式分配通道且仅使用单一模拟数据源", "mandatory": true, "profiles": ["quick", "full", "release"]},
+    {"id": "SIMULATION-002", "title": "模拟六类逻辑接口显式分配21个采集通道且仅使用单一模拟数据源", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "MODE_ISOLATION-001", "title": "入口安全默认模拟，模拟和真实采集状态隔离且模拟逻辑接口默认正常", "mandatory": true, "profiles": ["quick", "full", "release"]},
-    {"id": "INTERFACES-001", "title": "SMRF、PLC、UVC、ABB和M3232接口映射保持完整", "mandatory": true, "profiles": ["full", "release"]},
+    {"id": "INTERFACES-001", "title": "64路热电偶、PLC、UVC、ABB、M3232和ESR1001-A接口映射保持完整", "mandatory": true, "profiles": ["full", "release"]},
+    {"id": "ESR1001-001", "title": "ESR1001-A协议、六接口映射、21通道持久化和实物待验证边界完整", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "INTERFACES-002", "title": "真实物理接口可人工选择且严格Readiness门禁保持不变", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "USB_TOPOLOGY-001", "title": "USB设备归属、拓展坞物理端口识别、跨电脑分类和设备验证边界正确", "mandatory": true, "profiles": ["full", "release"]},
     {"id": "EDGE_HELPER-001", "title": "边缘辅助程序传输、确认、重连和会话隔离正确", "mandatory": true, "profiles": ["full", "release"]},
@@ -22,7 +23,7 @@
     {"id": "RELEASE_EVIDENCE-001", "title": "发布交付诊断和证据对应当前提交", "mandatory": true, "profiles": ["release"]},
     {"id": "FIELD_BOUNDARY-001", "title": "现场硬件和目标MySQL证据不得由模拟结果冒充", "mandatory": true, "profiles": ["release"]},
     {"id": "REAL_ACQUISITION-001", "title": "真实采集使用独立驱动、统一单调时钟和逐通道质量合同", "mandatory": true, "profiles": ["quick", "full", "release"]},
-    {"id": "PHYSICAL_READINESS-001", "title": "五类物理传感器按协议身份和全部必需通道失败关闭", "mandatory": true, "profiles": ["quick", "full", "release"]},
+    {"id": "PHYSICAL_READINESS-001", "title": "六类物理传感器按协议身份和全部必需通道失败关闭", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "LIVE_PREDICTION_SAFETY-001", "title": "实时预测只使用兼容频率下最近连续完整模型窗口", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "CAPTURE_PERSISTENCE-001", "title": "统一帧、质量侧车、数据库和停止终结可对账恢复", "mandatory": true, "profiles": ["full", "release"]},
     {"id": "REAL_RELEASE_GATE-001", "title": "G0至G5证据按交付修订分级且不可由低等级越级替代", "mandatory": true, "profiles": ["release"]},
@@ -42,7 +43,10 @@
     {"id": "PRE_SENSOR_INGRESS_GENERATION-001", "title": "公网入口地址变化必须推进持久化代际并使旧就绪证据失效", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "PRE_SENSOR_INGRESS_CUTOVER-001", "title": "入口切换必须验证新入口、发布代际并确认客户端就绪后才能退役旧入口", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "PRE_SENSOR_HELPER_GENERATION-001", "title": "Helper 会话、命令和结果必须绑定当前入口代际并拒绝跨代际复用", "mandatory": true, "profiles": ["quick", "full", "release"]},
-    {"id": "PRE_SENSOR_MODEL_PROVENANCE-001", "title": "模型来源必须由发行合同管理的根目录判定并向界面显式报告", "mandatory": true, "profiles": ["quick", "full", "release"]}
+    {"id": "PRE_SENSOR_MODEL_PROVENANCE-001", "title": "模型来源必须由发行合同管理的根目录判定并向界面显式报告", "mandatory": true, "profiles": ["quick", "full", "release"]},
+    {"id": "THERMOCOUPLE64-PROTOCOL-001", "title": "64路热电偶目录、映射、组均值和硬件事实门禁符合合同", "mandatory": true, "profiles": ["quick", "full", "release"]},
+    {"id": "THERMOCOUPLE64-LAYERS-001", "title": "64路异构层原始视图和同试样中位数派生范围保持分离", "mandatory": true, "profiles": ["quick", "full", "release"]},
+    {"id": "THERMOCOUPLE64-FRONTEND-001", "title": "64路与8组均值页面、模型兼容状态和其他传感器区域符合合同", "mandatory": true, "profiles": ["quick", "full", "release"]}
   ],
   "checks": [
     {
@@ -228,6 +232,48 @@
       "change_patterns": ["visualization_app/acquisition.py", "visualization_app/real_acquisition.py", "visualization_app/local_capture_agent.py", "visualization_app/edge_capture.py", "visualization_app/test_real_acquisition_modes.py", "harness/**", "openspec/changes/prepare-real-acquisition/**"]
     },
     {
+      "id": "thermocouple64-protocol-contracts",
+      "title": "64路热电偶模式、适配边界、组均值和实物发布门禁",
+      "kind": "command",
+      "command": ["{python}", "-m", "unittest", "visualization_app.test_thermocouple64_contracts", "-v"],
+      "cwd": ".",
+      "timeout_seconds": 120,
+      "profiles": ["quick", "full", "release"],
+      "environments": ["local", "ci"],
+      "blocking": true,
+      "evidence_tier": "automated",
+      "requirements": ["THERMOCOUPLE64-PROTOCOL-001"],
+      "change_patterns": ["visualization_app/acquisition.py", "visualization_app/thermocouple64.py", "visualization_app/test_thermocouple64_contracts.py", "openspec/changes/expand-thermocouple-to-64-channels/**"]
+    },
+    {
+      "id": "thermocouple64-layer-projection-contracts",
+      "title": "64路异构层原始对齐、整层中位数派生和来源清单",
+      "kind": "command",
+      "command": ["{python}", "-m", "unittest", "visualization_app.test_thermocouple64_layer_projection", "-v"],
+      "cwd": ".",
+      "timeout_seconds": 180,
+      "profiles": ["quick", "full", "release"],
+      "environments": ["local", "ci"],
+      "blocking": true,
+      "evidence_tier": "automated",
+      "requirements": ["THERMOCOUPLE64-LAYERS-001"],
+      "change_patterns": ["visualization_app/acquisition.py", "visualization_app/thermocouple64.py", "visualization_app/test_thermocouple64_layer_projection.py", "openspec/changes/expand-thermocouple-to-64-channels/**"]
+    },
+    {
+      "id": "thermocouple64-frontend-contracts",
+      "title": "64路与平均8路实时视图和兼容状态合同",
+      "kind": "command",
+      "command": ["{python}", "-m", "unittest", "visualization_app.test_thermocouple64_frontend", "visualization_app.test_thermocouple64_simulation", "-v"],
+      "cwd": ".",
+      "timeout_seconds": 180,
+      "profiles": ["quick", "full", "release"],
+      "environments": ["local", "ci"],
+      "blocking": true,
+      "evidence_tier": "automated",
+      "requirements": ["THERMOCOUPLE64-FRONTEND-001"],
+      "change_patterns": ["visualization_app/static/**", "visualization_app/app.py", "visualization_app/generate_thermocouple64_simulation.py", "visualization_app/test_thermocouple64_frontend.py", "openspec/changes/expand-thermocouple-to-64-channels/**"]
+    },
+    {
       "id": "harness-contracts",
       "title": "Harness单元与契约测试",
       "kind": "command",
@@ -257,7 +303,7 @@
     },
     {
       "id": "interface-monitor-contracts",
-      "title": "五类接口、通道归属和诊断展示契约",
+      "title": "六类接口、通道归属和诊断展示契约",
       "kind": "command",
       "command": ["{python}", "-m", "unittest", "discover", "-s", "interface_monitor_demo/tests", "-v"],
       "cwd": ".",
@@ -293,7 +339,7 @@
       "environments": ["local", "ci"],
       "blocking": true,
       "evidence_tier": "automated",
-      "requirements": ["STARTUP-001", "INTERFACES-001", "INTERFACES-002", "SIMULATION-002", "USB_TOPOLOGY-001", "PHYSICAL_READINESS-001"],
+      "requirements": ["STARTUP-001", "INTERFACES-001", "INTERFACES-002", "SIMULATION-002", "MODE_ISOLATION-001", "USB_TOPOLOGY-001", "PHYSICAL_READINESS-001"],
       "change_patterns": ["visualization_app/static/**", "visualization_app/test_frontend_guest_simulation.py", "visualization_app/test_usb_interface_candidates.py"]
     },
     {
@@ -351,7 +397,7 @@
     },
     {
       "id": "diagnosis-interface-contracts",
-      "title": "接口、M3232、本地与模型增强诊断契约",
+      "title": "六接口、本地与模型增强诊断契约",
       "kind": "command",
       "command": ["{python}", "-m", "unittest", "test_agentic_diagnosis", "test_interface_agent", "test_json_safety", "test_m3232_pressure", "test_mysql_diagnostics", "-v"],
       "cwd": "visualization_app",
@@ -403,17 +449,17 @@
     },
     {
       "id": "real-acquisition-protocol-contracts",
-      "title": "真实采集协议与交付前端模拟启动生命周期契约",
+      "title": "ESR1001-A协议、21通道数据链路与六接口契约",
       "kind": "command",
-      "command": ["{python}", "F:\\new_AFP_exam\\AFP_Integrated_System_Modular\\verification\\test_real_acquisition_pipeline.py", "-v"],
+      "command": ["{python}", "-m", "unittest", "visualization_app.test_esr1001_strain", "-v"],
       "cwd": ".",
       "timeout_seconds": 180,
       "profiles": ["quick", "full", "release"],
-      "environments": ["local"],
+      "environments": ["local", "ci"],
       "blocking": true,
       "evidence_tier": "protocol_simulation",
-      "requirements": ["STARTUP-001", "SIMULATION-001", "SIMULATION-002", "INTERFACES-002", "REAL_ACQUISITION-001", "PHYSICAL_READINESS-001", "MODE_ISOLATION-001", "DIAGNOSIS-001", "LIVE_PREDICTION_SAFETY-001", "CAPTURE_PERSISTENCE-001", "REAL_PREP_PROTOCOL-001"],
-      "change_patterns": ["visualization_app/static/**", "visualization_app/app.py", "visualization_app/acquisition.py", "visualization_app/real_acquisition.py", "pre_sensor/**", "modular_runtime/**", "openspec/changes/harden-real-acquisition-pipeline/**"]
+      "requirements": ["STARTUP-001", "SIMULATION-001", "SIMULATION-002", "INTERFACES-002", "REAL_ACQUISITION-001", "PHYSICAL_READINESS-001", "MODE_ISOLATION-001", "DIAGNOSIS-001", "LIVE_PREDICTION_SAFETY-001", "CAPTURE_PERSISTENCE-001", "REAL_PREP_PROTOCOL-001", "ESR1001-001"],
+      "change_patterns": ["visualization_app/static/**", "visualization_app/app.py", "visualization_app/acquisition.py", "visualization_app/real_acquisition.py", "visualization_app/test_esr1001_strain.py", "pre_sensor/**", "modular_runtime/**", "openspec/changes/add-esr1001-strain-acquisition/**"]
     },
     {
       "id": "release-module-status",
@@ -495,7 +541,7 @@
     },
     {
       "id": "field-real-hardware",
-      "title": "真实SMRF、PLC、ABB、UVC和M3232现场验收",
+      "title": "64路热电偶、PLC、ABB、UVC、M3232和ESR1001-A现场验收（热电偶协议资料待确认）",
       "kind": "field",
       "command": [],
       "cwd": ".",
@@ -504,7 +550,7 @@
       "environments": ["local"],
       "blocking": false,
       "evidence_tier": "field",
-      "requirements": ["INTERFACES-001", "FIELD_BOUNDARY-001", "REAL_ACQUISITION-001", "PHYSICAL_READINESS-001", "REAL_RELEASE_GATE-001", "REAL_PREP_MODE-001", "REAL_PREP_PROTOCOL-001", "REAL_PREP_RECOVERY-001"]
+      "requirements": ["INTERFACES-001", "FIELD_BOUNDARY-001", "REAL_ACQUISITION-001", "PHYSICAL_READINESS-001", "REAL_RELEASE_GATE-001", "REAL_PREP_MODE-001", "REAL_PREP_PROTOCOL-001", "REAL_PREP_RECOVERY-001", "ESR1001-001"]
     },
     {
       "id": "field-target-mysql",

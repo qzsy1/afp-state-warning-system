@@ -17,6 +17,12 @@ const state = {
   reloadQueued: false,
   requestedHorizon: null,
   showResidual: false,
+  thermocouple64View: "raw",
+  thermocouple64Visible: new Set(),
+  thermocouple64MeanVisible: new Set(Array.from({length: 8}, (_, index) => index)),
+  thermocouple64SelectedGroup: 0,
+  thermocouple64Cache: null,
+  thermocouple64Raf: 0,
   showLayerEvidence: true,
   manualPredictionModels: {},
   liveScopeKey: null,
@@ -98,6 +104,7 @@ const state = {
 };
 
 const $ = (id) => document.getElementById(id);
+const isModernSchemaId = (schemaId) => ["new_collection_v11_3", "new_collection_v12_0", "new_collection_v13_0"].includes(String(schemaId || ""));
 
 const agentApiKeyInput = $("agentApiKeyInput");
 const agentModelNameInput = $("agentModelNameInput");
@@ -778,6 +785,7 @@ function applySensorTypeProfile(row, resetEndpoint = true) {
   const endpoint = row.querySelector(".interface-endpoint");
   const map = row.querySelector(".interface-map");
   const mapLabel = map?.closest(".interface-map-label");
+  const baudrate = row.querySelector(".interface-baudrate");
   const detail = row.querySelector(".interface-profile-detail");
   const profile = sensorTypeProfile(role?.value || "custom");
   if (driver) {
@@ -787,6 +795,8 @@ function applySensorTypeProfile(row, resetEndpoint = true) {
   if (endpoint && (resetEndpoint || !endpoint.value.trim())) {
     endpoint.value = profile.endpoint || "";
   }
+  if (baudrate && profile.baudrate) baudrate.value = String(profile.baudrate);
+  row.dataset.slaveId = String(profile.slave_id || row.dataset.slaveId || 1);
   if (map) map.disabled = !profile.editable_driver;
   if (mapLabel) mapLabel.classList.toggle("hidden", !profile.editable_driver);
   if (detail) {
@@ -897,7 +907,7 @@ function selectedModelInputSensors() {
 
 
 function liveEvidenceScopeKey() {
-  const newSchema = controls.datasetSchema.value === "new_collection_v11_3";
+  const newSchema = isModernSchemaId(controls.datasetSchema.value);
   return JSON.stringify({
     schema: controls.datasetSchema.value || "legacy_original",
     specimen: controls.liveSpecimen.value.trim() || "LIVE_SPECIMEN",
@@ -923,7 +933,7 @@ function resetLiveEvidenceDisplay() {
   renderLayerProgress([]);
   state.payload = null;
   state.liveScopeKey = liveEvidenceScopeKey();
-  const layerControl = controls.datasetSchema.value === "new_collection_v11_3"
+  const layerControl = isModernSchemaId(controls.datasetSchema.value)
     ? controls.newLayer
     : controls.liveLayer;
   if (layerControl && !layerControl.disabled) layerControl.value = "0";
@@ -1403,11 +1413,17 @@ function updateDatasetMeta() {
 
 function configureBestPredictionOverride() {
   const schema = controls.datasetSchema.value || "legacy_original";
-  const enabled = controls.bestPredictionOverride.checked;
+  const overrideControl = controls.bestPredictionOverride;
   const bestProfile =
     state.bootstrap?.acquisition?.best_prediction_models?.[schema];
   const running = Boolean(state.payload?.acquisition?.running);
-  if (enabled && bestProfile) {
+  const available = Boolean(
+    bestProfile && bestProfile.available !== false && bestProfile.checkpoint,
+  );
+  if (!available) overrideControl.checked = false;
+  overrideControl.disabled = running || !available;
+  const enabled = overrideControl.checked;
+  if (enabled && available) {
     if (
       controls.predictionModel.value.trim()
       && controls.predictionModel.value.trim() !== bestProfile.checkpoint
@@ -1426,8 +1442,9 @@ function configureBestPredictionOverride() {
       controls.predictionModel.value = manualPath;
       inspectPredictionModel(true).catch(() => {});
     }
-    $("bestPredictionOverrideNote").textContent =
-      "未勾选：严格使用上方手动选择的模型；勾选：只按验证集误差选择同一采集方案内的最佳兼容模型，不使用测试集或未来真实值。";
+    $("bestPredictionOverrideNote").textContent = !available
+      ? (bestProfile?.reason || "当前采集方案没有可用的验证集兼容模型；可选择仅采集模式。")
+      : "未勾选：严格使用上方手动选择的模型；勾选：只按验证集误差选择同一采集方案内的最佳兼容模型，不使用测试集或未来真实值。";
   }
   controls.predictionModel.disabled = running || enabled;
   $("selectPredictionModelButton").disabled = running || enabled;
@@ -1990,6 +2007,7 @@ function agentEscapeHtml(value) {
 
 function buildAgentEvents(hardwareResult) {
   const interfaceLabels = {
+    thermocouple_64ch: "64路热电偶",
     thermocouple_8ch: "SMRF 八通道热电偶",
     plc_process: "松下 PLC",
     uvc_temperature: "BSV UVC 热像仪",
@@ -2706,7 +2724,7 @@ async function stopAcquisition() {
   if (statusNode) statusNode.textContent = "正在停止采集并保存文件，请勿关闭页面…";
   try {
     stopLocalSimulationReplay();
-    const layerControl = controls.datasetSchema.value === "new_collection_v11_3"
+    const layerControl = isModernSchemaId(controls.datasetSchema.value)
       ? controls.newLayer
       : controls.liveLayer;
     const completedLayer = Number(layerControl.value) || 0;
@@ -2962,7 +2980,12 @@ function configureDatasetSchema(useDefaults = true) {
     (item) => item.id === controls.datasetSchema.value
   );
   if (!schema) return;
-  const isNew = schema.id === "new_collection_v11_3";
+  if (useDefaults && schema.id === "new_collection_v13_0") {
+    controls.processingMode.value = "capture_only";
+    $("acquisitionSection").open = true;
+    $("sensorSettingsSection").open = true;
+  }
+  const isNew = isModernSchemaId(schema.id);
   populatePredictionModelTypes();
   const schemaIndicators = state.bootstrap.indicator_schemas?.[schema.id]
     || state.bootstrap.indicators;
@@ -3433,20 +3456,23 @@ async function loadRealtime() {
     return;
   }
   state.busy = true;
+  const endpoint = controls.dataMode.value === "live"
+    ? (state.accessRole === "guest" ? "/api/simulation/live" : "/api/live")
+    : "/api/realtime";
   try {
-    const endpoint = controls.dataMode.value === "live"
-      ? (state.accessRole === "guest" ? "/api/simulation/live" : "/api/live")
-      : "/api/realtime";
     const response = await fetch(`${endpoint}?${queryString()}`, { cache: "no-store" });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || "实时数据请求失败");
     applyRealtimePayload(payload);
   } catch (error) {
     stopPlayback();
-    toast(error.message);
+    const detail = `页面数据请求 ${endpoint} 失败：${error.message}`;
+    toast(detail);
     markServerDisconnected();
-    $("connectionStatus").textContent = "实时数据服务连接失败";
-    $("streamStatus").textContent = "数据服务异常";
+    $("connectionStatus").textContent = `数据加载失败（${endpoint}）`;
+    $("streamStatus").textContent = error.message === "Failed to fetch"
+      ? "无法连接页面数据服务；请核对启动入口与服务端口。"
+      : `页面数据请求失败：${error.message}`;
     document.querySelector(".live-dot")?.classList.remove("active");
   } finally {
     state.busy = false;
@@ -3553,6 +3579,8 @@ function renderProcessParameters(process) {
   const schemaLabels = {
     legacy_original: "旧数据格式（p / v / pr）",
     new_collection_v11_3: "新数据格式（压实力 / 速度 / 角度 / 设定温度）",
+    new_collection_v12_0: "历史21通道数据（只读兼容）",
+    new_collection_v13_0: "64路热电偶正式采集方案（77路原始通道）",
   };
   const sourceLabels = {
     input_data: "由输入数据自动提取",
@@ -3565,9 +3593,9 @@ function renderProcessParameters(process) {
 }
 
 function configuredProcessPayload() {
-  if (activeInputSchemaId() === "new_collection_v11_3") {
+  if (isModernSchemaId(activeInputSchemaId())) {
     return {
-      schema_id: "new_collection_v11_3",
+      schema_id: activeInputSchemaId(),
       parameter_source: "configuration",
       injection_severity: 0,
       display_parameters: [
@@ -3731,8 +3759,9 @@ function render(payload, {stablePublicDemo = false, previousPayload = null} = {}
   const visiblePredictionCount = payload.channels.filter(
     (item) => item.prediction_enabled !== false
   ).length;
+  const otherChannels = payload.thermocouple64?.other_channels || payload.channels;
   $("allChannelHint").textContent =
-    `${payload.channels.length}个通道显示实测；${visiblePredictionCount}个通道显示预测`;
+    `${otherChannels.length}个通道 · 一行4个 · 内部滚动 · 点击放大`;
   $("calculationModeNote").textContent =
     captureOnly
       ? "当前为仅采集模式：不加载模型，不生成预测、健康指标或三级预警。"
@@ -3759,7 +3788,8 @@ function render(payload, {stablePublicDemo = false, previousPayload = null} = {}
     renderProbabilities(windowData.type_probabilities);
     renderLayerProgress(payload.layers);
   }
-  renderSensorCards(payload.channels, payload.selection.sensor, {
+  renderThermocouple64(payload.thermocouple64);
+  renderSensorCards(payload.thermocouple64?.other_channels || payload.channels, payload.selection.sensor, {
     reuse: stablePublicDemo && Boolean(previousPayload),
   });
 }
@@ -3775,7 +3805,7 @@ function setupCanvas(canvas, height) {
 }
 
 function renderSeriesChart(channel) {
-  drawChannelChart($("seriesChart"), channel, 300, false);
+  drawChannelChart($("seriesChart"), channel, 220, false);
 }
 
 function drawChannelChart(canvas, channel, height, compact) {
@@ -3830,7 +3860,7 @@ function drawChannelChart(canvas, channel, height, compact) {
   const py = (value) => pad.top + ((ymax - value) / Math.max(ymax - ymin, 1e-9)) * (height - pad.top - pad.bottom);
 
   ctx.clearRect(0, 0, width, height);
-  ctx.font = compact ? "9px Segoe UI" : "10px Segoe UI";
+  ctx.font = "11px Segoe UI";
   ctx.strokeStyle = "#dce6ed";
   ctx.fillStyle = "#6b8193";
   ctx.lineWidth = 1;
@@ -3840,7 +3870,7 @@ function drawChannelChart(canvas, channel, height, compact) {
     ctx.beginPath(); ctx.moveTo(pad.left, yy); ctx.lineTo(width - pad.right, yy); ctx.stroke();
     ctx.fillText((ymax - (i / gridCount) * (ymax - ymin)).toFixed(2), 3, yy + 3);
   }
-  const xGridCount = compact ? 4 : 6;
+  const xGridCount = compact ? (width < 240 ? 2 : 4) : 6;
   for (let i = 0; i <= xGridCount; i += 1) {
     const xx = pad.left + (i / xGridCount) * (width - pad.left - pad.right);
     ctx.beginPath(); ctx.moveTo(xx, pad.top); ctx.lineTo(xx, height - pad.bottom); ctx.stroke();
@@ -3930,6 +3960,325 @@ function renderProbabilities(probabilities) {
   }));
 }
 
+const THERMOCOUPLE64_COLORS = [
+  "#1f6fb2", "#d94c57", "#18866b", "#d9902f",
+  "#7857c8", "#2e9eb2", "#8b5e3c", "#667788",
+];
+const THERMOCOUPLE64_HISTORY_LIMIT = 2048;
+
+function thermocouple64DownsampleIndices(matrix, maxPoints = 600) {
+  const length = matrix.reduce((maximum, row) => Math.max(maximum, row.length), 0);
+  if (length <= maxPoints) return Array.from({length}, (_, index) => index);
+  const chosen = new Set([0, length - 1]);
+  const buckets = Math.max(1, Math.floor((maxPoints - 2) / 2));
+  const size = (length - 2) / buckets;
+  for (let bucket = 0; bucket < buckets; bucket += 1) {
+    const start = 1 + Math.floor(bucket * size);
+    const end = Math.min(length - 1, 1 + Math.ceil((bucket + 1) * size));
+    let minimum = null, maximum = null;
+    for (let index = start; index < end; index += 1) {
+      const values = matrix.map((row) => row[index]).filter(Number.isFinite);
+      if (!values.length) continue;
+      const low = Math.min(...values), high = Math.max(...values);
+      if (!minimum || low < minimum.value) minimum = {index, value: low};
+      if (!maximum || high > maximum.value) maximum = {index, value: high};
+    }
+    if (minimum) chosen.add(minimum.index);
+    if (maximum) chosen.add(maximum.index);
+  }
+  return [...chosen].sort((a, b) => a - b).slice(0, maxPoints);
+}
+
+function drawThermocouple64GroupDetail(canvas, matrix, visible, fixedRange = null) {
+  if (!canvas?.isConnected || canvas.closest('.hidden')) return;
+  const preview = canvas.classList.contains('thermocouple64-preview');
+  const {ctx, width, height} = setupCanvas(canvas, preview ? 104 : 170);
+  if (width <= 0) return;
+  const active = matrix.filter((_, index) => visible[index] !== false);
+  const all = active.flat().filter(Number.isFinite);
+  canvas.dataset.seriesCount = String(matrix.length);
+  canvas.dataset.visibleSeriesCount = String(active.length);
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = '#5d7589';
+  ctx.font = '11px Segoe UI';
+  if (!all.length) {
+    ctx.fillText(active.length ? '暂无有效值' : '曲线已隐藏', 3, 24);
+    return;
+  }
+  let ymin = fixedRange?.min, ymax = fixedRange?.max;
+  if (!Number.isFinite(ymin) || !Number.isFinite(ymax) || ymin >= ymax) {
+    ymin = Math.min(...all); ymax = Math.max(...all);
+    const margin = Math.max((ymax - ymin) * .08, Math.abs(ymax) * .01, 1e-6);
+    ymin -= margin; ymax += margin;
+  }
+  canvas.dataset.rangeMin = String(ymin); canvas.dataset.rangeMax = String(ymax);
+  const pad = {left: preview ? 27 : 45, right: 5, top: 16, bottom: 19};
+  const indices = thermocouple64DownsampleIndices(active, Math.max(40, Math.floor(width)));
+  const length = Math.max(1, ...matrix.map(row => row.length));
+  const px = index => pad.left + index / Math.max(length - 1, 1) * (width - pad.left - pad.right);
+  const py = value => pad.top + (ymax - value) / (ymax - ymin) * (height - pad.top - pad.bottom);
+  ctx.strokeStyle = '#dce6ed'; ctx.lineWidth = 1;
+  for (let line = 0; line <= 2; line += 1) {
+    const y = pad.top + line / 2 * (height - pad.top - pad.bottom);
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(width - pad.right, y); ctx.stroke();
+    ctx.fillText((ymax - line / 2 * (ymax - ymin)).toFixed(preview ? 0 : 1), 1, y + 3);
+  }
+  ctx.fillText('°C', pad.left, 11);
+  const times = state.thermocouple64Cache?.timeAxis || [];
+  ctx.fillText(Number(times[0] || 0).toFixed(0), pad.left, height - 4);
+  ctx.textAlign = 'right';
+  ctx.fillText(`${Number(times.at(-1) || 0).toFixed(0)}s`, width - pad.right, height - 4);
+  ctx.textAlign = 'left';
+  matrix.forEach((values, channelIndex) => {
+    if (visible[channelIndex] === false) return;
+    ctx.beginPath(); let drawing = false, previous = -1;
+    indices.forEach(index => {
+      for (let gap = previous + 1; gap < index; gap += 1) {
+        if (!Number.isFinite(values[gap])) { drawing = false; break; }
+      }
+      previous = index;
+      const value = values[index];
+      if (!Number.isFinite(value)) { drawing = false; return; }
+      if (drawing) ctx.lineTo(px(index), py(value));
+      else { ctx.moveTo(px(index), py(value)); drawing = true; }
+    });
+    ctx.strokeStyle = THERMOCOUPLE64_COLORS[channelIndex % 8];
+    ctx.lineWidth = preview ? 1.2 : 1.7; ctx.stroke();
+  });
+}
+
+function thermocouple64UniformRange(cache) {
+  if (!$('thermocouple64UniformScale')?.checked) return null;
+  const values = (state.thermocouple64View === 'average' ? cache.derivedSeries.flat() : cache.rawSeries.flat(2)).filter(Number.isFinite);
+  if (!values.length) return null;
+  const min = values.reduce((value, item) => Math.min(value, item), Infinity);
+  const max = values.reduce((value, item) => Math.max(value, item), -Infinity);
+  const margin = Math.max((max - min) * .08, Math.abs(max) * .01, 1e-6);
+  return {min: min - margin, max: max + margin};
+}
+
+function thermocouple64GroupVisibility(groupIndex) {
+  const cache = state.thermocouple64Cache;
+  const abnormalOnly = Boolean($('thermocouple64AbnormalOnly')?.checked);
+  return Array.from({length: 8}, (_, offset) => {
+    const index = groupIndex * 8 + offset;
+    return state.thermocouple64Visible.has(index) && (!abnormalOnly || cache?.qualities[index] !== 'measured_new');
+  });
+}
+
+function scheduleThermocouple64Draw() {
+  if (state.thermocouple64Raf || document.hidden) return;
+  state.thermocouple64Raf = window.requestAnimationFrame(() => {
+    state.thermocouple64Raf = 0;
+    const cache = state.thermocouple64Cache;
+    if (!cache) return;
+    const raw = state.thermocouple64View === 'raw', range = thermocouple64UniformRange(cache);
+    const target = raw ? $('thermocouple64RawGroups') : $('thermocouple64AverageGroups');
+    target?.querySelectorAll('.thermocouple64-preview').forEach((canvas, group) => {
+      drawThermocouple64GroupDetail(canvas, raw ? cache.rawSeries[group] : [cache.derivedSeries[group]],
+        raw ? thermocouple64GroupVisibility(group) : [state.thermocouple64MeanVisible.has(group)], range);
+    });
+    if (state.thermocouple64DetailActive && $('sensorSharedDetail')?.open) {
+      const group = state.thermocouple64SelectedGroup || 0;
+      drawThermocouple64GroupDetail($('thermocouple64GroupCanvas'), raw ? cache.rawSeries[group] : [cache.derivedSeries[group]],
+        raw ? thermocouple64GroupVisibility(group) : [state.thermocouple64MeanVisible.has(group)], range);
+    }
+  });
+}
+
+function thermocouple64GroupLabel(groupIndex) {
+  return `TC-G${String(groupIndex + 1).padStart(2, '0')}`;
+}
+
+function updateThermocouple64ScrollHint() {
+  const viewport = document.querySelector('.thermocouple64-panel-content');
+  const hint = $('thermocouple64ScrollHint');
+  if (!viewport || !hint) return;
+  const hasMore = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight > 2;
+  hint.classList.toggle('hidden', !hasMore || state.thermocouple64View !== 'raw');
+}
+
+function updateThermocouple64DisplayedCount() {
+  const cache = state.thermocouple64Cache;
+  if (!cache) return;
+  const displayedChannels = Array.from({length: 8}, (_, group) => thermocouple64GroupVisibility(group)).flat().filter(Boolean).length;
+  $('thermocouple64Status').textContent = state.thermocouple64View === 'raw'
+    ? `8张组图 × 8条原始曲线 · 已显示 ${displayedChannels}/64 通道`
+    : '8张组图 × 1条严格均值曲线 · 共8个组均值';
+}
+
+function renderThermocouple64Legend(legend, groupIndex, compact = false) {
+  if (!legend) return;
+  const raw = state.thermocouple64View === 'raw';
+  const key = `${raw}:${groupIndex}`;
+  if (legend.dataset.key !== key) {
+    const buttons = Array.from({length: raw ? 8 : 1}, (_, offset) => {
+      const index = raw ? groupIndex * 8 + offset : groupIndex;
+      const name = raw ? `温度${index + 1}` : `热电偶均值${index + 1}`;
+      const button = document.createElement('button'); button.type = 'button';
+      button.className = 'thermocouple64-legend-button';
+      button.dataset.channelIndex = String(index);
+      button.setAttribute('aria-label', `${name}曲线显隐`);
+      const swatch = document.createElement('i'); swatch.style.backgroundColor = THERMOCOUPLE64_COLORS[offset];
+      button.append(swatch, document.createTextNode(compact ? (raw ? `T${index + 1}` : '均值') : name));
+      button.addEventListener('click', () => {
+        const visible = raw ? state.thermocouple64Visible : state.thermocouple64MeanVisible;
+        if (visible.has(index)) visible.delete(index); else visible.add(index);
+        refreshThermocouple64Legends(); updateThermocouple64DisplayedCount(); scheduleThermocouple64Draw();
+      });
+      return button;
+    });
+    legend.replaceChildren(...buttons); legend.dataset.key = key;
+  }
+  [...legend.children].forEach((button, offset) => {
+    const index = raw ? groupIndex * 8 + offset : groupIndex;
+    button.setAttribute('aria-pressed', String((raw ? state.thermocouple64Visible : state.thermocouple64MeanVisible).has(index)));
+    const cache = state.thermocouple64Cache;
+    const value = raw ? cache.rawSeries[groupIndex][offset].at(-1) : cache.derivedSeries[groupIndex].at(-1);
+    button.title = `${raw ? cache.rawNames[index] : `热电偶均值${index + 1}`}：${Number.isFinite(value) ? value.toFixed(2) + ' °C' : '不可用'}；${raw ? cache.qualities[index] || 'missing' : '严格8成员均值'}`;
+    button.dataset.quality = raw ? cache.qualities[index] || 'missing' : 'derived';
+  });
+}
+
+function refreshThermocouple64Legends() {
+  const target = state.thermocouple64View === 'raw' ? $('thermocouple64RawGroups') : $('thermocouple64AverageGroups');
+  target?.querySelectorAll('.thermocouple64-preview-legend').forEach((legend, group) => renderThermocouple64Legend(legend, group, true));
+  renderThermocouple64GroupLegend();
+}
+
+function renderThermocouple64GroupLegend() {
+  if (!state.thermocouple64Cache) return;
+  const group = state.thermocouple64SelectedGroup || 0;
+  renderThermocouple64Legend($('thermocouple64GroupLegend'), group);
+  const members = $('thermocouple64DetailMembers'), cache = state.thermocouple64Cache;
+  if (!members) return;
+  if (members.dataset.groupIndex !== String(group)) {
+    members.replaceChildren(...Array.from({length: 8}, (_, offset) => {
+      const button = document.createElement('button'); button.type = 'button';
+      button.addEventListener('click', () => selectThermocouple64Raw(`温度${group * 8 + offset + 1}`));
+      return button;
+    }));
+    members.dataset.groupIndex = String(group);
+  }
+  [...members.children].forEach((button, offset) => {
+    const index = group * 8 + offset, value = cache.rawSeries[group][offset].at(-1);
+    button.textContent = `${cache.rawNames[index]} ${Number.isFinite(value) ? value.toFixed(2) : '不可用'} °C ↗`;
+    button.title = `${cache.qualities[index] || 'missing'}；单通道放大`;
+  });
+}
+
+function showSensorSharedDetail(group = false) {
+  state.thermocouple64DetailActive = group;
+  $('sensorSingleDetail')?.classList.toggle('hidden', group);
+  $('thermocouple64GroupDetail')?.classList.toggle('hidden', !group);
+  document.querySelector('#sensorSharedDetail > summary .legend')?.classList.toggle('hidden', group);
+  if ($('sensorSharedDetail')) $('sensorSharedDetail').open = true;
+}
+
+function selectThermocouple64Group(groupIndex, {focusRow = false, openDetail = false} = {}) {
+  const normalized = Math.max(0, Math.min(7, Number(groupIndex) || 0));
+  state.thermocouple64SelectedGroup = normalized;
+  const label = thermocouple64GroupLabel(normalized);
+  document.querySelectorAll('.thermocouple64-row, .thermocouple64-average-card').forEach(card => {
+    const selected = Number(card.dataset.groupIndex) === normalized;
+    card.classList.toggle('selected', selected);
+    card.querySelector('.thermocouple64-row-label')?.setAttribute('aria-pressed', String(selected));
+  });
+  $('thermocouple64GroupDetailTitle').textContent = `${label} ${state.thermocouple64View === 'raw' ? '组详情' : '组均值详情'}：温度${normalized * 8 + 1}～温度${normalized * 8 + 8}`;
+  const info = state.thermocouple64Cache?.latest?.[normalized] || {};
+  $('thermocouple64GroupDetailStatus').textContent = `有效${info.valid_count || 0}/8 · ${info.imputed_channels?.length ? '含中位数补值' : '无补值'} · ${state.thermocouple64Cache?.scope || ''}`;
+  if (openDetail) showSensorSharedDetail(true);
+  if (state.thermocouple64DetailActive) $('seriesTitle').textContent = `${label} · 共用放大详情`;
+  renderThermocouple64GroupLegend();
+  if (focusRow) document.querySelector(`.thermocouple64-row[data-group-index="${normalized}"]`)?.scrollIntoView({block: 'nearest'});
+  updateThermocouple64ScrollHint(); scheduleThermocouple64Draw();
+}
+
+function selectThermocouple64Raw(name) {
+  const channel = state.payload?.channels?.find(item => item.name === name);
+  if (!channel) return;
+  controls.sensor.value = String(channel.id);
+  showSensorSharedDetail(false);
+  loadRealtime();
+}
+
+function selectThermocouple64Mean(index) {
+  selectThermocouple64Group(index, {openDetail: true});
+}
+
+function createThermocouple64GroupCard(groupIndex, average = false) {
+  const card = document.createElement('article');
+  card.className = average ? 'thermocouple64-average-card' : 'thermocouple64-row';
+  card.dataset.groupIndex = String(groupIndex);
+  const label = document.createElement('button'); label.type = 'button'; label.className = 'thermocouple64-row-label';
+  label.innerHTML = `${thermocouple64GroupLabel(groupIndex)}<span>温度${groupIndex * 8 + 1}～${groupIndex * 8 + 8}</span>`;
+  label.addEventListener('click', () => selectThermocouple64Group(groupIndex, {openDetail: true}));
+  const canvas = document.createElement('canvas'); canvas.className = 'thermocouple64-preview';
+  canvas.setAttribute('role', 'img'); canvas.setAttribute('aria-label', `${thermocouple64GroupLabel(groupIndex)}，${average ? '1条严格均值曲线' : '8条原始温度曲线'}，单位摄氏度`);
+  canvas.dataset.channels = Array.from({length: 8}, (_, offset) => `温度${groupIndex * 8 + offset + 1}`).join(',');
+  const legend = document.createElement('div'); legend.className = 'thermocouple64-preview-legend';
+  const status = document.createElement('div'); status.className = 'thermocouple64-preview-status';
+  const members = document.createElement('button'); members.type = 'button'; members.className = 'thermocouple64-member-entry';
+  members.textContent = '8成员 · 放大';
+  members.addEventListener('click', () => selectThermocouple64Group(groupIndex, {openDetail: true}));
+  card.append(label, canvas, legend, status, members);
+  return card;
+}
+
+function ensureThermocouple64RawControls(rawNames) {
+  const target = $('thermocouple64RawGroups');
+  if (target && target.children.length !== 8) target.replaceChildren(...Array.from({length: 8}, (_, group) => createThermocouple64GroupCard(group)));
+}
+
+function ensureThermocouple64AverageCards(meanNames) {
+  const target = $('thermocouple64AverageGroups');
+  if (target && target.children.length !== 8) target.replaceChildren(...Array.from({length: 8}, (_, group) => createThermocouple64GroupCard(group, true)));
+}
+
+function renderThermocouple64(payload) {
+  const panel = $('thermocouple64Panel'), split = $('sensorMonitorSplit');
+  if (!panel) return;
+  if (!payload?.raw_directory || !payload?.derived_directory) {
+    panel.classList.add('hidden'); split?.classList.add('thermocouple-unavailable');
+    state.thermocouple64Cache = null; return;
+  }
+  panel.classList.remove('hidden'); split?.classList.remove('thermocouple-unavailable');
+  window.requestAnimationFrame(() => split?.reapplySensorPanelRatio?.());
+  const rawNames = payload.raw_directory.channels.map(item => item.name);
+  const rawRows = (payload.raw_history || []).slice(-THERMOCOUPLE64_HISTORY_LIMIT);
+  const derivedRows = (payload.derived_history || []).slice(-THERMOCOUPLE64_HISTORY_LIMIT);
+  const rawSeries = Array.from({length: 8}, (_, group) => Array.from({length: 8}, (_, offset) => rawRows.map(row => row[group * 8 + offset] ?? null)));
+  const derivedSeries = Array.from({length: 8}, (_, index) => derivedRows.map(row => row[index] ?? null));
+  const latest = payload.derived_directory.channels.map(name => payload.derived_latest?.[name] || {});
+  state.thermocouple64Cache = {rawNames, rawSeries, derivedSeries, latest, scope: payload.scope,
+    qualities: payload.raw_latest_quality || [], timeAxis: (payload.time_axis || []).slice(-THERMOCOUPLE64_HISTORY_LIMIT), sequence: payload.sequence};
+  if (!state.thermocouple64VisibilityInitialized) {
+    rawNames.forEach((_, index) => state.thermocouple64Visible.add(index));
+    state.thermocouple64VisibilityInitialized = true;
+  }
+  const rawView = state.thermocouple64View === 'raw';
+  ensureThermocouple64RawControls(rawNames); ensureThermocouple64AverageCards(payload.derived_directory.channels);
+  $('thermocouple64RawView').classList.toggle('hidden', !rawView);
+  $('thermocouple64AverageGroups').classList.toggle('hidden', rawView);
+  const target = rawView ? $('thermocouple64RawGroups') : $('thermocouple64AverageGroups');
+  [...target.children].forEach((card, group) => {
+    const info = latest[group];
+    const valid = rawView ? rawSeries[group].filter((series, offset) => Number.isFinite(series.at(-1)) && state.thermocouple64Cache.qualities[group * 8 + offset] === 'measured_new').length : info.valid_count || 0;
+    const quality = valid === 8 ? '质量正常' : '存在缺失';
+    card.querySelector('.thermocouple64-preview-status').textContent = `有效${valid}/8 · ${quality}`;
+    card.querySelector('.thermocouple64-preview-status').title = `${info.imputed_channels?.length ? '含整层中位数补值：' + info.imputed_channels.join('、') : '无补值'} · ${payload.scope} · ${payload.model_support ? '模型支持' : '模型不匹配/仅采集'}`;
+    if (!rawView && info.imputed_channels?.length) card.querySelector('.thermocouple64-preview-status').textContent = `有效${valid}/8 · 含补值`;
+    card.dataset.validCount = String(valid);
+  });
+  refreshThermocouple64Legends(); updateThermocouple64DisplayedCount();
+  selectThermocouple64Group(state.thermocouple64SelectedGroup);
+  window.requestAnimationFrame(updateThermocouple64ScrollHint);
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) scheduleThermocouple64Draw();
+});
+
 function renderSensorCardsInto(target, channels, selectedId, {reuse = false} = {}) {
   const updateCard = (card, channel) => {
     const predictionEnabled = channel.prediction_enabled !== false;
@@ -3940,16 +4289,17 @@ function renderSensorCardsInto(target, channels, selectedId, {reuse = false} = {
     const actual = card.querySelector(".sensor-actual-value");
     const predicted = card.querySelector(".sensor-prediction-value");
     const rmse = card.querySelector(".sensor-rmse-value");
+    const quality = card.querySelector(".sensor-quality-status");
     if (actual) actual.textContent = fmt(channel.actual_current, 2);
     if (predicted) predicted.textContent = fmt(channel.prediction_current, 2);
     if (rmse) rmse.textContent = fmt(channel.rmse, 3);
+    if (quality) quality.textContent = channel.quality || channel.status || (Number.isFinite(channel.actual_current) ? "有效" : "不可用");
     window.requestAnimationFrame(() =>
-      drawChannelChart(card.querySelector("canvas"), channel, 170, true)
+      drawChannelChart(card.querySelector("canvas"), channel, 150, true)
     );
   };
   const existing = target ? [...target.querySelectorAll(":scope > .full-sensor-card")] : [];
-  const canReuse = reuse
-    && existing.length === channels.length
+  const canReuse = existing.length === channels.length
     && existing.every((card, index) => card.dataset.channelId === String(channels[index]?.id));
   if (canReuse) {
     existing.forEach((card, index) => updateCard(card, channels[index]));
@@ -3962,6 +4312,9 @@ function renderSensorCardsInto(target, channels, selectedId, {reuse = false} = {
       `sensor-card full-sensor-card${channel.id === selectedId ? " selected" : ""}` +
       `${predictionEnabled ? "" : " prediction-hidden"}`;
     card.dataset.channelId = String(channel.id);
+    card.tabIndex = 0;
+    card.setAttribute("role", "button");
+    card.setAttribute("aria-label", `${channel.name}，${channel.unit || "无单位"}，查看共享大图`);
     const predictionMetrics = predictionEnabled
       ? `<span>预测 <strong class="sensor-prediction-value">${fmt(channel.prediction_current, 2)}</strong></span>
          <span>RMSE <strong class="sensor-rmse-value">${fmt(channel.rmse, 3)}</strong></span>`
@@ -3972,12 +4325,20 @@ function renderSensorCardsInto(target, channels, selectedId, {reuse = false} = {
         <div class="sensor-live-values">
           <span>实测 <strong class="sensor-actual-value">${fmt(channel.actual_current, 2)}</strong></span>
           ${predictionMetrics}
+          <span class="sensor-quality-status">${channel.quality || channel.status || (Number.isFinite(channel.actual_current) ? "有效" : "不可用")}</span>
         </div>
       </div>
-      <canvas class="full-channel-chart" height="170"></canvas>`;
-    card.addEventListener("click", () => {
+      <canvas class="full-channel-chart" height="150" aria-label="${channel.name}实时曲线"></canvas>`;
+    const selectCard = () => {
       controls.sensor.value = card.dataset.channelId;
+      showSensorSharedDetail(false);
       loadRealtime();
+    };
+    card.addEventListener("click", selectCard);
+    card.addEventListener("keydown", (event) => {
+      if (!["Enter", " "].includes(event.key)) return;
+      event.preventDefault();
+      selectCard();
     });
     updateCard(card, channel);
     return card;
@@ -3987,6 +4348,10 @@ function renderSensorCardsInto(target, channels, selectedId, {reuse = false} = {
 
 function renderSensorCards(channels, selectedId, options = {}) {
   renderSensorCardsInto($("sensorCards"), channels, selectedId, options);
+}
+
+function currentOtherSensorChannels() {
+  return state.payload?.thermocouple64?.other_channels || state.payload?.channels || [];
 }
 
 const MODEL_LABELS = {
@@ -4183,6 +4548,10 @@ async function initialize() {
       )
     );
     controls.datasetSchema.value = payload.acquisition.schemas.some(
+      (item) => item.id === "new_collection_v13_0"
+    ) ? "new_collection_v13_0" : payload.acquisition.schemas.some(
+      (item) => item.id === "new_collection_v12_0"
+    ) ? "new_collection_v12_0" : payload.acquisition.schemas.some(
       (item) => item.id === "new_collection_v11_3"
     ) ? "new_collection_v11_3" : "legacy_original";
     configureDatasetSchema(true);
@@ -4241,7 +4610,7 @@ async function initialize() {
     scheduleAutomaticHardwareCheck(800);
   } catch (error) {
     toast(error.message);
-    $("connectionStatus").textContent = "初始化失败";
+    $("connectionStatus").textContent = `页面初始化失败：${error.message}`;
   }
 }
 
@@ -4291,7 +4660,10 @@ controls.autoIndicator.addEventListener("change", () => {
   configureAutomaticIndicator(true);
   loadRealtime();
 });
-controls.sensor.addEventListener("change", loadRealtime);
+controls.sensor.addEventListener("change", () => {
+  showSensorSharedDetail(false);
+  loadRealtime();
+});
 controls.history.addEventListener("change", loadRealtime);
 controls.step.addEventListener("change", loadRealtime);
 controls.indicator.addEventListener("change", () => {
@@ -4537,7 +4909,9 @@ window.addEventListener("resize", () => {
   if (!state.payload) return;
   renderSeriesChart(state.payload.selected_channel);
   renderTimeline(state.payload.timeline);
-  renderSensorCards(state.payload.channels, state.payload.selection.sensor);
+  renderSensorCards(currentOtherSensorChannels(), state.payload.selection.sensor);
+  scheduleThermocouple64Draw();
+  updateThermocouple64ScrollHint();
   if (!state.showLayerEvidence) renderLayerProgress(state.payload.layers);
 });
 
@@ -4560,7 +4934,8 @@ function redrawChartsAfterColumnResize() {
   window.requestAnimationFrame(() => {
     renderSeriesChart(state.payload.selected_channel);
     renderTimeline(state.payload.timeline);
-    renderSensorCards(state.payload.channels, state.payload.selection.sensor);
+    renderSensorCards(currentOtherSensorChannels(), state.payload.selection.sensor);
+    scheduleThermocouple64Draw();
     if (!state.showLayerEvidence) renderLayerProgress(state.payload.layers);
   });
 }
@@ -4776,6 +5151,111 @@ function initializeVerticalPanelResizer() {
   }
 }
 
+const SENSOR_PANEL_SPLIT_STORAGE_KEY = "afp-sensor-monitor-split-ratio-v1";
+
+function initializeSensorPanelResizer() {
+  const split = $("sensorMonitorSplit");
+  const handle = $("sensorPanelResizer");
+  const thermocouplePanel = $("thermocouple64Panel");
+  if (!split || !handle || !thermocouplePanel) return;
+  const defaultRatio = 0.42;
+  const regularTopMinimum = 180;
+  const regularBottomMinimum = 200;
+  const emergencyMinimum = 96;
+  let preferredRatio = defaultRatio;
+
+  function availableHeight() {
+    return Math.max(1, split.clientHeight - handle.offsetHeight);
+  }
+
+  function ratioLimits(total) {
+    if (total >= regularTopMinimum + regularBottomMinimum) {
+      return {minimum: regularTopMinimum / total, maximum: 1 - regularBottomMinimum / total};
+    }
+    const minimumPixels = Math.min(emergencyMinimum, Math.max(1, total * 0.35));
+    return {minimum: minimumPixels / total, maximum: 1 - minimumPixels / total};
+  }
+
+  function persistRatio() {
+    try { localStorage.setItem(SENSOR_PANEL_SPLIT_STORAGE_KEY, String(preferredRatio)); } catch (_error) {}
+  }
+
+  function applyRatio(value, {remember = true, persist = false} = {}) {
+    const requested = Math.max(0.1, Math.min(0.9, Number(value) || defaultRatio));
+    if (remember) preferredRatio = requested;
+    const total = availableHeight();
+    const limits = ratioLimits(total);
+    const safe = Math.max(limits.minimum, Math.min(limits.maximum, requested));
+    split.style.setProperty("--thermocouple-pane-size", `${Math.round(total * safe)}px`);
+    handle.setAttribute("aria-valuemin", String(Math.round(limits.minimum * 100)));
+    handle.setAttribute("aria-valuemax", String(Math.round(limits.maximum * 100)));
+    handle.setAttribute("aria-valuenow", String(Math.round(safe * 100)));
+    handle.setAttribute("aria-valuetext", `热电偶面板 ${Math.round(safe * 100)}%，其他传感器面板 ${Math.round((1 - safe) * 100)}%`);
+    if (persist) persistRatio();
+    redrawChartsAfterColumnResize();
+  }
+
+  function resetRatio() {
+    preferredRatio = defaultRatio;
+    try { localStorage.removeItem(SENSOR_PANEL_SPLIT_STORAGE_KEY); } catch (_error) {}
+    applyRatio(defaultRatio, {remember: true, persist: false});
+  }
+
+  handle.addEventListener("pointerdown", (event) => {
+    if (split.classList.contains("thermocouple-unavailable")) return;
+    event.preventDefault();
+    const startY = event.clientY;
+    const startHeight = thermocouplePanel.getBoundingClientRect().height;
+    handle.classList.add("dragging");
+    document.body.classList.add("resizing-sensor-panels");
+
+    function move(pointerEvent) {
+      applyRatio((startHeight + pointerEvent.clientY - startY) / availableHeight());
+    }
+
+    function end() {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", end);
+      window.removeEventListener("pointercancel", end);
+      handle.classList.remove("dragging");
+      document.body.classList.remove("resizing-sensor-panels");
+      persistRatio();
+    }
+
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", end, {once: true});
+    window.addEventListener("pointercancel", end, {once: true});
+  });
+
+  handle.addEventListener("dblclick", resetRatio);
+  handle.addEventListener("keydown", (event) => {
+    if (!["ArrowUp", "ArrowDown"].includes(event.key)) return;
+    event.preventDefault();
+    const step = event.shiftKey ? 0.08 : 0.03;
+    applyRatio(preferredRatio + (event.key === "ArrowDown" ? step : -step), {persist: true});
+  });
+
+  try {
+    const saved = Number(localStorage.getItem(SENSOR_PANEL_SPLIT_STORAGE_KEY));
+    preferredRatio = Number.isFinite(saved) && saved > 0.1 && saved < 0.9 ? saved : defaultRatio;
+  } catch (_error) {
+    preferredRatio = defaultRatio;
+  }
+  applyRatio(preferredRatio, {remember: true, persist: false});
+  split.reapplySensorPanelRatio = () => applyRatio(preferredRatio, {remember: false, persist: false});
+
+  if (typeof ResizeObserver === "function") {
+    let resizeFrame = 0;
+    new ResizeObserver(() => {
+      if (resizeFrame) return;
+      resizeFrame = window.requestAnimationFrame(() => {
+        resizeFrame = 0;
+        applyRatio(preferredRatio, {remember: false, persist: false});
+      });
+    }).observe(split);
+  }
+}
+
 const SENSOR_CHECKLIST_HEIGHT_STORAGE_KEY = "afp-state-monitor-sensor-list-height-v1";
 
 function initializeSensorChecklistResizer() {
@@ -4845,9 +5325,41 @@ function initializeSensorChecklistResizer() {
   }
 }
 
+function initializeThermocouple64Controls() {
+  function setView(value) {
+    state.thermocouple64View = value === 'average' ? 'average' : 'raw';
+    const raw = state.thermocouple64View === 'raw';
+    document.querySelectorAll('input[name="thermocouple64View"]').forEach(input => { input.checked = input.value === state.thermocouple64View; });
+    document.querySelectorAll('[data-thermocouple-view]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.thermocoupleView === state.thermocouple64View)));
+    $('thermocouple64RawView')?.classList.toggle('hidden', !raw);
+    $('thermocouple64AverageGroups')?.classList.toggle('hidden', raw);
+    const modeLabel = raw ? '完整模式（完整64通道）' : '平均模式（8组均值）';
+    if ($('thermocouple64ViewStatus')) $('thermocouple64ViewStatus').textContent = `当前模式：${modeLabel}`;
+    if ($('thermocouple64CurrentMode')) $('thermocouple64CurrentMode').textContent = `当前模式：${modeLabel}`;
+    if (state.payload?.thermocouple64) renderThermocouple64(state.payload.thermocouple64);
+    else scheduleThermocouple64Draw();
+    window.requestAnimationFrame(updateThermocouple64ScrollHint);
+  }
+  document.querySelectorAll('input[name="thermocouple64View"]').forEach(input => {
+    input.addEventListener('change', () => { if (input.checked) setView(input.value); });
+  });
+  document.querySelectorAll('[data-thermocouple-view]').forEach(button => {
+    button.addEventListener('click', () => setView(button.dataset.thermocoupleView));
+  });
+  $('thermocouple64UniformScale')?.addEventListener('change', scheduleThermocouple64Draw);
+  $('thermocouple64AbnormalOnly')?.addEventListener('change', () => {
+    updateThermocouple64DisplayedCount(); scheduleThermocouple64Draw();
+  });
+  document.querySelector('.thermocouple64-panel-content')?.addEventListener('scroll', updateThermocouple64ScrollHint);
+  $('sensorSharedDetail')?.addEventListener('toggle', scheduleThermocouple64Draw);
+  globalThis.addEventListener?.('resize', updateThermocouple64ScrollHint);
+}
+
 initializeColumnResizers();
 initializeVerticalPanelResizer();
+initializeSensorPanelResizer();
 initializeSensorChecklistResizer();
+initializeThermocouple64Controls();
 initialize();
 
 // Unified sensor-interface cards.  The legacy driver/endpoint fields remain
@@ -4886,6 +5398,7 @@ function interfaceConfigs() {
       driver: row.querySelector(".interface-driver")?.value || "serial_json",
       endpoint: row.querySelector(".interface-endpoint")?.value?.trim() || "",
       baudrate: Number(row.querySelector(".interface-baudrate")?.value) || 115200,
+      slave_id: Number(row.dataset.slaveId || 1),
       physical_interface_id: selectedPhysical?.dataset?.liveId
         || (!selectedPhysical?.dataset?.portId ? physicalSelect?.value || "" : ""),
       physical_port_id: selectedPhysical?.dataset?.portId || "",
@@ -5208,7 +5721,7 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
     const enabled = row.querySelector(".interface-enabled");
     if (enabled) {
       enabled.disabled = false;
-      // The operator's five independent logical interface choices remain
+      // The operator's six independent logical interface choices remain
       // intact; a CSV source does not alter which sensor roles are enabled.
     }
     let warning = row.querySelector(".interface-physical-warning");
@@ -5306,13 +5819,15 @@ function itemEnabledForSimulation(row) {
 function defaultInterfaceCatalog() {
   return [
     {
-      id: "thermocouple_8ch", enabled: true, role: "thermocouple", driver: "smrf_hid",
-      endpoint: "SMRFCT08B", channel_types: ["K", "K", "K", "K", "K", "K", "K", "K"], channel_map: {},
+      id: "thermocouple_64ch", enabled: true, role: "thermocouple64",
+      driver: "thermocouple64_protocol_pending", endpoint: "",
+      channels: Array.from({length: 64}, (_, index) => `温度${index + 1}`), channel_map: {},
     },
     { id: "plc_process", enabled: true, role: "plc", driver: "modbus_tcp", endpoint: "192.168.125.5:502", channel_map: {} },
     { id: "uvc_temperature", enabled: true, role: "thermal_uvc", driver: "uvc_thermal", endpoint: "BSV UVC (WinUSB)", channel_map: {} },
     { id: "abb_motion", enabled: true, role: "robot", driver: "abb_robot", endpoint: "192.168.125.1", channel_map: {} },
     { id: "m3232_pressure", enabled: true, role: "pressure", driver: "m3232_pressure", endpoint: "COM8", baudrate: 115200, channel_map: {} },
+    { id: "esr1001_strain", enabled: true, role: "esr1001_strain", driver: "modbus_rtu_esr1001", endpoint: "", baudrate: 9600, slave_id: 1, channel_map: {} },
   ];
 }
 
@@ -5357,6 +5872,7 @@ function renderInterfacePanel(configs) {
     row.dataset.physicalKind = item.physical_interface_kind || "";
     row.dataset.transportFamily = item.physical_transport_family || "";
     row.dataset.endpoint = item.endpoint || "";
+    row.dataset.slaveId = String(Number(item.slave_id || 1));
     const addLabel = (text, node, className = "") => {
       const label = document.createElement("label");
       if (className) label.className = className;
@@ -5372,7 +5888,7 @@ function renderInterfacePanel(configs) {
     const canonicalRole = item.role === "thermal" ? (item.driver === "rtsp_thermal" ? "thermal_rtsp" : "thermal_uvc") : (["other", "new_sensor"].includes(item.role) ? "custom" : item.role);
     role.value = state.sensorTypeProfiles.some((profile) => profile.id === canonicalRole) ? canonicalRole : "custom";
     const driver = document.createElement("select"); driver.className = "interface-driver";
-    [["smrf_hid", "SMRF USB HID"], ["serial_json", "串口 JSON"], ["tcp_json", "TCP JSON"], ["modbus_tcp", "Modbus TCP(PLC)"], ["abb_robot", "ABB RWS"], ["uvc_thermal", "BSV UVC热像仪"], ["rtsp_thermal", "IP热像仪 RTSP"], ["m3232_pressure", "M3232薄膜压力"], ["simulator", "CSV 模拟"]].forEach(([value, text]) => {
+    [["thermocouple64_protocol_pending", "64路热电偶协议待确认"], ["smrf_hid", "SMRF USB HID"], ["serial_json", "串口 JSON"], ["tcp_json", "TCP JSON"], ["modbus_tcp", "Modbus TCP(PLC)"], ["modbus_rtu_esr1001", "ESR1001-A Modbus RTU"], ["abb_robot", "ABB RWS"], ["uvc_thermal", "BSV UVC热像仪"], ["rtsp_thermal", "IP热像仪 RTSP"], ["m3232_pressure", "M3232薄膜压力"], ["simulator", "CSV 模拟"]].forEach(([value, text]) => {
       const option = document.createElement("option"); option.value = value; option.textContent = text; driver.append(option);
     });
     driver.value = item.driver || "serial_json";
@@ -5894,7 +6410,7 @@ function updateSimulationSettings() {
   }
   if (controls.simulationSourceNote) {
     controls.simulationSourceNote.textContent = publicDemo
-      ? "公网模拟采用预计算 synthetic 演示包，覆盖 SMRF 热电偶、PLC、UVC 热像仪、ABB 与 M3232 薄膜压力五类逻辑接口：下载校验一次后，10 Hz 逻辑时间与图表都在浏览器本地运行；不会启动采集、保存、MySQL、运行时预测或 LangChain。"
+      ? "公网模拟采用预计算 synthetic 演示包，覆盖64路热电偶及PLC、UVC热像仪、ABB、M3232薄膜压力与ESR1001-A应变六类逻辑接口和77个采集通道：下载校验一次后，10 Hz逻辑时间、64路原始曲线和8组严格均值都在浏览器本地运行；不会连接物理设备或启动数据保存、MySQL、运行时预测或LangChain。"
       : "模拟模式使用所选文件夹、CSV或MySQL数据逐行读取；真实接口模式不会读取本地文件。";
   }
   if (controls.simulationSourcePath) {
@@ -6071,7 +6587,12 @@ async function loadSimulationPackages() {
         option.textContent = `${item.label} · ${channelCount}通道 · ${item.bytes || 0}字节`;
         controls.simulationPackage.appendChild(option);
       });
-      if (state.simulationPackages.some((item) => item.package_id === "quick_240")) {
+      const preferredPackage = publicDemo
+        ? "quick_240"
+        : "thermocouple64_quick_240";
+      if (state.simulationPackages.some((item) => item.package_id === preferredPackage)) {
+        controls.simulationPackage.value = preferredPackage;
+      } else if (state.simulationPackages.some((item) => item.package_id === "quick_240")) {
         controls.simulationPackage.value = "quick_240";
       }
     }
@@ -6291,7 +6812,7 @@ async function uploadSimulationSource() {
 function acquisitionConfig() {
   const allowUnverifiedPhysical = arguments[0]?.allowUnverifiedPhysical === true;
   const diagnosticValidation = arguments[0]?.diagnosticValidation === true;
-  const newSchema = controls.datasetSchema.value === "new_collection_v11_3";
+  const newSchema = isModernSchemaId(controls.datasetSchema.value);
   const interfaceState = interfaceConfigs();
   if (!diagnosticValidation) {
     validatePhysicalInterfaceBindings(
@@ -6385,7 +6906,7 @@ function renderProcessParameterReadStatus(summary, result) {
 
 async function readProcessParameters({automatic = false} = {}) {
   if (state.processParameterBusy) return false;
-  if (controls.datasetSchema?.value !== "new_collection_v11_3") return false;
+  if (!isModernSchemaId(controls.datasetSchema?.value)) return false;
   const status = controls.processParameterReadStatus;
   const button = controls.readProcessParameters;
   state.processParameterBusy = true;

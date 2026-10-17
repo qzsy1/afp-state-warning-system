@@ -558,6 +558,46 @@ class PublicWebHttpTests(unittest.TestCase):
         finally:
             handler.access_context = "public"
 
+    def test_cutover_reservation_does_not_block_local_admin_simulation(self):
+        handler = self.server.RequestHandlerClass
+        handler.access_context = "local_admin"
+        reservation_id = ""
+        try:
+            status, reservation, _ = self.request_json(
+                "POST", "/api/ingress/cutover-reservation", {}
+            )
+            self.assertEqual(status, 200, reservation)
+            reservation_id = reservation["reservation_id"]
+            with patch.object(
+                self.server.dashboard.acquisition,
+                "start",
+                return_value={"running": True},
+            ) as start:
+                status, payload, _ = self.request_json(
+                    "POST",
+                    "/api/acquisition/start",
+                    {
+                        "acquisition_mode": "simulation",
+                        "driver": "simulator",
+                        "processing_mode": "capture_only",
+                        "simulation_source_type": "single_csv",
+                        "simulation_source_path": str(self.default_simulation_source),
+                        "source_file": str(self.default_simulation_source),
+                    },
+                )
+
+            self.assertEqual(status, 200, payload)
+            self.assertTrue(payload["running"])
+            start.assert_called_once()
+        finally:
+            if reservation_id:
+                self.request_json(
+                    "POST",
+                    "/api/ingress/cutover-release",
+                    {"reservation_id": reservation_id},
+                )
+            handler.access_context = "public"
+
     def test_create_server_replaces_unconfigured_registry_and_reuses_configured_one(self):
         from app import create_server
         from helper_relay import HelperRegistry
@@ -857,6 +897,7 @@ class PublicWebHttpTests(unittest.TestCase):
             "capabilities": {
                 "real_capture": True,
                 "unified_frame_v1": True,
+                "unified_frame_v2": True,
                 "protocol_version": contract.helper_protocol_version,
                 "helper_version": contract.helper_version,
                 "build_id": contract.release_revision,
@@ -1097,6 +1138,21 @@ class PublicWebHttpTests(unittest.TestCase):
         stop_status, _, _ = self.request_json("POST", "/api/simulation/stop", {})
         self.assertEqual(stop_status, 200)
 
+    def test_guest_simulation_start_does_not_require_public_ingress_state(self):
+        self.request_json("GET", "/api/auth/session")
+        self.server.dashboard.helper_registry.ingress_state_path.unlink()
+
+        status, payload, _ = self.request_json(
+            "POST",
+            "/api/simulation/start",
+            {"source_profile": "builtin"},
+        )
+
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(payload["running"])
+        stop_status, _, _ = self.request_json("POST", "/api/simulation/stop", {})
+        self.assertEqual(stop_status, 200)
+
     def test_authorized_cookie_resolves_until_logout(self):
         self.request_json("GET", "/api/auth/session")
         status, _, _ = self.request_json(
@@ -1157,15 +1213,16 @@ class PublicWebHttpTests(unittest.TestCase):
         self.assertEqual(
             {item["role"]: item["driver"] for item in acquisition.get("interface_defaults", [])},
             {
-                "thermocouple": "smrf_hid",
+                "thermocouple64": "thermocouple64_protocol_pending",
                 "plc": "modbus_tcp",
                 "thermal_uvc": "uvc_thermal",
                 "robot": "abb_robot",
                 "pressure": "m3232_pressure",
+                "esr1001_strain": "modbus_rtu_esr1001",
             },
         )
         self.assertTrue(
-            {"thermocouple", "plc", "thermal_uvc", "robot", "pressure"}.issubset(
+            {"thermocouple64", "plc", "thermal_uvc", "robot", "pressure", "esr1001_strain"}.issubset(
                 {item["id"] for item in acquisition.get("sensor_types", [])}
             )
         )

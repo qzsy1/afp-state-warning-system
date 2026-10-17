@@ -23,6 +23,7 @@ class RemoteAcquisitionMirror:
         self._rows: deque[dict[str, Any]] = deque(maxlen=self.max_rows)
         self._timestamps: deque[float] = deque(maxlen=self.max_rows)
         self._frames: deque[dict[str, Any]] = deque(maxlen=self.max_rows)
+        self.frame_quality: deque[dict[str, str]] = deque(maxlen=self.max_rows)
         self._capture_uuid = ""
         self._expected_sequence = 0
         self._expected_frame_sequence = 0
@@ -68,6 +69,7 @@ class RemoteAcquisitionMirror:
         self._rows.clear()
         self._timestamps.clear()
         self._frames.clear()
+        self.frame_quality.clear()
         self._capture_uuid = capture_uuid
         self._expected_sequence = 0
         self._expected_frame_sequence = 0
@@ -164,20 +166,54 @@ class RemoteAcquisitionMirror:
         required_frame_contract = str(
             batch.get("required_frame_contract") or ""
         ).strip()
-        if required_frame_contract and required_frame_contract != "unified_frame_v1":
+        if required_frame_contract and required_frame_contract not in {
+            "unified_frame_v1", "unified_frame_v2"
+        }:
             return {"ok": False, "error": "frame_contract_unsupported"}
-        if required_frame_contract == "unified_frame_v1" and frames is None:
+        if required_frame_contract in {"unified_frame_v1", "unified_frame_v2"} and frames is None:
             return {"ok": False, "error": "unified_frames_required"}
         frame_sequences: list[int] = []
         restored_frames: list[UnifiedFrame] = []
+        frame_catalog = batch.get("frame_catalog")
+        if required_frame_contract == "unified_frame_v2":
+            if not isinstance(frame_catalog, dict):
+                return {"ok": False, "error": "frame_catalog_required"}
+            if str(frame_catalog.get("mode_id") or "") != "new_collection_v13_0":
+                return {"ok": False, "error": "frame_mode_unsupported"}
+            catalog_channels = frame_catalog.get("channels")
+            catalog_names = [
+                str(item.get("name") if isinstance(item, dict) else item)
+                for item in catalog_channels
+            ] if isinstance(catalog_channels, list) else []
+            if not catalog_names or (self._expected_channels and tuple(catalog_names) != self._expected_channels):
+                return {"ok": False, "error": "frame_channel_contract_mismatch"}
+            for item in catalog_channels:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "")
+                expected_unit = self._expected_channel_units.get(name, "")
+                actual_unit = str(item.get("unit") or "")
+                if expected_unit and expected_unit != actual_unit:
+                    return {"ok": False, "error": "frame_unit_contract_mismatch"}
         if frames is not None:
             if not isinstance(frames, list) or len(frames) != len(rows):
                 return {"ok": False, "error": "frame_batch_length_mismatch"}
             try:
+                previous_frame_sequence = None
                 for frame in frames:
-                    restored = UnifiedFrame.from_envelope(frame)
-                    if str(frame.get("capture_uuid") or "") != capture_uuid:
-                        raise ValueError("frame capture_uuid mismatch")
+                    if required_frame_contract == "unified_frame_v2":
+                        restored = UnifiedFrame.from_envelope_v2(
+                            frame,
+                            expected_session_id=capture_uuid,
+                            expected_mode_id=str(frame_catalog["mode_id"]),
+                            catalog=frame_catalog,
+                            last_sequence=previous_frame_sequence,
+                        )
+                        previous_frame_sequence = restored.capture_sequence
+                    else:
+                        restored = UnifiedFrame.from_envelope(frame)
+                        if str(frame.get("capture_uuid") or "") != capture_uuid:
+                            raise ValueError("frame capture_uuid mismatch")
                     if restored.capture_sequence < 0:
                         raise ValueError("frame_sequence invalid")
                     frame_sequences.append(restored.capture_sequence)
@@ -192,7 +228,7 @@ class RemoteAcquisitionMirror:
             return {"ok": False, "error": "sample_timestamp_invalid"}
         if not all(math.isfinite(value) for value in numeric_timestamps):
             return {"ok": False, "error": "sample_timestamp_invalid"}
-        if required_frame_contract == "unified_frame_v1":
+        if required_frame_contract in {"unified_frame_v1", "unified_frame_v2"}:
             for row, timestamp, frame in zip(rows, numeric_timestamps, restored_frames):
                 expected_channels = set(self._expected_channels)
                 if not expected_channels:
@@ -209,7 +245,7 @@ class RemoteAcquisitionMirror:
                 for name, channel in frame.channels.items():
                     expected_unit = self._expected_channel_units.get(name, "")
                     actual_unit = str(channel.metadata.get("unit") or "")
-                    if expected_unit and actual_unit != expected_unit:
+                    if required_frame_contract == "unified_frame_v1" and expected_unit and actual_unit != expected_unit:
                         return {"ok": False, "error": "frame_unit_contract_mismatch"}
                     row_value = row.get(name)
                     if channel.value is None:
@@ -299,7 +335,7 @@ class RemoteAcquisitionMirror:
             for index, (row, timestamp) in enumerate(zip(rows, numeric_timestamps)):
                 canonical_row = dict(row)
                 canonical_timestamp = timestamp
-                if required_frame_contract == "unified_frame_v1":
+                if required_frame_contract in {"unified_frame_v1", "unified_frame_v2"}:
                     restored = restored_frames[index]
                     canonical_row.update(restored.values())
                     canonical_timestamp = restored.target_wall_time
@@ -307,6 +343,7 @@ class RemoteAcquisitionMirror:
                 self._timestamps.append(canonical_timestamp)
             for frame in frames or []:
                 self._frames.append(deepcopy(frame))
+            self.frame_quality.extend(frame.quality() for frame in restored_frames)
             self._accepted_batch_digests[sequence] = batch_digest
             self._accepted_batch_order.append(sequence)
             while len(self._accepted_batch_order) > 4096:
@@ -485,7 +522,18 @@ class RemoteAcquisitionRegistry:
             if contract is None:
                 contract = self._contracts.get(key)
         if contract is None:
-            if str(batch.get("required_frame_contract") or "") == "unified_frame_v1":
+            if str(batch.get("required_frame_contract") or "") in {
+                "unified_frame_v1", "unified_frame_v2"
+            }:
+                if str(batch.get("required_frame_contract") or "") == "unified_frame_v2":
+                    catalog = batch.get("frame_catalog")
+                    channels = catalog.get("channels") if isinstance(catalog, dict) else None
+                    names = [
+                        str(item.get("name") if isinstance(item, dict) else item)
+                        for item in channels
+                    ] if isinstance(channels, list) else []
+                    if names:
+                        return self.for_session(key).configure_contract(names)
                 return {"ok": False, "error": "frame_channel_contract_unbound"}
             return {"ok": True}
         return self.for_session(key).configure_contract(contract[0], contract[1])

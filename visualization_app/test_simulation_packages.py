@@ -20,6 +20,9 @@ class SimulationPackageTests(unittest.TestCase):
         self.assertEqual(by_id["endurance_6000"]["points"], 6000)
         self.assertEqual(by_id["quick_240"]["sample_rate_hz"], 10.0)
         self.assertEqual(by_id["endurance_6000"]["duration_seconds"], 600.0)
+        self.assertEqual(by_id["thermocouple64_quick_240"]["dataset_schema"], "new_collection_v13_0")
+        self.assertEqual(len(by_id["thermocouple64_quick_240"]["channels"]), 77)
+        self.assertEqual(by_id["thermocouple64_endurance_6000"]["points"], 6000)
         self.assertTrue(all(item["synthetic"] for item in packages))
         self.assertTrue(all(len(item["sha256"]) == 64 for item in packages))
         self.assertTrue(all("path" not in item for item in packages))
@@ -33,7 +36,8 @@ class SimulationPackageTests(unittest.TestCase):
                 reader = csv.DictReader(handle)
                 rows = list(reader)
             self.assertEqual(len(rows), item["points"])
-            self.assertEqual(len(item["channels"]), 17)
+            expected_channels = 77 if item["dataset_schema"] == "new_collection_v13_0" else 17
+            self.assertEqual(len(item["channels"]), expected_channels)
             self.assertEqual(set(item["channels"]), set(reader.fieldnames or []) & set(item["channels"]))
 
 

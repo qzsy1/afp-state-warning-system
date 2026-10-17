@@ -194,7 +194,7 @@ const fetch = async () => { requests += 1; return {ok: true, json: async () => (
     def test_failed_server_target_mysql_has_a_session_bound_retry_control(self):
         html = (Path(__file__).with_name("static") / "index.html").read_text(encoding="utf-8")
         self.assertIn('id="retryTargetMysqlButton"', html)
-        self.assertIn('/app.js?v=20261014-model-path-relocation-v1', html)
+        self.assertRegex(html, r'/app\.js\?v=\d{8}-thermocouple64-v\d+')
         text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
         start = text.index("async function retryServerTargetMysql()")
         end = text.index("async function stopAcquisition()", start)
@@ -473,6 +473,7 @@ const button = {disabled: false, textContent: "停止并保存"};
 const $ = (name) => name === "stopAcquisitionButton" ? button : status;
 const controls = {datasetSchema: {value: "legacy_original"}, liveLayer: {value: "0"},
   newLayer: {value: "0"}, acquisitionMode: {value: "simulation"}};
+const isModernSchemaId = (value) => String(value || "").startsWith("new_collection_v");
 const stopLocalSimulationReplay = () => {};
 const usesLocalCaptureHelper = () => false;
 let count = 0;

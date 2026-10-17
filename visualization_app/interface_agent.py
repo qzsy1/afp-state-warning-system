@@ -59,6 +59,7 @@ _INTERFACE_LABELS = {
     "uvc_temperature": "BSV UVC 热像仪",
     "abb_motion": "ABB 机器人",
     "m3232_pressure": "M3232 薄膜压力",
+    "esr1001_strain": "ESR1001-A 四通道应变",
 }
 _EVENT_FIELDS = {
     "event_id",

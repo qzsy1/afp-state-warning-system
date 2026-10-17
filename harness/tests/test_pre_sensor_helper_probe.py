@@ -38,6 +38,7 @@ class HelperReadinessProbeTests(unittest.TestCase):
                 "configuration_schema_version": values["configuration_schema_version"],
                 "readiness_schema_version": values["readiness_schema_version"],
                 "unified_frame_v1": True,
+                "unified_frame_v2": True,
             },
         }
 

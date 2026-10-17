@@ -356,6 +356,37 @@ class HelperRelayTests(unittest.TestCase):
         self.assertEqual(blocked["error"], "ingress_not_online")
         self.assertFalse(registry.begin_capture_start())
 
+    def test_local_capture_start_ignores_public_ingress_and_cutover_state(self):
+        ingress_path = (
+            Path(self.runtime_directory.name) / "missing-ingress-state.json"
+        )
+        registry = HelperRegistry(
+            ingress_state_path=ingress_path,
+            expected_candidate_id="candidate-1",
+        )
+
+        self.assertTrue(
+            registry.begin_capture_start(require_ingress_ready=False)
+        )
+        registry.end_capture_start()
+        ingress_path.with_name("public-ingress-cutover.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "reservation_hash": "0" * 64,
+                    "expires_at": time.time() + 60,
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertTrue(
+            registry.begin_capture_start(
+                require_ingress_ready=False,
+                require_cutover_clear=False,
+            )
+        )
+        registry.end_capture_start()
+
     def test_deployment_readiness_requires_compatible_online_helper(self):
         loader = MutableIngressLoader()
         registry = self.generation_registry(loader)
