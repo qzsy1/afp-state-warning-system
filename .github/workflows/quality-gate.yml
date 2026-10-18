@@ -51,6 +51,7 @@ jobs:
         shell: pwsh
         run: |
           python -m unittest `
+            harness.tests.test_local_branch_workflow `
             harness.tests.test_entrypoint_contract `
             harness.tests.test_matrix `
             harness.tests.test_quality_gate_cli `
