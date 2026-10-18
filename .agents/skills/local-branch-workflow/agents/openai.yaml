@@ -1,0 +1,4 @@
+interface:
+  display_name: "Local Branch Workflow"
+  short_description: "Safe single-checkout task branch and PR workflow"
+  default_prompt: "Use $local-branch-workflow to start and complete this repository task safely."

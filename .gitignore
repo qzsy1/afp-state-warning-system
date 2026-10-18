@@ -67,9 +67,6 @@ modular_runtime/models/
 /harness/config/local-settings.json
 /artifacts/
 
-# Local isolated Git worktrees
-/.worktrees/
-
 # Publish only the immutable v2.0.4 delivery through Git and Git LFS. These
 # rules must remain after the general generated-file rules above.
 !/delivery/AFP_Integrated_System_Modular_v2.0.4_Agentic/

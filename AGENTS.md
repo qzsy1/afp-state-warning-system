@@ -9,3 +9,12 @@
 - 源码固定目录为 `F:\new_AFP_exam\AFP-Readiness-Repo`；构建中间产物只能写入 `F:\new_AFP_exam\.afp-staging`，发布成功或失败后必须清理。
 - 采集数据默认保存到 `F:\AFP_Capture`；用户明确选择其他位置时也应优先使用 F 盘，并在写入前确认目录存在且可写。
 - 需要额外保留完整可运行副本、长期候选目录或大体积归档时，必须先取得用户明确许可。
+- 默认只在普通 Local checkout 中工作，禁止创建或使用 Git worktree、Codex Worktree、额外 clone 或项目副本。
+- 所有代码、文档和配置修改必须在任务分支完成；禁止直接修改、提交或推送 `main`。
+- 新任务必须先获取远程更新并基于最新 `origin/main` 创建分支，分支名称使用 `codex/<machine-id>/<task-slug>`。
+- 每台电脑只能操作包含本机 `codex.machine-id` 的任务分支，不得在多台电脑上同时操作同一任务分支。
+- 合并前必须重新获取最新 `origin/main`、将其整合到任务分支、运行与修改范围匹配的真实测试并完成校验；测试期间 `origin/main` 更新时必须重新整合并重新测试。
+- 禁止通过 `filename_v2`、`filename_final`、`filename_new`、`filename_backup` 等复制文件保留版本；修改现有内容时直接更新原文件，版本历史只由 Git 保存。
+- 禁止创建过程报告、AI 修改记录、临时阶段文档和重复总结文件。
+- 临时文件、日志、缓存、依赖和构建产物必须写入已被 `.gitignore` 忽略的位置。
+- 不得删除、覆盖、暂存、隐藏或提交来源不明的用户修改。

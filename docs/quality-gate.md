@@ -47,7 +47,7 @@ py -3.11 -m venv .venv
 
 ## GitHub 和分支保护
 
-GitHub Actions 的必需检查名称为 `quality-gate`。稳定分支应在 GitHub 分支保护中把该检查设置为必需状态；检查失败时禁止合并。工作流运行 `full/ci`，不使用仓库外私密凭据，也不连接现场硬件或目标 MySQL。
+GitHub Actions 的必需检查名称为 `quality-gate`。稳定分支应在 GitHub 分支保护中把该检查设置为必需状态；检查失败时禁止合并。工作流运行 Harness 核心契约和回归矩阵中支持 `ci` 且不依赖仓库外运行目录、未跟踪模型或现场资源的项目检查，不使用仓库外私密凭据，也不连接现场硬件或目标 MySQL。`full` 和 `release` 由具备 F 盘运行目录及相应资产的本机环境执行。
 
 生产前端行为、LAN 和公网不是由测试名称隐式带过：`frontend-behavior-contracts` 执行真实 JavaScript 行为回归，`modular-runtime-contracts` 检查 LAN 地址与双端口配置，`frontend-public-contracts` 检查 LAN 操作员、远程 helper、公网访客、脱敏和隧道健康。矩阵契约会在任何一项从 full/release 或命令清单中移除时直接失败。
 
