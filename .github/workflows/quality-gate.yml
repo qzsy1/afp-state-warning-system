@@ -31,6 +31,15 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Check changed lines for whitespace errors
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_EVENT_NAME -eq "pull_request") {
+            git diff --check "origin/$env:GITHUB_BASE_REF...HEAD"
+          } else {
+            git diff --check "${{ github.event.before }}...HEAD"
+          }
+
       - name: Install portable test dependencies
         shell: pwsh
         run: |
