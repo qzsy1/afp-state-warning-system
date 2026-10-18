@@ -46,11 +46,17 @@ function Assert-OrdinaryCheckout {
 }
 
 function Get-MachineIdentity {
-    $identity = Get-GitText @("config", "--local", "--get", "codex.machine-id")
-    if ([string]::IsNullOrWhiteSpace($identity)) {
-        throw "codex.machine-id is not configured in this clone."
+    $identity = & git config --local --get codex.machine-id
+    $configExitCode = $LASTEXITCODE
+    if ($configExitCode -eq 1) {
+        $skillPath = Join-Path $repositoryRoot ".agents/skills/local-branch-workflow/SKILL.md"
+        $identity = if (Test-Path -LiteralPath $skillPath -PathType Leaf) { "PC-B" } else { "PC-A" }
+        Invoke-Git @("config", "--local", "codex.machine-id", $identity)
+        $identity = Get-GitText @("config", "--local", "--get", "codex.machine-id")
+    } elseif ($configExitCode -ne 0) {
+        throw "Cannot read clone-local codex.machine-id (exit $configExitCode)."
     }
-    if ($identity -notmatch '^[A-Za-z0-9][A-Za-z0-9-]*$') {
+    if ([string]::IsNullOrWhiteSpace($identity) -or $identity -notmatch '^[A-Za-z0-9][A-Za-z0-9-]*$') {
         throw "codex.machine-id '$identity' cannot be used in a branch name."
     }
     return $identity
@@ -146,7 +152,7 @@ switch ($Action) {
         if (Test-GitSuccess @("show-ref", "--verify", "--quiet", "refs/remotes/origin/$taskBranch")) {
             throw "Remote branch 'origin/$taskBranch' already exists. Do not reuse another computer's work."
         }
-        Invoke-Git @("switch", "-c", $taskBranch, "origin/$defaultBranch")
+        Invoke-Git @("switch", "--no-track", "-c", $taskBranch, "origin/$defaultBranch")
     }
 
     "PrepareMerge" {
