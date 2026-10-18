@@ -47,9 +47,46 @@ jobs:
           python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu -r visualization_app/requirements.txt
           python -m pip install -r interface_monitor_demo/requirements.txt
 
-      - name: Run full CI quality gate
+      - name: Run Harness core contracts
         shell: pwsh
-        run: ./harness/engine/run.ps1 -Profile full -Environment ci
+        run: |
+          python -m unittest `
+            harness.tests.test_entrypoint_contract `
+            harness.tests.test_matrix `
+            harness.tests.test_quality_gate_cli `
+            harness.tests.test_reporting `
+            harness.tests.test_runner `
+            -v
+
+      - name: Run CI-supported project checks
+        shell: pwsh
+        run: |
+          $checks = @(
+            "pre-sensor-endurance-unit-contracts",
+            "pre-sensor-field-operations-contracts",
+            "real-acquisition-mode-contracts",
+            "real-acquisition-local-direct-contracts",
+            "real-acquisition-remote-helper-contracts",
+            "real-acquisition-mode-equivalence-contracts",
+            "modular-runtime-contracts",
+            "interface-monitor-contracts",
+            "usb-dock-topology-contracts",
+            "frontend-behavior-contracts",
+            "native-function-contracts",
+            "frontend-public-contracts",
+            "diagnosis-interface-contracts",
+            "edge-helper-websocket-contracts",
+            "real-acquisition-protocol-contracts",
+            "thermocouple64-protocol-contracts",
+            "thermocouple64-layer-projection-contracts",
+            "thermocouple64-frontend-contracts"
+          )
+          foreach ($check in $checks) {
+            ./harness/engine/run.ps1 -Check $check -Environment ci
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+          }
 
       - name: Upload quality-gate reports
         if: always()

@@ -40,7 +40,7 @@ class EntrypointContractTests(unittest.TestCase):
         self.assertRegex(self.workflow, r"(?m)^\s*quality-gate:\s*$")
         self.assertIn("windows-latest", self.workflow)
         self.assertIn("harness/engine/run.ps1", self.workflow)
-        self.assertIn("-Profile full", self.workflow)
+        self.assertIn("-Check $check", self.workflow)
         self.assertIn("-Environment ci", self.workflow)
         self.assertNotIn("tools/verification/quality_gate.py", self.workflow)
 
