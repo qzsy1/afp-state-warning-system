@@ -61,7 +61,7 @@ function Test-AfpReleaseGate {
     }
     $expectedContracts = [ordered]@{
         helper_protocol_version = 2
-        unified_frame_contract = "unified_frame_v1"
+        unified_frame_contract = "unified_frame_v2"
         configuration_schema_version = 1
         readiness_schema_version = 1
     }
