@@ -5475,7 +5475,7 @@ function refreshInterfaceEndpointOptions() {
     });
 }
 
-const USB_SENSOR_ROLES = new Set(["thermocouple", "thermal_uvc", "pressure"]);
+const USB_SENSOR_ROLES = new Set(["thermocouple", "thermal_uvc", "pressure", "esr1001_strain"]);
 
 function interfaceTransportFamily(item) {
   const explicit = String(item?.transport_family || "");
@@ -5628,7 +5628,7 @@ function physicalCandidatesForRole(role) {
     .map((item) => ({...item, kind: item.kind || item.interface_kind || item.type || ""}));
   if (USB_SENSOR_ROLES.has(role)) {
     const candidates = usbPhysicalCandidatesForRole(role);
-    if (role === "pressure") {
+    if (role === "pressure" || role === "esr1001_strain") {
       physical.filter((item) => interfaceTransportFamily(item) === "serial_native")
         .forEach((item) => candidates.push({
           ...item,

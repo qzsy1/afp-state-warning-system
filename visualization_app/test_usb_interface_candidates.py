@@ -17,6 +17,7 @@ def run_candidate_script(assertions: str) -> dict:
         "thermocouple": {"label": "八通道热电偶", "physical_kind": "usb_hid"},
         "thermal_uvc": {"label": "UVC", "physical_kind": "usb_uvc"},
         "pressure": {"label": "M3232", "physical_kind": "serial"},
+        "esr1001_strain": {"label": "ESR1001-A四通道应变", "physical_kind": "serial"},
         "plc": {"label": "PLC", "physical_kind": "ethernet"},
         "robot": {"label": "ABB", "physical_kind": "ethernet"},
     }
@@ -206,6 +207,48 @@ console.log(JSON.stringify({usbIds, pressureGroups}));
         self.assertEqual(result["usbIds"]["thermal_uvc"], expected)
         self.assertEqual(result["usbIds"]["pressure"], expected)
         self.assertIn("主机原生串口", result["pressureGroups"])
+
+    def test_strain_receives_usb_ports_from_host_and_dock_plus_native_serial(self) -> None:
+        result = run_candidate_script(
+            r"""
+state.usbTopology = {
+  usb_ports: [
+    {id:"host:1", owner_kind:"host", label:"电脑本机 · USB3-1", state:"empty", user_connectable:true},
+    {id:"dock:1", owner_kind:"dock", dock_id:"d1", label:"拓展坞 1 · USB3-1", state:"occupied", user_connectable:true},
+    {id:"dock:2", owner_kind:"dock", dock_id:"d1", label:"拓展坞 1 · USB3-2", state:"empty", user_connectable:true},
+  ],
+  devices: [],
+};
+state.physicalInterfaces = [
+  {id:"serial:COM8", kind:"serial", transport_family:"usb", parent_port_id:"dock:1", endpoint:"COM8", label:"USB Serial COM8", detected:true},
+  {id:"serial:COM1", kind:"serial", transport_family:"serial_native", endpoint:"COM1", label:"COM1", detected:true},
+];
+const candidates = physicalCandidatesForRole("esr1001_strain");
+const dockCandidate = candidates.find((item) => item.id === "dock:1");
+console.log(JSON.stringify({
+  usbIds: candidates.filter((item) => item.transport_family === "usb").map((item) => item.id).sort(),
+  groups: candidates.map((item) => item.group_label),
+  dockCandidate: {
+    physicalInterfaceId: dockCandidate?.physical_interface_id,
+    endpoint: dockCandidate?.endpoint,
+    compatible: dockCandidate?.compatible,
+    detected: dockCandidate?.detected,
+  },
+}));
+"""
+        )
+        self.assertEqual(result["usbIds"], ["dock:1", "dock:2", "host:1"])
+        self.assertIn("拓展坞 1 USB 接口", result["groups"])
+        self.assertIn("主机原生串口", result["groups"])
+        self.assertEqual(
+            result["dockCandidate"],
+            {
+                "physicalInterfaceId": "serial:COM8",
+                "endpoint": "COM8",
+                "compatible": True,
+                "detected": True,
+            },
+        )
 
     def test_default_assignment_uses_distinct_usb_ports_and_shared_ethernet(self) -> None:
         result = run_candidate_script(
