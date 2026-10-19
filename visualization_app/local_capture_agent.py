@@ -31,7 +31,11 @@ from mysql_storage import MySQLCaptureStore
 from json_safety import json_safe_value
 from remote_mysql_setup import classify_mysql_error
 from real_acquisition import ReadinessSnapshot
-from release_contract import assert_helper_contract, load_release_contract
+from release_contract import (
+    DEVICE_READINESS_CONTRACT,
+    assert_helper_contract,
+    load_release_contract,
+)
 from simulation_source_transfer import SimulationSourceCache, inspect_csv_source
 from interface_transport_catalog import (
     enrich_interface_transports,
@@ -173,6 +177,8 @@ class LocalCaptureAgent:
                 }
             )
         return {
+            "device_readiness_contract": DEVICE_READINESS_CONTRACT,
+            "readiness_schema_version": RELEASE_CONTRACT.readiness_schema_version,
             "interfaces": physical,
             "sensor_bindings": bindings,
             "usb_topology": discovered.get("usb_topology") or {
@@ -193,6 +199,8 @@ class LocalCaptureAgent:
                 "ethernet_interface_ids": [],
             },
             "capabilities": {
+                "device_readiness_contract": DEVICE_READINESS_CONTRACT,
+                "unified_device_readiness_v1": True,
                 "hardware_discovery": True,
                 "usb_topology_v1": bool(discovered.get("usb_topology")),
                 "usb_topology_v2": bool(discovered.get("usb_topology")),
@@ -584,6 +592,8 @@ class LocalCaptureAgent:
     def check_capture(self, config: Any) -> dict[str, Any]:
         result = self.manager.test_connection(config)
         response = dict(result) if isinstance(result, dict) else {"ok": False, "result": result}
+        response["device_readiness_contract"] = DEVICE_READINESS_CONTRACT
+        response["readiness_schema_version"] = RELEASE_CONTRACT.readiness_schema_version
         snapshot = ReadinessSnapshot.create(
             config,
             response,
@@ -593,6 +603,8 @@ class LocalCaptureAgent:
                 "unified_frame_v2": True,
                 "thermocouple64_hardware_gate": True,
                 "unified_frame_contract": "unified_frame_v2",
+                "device_readiness_contract": DEVICE_READINESS_CONTRACT,
+                "unified_device_readiness_v1": True,
             },
         )
         self._readiness_snapshot = snapshot
@@ -601,6 +613,9 @@ class LocalCaptureAgent:
 
     def import_readiness_snapshot(self, payload: dict[str, Any]) -> None:
         self._readiness_snapshot = ReadinessSnapshot.from_dict(payload)
+        importer = getattr(self.manager, "import_readiness_snapshot", None)
+        if callable(importer):
+            importer(payload)
 
     def read_process_parameters(self, config: Any) -> dict[str, Any]:
         return self.manager.read_process_parameters(config)

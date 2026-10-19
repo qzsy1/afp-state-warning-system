@@ -1,0 +1,359 @@
+from __future__ import annotations
+
+import json
+import subprocess
+import unittest
+from pathlib import Path
+
+from visualization_app.test_usb_interface_candidates import run_candidate_script
+
+
+APP_JS = Path(__file__).with_name("static") / "app.js"
+
+
+def run_remembered_selection_script(assertions: str) -> list[dict]:
+    source = APP_JS.read_text(encoding="utf-8")
+    start = source.index("function mergeRememberedInterfaceSelections")
+    end = source.index("async function discoverInterfaces", start)
+    result = subprocess.run(
+        ["node", "-e", f"{source[start:end]}\n{assertions}"],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return json.loads(result.stdout)
+
+
+def run_hardware_status_script(assertions: str):
+    source = APP_JS.read_text(encoding="utf-8")
+    start = source.index("function hardwareStateLabel")
+    end = source.index("function clearHardwareRowStates", start)
+    result = subprocess.run(
+        ["node", "-e", f"{source[start:end]}\n{assertions}"],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return json.loads(result.stdout)
+
+
+def run_hardware_fingerprint_script(assertions: str):
+    source = APP_JS.read_text(encoding="utf-8")
+    start = source.index("function readinessInterfaceFingerprint")
+    end = source.index("function hardwareStateLabel", start)
+    result = subprocess.run(
+        ["node", "-e", f"{source[start:end]}\n{assertions}"],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return json.loads(result.stdout)
+
+
+class PlcAbbPhysicalBindingFrontendTests(unittest.TestCase):
+    def test_browser_check_then_start_keeps_the_same_readiness_configuration(self) -> None:
+        from visualization_app.real_acquisition import ReadinessSnapshot
+
+        source = APP_JS.read_text(encoding="utf-8")
+        sections = [
+            ("function acquisitionConfig()", "function renderProcessParameterReadStatus"),
+            ("function readinessInterfaceFingerprint", "function hardwareStateLabel"),
+            ("async function testSensorConnection", "async function resetAndCheckHardware"),
+            ("async function startAcquisition()", "async function waitForHelperFlushComplete"),
+        ]
+        functions = "\n".join(
+            source[source.rindex(start):source.index(end, source.rindex(start))]
+            for start, end in sections
+        )
+        script = r'''
+const controls = new Proxy({
+  acquisitionMode:{value:"real"}, processingMode:{value:"capture_only"},
+  datasetSchema:{value:"new_collection_v11_3"}, sampleRate:{value:"10"},
+  saveRoot:{value:"D:\\AFP_Capture"},
+}, {get:(target,key)=>target[key] || {value:"",checked:false}});
+const state = {accessRole:"local_admin", acquisitionStatus:{running:false},
+  bootstrap:{application:{}}, simulationPackages:[], helperStatus:{},
+  mysqlConnectionTests:{}};
+let helper = false;
+let requests = [];
+const channels = ["温度","压力","张力","ABB_X","ABB_Y","ABB_Z","线速度"];
+const check = {ok:true, interfaces:[
+  {id:"plc",physical_interface_id:"ethernet:industrial",state:"data_ready",ok:true},
+  {id:"abb",physical_interface_id:"ethernet:industrial",state:"data_ready",ok:true},
+], sensors:channels.map(name=>({name,state:"ok",ok:true}))};
+function usesLocalCaptureHelper(){return helper;}
+function usesBrowserLocalExport(){return false;}
+function isModernSchemaId(){return true;}
+function interfaceConfigs(){return {interfaces:[
+  {id:"plc",enabled:true,role:"plc",driver:"modbus_tcp",endpoint:"192.168.125.5:502",
+    physical_interface_id:"ethernet:industrial",physical_verified:true},
+  {id:"abb",enabled:true,role:"robot",driver:"abb_robot",endpoint:"192.168.125.1",
+    physical_interface_id:"ethernet:industrial",physical_verified:true},
+],assignments:{plc:channels.slice(0,3),abb:channels.slice(3)}};}
+function validatePhysicalInterfaceBindings(){}
+function selectedLiveSensors(){return channels;}
+function selectedPredictionSensors(){return [];}
+function selectedModelInputSensors(){return [];}
+function $(id){return null;}
+function synchronizeAcquisitionButtons(){}
+function isPublicPrecomputedSimulationMode(){return false;}
+async function validateEnabledMysqlBeforeStart(){}
+async function acquireRealControl(){}
+function liveEvidenceScopeKey(){return "specimen";}
+function resetLiveEvidenceDisplay(){}
+function renderHardwareCheckResult(){}
+function updateAgentFromHardwareResult(){}
+function normalizeHardwareCheckResult(result){return result;}
+function validateHelperStartResult(){}
+async function waitForEdgeFirstSample(){return {running:true};}
+function renderAcquisitionStatus(){}
+function configureDataMode(){}
+async function loadRealtime(){}
+function toast(message){throw new Error(message);}
+async function postJson(path,payload){
+  requests.push({path,payload:structuredClone(payload)});
+  return path.endsWith("/test") ? structuredClone(check) : {running:true};
+}
+async function requestLocalHelper(command,payload){
+  requests.push({path:command,payload:structuredClone(payload)});
+  return command==="check_capture" ? structuredClone(check) : {running:true};
+}
+(async()=>{
+  const results=[];
+  for (helper of [false,true]) {
+    requests=[];state.hardwareCheck=null;
+    await testSensorConnection();
+    await startAcquisition();
+    results.push({helper,requests});
+  }
+  console.log(JSON.stringify({check,results}));
+})().catch(error=>{console.error(error);process.exit(1);});
+'''
+        result = subprocess.run(
+            ["node"], input=functions + script, check=False,
+            capture_output=True, text=True, encoding="utf-8",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        for flow in payload["results"]:
+            with self.subTest(helper=flow["helper"]):
+                check_request, start_request = flow["requests"]
+                expected_host = "helper_local" if flow["helper"] else "server"
+                self.assertEqual(check_request["payload"].get("execution_host"), expected_host)
+                snapshot = ReadinessSnapshot.create(check_request["payload"], payload["check"])
+                snapshot.validate(start_request["payload"])
+                changed = json.loads(json.dumps(start_request["payload"]))
+                changed["interfaces"][1]["endpoint"] = "192.168.125.2"
+                with self.assertRaisesRegex(ValueError, "fingerprint mismatch"):
+                    snapshot.validate(changed)
+
+    def test_failed_check_identifies_execution_host_without_claiming_device_failure(self) -> None:
+        source = APP_JS.read_text(encoding="utf-8")
+        start = source.index("function normalizeHardwareCheckResult")
+        end = source.index("async function checkSimulationSourceReadiness", start)
+        script = r'''
+const controls = {interfacePanel:{querySelectorAll:()=>[{
+  dataset:{interfaceId:"plc"}, querySelector:(selector)=>({
+    ".interface-role":{value:"plc"},
+    ".interface-endpoint":{value:"192.168.125.5:502"},
+    ".interface-enabled":{checked:true},
+  }[selector] || null),
+}]}};
+function selectedAcquisitionChannelsForInterfaces(){return ["温度"];}
+function sensorTypeProfile(){return {channels:["温度"]};}
+console.log(JSON.stringify(["local_direct","helper_local"].map(executionHost=>
+  normalizeHardwareCheckResult({ok:false,error:"请求超时（20秒）"}, {executionHost})
+)));
+'''
+        result = subprocess.run(
+            ["node", "-e", source[start:end] + script],
+            check=True, capture_output=True, text=True, encoding="utf-8",
+        )
+        local, helper = json.loads(result.stdout)
+        for item in (local, helper):
+            self.assertFalse(item["ok"])
+            self.assertEqual(item["interfaces"][0]["state"], "hardware_check_timeout")
+            self.assertEqual(item["interfaces"][0]["endpoint"], "192.168.125.5:502")
+        self.assertIn("本机检查请求", local["interfaces"][0]["message"])
+        self.assertNotIn("辅助程序", local["sensors"][0]["message"])
+        self.assertIn("辅助程序", helper["interfaces"][0]["message"])
+        self.assertEqual(local["execution_host"], "local_direct")
+
+    def test_usb_candidate_keeps_identity_and_driver_facts_for_check_invalidation(self) -> None:
+        result = run_candidate_script(r'''
+state.usbTopology = {usb_ports:[{id:"usbport:1", user_connectable:true}], devices:[]};
+state.physicalInterfaces = [{
+  id:"uvc:bsv", kind:"usb_uvc", protocol:"uvc", detected:true,
+  parent_port_id:"usbport:1", instance_id:"USB\\VID_2BDF&PID_0102\\A",
+  container_id:"container-a", vid:11231, pid:258,
+  driver_service:"usbvideo", driver_provider:"Microsoft", driver_version:"10.0.1",
+}];
+console.log(JSON.stringify(physicalCandidatesForRole("thermal_uvc")[0]));
+''')
+        self.assertEqual(result["instance_id"], r"USB\VID_2BDF&PID_0102\A")
+        self.assertEqual(result["driver_service"], "usbvideo")
+        self.assertEqual(result["driver_version"], "10.0.1")
+
+    def test_hardware_fingerprint_expires_for_every_readiness_identity_change(self) -> None:
+        result = run_hardware_fingerprint_script(
+            r'''
+let currentConfig = {
+  acquisition_mode:"real", dataset_schema:"new_collection_v11_3",
+  selected_sensors:["ABB_X"], interface_channel_assignments:{abb_motion:["ABB_X"]},
+  interfaces:[{
+    id:"abb_motion", enabled:true, role:"robot", driver:"abb_robot",
+    endpoint:"192.168.125.1", baudrate:0, slave_id:0,
+    physical_interface_id:"ethernet:industrial", physical_port_id:"pcie:1",
+    physical_interface_kind:"ethernet", physical_transport_family:"ethernet",
+    credential_identifier:"sha256-a",
+    device_identity:{controller_id:"abb-a"},
+    driver_state:{available:true, version:"1.0"},
+    device_profile:{id:"abb-rws", version:1, approval_status:"approved"},
+  }],
+};
+const state = {
+  bootstrap:{application:{version:"2.0.0", build_id:"build-a"}},
+  simulationSourcePackageId:"", simulationSourceId:"", publicDemoBundle:null,
+  simulationPackages:[], simulationSourceReady:null, publicDemoReady:false,
+  simulationDatasetCache:null,
+};
+const controls = {simulationPackage:{value:""}};
+function acquisitionConfig() { return currentConfig; }
+const baseline = hardwareConfigFingerprint();
+const changes = [];
+function mutateInterface(field, value) {
+  currentConfig = JSON.parse(JSON.stringify(currentConfig));
+  currentConfig.interfaces[0][field] = value;
+  changes.push(hardwareConfigFingerprint() !== baseline);
+  currentConfig = JSON.parse(JSON.stringify(baseConfig));
+}
+const baseConfig = JSON.parse(JSON.stringify(currentConfig));
+mutateInterface("endpoint", "192.168.125.2");
+mutateInterface("physical_port_id", "pcie:2");
+mutateInterface("credential_identifier", "sha256-b");
+mutateInterface("device_identity", {controller_id:"abb-b"});
+mutateInterface("driver_state", {available:true, version:"1.1"});
+mutateInterface("device_profile", {id:"abb-rws", version:2, approval_status:"approved"});
+state.bootstrap.application.build_id = "build-b";
+changes.push(hardwareConfigFingerprint() !== baseline);
+console.log(JSON.stringify({changes, baseline}));
+'''
+        )
+
+        self.assertEqual(result["changes"], [True] * 7)
+        self.assertNotIn("robotics", result["baseline"])
+
+    def test_failure_detail_preserves_endpoint_physical_binding_stages_and_raw_code(self) -> None:
+        result = run_hardware_status_script(
+            r'''
+console.log(JSON.stringify({
+  known: hardwareInterfaceDetail({
+    endpoint:"192.168.125.1", physical_interface_id:"ethernet:industrial",
+    final_status:"authentication_failed", stages:{
+      authentication:{state:"failed"}, protocol:{state:"not_reached"},
+      network_path:{state:"passed"}, usb_binding:{state:"not_applicable"},
+    },
+  }),
+  unknown: hardwareStateLabel("vendor_specific_failure"),
+}));
+'''
+        )
+
+        self.assertIn("192.168.125.1", result["known"])
+        self.assertIn("ethernet:industrial", result["known"])
+        self.assertIn("authentication_failed", result["known"])
+        self.assertIn("authentication:failed", result["known"])
+        self.assertIn("protocol:not_reached", result["known"])
+        self.assertIn("vendor_specific_failure", result["unknown"])
+
+    def test_auto_assignment_preserves_plc_and_abb_protocol_endpoints(self) -> None:
+        result = run_candidate_script(
+            r"""
+state.physicalInterfaces = [
+  {id:"ethernet:industrial", kind:"ethernet", endpoint:"以太网", addresses:["192.168.125.209"], detected:true, compatible:true, interface_type:"physical", target_subnet_match:true, best_route:true, auto_eligible:true},
+];
+const configs = [
+  {id:"plc", role:"plc", endpoint:"192.168.125.5:502"},
+  {id:"abb", role:"robot", endpoint:"192.168.125.1"},
+];
+autoAssignPhysicalInterfaces(configs);
+console.log(JSON.stringify(configs));
+"""
+        )
+
+        self.assertEqual(result[0]["endpoint"], "192.168.125.5:502")
+        self.assertEqual(result[1]["endpoint"], "192.168.125.1")
+        self.assertEqual(
+            [item["physical_interface_id"] for item in result],
+            ["ethernet:industrial", "ethernet:industrial"],
+        )
+
+    def test_only_serial_physical_selection_can_supply_protocol_endpoint(self) -> None:
+        result = run_candidate_script(
+            r"""
+console.log(JSON.stringify({
+  plc: physicalSelectionProvidesProtocolEndpoint("plc", {kind:"ethernet"}),
+  abb: physicalSelectionProvidesProtocolEndpoint("robot", {kind:"ethernet"}),
+  uvc: physicalSelectionProvidesProtocolEndpoint("thermal_uvc", {kind:"usb_uvc"}),
+  pressure: physicalSelectionProvidesProtocolEndpoint("pressure", {kind:"serial"}),
+  strain: physicalSelectionProvidesProtocolEndpoint("esr1001_strain", {kind:"com"}),
+}));
+"""
+        )
+
+        self.assertEqual(
+            result,
+            {"plc": False, "abb": False, "uvc": False, "pressure": True, "strain": True},
+        )
+
+    def test_rediscovery_mode_round_trip_keeps_protocol_endpoints_and_saved_bindings(self) -> None:
+        result = run_remembered_selection_script(
+            r"""
+const state = {interfaceCatalog:[]};
+const controls = {acquisitionMode:{value:"real"}, interfacePanel:{querySelectorAll(){return [{}];}}};
+function interfaceConfigs() { return {interfaces:[
+  {id:"plc_process", role:"plc", endpoint:"192.168.125.5:502", physical_interface_id:"ethernet:industrial", physical_interface_kind:"ethernet", selection_origin:"manual"},
+  {id:"uvc_temperature", role:"thermal_uvc", endpoint:"BSV UVC (WinUSB)", physical_port_id:"usbport:external:1", physical_interface_id:"uvc:2bdf:0102", physical_interface_kind:"usb_uvc", selection_origin:"manual"},
+  {id:"abb_motion", role:"robot", endpoint:"192.168.125.1", physical_interface_id:"ethernet:industrial", physical_interface_kind:"ethernet", selection_origin:"manual"},
+]}; }
+const merged = mergeRememberedInterfaceSelections([
+  {id:"plc_process", role:"plc", endpoint:"192.168.125.5:502"},
+  {id:"uvc_temperature", role:"thermal_uvc", endpoint:"BSV UVC (WinUSB)"},
+  {id:"abb_motion", role:"robot", endpoint:"192.168.125.1"},
+]);
+console.log(JSON.stringify(merged));
+"""
+        )
+
+        self.assertEqual(
+            [item["endpoint"] for item in result],
+            ["192.168.125.5:502", "BSV UVC (WinUSB)", "192.168.125.1"],
+        )
+        self.assertEqual(result[0]["physical_interface_id"], "ethernet:industrial")
+        self.assertEqual(result[1]["physical_port_id"], "usbport:external:1")
+        self.assertEqual(result[2]["physical_interface_id"], "ethernet:industrial")
+
+    def test_auto_assignment_rejects_apipa_wlan_tun_and_selects_direct_industrial_route(self) -> None:
+        result = run_candidate_script(
+            r"""
+state.physicalInterfaces = [
+  {id:"ethernet:bluetooth", kind:"ethernet", name:"蓝牙网络连接", endpoint:"蓝牙网络连接", addresses:["169.254.123.214"], detected:true, interface_type:"physical"},
+  {id:"ethernet:wlan", kind:"ethernet", name:"WLAN", endpoint:"WLAN", addresses:["192.168.15.162"], detected:true, interface_type:"wireless"},
+  {id:"ethernet:tun", kind:"ethernet", name:"FlClash", endpoint:"FlClash", addresses:["198.18.0.1"], detected:true, interface_type:"virtual"},
+  {id:"ethernet:industrial", kind:"ethernet", name:"以太网", endpoint:"以太网", addresses:["192.168.125.209"], detected:true, interface_type:"physical", target_subnet_match:true, best_route:true, route_source_address:"192.168.125.209"},
+];
+const configs = [{id:"plc", role:"plc", endpoint:"192.168.125.5:502"}];
+autoAssignPhysicalInterfaces(configs);
+console.log(JSON.stringify(configs[0]));
+"""
+        )
+
+        self.assertEqual(result["physical_interface_id"], "ethernet:industrial")
+        self.assertEqual(result["endpoint"], "192.168.125.5:502")
+
+
+if __name__ == "__main__":
+    unittest.main()

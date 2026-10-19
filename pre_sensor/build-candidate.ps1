@@ -28,10 +28,21 @@ if (-not $gitRevision) { throw "Cannot resolve source revision." }
 $revision = $gitRevision
 $candidateRevision = $gitRevision
 $diff = (& git -C $BuildSourceRoot diff --binary HEAD -- .) -join "`n"
-if ($diff) {
+$untracked = @(& git -C $BuildSourceRoot ls-files --others --exclude-standard)
+if ($LASTEXITCODE -ne 0) { throw "Cannot enumerate untracked build inputs." }
+$untrackedFingerprints = @(
+    foreach ($relativePath in @($untracked | Sort-Object)) {
+        $absolutePath = Join-Path $BuildSourceRoot $relativePath
+        if (Test-Path -LiteralPath $absolutePath -PathType Leaf) {
+            "untracked`t$relativePath`t$((Get-FileHash -LiteralPath $absolutePath -Algorithm SHA256).Hash.ToLowerInvariant())"
+        }
+    }
+)
+$workingTreeIdentity = (@($diff) + $untrackedFingerprints) -join "`n"
+if ($workingTreeIdentity) {
     $algorithm = [Security.Cryptography.SHA256]::Create()
     try {
-        $diffHash = ([BitConverter]::ToString($algorithm.ComputeHash([Text.Encoding]::UTF8.GetBytes($diff)))).Replace("-", "").ToLowerInvariant()
+        $diffHash = ([BitConverter]::ToString($algorithm.ComputeHash([Text.Encoding]::UTF8.GetBytes($workingTreeIdentity)))).Replace("-", "").ToLowerInvariant()
     } finally {
         $algorithm.Dispose()
     }

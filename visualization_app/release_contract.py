@@ -13,6 +13,9 @@ class ReleaseContractError(ValueError):
     """Raised when a release identity is missing, malformed, or inconsistent."""
 
 
+DEVICE_READINESS_CONTRACT = "plc_abb_uvc_readiness_v1"
+
+
 @dataclass(frozen=True)
 class ReleaseContract:
     schema_version: int
@@ -221,6 +224,8 @@ def helper_capability_mismatches(
         "unified_frame_contract": expected.unified_frame_contract,
         "configuration_schema_version": expected.configuration_schema_version,
         "readiness_schema_version": expected.readiness_schema_version,
+        "device_readiness_contract": DEVICE_READINESS_CONTRACT,
+        "unified_device_readiness_v1": True,
     }
     candidate_id, helper_sha256 = release_manifest_helper_identity(expected)
     if candidate_id:

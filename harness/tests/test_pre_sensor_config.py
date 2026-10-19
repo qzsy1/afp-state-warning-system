@@ -223,6 +223,8 @@ class PreSensorConfigurationValidationTests(unittest.TestCase):
             "unified_frame_contract": contracts["unified_frame_contract"],
             "configuration_schema_version": contracts["configuration_schema_version"],
             "readiness_schema_version": contracts["readiness_schema_version"],
+            "device_readiness_contract": "plc_abb_uvc_readiness_v1",
+            "unified_device_readiness_v1": True,
             "unified_frame_v2": True,
             "thermocouple64_hardware_gate": True,
             "real_capture": True,

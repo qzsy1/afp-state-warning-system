@@ -395,7 +395,7 @@ class AcquisitionIntegrityTests(unittest.TestCase):
         self.assertEqual(result["interfaces"][0]["state"], "not_connected")
         self.assertIn("临时分配串口", result["interfaces"][0]["message"])
 
-    def test_connection_still_probes_driver_when_physical_interface_is_unverified(self) -> None:
+    def test_connection_does_not_probe_uvc_with_unapproved_device_profile(self) -> None:
         config = AcquisitionConfig(
             acquisition_mode="real", dataset_schema="new_collection_v11_3",
             selected_sensors=["ROI平均温度"],
@@ -413,14 +413,10 @@ class AcquisitionIntegrityTests(unittest.TestCase):
         with patch("acquisition.MultiInterfaceDriver") as driver:
             driver.return_value.read_sample.return_value = {"ROI平均温度": 42.5}
             result = manager.test_connection(config, timeout_seconds=0.1)
-        driver.assert_called_once()
-        driver.return_value.open.assert_called_once()
-        driver.return_value.read_sample.assert_called()
-        driver.return_value.close.assert_called_once()
-        self.assertEqual(result["interfaces"][0]["detected_channels"], ["ROI平均温度"])
-        self.assertEqual(result["interfaces"][0]["state"], "physical_unverified")
-        self.assertIn("已收到有效数据", result["interfaces"][0]["message"])
-        self.assertIn("物理端口", result["interfaces"][0]["message"])
+        driver.assert_not_called()
+        self.assertEqual(result["interfaces"][0]["detected_channels"], [])
+        self.assertEqual(result["interfaces"][0]["state"], "device_profile_incomplete")
+        self.assertIn("设备档", result["interfaces"][0]["message"])
         self.assertFalse(result["interfaces"][0]["ok"])
         self.assertFalse(result["ok"])
 

@@ -34,8 +34,23 @@ class RegressionMatrixContractTests(unittest.TestCase):
                 "PRE_SENSOR_HELPER_GENERATION", "PRE_SENSOR_MODEL_PROVENANCE",
                 "ESR1001",
                 "THERMOCOUPLE64",
+                "PLC_ABB_UVC",
             },
         )
+
+    def test_plc_abb_uvc_contract_has_automated_and_field_evidence(self) -> None:
+        requirements = {item.id: item for item in self.matrix.requirements}
+        checks = {item.id: item for item in self.matrix.checks}
+        self.assertIn("PLC_ABB_UVC-001", requirements)
+        self.assertIn("PLC_ABB_UVC-FIELD-001", requirements)
+        automated = checks["plc-abb-uvc-readiness-contracts"]
+        self.assertTrue(automated.blocking)
+        self.assertEqual(automated.evidence_tier, "automated")
+        self.assertEqual(automated.profiles, ("quick", "full", "release"))
+        self.assertIn("PLC_ABB_UVC-001", automated.requirements)
+        field = checks["field-real-hardware"]
+        self.assertIn("PLC_ABB_UVC-FIELD-001", field.requirements)
+        self.assertEqual(field.evidence_tier, "field")
 
     def test_all_commands_have_existing_working_directories_and_sources(self) -> None:
         for check in self.matrix.checks:

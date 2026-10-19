@@ -37,6 +37,8 @@ class HelperReadinessProbeTests(unittest.TestCase):
                 "unified_frame_contract": values["unified_frame_contract"],
                 "configuration_schema_version": values["configuration_schema_version"],
                 "readiness_schema_version": values["readiness_schema_version"],
+                "device_readiness_contract": "plc_abb_uvc_readiness_v1",
+                "unified_device_readiness_v1": True,
                 "unified_frame_v1": True,
                 "unified_frame_v2": True,
             },

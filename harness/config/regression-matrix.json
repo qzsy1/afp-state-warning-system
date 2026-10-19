@@ -24,6 +24,8 @@
     {"id": "FIELD_BOUNDARY-001", "title": "现场硬件和目标MySQL证据不得由模拟结果冒充", "mandatory": true, "profiles": ["release"]},
     {"id": "REAL_ACQUISITION-001", "title": "真实采集使用独立驱动、统一单调时钟和逐通道质量合同", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "PHYSICAL_READINESS-001", "title": "六类物理传感器按协议身份和全部必需通道失败关闭", "mandatory": true, "profiles": ["quick", "full", "release"]},
+    {"id": "PLC_ABB_UVC-001", "title": "PLC、ABB和BSV UVC使用独立端点与物理绑定、真实协议读取和统一Readiness合同", "mandatory": true, "profiles": ["quick", "full", "release"]},
+    {"id": "PLC_ABB_UVC-FIELD-001", "title": "PLC、ABB和BSV UVC实物身份、参考语义、测温与数据就绪由现场证据确认", "mandatory": true, "profiles": ["release"]},
     {"id": "LIVE_PREDICTION_SAFETY-001", "title": "实时预测只使用兼容频率下最近连续完整模型窗口", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "CAPTURE_PERSISTENCE-001", "title": "统一帧、质量侧车、数据库和停止终结可对账恢复", "mandatory": true, "profiles": ["full", "release"]},
     {"id": "REAL_RELEASE_GATE-001", "title": "G0至G5证据按交付修订分级且不可由低等级越级替代", "mandatory": true, "profiles": ["release"]},
@@ -202,6 +204,20 @@
       "evidence_tier": "automated",
       "requirements": ["REAL_PREP_MODE-001", "REAL_PREP_FRAME-001", "REAL_PREP_RECOVERY-001"],
       "change_patterns": ["visualization_app/acquisition.py", "visualization_app/real_acquisition.py", "visualization_app/*capture*", "visualization_app/test_real_acquisition_modes.py", "harness/**", "openspec/changes/prepare-real-acquisition/**"]
+    },
+    {
+      "id": "plc-abb-uvc-readiness-contracts",
+      "title": "PLC、ABB与BSV UVC端点、协议、驱动和统一Readiness合同",
+      "kind": "command",
+      "command": ["{python}", "-m", "unittest", "visualization_app.test_plc_abb_uvc_readiness", "visualization_app.test_plc_abb_uvc_frontend", "visualization_app.test_plc_modbus_contract", "visualization_app.test_abb_digest_contract", "visualization_app.test_uvc_dll_contract", "visualization_app.test_unified_device_readiness", "visualization_app.test_readiness_fingerprint", "visualization_app.test_plc_abb_uvc_fault_isolation", "visualization_app.test_plc_abb_uvc_documentation", "visualization_app.test_industrial_acquisition_probe", "-v"],
+      "cwd": ".",
+      "timeout_seconds": 300,
+      "profiles": ["quick", "full", "release"],
+      "environments": ["local", "ci"],
+      "blocking": true,
+      "evidence_tier": "automated",
+      "requirements": ["PLC_ABB_UVC-001", "REAL_ACQUISITION-001", "PHYSICAL_READINESS-001", "REAL_PREP_PROTOCOL-001"],
+      "change_patterns": ["visualization_app/acquisition.py", "visualization_app/real_acquisition.py", "visualization_app/local_capture_agent.py", "visualization_app/release_contract.py", "visualization_app/static/app.js", "visualization_app/test_plc_abb_uvc*.py", "visualization_app/test_plc_modbus_contract.py", "visualization_app/test_abb_digest_contract.py", "visualization_app/test_uvc_dll_contract.py", "visualization_app/test_unified_device_readiness.py", "visualization_app/test_readiness_fingerprint.py", "visualization_app/industrial_acquisition_probe.py", "visualization_app/test_industrial_acquisition_probe.py", "pre_sensor/FIELD-OPERATIONS.md", "openspec/changes/fix-plc-abb-uvc-real-acquisition/**"]
     },
     {
       "id": "real-acquisition-remote-helper-contracts",
@@ -550,7 +566,7 @@
       "environments": ["local"],
       "blocking": false,
       "evidence_tier": "field",
-      "requirements": ["INTERFACES-001", "FIELD_BOUNDARY-001", "REAL_ACQUISITION-001", "PHYSICAL_READINESS-001", "REAL_RELEASE_GATE-001", "REAL_PREP_MODE-001", "REAL_PREP_PROTOCOL-001", "REAL_PREP_RECOVERY-001", "ESR1001-001"]
+      "requirements": ["INTERFACES-001", "FIELD_BOUNDARY-001", "REAL_ACQUISITION-001", "PHYSICAL_READINESS-001", "REAL_RELEASE_GATE-001", "REAL_PREP_MODE-001", "REAL_PREP_PROTOCOL-001", "REAL_PREP_RECOVERY-001", "ESR1001-001", "PLC_ABB_UVC-FIELD-001"]
     },
     {
       "id": "field-target-mysql",

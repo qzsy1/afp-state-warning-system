@@ -52,6 +52,7 @@ class LocalDirectAdapter:
         reconnect_backoff_seconds: float = 0.05,
         max_reconnect_backoff_seconds: float = 1.0,
         max_reconnect_attempts: int = 5,
+        before_open: Callable[[], Any] | None = None,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
     ) -> None:
@@ -68,11 +69,14 @@ class LocalDirectAdapter:
             float(max_reconnect_backoff_seconds),
         )
         self.max_reconnect_attempts = max(0, int(max_reconnect_attempts))
+        self.before_open = before_open
         self.clock = clock
         self.wall_clock = wall_clock
         self.stop_event = threading.Event()
         self.opened = threading.Event()
         self.thread: threading.Thread | None = None
+        self._close_lock = threading.Lock()
+        self._stop_close_thread: threading.Thread | None = None
         self.source_sequence = 0
         self.read_calls = 0
         self.reconnect_attempts = 0
@@ -120,6 +124,7 @@ class LocalDirectAdapter:
                     ),
                     received_wall_time=received_wall_time,
                     received_monotonic=received_monotonic,
+                    device_timestamp=getattr(self.driver, "source_timestamp", None),
                     source_sequence=self.source_sequence,
                     protocol_ok=getattr(self.driver, "protocol_verified", None),
                     metadata=(
@@ -132,17 +137,20 @@ class LocalDirectAdapter:
         return True
 
     def _safe_close(self) -> None:
-        try:
-            self.driver.close()
-        except Exception as exc:
-            if not self.last_error:
-                self.last_error = str(exc)
+        with self._close_lock:
+            try:
+                self.driver.close()
+            except Exception as exc:
+                if not self.last_error:
+                    self.last_error = str(exc)
 
     def _run(self) -> None:
         try:
             while not self.stop_event.is_set():
                 try:
                     self.state = "opening" if self.reconnect_attempts == 0 else "reconnecting"
+                    if self.before_open is not None:
+                        self.before_open()
                     self.driver.open()
                     self.opened.set()
                     self.state = "running"
@@ -178,12 +186,26 @@ class LocalDirectAdapter:
                 self.state = "stopped"
 
     def stop(self, timeout_seconds: float = 0.5) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
         self.stop_event.set()
-        self._safe_close()
+        close_thread = self._stop_close_thread
+        if close_thread is None or not close_thread.is_alive():
+            close_thread = threading.Thread(
+                target=self._safe_close,
+                name=f"AFP-Close-{self.interface_id}",
+                daemon=True,
+            )
+            self._stop_close_thread = close_thread
+            close_thread.start()
+        close_thread.join(max(0.0, deadline - time.monotonic()))
         thread = self.thread
         if thread is not None:
-            thread.join(max(0.0, float(timeout_seconds)))
-        stopped = thread is None or not thread.is_alive()
+            thread.join(max(0.0, deadline - time.monotonic()))
+        stopped = (
+            (thread is None or not thread.is_alive())
+            and not close_thread.is_alive()
+            and not bool(getattr(self.driver, "native_call_pending", False))
+        )
         if not stopped:
             self.state = "stop_timed_out"
         return stopped

@@ -6,6 +6,8 @@
 
 使用 `manage-single-runtime-delivery.ps1 -Mode Stage` 在 staging 装配最新交付并完成 manifest、版本、Helper、`--verify-files`、`--self-test` 和 `--module-status` 门禁。失败时停止并清理本次 deployment 子目录，不得从其他目录补文件。
 
+软件交付完成前，必须把已验证且获得用户发布授权的版本更新到固定运行目录，从该目录启动，并核对实际进程路径、运行修订、发布清单、磁盘与页面资源摘要一致，再完成授权接口实读、短时采集、文件终结与保存复验。仅源码或候选通过不能称为正式软件已交付；未获授权时明确说明正式目录尚未更新。软件更新与实物最终验收分别报告，未完成的参考核对、UVC 测温和三设备联合验收继续保持未完成。
+
 切换前必须输出准确 PID、当前可执行路径、当前和目标身份、预计中断及回滚方法，等待独立的“切换审批”。未批准时不得停止进程、交换运行目录或修改公网源站。批准后也只能操作 inventory 锁定的 AFP 目标；服务门禁失败时恢复切换前目录。
 
 启动项修改与旧目录删除不包含在切换审批内。旧候选、旧 delivery 和旧证据副本必须逐项生成清理预览，等待独立的“清理审批”；禁止通配符、父目录或工作区根删除。历史版本通过 Git 提交/标签和 Git LFS 在 staging 重建，再经过同一发布与服务门禁，不依赖长期保存多套运行目录。
@@ -24,6 +26,50 @@
 
 按报告中的 remediation 逐项处理。目标 MySQL、第二台 Windows、管理员权限、网络/防火墙和电源策略缺失属于环境阻塞，不是传感器待验证。修复后重新运行完整预检。
 
+设备地址与实际物理接口必须分别核对。PLC 设备地址保留 Modbus TCP 主机与端口，ABB 设备地址保留 RWS 主机，BSV UVC 设备地址保留批准设备档端点；重新发现或选择网卡、USB 端口时不得把接口名称写入设备地址。只有串口设备允许所选 COM 端点更新设备地址。先执行接口重新发现，确认 PLC/ABB 的目标地址、实际源地址和最佳路由均指向所选工业有线网卡，再确认 UVC 的 Windows 设备身份、VID/PID、驱动服务和 USB 物理端口。随后执行立即检查；任何地址、绑定、设备身份或驱动状态变化后都必须重新发现并再次检查。出现 `network_path_invalid` 时保留当前选择供诊断，但不得启动正式真实采集。
+
+本机直连和远程 Helper 都使用 `plc_abb_uvc_readiness_v1`。远程电脑的 Helper 必须在线，并在能力中返回 `unified_device_readiness_v1=true`；旧版或缺少能力的 Helper 必须停止在重新检查之前，不得回退到服务器电脑的接口。检查使用 `POST /api/acquisition/test`，正式启动使用 `POST /api/acquisition/start`。逐台确认接口阶段 `physical_binding`、`device_identity`、`driver`、路径或 USB、认证、协议、通道、`freshness` 和 `stability`；PLC、ABB、BSV UVC 只有最终状态均为 `data_ready` 才进入联合现场采集。`partial_channels`、`authentication_failed`、`driver_incompatible`、`device_open_failed`、`no_valid_frame` 和 `device_profile_incomplete` 均为阻断状态。
+
+设备端点、物理绑定、凭据配置、设备身份、驱动状态、设备档版本或运行修订变化后，旧检查快照立即失效，必须重新发现并重新检查。程序只检测和报告 UVC 驱动，不得静默安装、替换或回滚 UVC 驱动。需要改变系统驱动时，先停止 AFP，核对经批准的厂商资料，向操作员说明预览/测温能力风险、当前驱动身份和回滚步骤，再由操作员在维护窗口执行；变更后重新枚举、重新检查，失败时按批准步骤恢复。
+
+PLC 默认目标为 `192.168.125.5:502`，Unit ID 为 255，FC03 起始寄存器为温度 28、压力 37、张力 23，每通道读取两个寄存器并按低字在前的浮点映射解析。TCP 握手成功不等于三个通道就绪；必须逐通道取得有限新鲜值，并与已知工艺值核对倍率、单位和偏差。不得因现场值为零而补造样本，也不得把未经参考核对的寄存器数值作为最终验收结论。
+
+ABB 默认目标为 `192.168.125.1`，只读资源为 `/rw/motionsystem/mechunits/ROB_1/robtarget?coordinate=Base&json=1`。凭据在接口的 `username`、`password` 字段配置，不在文档、日志或诊断证据中填写明文；账户只需读取相应 RWS 资源，不申请主控权或运动权限。会话协商 Digest 并显式绕过系统 HTTP 代理。核对控制器、`ROB_1`、Base 坐标系及毫米单位；首个位置样本不能验证速度，两个有效位置按时间差计算的毫米每秒值仍须与示教器或批准受控运动核对。`authentication_failed`、资源错误、解析错误与 `transport_timeout` 分别处理，不能统称设备断线。
+
+检查与重连前的 `network_path` 使用实际 TCP 连接源地址；系统 UDP 路由指向工业网卡仍可能存在 TCP 被 TUN 接管的情况。源地址属于 WLAN、APIPA 或 TUN 时返回 `network_path_invalid`，由操作员核对系统分流规则后重新检查，不自动改变系统代理或路由。浏览器检查请求超时只说明本次未取得完整响应；本机请求与 Helper 请求分开标明，超时生成的失败行不能证明各设备均存在协议故障。先核对正在运行的修订、页面当前设备地址、物理绑定和请求执行端，再读取逐接口协议结果。
+
+PLC 与 ABB 的协议连接绑定到路径检查通过的工业 IPv4 源地址，并再次核对实际连接源地址；打开和重连不会退回未绑定的默认网络连接。ABB HTTP/HTTPS 请求使用同一绑定与 Digest 会话。
+
+ABB 同一驱动实例复用内存中的会话 Cookie，结束时通过 `/logout` 只释放本客户端会话，不记录 Cookie 值。`session_limit_exceeded` 表示控制器报告会话已满，`session_close_failed` 表示本客户端退出未成功；不要清除其他客户端会话或通过不断重新登录重试。[ABB 官方会话说明](https://developercenter.robotstudio.com/api/rwsApi/index.html)要求复用 Cookie，[退出接口](https://developercenter.robotstudio.com/api/rwsApi/root_resource_logout_page.html)用于释放关联会话。
+
+### PLC 独立采集配置
+
+独立排查 PLC 时选择“仅采集”和“本机直连”，仅启用 PLC 接口及温度、压力、张力三个采集/保存通道。先选择实际网卡“以太网”，再确认设备地址仍为 `192.168.125.5:502`，工业 IPv4 为 `192.168.125.209`；设备地址不能填写“以太网”或其他网卡名称。重新发现或改变绑定后，再核对地址并执行立即检查。仅选三通道时不能套用要求其他传感器输入的预测模型；需要预测时另行选择已验证兼容模型与完整输入。
+
+PLC 独立检查必须显示三个通道均收到有效数据，之后以 10 Hz 启动并保存到可写的 D 盘目录，结束时核对样本数、CSV 行数和质量侧车。其他设备未参与本次独立验证时，不将它们计为通过，也不据此形成三设备验收结论。PLC 参考值、单位和倍率仍须单独核对。
+
+### PLC 与 ABB 只读复现入口
+
+先核对拓展坞网口经交换机连接 PLC 和 ABB；工业网卡使用设备同网段的固定 IPv4，默认网关保持为空。翻墙软件可以继续运行，但到两个设备的实际 TCP 路径必须属于工业网卡；固定源地址并不能使无应答的设备成为已连接。不要修改 PLC 寄存器、ABB 运动或系统驱动。
+
+在固定源码目录运行以下命令，使用权威生产驱动按 10 Hz 并行读取 PLC 与 ABB，独立打开并关闭连接共三轮，每轮 10 秒：
+
+```powershell
+.\.venv\Scripts\python.exe .\visualization_app\industrial_acquisition_probe.py --interface-id 'ethernet:以太网' --duration 10 --repeat 3
+```
+
+已包含该入口的候选或批准运行程序可执行：
+
+```powershell
+& '<运行目录>\AFP_Integrated_System_Modular.exe' --industrial-readonly-probe --industrial-interface-id 'ethernet:以太网' --industrial-probe-duration 10 --industrial-probe-repeat 3
+```
+
+仅验证 PLC 时，源码命令增加 `--role plc`，候选程序命令增加 `--industrial-probe-role plc`；该模式完全不检查或打开 ABB。证据中的 `requested_roles` 明确本次选择范围，不将未选设备记为成功。
+
+证据默认写入已存在且可写的 `D:\AFP_Capture\diagnostics\fix-plc-abb-uvc-real-acquisition` 下独立的 `industrial-readonly-*\samples.json`，包含驱动内容摘要、运行修订、每轮端点、实际源地址、逐次读数、通道有限值比例、最长无有效数据间隔和错误。一个设备失败不会跳过另一个设备；任一设备未通过时退出码为 2。ABB 首个位置样本的速度为空，保留在统计分母中；不补零，不沿用旧样本。
+
+`read_only_probe_passed` 要求每轮所选设备的每个必需通道至少取得两个有限样本、有限值比例不低于 99%、最长无有效数据间隔不超过 2 秒且无读取或关闭错误。它只证明本次只读读取复现；结果的 `reference_semantics_verified` 和 `field_acceptance_passed` 保持 false，不替代工艺参考核对、UVC 测温或三设备 600 秒联合验收。
+
 ## 5. 启动采集
 
 先确认固定运行目录的摘要、模式配置和预检报告属于同一 candidate ID。远程模式还必须确认 Helper 在线、已配对、readiness 已导入且能力协商一致，再从主程序启动。模拟采集只能证明协议、队列、保存和恢复路径，不得写成真实传感器或真实双机通过。
@@ -36,9 +82,13 @@
 
 持续观察77个原始通道的逐通道质量、绝对序号、当前配置目标速率下的有效频率、writer/transport 队列高水位、网络 ACK/重传、CSV/质量侧车、journal、MySQL 与 retry spool 状态。64路热电偶还需核对各组有效率、缺失/过期区间和协议错误计数；应变质量证据包括四通道观测数、最后有效时间、缺失/过期区间和协议错误计数。达到容量警告时正常停止并处理，禁止继续堆积。
 
+接口状态为 `waiting_first_sample` 时等待首个有效样本；进入 `reconnecting` 时记录受影响设备、开始时间和重连次数，同时确认其他接口继续采集和保存。超过设备档新鲜度后通道进入 `stale`，旧值不得作为新的有限值保存；恢复点必须出现新的来源序号和 `measured_new`。状态变为 `failed` 时停止本次正式验收并保留已写入证据。降级期间不得把缺失或陈旧通道计入有效数据比例，也不得用其他接口的值填充。
+
 ## 7. 正常停止
 
 只执行一次停止并等待 `finalization_complete`。重复停止应返回相同结果。超时、断网或数据库不可用时保留工作文件/journal/spool，不得手工删除后宣称完成。
+
+若返回 `stop_timed_out`，表示至少一个设备或写入线程未在声明上限内退出；此时 `finalization_complete` 必须为 false。不要强制覆盖保存文件或开始下一次采集，先停止 AFP 进程、保存诊断证据并按设备维护步骤恢复。
 
 ## 8. 数据库重试与最终对账
 

@@ -102,6 +102,11 @@ class HelperTransportTests(unittest.TestCase):
             helper_entry.RELEASE_CONTRACT.helper_version,
         )
         self.assertEqual(capabilities["command_lifecycle"], "isolated_hardware_check")
+        self.assertEqual(
+            capabilities["device_readiness_contract"],
+            "plc_abb_uvc_readiness_v1",
+        )
+        self.assertTrue(capabilities["unified_device_readiness_v1"])
         self.assertTrue(capabilities["simulation_replay_v1"])
 
     def test_dispatcher_materializes_simulation_source_before_start(self):

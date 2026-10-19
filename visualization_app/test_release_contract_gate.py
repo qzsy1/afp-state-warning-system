@@ -39,6 +39,26 @@ def _real_payload() -> dict:
 
 
 class ReleaseContractStartGateTests(unittest.TestCase):
+    def test_old_helper_without_unified_device_readiness_fails_closed(self) -> None:
+        contract = release_contract.load_release_contract(start=__file__)
+        capabilities = {
+            "protocol_version": contract.helper_protocol_version,
+            "helper_version": contract.helper_version,
+            "build_id": contract.release_revision,
+            "configuration_schema_version": contract.configuration_schema_version,
+            "readiness_schema_version": contract.readiness_schema_version,
+            "unified_frame_v1": True,
+            "unified_frame_v2": True,
+            "unified_frame_contract": contract.unified_frame_contract,
+        }
+
+        mismatches = release_contract.helper_capability_mismatches(
+            contract, capabilities
+        )
+
+        self.assertIn("device_readiness_contract", mismatches)
+        self.assertIn("unified_device_readiness_v1", mismatches)
+
     def test_frozen_helper_finds_manifest_beside_candidate_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             candidate = Path(temporary) / "candidate"

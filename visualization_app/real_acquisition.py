@@ -278,7 +278,7 @@ class ReadinessSnapshot:
 
 
 def readiness_config_fingerprint(config: Any) -> str:
-    """Hash only readiness-relevant, non-secret configuration fields."""
+    """Hash every fact that can invalidate a hardware readiness result."""
 
     if hasattr(config, "__dict__"):
         source = vars(config)
@@ -290,20 +290,69 @@ def readiness_config_fingerprint(config: Any) -> str:
     for item in source.get("interfaces", []) or []:
         if not isinstance(item, Mapping):
             continue
-        interfaces.append({
+        credential_material = {
+            "username": str(item.get("username") or ""),
+            "password": str(item.get("password") or ""),
+            "credential_id": str(
+                item.get("credential_id")
+                or item.get("credential_identifier")
+                or ""
+            ),
+        }
+        credential_identifier = ""
+        if any(credential_material.values()):
+            credential_canonical = json.dumps(
+                credential_material,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            credential_identifier = hashlib.sha256(
+                credential_canonical.encode("utf-8")
+            ).hexdigest()
+        device_profile = item.get("device_profile")
+        if not isinstance(device_profile, Mapping):
+            device_profile = {
+                "id": item.get("device_profile_id") or item.get("profile_id"),
+                "version": item.get("profile_version"),
+                "approval_status": item.get("profile_approval_status"),
+            }
+        driver_state = item.get("driver_state")
+        if not isinstance(driver_state, Mapping):
+            driver_state = {
+                "available": item.get("driver_available"),
+                "provider": item.get("driver_provider"),
+                "version": item.get("driver_version"),
+                "status": item.get("driver_status"),
+                "service": item.get("driver_service"),
+            }
+        interface_facts = {
             key: item.get(key)
             for key in (
-                "id", "enabled", "role", "driver", "endpoint", "baudrate",
-                "physical_interface_id", "physical_port_id", "physical_verified",
+                "id", "enabled", "role", "driver", "endpoint", "baudrate", "slave_id",
+                "physical_interface_id", "physical_port_id", "physical_interface_kind",
+                "physical_transport_family", "physical_verified",
                 "physical_vid", "physical_pid", "physical_serial", "physical_location",
                 "device_profile_id", "identity_confirmed",
                 "source_address", "device_subnet", "network_interface_name",
                 "profile_id", "profile_version", "protocol_verified",
                 "channel_types", "channel_types_confirmed", "roi", "dll_path",
             )
+        }
+        interface_facts.update({
+            "credential_identifier": credential_identifier,
+            "device_identity": _sanitize_readiness_evidence(
+                item.get("device_identity") or {}
+            ),
+            "driver_state": _sanitize_readiness_evidence(driver_state),
+            "device_profile": _sanitize_readiness_evidence(device_profile),
         })
+        interfaces.append(interface_facts)
     payload = {
         "config_version": source.get("config_version"),
+        "application_version": source.get("application_version"),
+        "release_revision": source.get("release_revision"),
+        "configuration_schema_version": source.get("configuration_schema_version"),
         "acquisition_mode": source.get("acquisition_mode"),
         "real_acquisition_mode": source.get("real_acquisition_mode"),
         "execution_host": source.get("execution_host"),
@@ -1104,7 +1153,7 @@ class FrameAssembler:
                 value = None
             elif age > freshness:
                 quality = ChannelQuality.STALE
-                value = source.value
+                value = None
             elif is_new:
                 quality = ChannelQuality.MEASURED_NEW
                 value = source.value

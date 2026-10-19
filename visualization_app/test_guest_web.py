@@ -77,6 +77,46 @@ class PublicDeviceStatusTests(unittest.TestCase):
         )
         self.assertTrue(all(item["state"] == "unchecked" for item in payload["interfaces"]))
 
+    def test_public_status_preserves_unknown_failure_and_safe_stage_states(self):
+        module = self._module()
+        payload = module.build_public_device_status(
+            {},
+            {
+                "checked_at": 100.0,
+                "interfaces": [{
+                    "role": "thermal_uvc",
+                    "state": "vendor_specific_failure",
+                    "endpoint": r"USB\VID_SECRET",
+                    "physical_interface_id": "usbport:secret",
+                    "ok": False,
+                    "stages": {
+                        "driver": {"state": "failed", "evidence": "secret"},
+                        "protocol": {"state": "not_reached"},
+                    },
+                }],
+            },
+            {"running": False},
+            now=101.0,
+        )
+        uvc = next(
+            item for item in payload["interfaces"] if item["role"] == "thermal_uvc"
+        )
+        encoded = json.dumps(payload, ensure_ascii=False)
+
+        self.assertEqual(uvc["state"], "vendor_specific_failure")
+        self.assertEqual(uvc["message_code"], "vendor_specific_failure")
+        self.assertIn("vendor_specific_failure", uvc["message"])
+        self.assertEqual(
+            uvc["stages"],
+            [
+                {"name": "driver", "state": "failed"},
+                {"name": "protocol", "state": "not_reached"},
+            ],
+        )
+        self.assertNotIn("VID_SECRET", encoded)
+        self.assertNotIn("usbport:secret", encoded)
+        self.assertNotIn("secret", encoded)
+
     def test_public_status_reads_cached_result_without_reopening_hardware(self):
         with tempfile.TemporaryDirectory() as folder:
             manager = AcquisitionManager(capture_root=Path(folder))

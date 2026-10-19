@@ -40,7 +40,11 @@ from real_acquisition import (
     UnifiedFrame,
     readiness_config_fingerprint,
 )
-from release_contract import ReleaseContractError, load_release_contract
+from release_contract import (
+    DEVICE_READINESS_CONTRACT,
+    ReleaseContractError,
+    load_release_contract,
+)
 try:
     from real_acquisition import ReadinessSnapshot
 except ImportError:
@@ -57,6 +61,8 @@ def compatible_helper_capabilities(**overrides):
         "build_id": RELEASE_CONTRACT.release_revision,
         "configuration_schema_version": RELEASE_CONTRACT.configuration_schema_version,
         "readiness_schema_version": RELEASE_CONTRACT.readiness_schema_version,
+        "device_readiness_contract": DEVICE_READINESS_CONTRACT,
+        "unified_device_readiness_v1": True,
         "unified_frame_v1": True,
         "unified_frame_v2": True,
         "unified_frame_contract": RELEASE_CONTRACT.unified_frame_contract,

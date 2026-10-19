@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import base64
 import csv
 import ctypes
 import hashlib
 import io
+import ipaddress
 import json
 import math
 import os
@@ -12,12 +12,18 @@ import queue
 import re
 import socket
 import struct
+import subprocess
 import threading
 import time
 import tempfile
 import sys
 import urllib.request
 import urllib.parse
+import urllib.error
+import requests
+import urllib3.connectionpool
+from requests.adapters import HTTPAdapter
+from requests.auth import HTTPDigestAuth
 import uuid
 from collections import deque
 from copy import deepcopy
@@ -39,6 +45,7 @@ from real_acquisition import (
     ChannelSampleCache,
     DriverWorker,
     FrameAssembler,
+    ReadinessSnapshot,
     UnifiedFrame,
 )
 from local_direct_acquisition import LocalDirectAdapter, minimum_poll_interval
@@ -259,6 +266,389 @@ ABB_PROCESS_TASK = "T_ROB1"
 ABB_PROCESS_MODULE = "MainModule"
 ABB_SPEED_VARIABLE = "zMovespeed"
 PLC_PID_ANGLE_REGISTER = 20
+
+
+def _network_interface_type(name: str, description: str = "") -> str:
+    text = f"{name} {description}".casefold()
+    if any(token in text for token in ("wlan", "wi-fi", "wifi", "wireless", "无线")):
+        return "wireless"
+    if any(
+        token in text
+        for token in (
+            "flclash", "tunnel", "tun", " tap", "vpn", "loopback",
+            "hyper-v", "vethernet", "wsl", "virtual", "虚拟",
+        )
+    ):
+        return "virtual"
+    return "physical"
+
+
+def network_interface_route_facts(
+    name: str,
+    description: str,
+    ipv4_bindings: list[dict[str, str]],
+    targets: dict[str, str],
+    route_sources: dict[str, str],
+) -> dict[str, Any]:
+    bindings = [
+        {
+            "address": str(item.get("address") or ""),
+            "netmask": str(item.get("netmask") or ""),
+        }
+        for item in ipv4_bindings
+        if str(item.get("address") or "")
+    ]
+    addresses = [item["address"] for item in bindings]
+    parsed_addresses = []
+    for item in bindings:
+        try:
+            parsed_addresses.append(
+                ipaddress.IPv4Interface(
+                    f"{item['address']}/{item['netmask'] or '255.255.255.255'}"
+                )
+            )
+        except ValueError:
+            continue
+    interface_type = _network_interface_type(name, description)
+    apipa_only = bool(parsed_addresses) and all(
+        address.ip.is_link_local for address in parsed_addresses
+    )
+    target_routes: dict[str, dict[str, Any]] = {}
+    for target_id, target_value in targets.items():
+        target = ipaddress.IPv4Address(str(target_value))
+        source_address = str(route_sources.get(target_id) or "")
+        target_subnet_match = any(
+            target in address.network for address in parsed_addresses
+        )
+        best_route = bool(source_address and source_address in addresses)
+        target_routes[str(target_id)] = {
+            "target_address": str(target),
+            "source_address": source_address,
+            "target_subnet_match": target_subnet_match,
+            "best_route": best_route,
+            "auto_eligible": bool(
+                interface_type == "physical"
+                and not apipa_only
+                and target_subnet_match
+                and best_route
+            ),
+        }
+    return {
+        "interface_type": interface_type,
+        "ipv4_bindings": bindings,
+        "apipa_only": apipa_only,
+        "target_routes": target_routes,
+    }
+
+
+def _route_source_address(host: str, port: int) -> str:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect((str(host), int(port)))
+        return str(sock.getsockname()[0])
+    except OSError:
+        return ""
+    finally:
+        sock.close()
+
+
+def _network_adapter_snapshot() -> list[dict[str, Any]]:
+    try:
+        import psutil
+    except ImportError:
+        return _windows_network_adapter_snapshot()
+    if psutil is None:
+        return _windows_network_adapter_snapshot()
+    result = []
+    for name, addresses in psutil.net_if_addrs().items():
+        bindings = [
+            {
+                "address": str(address.address),
+                "netmask": str(address.netmask or ""),
+            }
+            for address in addresses
+            if getattr(address, "family", None) == socket.AF_INET
+            and not str(address.address).startswith("127.")
+        ]
+        result.append({
+            "id": f"ethernet:{name}",
+            "name": str(name),
+            "description": "",
+            "ipv4_bindings": bindings,
+        })
+    return result
+
+
+def _windows_network_adapter_snapshot() -> list[dict[str, Any]]:
+    """Read Windows IPv4 adapter identities without requiring psutil."""
+    if not sys.platform.startswith("win"):
+        return []
+    script = (
+        "$utf8=[System.Text.UTF8Encoding]::new($false);"
+        "[Console]::OutputEncoding=$utf8;$OutputEncoding=$utf8;"
+        "$items=@(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | "
+        "Where-Object {$_.IPAddress -notlike '127.*'} | ForEach-Object {"
+        "$adapter=Get-NetAdapter -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue;"
+        "[pscustomobject]@{Name=$_.InterfaceAlias;Description=$adapter.InterfaceDescription;"
+        "Address=$_.IPAddress;PrefixLength=$_.PrefixLength}});"
+        "$items | ConvertTo-Json -Compress"
+    )
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    completed = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=8.0,
+        creationflags=creation_flags,
+    )
+    if completed.returncode != 0 or not completed.stdout.strip():
+        return []
+    decoded = json.loads(completed.stdout)
+    rows = decoded if isinstance(decoded, list) else [decoded]
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("Name") or "").strip()
+        address = str(row.get("Address") or "").strip()
+        if not name or not address:
+            continue
+        try:
+            prefix_length = int(row.get("PrefixLength"))
+            netmask = str(ipaddress.IPv4Network(f"0.0.0.0/{prefix_length}").netmask)
+        except (TypeError, ValueError):
+            netmask = ""
+        item = grouped.setdefault(
+            name,
+            {
+                "id": f"ethernet:{name}",
+                "name": name,
+                "description": str(row.get("Description") or ""),
+                "ipv4_bindings": [],
+            },
+        )
+        item["ipv4_bindings"].append({"address": address, "netmask": netmask})
+    return list(grouped.values())
+
+
+def _usb_vid_pid(instance_id: str) -> tuple[int | None, int | None]:
+    match = re.search(
+        r"VID_([0-9A-F]{4})&PID_([0-9A-F]{4})",
+        str(instance_id or ""),
+        re.IGNORECASE,
+    )
+    if not match:
+        return None, None
+    return int(match.group(1), 16), int(match.group(2), 16)
+
+
+def _windows_camera_pnp_facts() -> list[dict[str, Any]]:
+    """Return read-only Windows camera identity and driver facts."""
+    if not sys.platform.startswith("win"):
+        return []
+    script = (
+        "$utf8=[System.Text.UTF8Encoding]::new($false);"
+        "[Console]::OutputEncoding=$utf8;$OutputEncoding=$utf8;"
+        "$items=@(Get-PnpDevice -PresentOnly -Class Camera -ErrorAction Stop | "
+        "ForEach-Object {"
+        "$id=$_.InstanceId;"
+        "$props=@(Get-PnpDeviceProperty -InstanceId $id -ErrorAction SilentlyContinue);"
+        "$service=($props|Where-Object KeyName -eq 'DEVPKEY_Device_Service').Data;"
+        "$provider=($props|Where-Object KeyName -eq 'DEVPKEY_Device_DriverProvider').Data;"
+        "$version=($props|Where-Object KeyName -eq 'DEVPKEY_Device_DriverVersion').Data;"
+        "$locations=($props|Where-Object KeyName -eq 'DEVPKEY_Device_LocationPaths').Data;"
+        "$container=($props|Where-Object KeyName -eq 'DEVPKEY_Device_ContainerId').Data;"
+        "[pscustomobject]@{InstanceId=$id;FriendlyName=$_.FriendlyName;"
+        "Status=$_.Status;Service=$service;DriverProvider=$provider;"
+        "DriverVersion=$version;LocationPaths=@($locations);ContainerId=\"$container\"}"
+        "});$items | ConvertTo-Json -Depth 4 -Compress"
+    )
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30.0,
+            creationflags=creation_flags,
+        )
+        if completed.returncode != 0 or not completed.stdout.strip():
+            return []
+        decoded = json.loads(completed.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError):
+        return []
+    rows = decoded if isinstance(decoded, list) else [decoded]
+    result = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        instance_id = str(row.get("InstanceId") or "")
+        vid, pid = _usb_vid_pid(instance_id)
+        locations = row.get("LocationPaths") or []
+        if not isinstance(locations, list):
+            locations = [locations]
+        result.append({
+            "instance_id": instance_id,
+            "friendly_name": str(row.get("FriendlyName") or ""),
+            "pnp_status": str(row.get("Status") or ""),
+            "service": str(row.get("Service") or ""),
+            "driver_provider": str(row.get("DriverProvider") or ""),
+            "driver_version": str(row.get("DriverVersion") or ""),
+            "location_paths": [str(item) for item in locations if str(item)],
+            "container_id": str(row.get("ContainerId") or ""),
+            "vid": vid,
+            "pid": pid,
+        })
+    return result
+
+
+def _identity_key(prefix: str, value: str) -> str:
+    digest = hashlib.sha256(
+        str(value or "").strip().lower().encode("utf-8", errors="replace")
+    ).hexdigest()[:20]
+    return f"{prefix}:{digest}"
+
+
+def _merge_camera_pnp_with_usb_topology(
+    topology: dict[str, Any], camera_devices: list[dict[str, Any]]
+) -> None:
+    """Attach PnP instance/container/location facts to unique USB devices."""
+    topology_devices = [
+        item for item in topology.get("devices", []) if isinstance(item, dict)
+    ]
+    for camera in camera_devices:
+        matches = [
+            item for item in topology_devices
+            if item.get("vid") == camera.get("vid")
+            and item.get("pid") == camera.get("pid")
+        ]
+        if len(matches) != 1:
+            continue
+        device = matches[0]
+        instance_id = str(camera.get("instance_id") or "")
+        container_id = str(camera.get("container_id") or "")
+        location_paths = list(camera.get("location_paths") or [])
+        device.update({
+            "instance_id": instance_id,
+            "instance_key": _identity_key("pnp", instance_id) if instance_id else "",
+            "container_id": container_id,
+            "container_key": _identity_key("container", container_id) if container_id else "",
+            "location_paths": location_paths,
+            "location_keys": [
+                _identity_key("location", value) for value in location_paths
+            ],
+            "friendly_name": str(camera.get("friendly_name") or device.get("friendly_name") or ""),
+            "service": str(camera.get("service") or ""),
+            "driver_provider": str(camera.get("driver_provider") or ""),
+            "driver_version": str(camera.get("driver_version") or ""),
+            "pnp_status": str(camera.get("pnp_status") or ""),
+        })
+        camera["parent_port_id"] = str(device.get("parent_port_id") or "")
+        camera["usb_device_id"] = str(device.get("id") or "")
+
+
+def _network_endpoint(endpoint: str, role: str) -> tuple[str, int]:
+    value = str(endpoint or "").strip()
+    if "://" in value:
+        parsed = urllib.parse.urlparse(value)
+        return str(parsed.hostname or ""), int(parsed.port or 80)
+    if ":" in value:
+        host, port_text = value.rsplit(":", 1)
+        if port_text.isdigit():
+            return host, int(port_text)
+    return value, DEFAULT_PLC_PORT if role == "plc" else 80
+
+
+def validate_network_path(
+    interface: dict[str, Any],
+    *,
+    adapter_snapshot: list[dict[str, Any]] | None = None,
+    route_source: str | None = None,
+) -> dict[str, Any]:
+    role = str(interface.get("role") or "")
+    host, port = _network_endpoint(str(interface.get("endpoint") or ""), role)
+    selected_id = str(interface.get("physical_interface_id") or "")
+    adapters = list(adapter_snapshot) if adapter_snapshot is not None else _network_adapter_snapshot()
+    tcp_probe_error = ""
+    if route_source is not None:
+        actual_source = str(route_source)
+    else:
+        try:
+            with socket.create_connection((host, port), timeout=2.0) as connection:
+                actual_source = str(connection.getsockname()[0])
+        except OSError as exc:
+            actual_source = ""
+            tcp_probe_error = str(exc)
+    selected = next(
+        (
+            item for item in adapters
+            if str(item.get("id") or f"ethernet:{item.get('name', '')}") == selected_id
+        ),
+        None,
+    )
+    actual = next(
+        (
+            item for item in adapters
+            if actual_source in {
+                str(binding.get("address") or "")
+                for binding in item.get("ipv4_bindings", [])
+                if isinstance(binding, dict)
+            }
+        ),
+        None,
+    )
+    facts = network_interface_route_facts(
+        str((selected or {}).get("name") or selected_id.removeprefix("ethernet:")),
+        str((selected or {}).get("description") or ""),
+        list((selected or {}).get("ipv4_bindings") or []),
+        {role or "target": host},
+        {role or "target": actual_source},
+    )
+    target_facts = facts["target_routes"][role or "target"]
+    actual_id = str(
+        (actual or {}).get("id")
+        or (f"ethernet:{(actual or {}).get('name')}" if actual else "")
+    )
+    ok = bool(
+        selected
+        and selected_id
+        and actual_id == selected_id
+        and target_facts["auto_eligible"]
+    )
+    return {
+        "ok": ok,
+        "status": "network_path_ready" if ok else "network_path_invalid",
+        "target_address": host,
+        "target_port": port,
+        "selected_interface_id": selected_id,
+        "actual_interface_id": actual_id,
+        "actual_source_address": actual_source,
+        "source_probe": "injected" if route_source is not None else "tcp_connect",
+        "tcp_probe_error": tcp_probe_error,
+        "interface_type": facts["interface_type"],
+        "apipa_only": facts["apipa_only"],
+        "target_subnet_match": target_facts["target_subnet_match"],
+        "best_route": target_facts["best_route"],
+    }
+
+
+def require_network_path(interface: dict[str, Any]) -> dict[str, Any]:
+    result = validate_network_path(interface)
+    if not result["ok"]:
+        raise RuntimeError(
+            "network_path_invalid: "
+            f"target={result['target_address']} "
+            f"selected={result['selected_interface_id']} "
+            f"actual={result['actual_interface_id']} "
+            f"source={result['actual_source_address']}"
+        )
+    return result
 
 PROCESS_PARAMETER_DEFINITIONS = (
     ("initial_compaction_force_N", "初始压实力", "N"),
@@ -645,6 +1035,8 @@ BSV_UVC_TEMP_RANGE_CODE = 4
 BSV_UVC_TEMP_FORMULA_SCALE = 64.0
 BSV_UVC_TEMP_FORMULA_OFFSET = -50.0
 BSV_UVC_DLL_NAME = "BsvUvcNative.dll"
+BSV_UVC_VENDOR_ID = 0x2BDF
+BSV_UVC_PRODUCT_ID = 0x0102
 DEFAULT_RTSP_URL = "rtsp://192.168.125.2:554/"
 # The vendor operation manual specifies 115200 baud.  The vendor packet
 # framing is not documented, so the driver accepts JSON matrix frames for the
@@ -795,6 +1187,84 @@ SENSOR_INTERFACE_PROFILES: dict[str, dict[str, Any]] = {
     },
 }
 
+SHARED_DEVICE_PROFILES: dict[str, dict[str, Any]] = {
+    "plc": {
+        "id": "panasonic-plc-process-v1",
+        "version": 1,
+        "approval_status": "approved",
+        "unit_id": DEFAULT_PLC_SLAVE_ID,
+        "register_map": dict(PLC_DEFAULT_REGISTER_MAP),
+        "byte_order": "little_endian_bytes",
+        "word_order": "low_word_first",
+        "freshness_seconds": 0.5,
+    },
+    "robot": {
+        "id": "abb-rws-rob1-base-v1",
+        "version": 1,
+        "approval_status": "approved",
+        "mechanical_unit": "ROB_1",
+        "coordinate_system": "Base",
+        "resource": ABB_ROBTARGET_PATH,
+        "authentication": "digest_challenge",
+        "freshness_seconds": 0.5,
+    },
+    "thermal_uvc": {
+        "id": "bsv-uvc-2bdf-0102-v1",
+        "version": 1,
+        "approval_status": "vendor_confirmation_required",
+        "observed_identity": {"vid": 0x2BDF, "pid": 0x0102},
+        "required_vendor_facts": {
+            "windows_binding": None,
+            "interface_number": None,
+            "endpoints": None,
+            "temperature_range": None,
+            "frame_format": None,
+            "conversion": None,
+            "freshness_seconds": None,
+        },
+    },
+}
+
+
+def _credential_identifier(username: str, password: str) -> str:
+    canonical = json.dumps(
+        {"username": str(username), "password": str(password)},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def device_profile_readiness(interface: dict[str, Any]) -> dict[str, Any]:
+    profile = interface.get("device_profile")
+    if not isinstance(profile, dict):
+        return {
+            "ready": False,
+            "status": "device_profile_incomplete",
+            "profile_id": "",
+            "profile_version": 0,
+            "missing_device_facts": ["device_profile"],
+        }
+    required_vendor_facts = profile.get("required_vendor_facts")
+    missing = sorted(
+        str(name)
+        for name, value in (
+            required_vendor_facts.items()
+            if isinstance(required_vendor_facts, dict)
+            else []
+        )
+        if value in (None, "", [], {})
+    )
+    ready = profile.get("approval_status") == "approved" and not missing
+    return {
+        "ready": ready,
+        "status": "approved" if ready else "device_profile_incomplete",
+        "profile_id": str(profile.get("id") or ""),
+        "profile_version": int(profile.get("version") or 0),
+        "missing_device_facts": missing,
+    }
+
 
 def default_capture_interfaces() -> list[dict[str, Any]]:
     """Return the six logical interfaces in the complete acquisition plan."""
@@ -815,17 +1285,25 @@ def default_capture_interfaces() -> list[dict[str, Any]]:
             "endpoint": f"{DEFAULT_PLC_IP}:{DEFAULT_PLC_PORT}",
             "slave_id": DEFAULT_PLC_SLAVE_ID,
             "register_map": dict(PLC_DEFAULT_REGISTER_MAP),
+            "device_profile": deepcopy(SHARED_DEVICE_PROFILES["plc"]),
             "channel_map": {},
         },
         {
             "id": "uvc_temperature", "enabled": True,
             "role": "thermal_uvc", "driver": "uvc_thermal",
-            "endpoint": "BSV UVC (WinUSB)", "roi": "", "channel_map": {},
+            "endpoint": "BSV UVC (WinUSB)", "roi": "",
+            "device_profile": deepcopy(SHARED_DEVICE_PROFILES["thermal_uvc"]),
+            "channel_map": {},
         },
         {
             "id": "abb_motion", "enabled": True,
             "role": "robot", "driver": "abb_robot",
-            "endpoint": DEFAULT_ABB_IP, "channel_map": {},
+            "endpoint": DEFAULT_ABB_IP,
+            "credential_identifier": _credential_identifier(
+                DEFAULT_ABB_USER, DEFAULT_ABB_PASSWORD
+            ),
+            "device_profile": deepcopy(SHARED_DEVICE_PROFILES["robot"]),
+            "channel_map": {},
         },
         {
             "id": "m3232_pressure", "enabled": True,
@@ -1461,6 +1939,9 @@ class AcquisitionConfig:
                 )
             )
             _apply_sensor_interface_profile(interface)
+            authoritative_device_profile = SHARED_DEVICE_PROFILES.get(interface["role"])
+            if authoritative_device_profile is not None:
+                interface["device_profile"] = deepcopy(authoritative_device_profile)
             interface["physical_interface_id"] = str(
                 interface.get("physical_interface_id") or ""
             ).strip()
@@ -1472,6 +1953,22 @@ class AcquisitionConfig:
                 or SENSOR_INTERFACE_PROFILES.get(interface["role"], SENSOR_INTERFACE_PROFILES["custom"]).get("physical_kind")
                 or ""
             ).strip().lower()
+            default_transport_family = {
+                "ethernet": "ethernet",
+                "usb_uvc": "usb",
+                "usb_hid": "usb",
+                "serial": "serial_native",
+            }.get(interface["physical_interface_kind"], "")
+            interface["physical_transport_family"] = str(
+                interface.get("physical_transport_family")
+                or default_transport_family
+            ).strip().lower()
+            raw_device_identity = interface.get("device_identity")
+            interface["device_identity"] = (
+                deepcopy(raw_device_identity)
+                if isinstance(raw_device_identity, dict)
+                else {}
+            )
             interface["physical_verified"] = bool(interface.get("physical_verified", False))
             interface["physical_fallback"] = bool(interface.get("physical_fallback", False))
             normalized_interfaces.append(interface)
@@ -2680,11 +3177,14 @@ class ModbusTcpDriver(SampleDriver):
     """Panasonic PLC Modbus/TCP FC03 reader from the mapped field build."""
 
     def __init__(self, endpoint: str, register_map: dict[str, int] | None = None,
-                 slave_id: int = DEFAULT_PLC_SLAVE_ID, timeout: float = 1.0) -> None:
+                 slave_id: int = DEFAULT_PLC_SLAVE_ID, timeout: float = 1.0,
+                 source_address: str = "") -> None:
         self.endpoint = endpoint or f"{DEFAULT_PLC_IP}:{DEFAULT_PLC_PORT}"
         self.register_map = dict(register_map or PLC_DEFAULT_REGISTER_MAP)
         self.slave_id = int(slave_id)
         self.timeout = max(0.1, float(timeout))
+        self.source_address = str(source_address)
+        self.actual_source_address = ""
         self.sock: socket.socket | None = None
         self._transaction_id = 0
 
@@ -2697,7 +3197,14 @@ class ModbusTcpDriver(SampleDriver):
             if ":" in self.endpoint
             else (self.endpoint, str(DEFAULT_PLC_PORT))
         )
-        self.sock = socket.create_connection((host, int(port_text)), timeout=2.0)
+        options = {"source_address": (self.source_address, 0)} if self.source_address else {}
+        connection = socket.create_connection((host, int(port_text)), timeout=2.0, **options)
+        if self.source_address:
+            self.actual_source_address = str(connection.getsockname()[0])
+            if self.actual_source_address != self.source_address:
+                connection.close()
+                raise RuntimeError("network_path_invalid: PLC connection source changed")
+        self.sock = connection
         self.sock.settimeout(self.timeout)
 
     def _reconnect(self) -> None:
@@ -2785,7 +3292,9 @@ class ModbusTcpDriver(SampleDriver):
     @staticmethod
     def _registers_to_float(low_word: int, high_word: int) -> float:
         value = struct.unpack("<f", struct.pack("<HH", low_word, high_word))[0]
-        return 0.0 if not math.isfinite(value) else round(float(value), 2)
+        if not math.isfinite(value):
+            raise ValueError("PLC寄存器解析得到非有限浮点值")
+        return round(float(value), 2)
 
     def _read_registers(self) -> dict[int, int]:
         addresses = sorted({
@@ -2846,11 +3355,201 @@ class ModbusTcpDriver(SampleDriver):
             self.sock = None
 
 
+class AbbRwsError(RuntimeError):
+    def __init__(self, code: str, stage: str, detail: str = "") -> None:
+        self.code = str(code)
+        self.stage = str(stage)
+        self.detail = str(detail)
+        message = f"{self.code}: ABB RWS {self.stage}"
+        if self.detail:
+            message += f" ({self.detail})"
+        super().__init__(message)
+
+
+def classify_interface_probe_error(role: str, error_text: str) -> str:
+    text = str(error_text or "")
+    if "network_path_invalid" in text:
+        return "network_path_invalid"
+    if str(role or "") == "robot":
+        for code in (
+            "authentication_failed",
+            "resource_not_found",
+            "resource_invalid",
+            "invalid_json",
+            "numeric_invalid",
+            "transport_timeout",
+            "transport_error",
+            "session_limit_exceeded",
+            "session_close_failed",
+            "http_error",
+        ):
+            if code in text:
+                return code
+    if str(role or "") == "thermal_uvc":
+        for code in (
+            "driver_incompatible",
+            "device_open_failed",
+            "no_valid_frame",
+            "invalid_temperature_matrix",
+            "native_call_timeout",
+        ):
+            if code in text:
+                return code
+    return "not_connected"
+
+
+READINESS_STAGE_NAMES = (
+    "physical_binding",
+    "device_identity",
+    "driver",
+    "network_path",
+    "usb_binding",
+    "authentication",
+    "protocol",
+    "channels",
+    "freshness",
+    "stability",
+)
+
+
+def normalize_interface_readiness(
+    interface_result: dict[str, Any],
+) -> dict[str, Any]:
+    """Return one explicit readiness schema without erasing raw evidence."""
+    result = deepcopy(interface_result)
+    role = str(result.get("role") or "")
+    final_state = str(result.get("state") or "not_connected")
+    existing = result.get("stages") if isinstance(result.get("stages"), dict) else {}
+
+    def stage(name: str, state: str, **values: Any) -> dict[str, Any]:
+        prior = dict(existing.get(name) or {})
+        prior.update(values)
+        prior["state"] = state
+        return prior
+
+    has_binding = bool(
+        result.get("physical_interface_id") or result.get("physical_port_id")
+    )
+    physical_state = (
+        "not_applicable" if final_state == "disabled"
+        else "passed" if has_binding and result.get("physical_verified") is not False
+        else "failed"
+    )
+    network_applicable = role in {"plc", "robot"}
+    usb_applicable = role == "thermal_uvc"
+    network_path = result.get("network_path")
+    network_state = (
+        "not_applicable" if not network_applicable
+        else "failed" if final_state == "network_path_invalid"
+        else "passed" if isinstance(network_path, dict) and network_path.get("ok")
+        else "not_reached"
+    )
+    usb_state = (
+        "not_applicable" if not usb_applicable
+        else "passed" if has_binding and result.get("physical_verified") is not False
+        else "failed"
+    )
+    identity_state = (
+        "failed" if final_state in {"device_profile_incomplete", "device_identity_mismatch"}
+        else "not_reached" if final_state in {"network_path_invalid", "configuration_invalid"}
+        else "passed" if final_state not in {"disabled", "no_channels"}
+        else "not_applicable"
+    )
+    driver_state = (
+        "failed" if final_state in {"driver_incompatible", "device_open_failed", "native_call_timeout"}
+        else "not_reached" if final_state in {"device_profile_incomplete", "network_path_invalid", "configuration_invalid"}
+        else "not_applicable" if final_state in {"disabled", "no_channels"}
+        else "passed"
+    )
+    authentication_state = (
+        "not_applicable" if role != "robot"
+        else "failed" if final_state == "authentication_failed"
+        else "not_reached" if final_state in {
+            "network_path_invalid", "device_profile_incomplete",
+            "driver_incompatible", "device_open_failed", "configuration_invalid",
+        }
+        else "passed"
+    )
+    if final_state in {"data_ready", "partial_channels"}:
+        protocol_state = "passed"
+    elif final_state in {"authentication_failed", "network_path_invalid", "driver_incompatible", "device_open_failed", "device_profile_incomplete", "configuration_invalid"}:
+        protocol_state = "not_reached"
+    elif final_state in {"disabled", "no_channels"}:
+        protocol_state = "not_applicable"
+    else:
+        protocol_state = "failed"
+    if final_state == "data_ready":
+        channel_state = freshness_state = "passed"
+    elif final_state in {"partial_channels", "invalid_data", "no_data", "no_valid_frame", "invalid_temperature_matrix", "stale"}:
+        channel_state = "failed"
+        freshness_state = "failed" if final_state in {"stale", "no_data", "no_valid_frame"} else "not_verified"
+    elif final_state in {"disabled", "no_channels"}:
+        channel_state = freshness_state = "not_applicable"
+    else:
+        channel_state = freshness_state = "not_reached"
+
+    result["stages"] = {
+        "physical_binding": stage("physical_binding", physical_state),
+        "device_identity": stage("device_identity", identity_state),
+        "driver": stage("driver", driver_state),
+        "network_path": stage(
+            "network_path", network_state, evidence=deepcopy(network_path)
+        ),
+        "usb_binding": stage(
+            "usb_binding",
+            usb_state,
+            physical_port_id=str(result.get("physical_port_id") or ""),
+        ),
+        "authentication": stage("authentication", authentication_state),
+        "protocol": stage("protocol", protocol_state),
+        "channels": stage("channels", channel_state),
+        "freshness": stage("freshness", freshness_state),
+        "stability": stage(
+            "stability",
+            "not_applicable" if final_state in {"disabled", "no_channels"} else "not_verified",
+        ),
+    }
+    result["final_status"] = final_state
+    return result
+
+
+class _IndustrialHTTPAdapter(HTTPAdapter):
+    def __init__(self, owner: Any) -> None:
+        self.owner = owner
+        super().__init__(pool_connections=1, pool_maxsize=1, max_retries=0)
+
+    def init_poolmanager(self, connections, maxsize, block=False, **options):
+        owner = self.owner
+        if owner.source_address:
+            options["source_address"] = (owner.source_address, 0)
+        super().init_poolmanager(connections, maxsize, block=block, **options)
+        pools = {}
+        for scheme, pool_type in (
+            ("http", urllib3.connectionpool.HTTPConnectionPool),
+            ("https", urllib3.connectionpool.HTTPSConnectionPool),
+        ):
+            base_connection = pool_type.ConnectionCls
+
+            class BoundConnection(base_connection):
+                def connect(self) -> None:
+                    self.source_address = (owner.source_address, 0) if owner.source_address else None
+                    super().connect()
+                    owner.actual_source_address = str(self.sock.getsockname()[0])
+                    if owner.source_address and owner.actual_source_address != owner.source_address:
+                        self.close()
+                        raise RuntimeError("network_path_invalid: ABB connection source changed")
+
+            pools[scheme] = type("IndustrialConnectionPool", (pool_type,), {"ConnectionCls": BoundConnection})
+        self.poolmanager.pool_classes_by_scheme = pools
+
+
 class AbbRobotDriver(SampleDriver):
     def __init__(self, endpoint: str = DEFAULT_ABB_IP,
                  username: str = DEFAULT_ABB_USER,
                  password: str = DEFAULT_ABB_PASSWORD,
-                 timeout: float = 1.5) -> None:
+                 timeout: float = 1.5,
+                 clock: Any = time.time,
+                 source_address: str = "") -> None:
         if str(endpoint).startswith("http"):
             self.base_url = str(endpoint).rstrip("/")
         else:
@@ -2858,29 +3557,78 @@ class AbbRobotDriver(SampleDriver):
         self.username = username
         self.password = password
         self.timeout = max(0.1, float(timeout))
+        self.clock = clock
+        self.source_address = str(source_address)
+        self.actual_source_address = ""
         self._last_time: float | None = None
         self._last_x: float | None = None
         self._last_y: float | None = None
         self._last_z: float | None = None
+        self.source_timestamp: float | None = None
+        self.quality_metadata: dict[str, Any] = {
+            "mechanical_unit": "ROB_1",
+            "coordinate_system": "Base",
+            "speed_quality": "unverified_first_sample",
+        }
+        self._session = requests.Session()
+        self._session.trust_env = False
+        self._session.auth = HTTPDigestAuth(self.username, self.password)
+        self._session.mount("http://", _IndustrialHTTPAdapter(self))
+        self._session.mount("https://", _IndustrialHTTPAdapter(self))
+        self._cookies = self._session.cookies
 
     def open(self) -> None:
-        return
+        self._last_time = self._last_x = self._last_y = self._last_z = None
+        self.source_timestamp = None
+        self.quality_metadata["speed_quality"] = "unverified_first_sample"
+
+    def close(self) -> None:
+        try:
+            if any(cookie.name == "ABBCX" for cookie in self._cookies):
+                with self._session.get(f"{self.base_url}/logout", timeout=self.timeout) as response:
+                    if not 200 <= response.status_code < 300:
+                        raise AbbRwsError("session_close_failed", "session", f"status={response.status_code}")
+        except requests.RequestException:
+            raise AbbRwsError("session_close_failed", "session") from None
+        finally:
+            self._cookies.clear()
+            self._session.close()
+
+    def _request_json(self, path: str) -> dict[str, Any]:
+        try:
+            with self._session.get(f"{self.base_url}{path}", headers={"Accept": "application/json"}, timeout=self.timeout) as response:
+                status = response.status_code
+                raw = response.content.decode("utf-8")
+            if status in {401, 403}:
+                raise AbbRwsError("authentication_failed", "authentication") from None
+            if status == 404:
+                raise AbbRwsError("resource_not_found", "resource") from None
+            if status == 503 and "Too many sessions" in raw:
+                raise AbbRwsError("session_limit_exceeded", "session", "status=503") from None
+            if not 200 <= status < 300:
+                raise AbbRwsError("http_error", "http", f"status={status}") from None
+        except requests.Timeout:
+            raise AbbRwsError("transport_timeout", "transport") from None
+        except requests.RequestException:
+            raise AbbRwsError("transport_error", "transport") from None
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise AbbRwsError("invalid_json", "parsing") from None
+        if not isinstance(payload, dict):
+            raise AbbRwsError("invalid_json", "parsing")
+        return payload
 
     def _fetch_position(self) -> tuple[float, float, float]:
-        credentials = base64.b64encode(
-            f"{self.username}:{self.password}".encode("utf-8")
-        ).decode("ascii")
-        request = urllib.request.Request(
-            self.base_url + ABB_ROBTARGET_PATH,
-            headers={
-                "Authorization": f"Basic {credentials}",
-                "Accept": "application/json",
-            },
-        )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        state = payload["_embedded"]["_state"][0]
-        return float(state["x"]), float(state["y"]), float(state["z"])
+        payload = self._request_json(ABB_ROBTARGET_PATH)
+        try:
+            state = payload["_embedded"]["_state"][0]
+            values = (float(state["x"]), float(state["y"]), float(state["z"]))
+        except (KeyError, IndexError, TypeError, ValueError):
+            raise AbbRwsError("resource_invalid", "parsing") from None
+        if not all(math.isfinite(value) for value in values):
+            raise AbbRwsError("numeric_invalid", "value")
+        return values
 
     @staticmethod
     def _find_json_value(value: Any) -> Any:
@@ -2904,35 +3652,25 @@ class AbbRobotDriver(SampleDriver):
         module: str,
         variable: str,
     ) -> str:
-        credentials = base64.b64encode(
-            f"{self.username}:{self.password}".encode("utf-8")
-        ).decode("ascii")
         path = "/".join(
             urllib.parse.quote(str(part), safe="")
             for part in (task, module, variable)
         )
-        request = urllib.request.Request(
-            f"{self.base_url}{ABB_RAPID_SYMBOL_BASE_PATH}/{path}?json=1",
-            headers={
-                "Authorization": f"Basic {credentials}",
-                "Accept": "application/json",
-            },
+        payload = self._request_json(
+            f"{ABB_RAPID_SYMBOL_BASE_PATH}/{path}?json=1"
         )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            raw = response.read().decode("utf-8")
-        payload = json.loads(raw)
         value = self._find_json_value(payload)
         if value is None:
             raise ValueError(f"ABB变量{variable}响应中没有value字段")
         return str(value)
 
     def read_sample(self) -> dict[str, float] | None:
-        try:
-            x, y, z = self._fetch_position()
-        except Exception:
-            return None
-        now = time.time()
-        speed = 0.0
+        x, y, z = self._fetch_position()
+        if not all(math.isfinite(value) for value in (x, y, z)):
+            raise AbbRwsError("numeric_invalid", "value")
+        now = float(self.clock())
+        self.source_timestamp = now
+        result = {"ABB_X": x, "ABB_Y": y, "ABB_Z": z}
         if self._last_time is not None and self._last_x is not None:
             delta_time = now - self._last_time
             if delta_time > 0:
@@ -2941,8 +3679,14 @@ class AbbRobotDriver(SampleDriver):
                     + (y - self._last_y) ** 2
                     + (z - self._last_z) ** 2
                 ) / delta_time, 2)
+                result["线速度"] = speed
+                self.quality_metadata["speed_quality"] = "measured_new"
+            else:
+                self.quality_metadata["speed_quality"] = "unverified_zero_delta"
+        else:
+            self.quality_metadata["speed_quality"] = "unverified_first_sample"
         self._last_time, self._last_x, self._last_y, self._last_z = now, x, y, z
-        return {"ABB_X": x, "ABB_Y": y, "ABB_Z": z, "线速度": speed}
+        return result
 
 
 def _parse_roi(value: Any) -> tuple[int, int, int, int] | None:
@@ -2961,16 +3705,92 @@ def _parse_roi(value: Any) -> tuple[int, int, int, int] | None:
         return None
 
 
+class UvcDriverError(RuntimeError):
+    def __init__(
+        self,
+        code: str,
+        stage: str,
+        *,
+        return_code: int | None = None,
+        last_error: int | None = None,
+    ) -> None:
+        self.code = str(code)
+        self.stage = str(stage)
+        self.return_code = return_code
+        self.last_error = last_error
+        details = [f"stage={self.stage}"]
+        if return_code is not None:
+            details.append(f"code={return_code}")
+        if last_error is not None:
+            details.append(f"lastError={last_error}")
+        super().__init__(f"{self.code}: " + ", ".join(details))
+
+
 class UvcThermalDriver(SampleDriver):
     """BSV UVC native DLL reader; produces a calibrated ROI temperature."""
 
-    def __init__(self, dll_path: str = "", roi: Any = None, poll_retries: int = 3) -> None:
+    def __init__(
+        self,
+        dll_path: str = "",
+        roi: Any = None,
+        poll_retries: int = 3,
+        call_timeout_seconds: float = 1.0,
+    ) -> None:
         self.dll_path = str(dll_path or "").strip()
         self.roi = _parse_roi(roi)
         self.poll_retries = max(1, int(poll_retries))
+        self.call_timeout_seconds = max(0.01, float(call_timeout_seconds))
         self.dll = None
+        self._started = False
+        self._native_lock = threading.Lock()
+        self._native_timeout_stage = ""
+        self.source_timestamp: float | None = None
+        self.quality_metadata: dict[str, Any] = {}
         self.yuv_buffer = (ctypes.c_ubyte * BSV_UVC_YUV_BYTES)()
         self.temp_buffer = (ctypes.c_ushort * BSV_UVC_PIXELS)()
+
+    @property
+    def native_call_pending(self) -> bool:
+        return bool(self._native_timeout_stage)
+
+    def _native_call(self, stage: str, function: Any, *args: Any) -> Any:
+        if self._native_timeout_stage:
+            raise UvcDriverError("native_call_timeout", self._native_timeout_stage)
+        if not self._native_lock.acquire(timeout=self.call_timeout_seconds):
+            self._native_timeout_stage = stage
+            raise UvcDriverError("native_call_timeout", stage)
+        completed = threading.Event()
+        outcome: dict[str, Any] = {}
+
+        def invoke() -> None:
+            try:
+                outcome["value"] = function(*args)
+            except BaseException as exc:
+                outcome["error"] = exc
+            finally:
+                self._native_lock.release()
+                completed.set()
+
+        thread = threading.Thread(
+            target=invoke,
+            name=f"AFP-BSV-UVC-{stage}",
+            daemon=True,
+        )
+        thread.start()
+        if not completed.wait(self.call_timeout_seconds):
+            self._native_timeout_stage = stage
+            raise UvcDriverError("native_call_timeout", stage)
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome.get("value")
+
+    def _safe_last_error(self) -> int | None:
+        if self.dll is None:
+            return None
+        try:
+            return int(self._native_call("last_error", self.dll.BsvGetLastError))
+        except Exception:
+            return None
 
     def _find_dll(self) -> Path:
         candidates = []
@@ -2978,6 +3798,8 @@ class UvcThermalDriver(SampleDriver):
             candidates.append(Path(self.dll_path))
         candidates.extend([
             _NATIVE_DLL_DIR / BSV_UVC_DLL_NAME,
+            RELEASE_CONTRACT.source_path.parent / "native_dll" / BSV_UVC_DLL_NAME,
+            APP_DIR / "hardware_dlls" / BSV_UVC_DLL_NAME,
             APP_DIR / BSV_UVC_DLL_NAME,
             APP_DIR.parent / BSV_UVC_DLL_NAME,
             Path.cwd() / BSV_UVC_DLL_NAME,
@@ -3017,20 +3839,48 @@ class UvcThermalDriver(SampleDriver):
         self.dll.BsvClose.restype = None
 
     def open(self) -> None:
-        self.dll = ctypes.CDLL(str(self._find_dll()))
-        self._bind_api()
-        if self.dll.BsvSetTempRangeCode(BSV_UVC_TEMP_RANGE_CODE) < 0:
-            raise IOError("BSV UVC 设置温度量程失败")
-        result = self.dll.BsvOpen()
-        if result <= 0:
-            error = self.dll.BsvGetLastError()
+        try:
+            dll_path = self._find_dll()
+            self.dll = self._native_call("load", ctypes.CDLL, str(dll_path))
+            self._bind_api()
+        except UvcDriverError:
+            raise
+        except Exception:
             self.dll = None
-            raise IOError(f"BSV UVC 打开设备失败：code={result}, lastError={error}")
-        result = self.dll.BsvStart()
-        if result <= 0:
-            error = self.dll.BsvGetLastError()
-            self.close()
-            raise IOError(f"BSV UVC 启动视频流失败：code={result}, lastError={error}")
+            raise UvcDriverError("driver_incompatible", "load") from None
+        try:
+            range_result = int(self._native_call(
+                "set_range",
+                self.dll.BsvSetTempRangeCode,
+                BSV_UVC_TEMP_RANGE_CODE,
+            ))
+            if range_result < 0:
+                raise UvcDriverError(
+                    "driver_incompatible",
+                    "set_range",
+                    return_code=range_result,
+                    last_error=self._safe_last_error(),
+                )
+            result = int(self._native_call("open", self.dll.BsvOpen))
+            if result <= 0:
+                raise UvcDriverError(
+                    "device_open_failed",
+                    "open",
+                    return_code=result,
+                    last_error=self._safe_last_error(),
+                )
+            result = int(self._native_call("start", self.dll.BsvStart))
+            if result <= 0:
+                raise UvcDriverError(
+                    "device_open_failed",
+                    "start",
+                    return_code=result,
+                    last_error=self._safe_last_error(),
+                )
+            self._started = True
+        except Exception:
+            self._release_native(raise_errors=False)
+            raise
 
     def _roi_average_temperature(self) -> float:
         x1, y1, x2, y2 = self.roi or (0, 0, BSV_UVC_WIDTH, BSV_UVC_HEIGHT)
@@ -3050,29 +3900,63 @@ class UvcThermalDriver(SampleDriver):
     def read_sample(self) -> dict[str, float] | None:
         if self.dll is None:
             return None
+        last_result: int | None = None
         for _ in range(self.poll_retries):
-            if self.dll.BsvHasFrame() <= 0:
-                return None
-            result = self.dll.BsvGetFrame(
-                self.yuv_buffer, BSV_UVC_YUV_BYTES,
-                self.temp_buffer, BSV_UVC_PIXELS,
-            )
+            has_frame = int(self._native_call("has_frame", self.dll.BsvHasFrame))
+            if has_frame <= 0:
+                last_result = has_frame
+                continue
+            result = int(self._native_call(
+                "get_frame",
+                self.dll.BsvGetFrame,
+                self.yuv_buffer,
+                BSV_UVC_YUV_BYTES,
+                self.temp_buffer,
+                BSV_UVC_PIXELS,
+            ))
+            last_result = result
             if result > 0:
-                return {"ROI平均温度": self._roi_average_temperature()}
-        return None
+                temperature = self._roi_average_temperature()
+                if not math.isfinite(temperature):
+                    raise UvcDriverError(
+                        "invalid_temperature_matrix", "validate_frame"
+                    )
+                self.source_timestamp = time.time()
+                self.quality_metadata = {
+                    "frame_kind": "temperature_matrix",
+                    "width": BSV_UVC_WIDTH,
+                    "height": BSV_UVC_HEIGHT,
+                }
+                return {"ROI平均温度": temperature}
+        raise UvcDriverError(
+            "no_valid_frame",
+            "get_frame" if last_result not in (None, 0) else "has_frame",
+            return_code=last_result,
+            last_error=self._safe_last_error(),
+        )
+
+    def _release_native(self, *, raise_errors: bool) -> None:
+        dll = self.dll
+        was_started = self._started
+        self.dll = None
+        self._started = False
+        if dll is None:
+            return
+        errors: list[Exception] = []
+        if was_started:
+            try:
+                self._native_call("stop", dll.BsvStop)
+            except Exception as exc:
+                errors.append(exc)
+        try:
+            self._native_call("close", dll.BsvClose)
+        except Exception as exc:
+            errors.append(exc)
+        if raise_errors and errors:
+            raise errors[0]
 
     def close(self) -> None:
-        if self.dll is None:
-            return
-        try:
-            self.dll.BsvStop()
-        except Exception:
-            pass
-        try:
-            self.dll.BsvClose()
-        except Exception:
-            pass
-        self.dll = None
+        self._release_native(raise_errors=True)
 
 
 class RtspThermalDriver(SampleDriver):
@@ -3323,7 +4207,10 @@ class MultiInterfaceDriver(SampleDriver):
                     )
                 elif driver_name == "uvc_thermal":
                     driver = UvcThermalDriver(
-                        str(item.get("dll_path") or ""), item.get("roi"),
+                        str(item.get("dll_path") or ""),
+                        item.get("roi"),
+                        int(item.get("poll_retries") or 3),
+                        float(item.get("native_call_timeout_seconds") or 1.0),
                     )
                 elif driver_name == "rtsp_thermal":
                     scale = item.get("temp_scale")
@@ -3358,6 +4245,12 @@ class MultiInterfaceDriver(SampleDriver):
                 if allowed is None:
                     allowed = list(self.selected_sensors)
                 requested_poll = float(item.get("poll_interval_seconds") or 0.002)
+                before_open = None
+                if driver_name in {"modbus_tcp", "abb_robot"}:
+                    network_interface = deepcopy(item)
+                    def before_open(value=network_interface, target=driver):
+                        path = require_network_path(value)
+                        target.source_address = path["actual_source_address"]
                 worker = LocalDirectAdapter(
                     interface_id,
                     driver,
@@ -3372,11 +4265,19 @@ class MultiInterfaceDriver(SampleDriver):
                         item.get("max_reconnect_backoff_seconds") or 1.0
                     ),
                     max_reconnect_attempts=int(item.get("max_reconnect_attempts") or 5),
+                    before_open=before_open,
                 )
                 self.workers.append(worker)
                 worker.start()
             for worker in self.workers:
-                open_deadline = time.monotonic() + 2.5
+                open_timeout = float(
+                    getattr(worker.driver, "open_timeout_seconds", 2.5)
+                )
+                if worker.before_open is not None and sys.platform.startswith("win"):
+                    # The dependency-free Windows adapter lookup starts a
+                    # bounded PowerShell query before the protocol opens.
+                    open_timeout = max(open_timeout, 10.0)
+                open_deadline = time.monotonic() + open_timeout
                 while (
                     not worker.opened.is_set()
                     and worker.thread is not None
@@ -3389,7 +4290,7 @@ class MultiInterfaceDriver(SampleDriver):
                         raise RuntimeError(
                             f"接口{worker.interface_id}打开失败：{worker.last_error}"
                         )
-                    raise TimeoutError(f"接口{worker.interface_id}在2.5秒内未完成打开")
+                    raise TimeoutError(f"接口{worker.interface_id}在打开期限内未完成打开")
                 if worker.state == "failed" or (
                     worker.thread is not None and not worker.thread.is_alive()
                 ):
@@ -3404,7 +4305,7 @@ class MultiInterfaceDriver(SampleDriver):
         merged = {
             name: sample.value
             for name, sample in self.cache.snapshot().items()
-            if sample.value is not None and name in self.selected_sensors
+            if name in self.selected_sensors
         }
         return merged or None
 
@@ -3412,8 +4313,10 @@ class MultiInterfaceDriver(SampleDriver):
         return [worker.status() for worker in self.workers]
 
     def close(self) -> None:
+        pending: list[LocalDirectAdapter] = []
         for worker in self.workers:
-            worker.stop(timeout_seconds=0.5)
+            if not worker.stop(timeout_seconds=0.5):
+                pending.append(worker)
         self.final_worker_status = [worker.status() for worker in self.workers]
         self.interface_quality_metadata = {
             worker.interface_id: dict(metadata)
@@ -3421,8 +4324,9 @@ class MultiInterfaceDriver(SampleDriver):
             for metadata in [getattr(worker.driver, "quality_metadata", {})]
             if isinstance(metadata, dict)
         }
-        self.workers = []
-        self.drivers = []
+        self.workers = pending
+        if not pending:
+            self.drivers = []
 
 
 def build_driver(config: AcquisitionConfig) -> SampleDriver:
@@ -3740,6 +4644,7 @@ class AcquisitionManager:
             "interfaces": [],
             "sensors": [],
         }
+        self._readiness_snapshot: ReadinessSnapshot | None = None
         if recovery_scan is None:
             recovery_scan = Path(capture_root).resolve() != DEFAULT_CAPTURE_ROOT.resolve()
         self.recovery_state = (
@@ -3922,6 +4827,14 @@ class AcquisitionManager:
         payload["simulation_mysql_password"] = (
             "***" if config.simulation_mysql_password else ""
         )
+        for item in payload.get("interfaces") or []:
+            if item.get("role") == "robot":
+                item["credential_identifier"] = _credential_identifier(
+                    str(item.get("username") or DEFAULT_ABB_USER),
+                    str(item.get("password") or DEFAULT_ABB_PASSWORD),
+                )
+            item.pop("username", None)
+            item.pop("password", None)
         return payload
 
     @staticmethod
@@ -4090,20 +5003,77 @@ class AcquisitionManager:
             candidate.is_file()
             for candidate in (
                 _NATIVE_DLL_DIR / BSV_UVC_DLL_NAME,
+                RELEASE_CONTRACT.source_path.parent / "native_dll" / BSV_UVC_DLL_NAME,
+                APP_DIR / "hardware_dlls" / BSV_UVC_DLL_NAME,
                 APP_DIR / BSV_UVC_DLL_NAME,
                 APP_DIR.parent / BSV_UVC_DLL_NAME,
                 Path.cwd() / BSV_UVC_DLL_NAME,
             )
         )
-        if uvc_dll_found:
-            # The native DLL confirms that the vendor driver is installed; a
-            # camera instance still needs protocol/data verification.
+        camera_devices = _windows_camera_pnp_facts()
+        _merge_camera_pnp_with_usb_topology(usb_topology, camera_devices)
+        bsv_pnp = next(
+            (
+                item for item in camera_devices
+                if item.get("vid") == BSV_UVC_VENDOR_ID
+                and item.get("pid") == BSV_UVC_PRODUCT_ID
+            ),
+            {},
+        )
+        bsv_devices = [
+            item for item in usb_topology.get("devices", [])
+            if isinstance(item, dict)
+            and item.get("vid") == BSV_UVC_VENDOR_ID
+            and item.get("pid") == BSV_UVC_PRODUCT_ID
+        ]
+        if not bsv_devices and bsv_pnp:
+            bsv_devices = [{
+                "id": str(bsv_pnp.get("usb_device_id") or "usbdev:bsv-unlocated"),
+                "parent_port_id": str(bsv_pnp.get("parent_port_id") or ""),
+                "vid": BSV_UVC_VENDOR_ID,
+                "pid": BSV_UVC_PRODUCT_ID,
+            }]
+        for device in bsv_devices:
+            parent_port_id = str(device.get("parent_port_id") or "")
+            pnp = bsv_pnp if bsv_pnp else device
+            physical_interfaces.append({
+                "id": f"uvc:bsv:{str(device.get('id') or parent_port_id or 'device')}",
+                "kind": "usb_uvc", "protocol": "uvc",
+                "endpoint": str(pnp.get("instance_id") or device.get("id") or "BSV UVC"),
+                "label": "BSV UVC热像仪（设备已发现，待温度数据验证）",
+                "detected": True,
+                "device_detected": True,
+                "topology_bound": bool(parent_port_id),
+                "driver_available": uvc_dll_found,
+                "auto_assignable": True,
+                "vid": BSV_UVC_VENDOR_ID,
+                "pid": BSV_UVC_PRODUCT_ID,
+                "serial": str(device.get("serial") or pnp.get("serial") or ""),
+                "pnp_instance_id": str(pnp.get("instance_id") or ""),
+                "container_id": str(pnp.get("container_id") or ""),
+                "location_paths": list(pnp.get("location_paths") or []),
+                "parent_port_id": parent_port_id,
+                "service": str(pnp.get("service") or ""),
+                "driver_provider": str(pnp.get("driver_provider") or ""),
+                "driver_version": str(pnp.get("driver_version") or ""),
+                "pnp_status": str(pnp.get("pnp_status") or ""),
+                "compatible_roles": ["thermal_uvc"],
+            })
+        if uvc_dll_found and not bsv_devices:
+            # DLL presence is a driver capability fact, not device presence.
             physical_interfaces.append({
                 "id": "uvc:bsv",
                 "kind": "usb_uvc", "protocol": "uvc",
-                "endpoint": "BSV UVC (WinUSB)",
-                "label": "BSV UVC热像仪（驱动已安装，待数据验证）",
-                "detected": False, "driver_available": True,
+                "endpoint": "BSV UVC",
+                "label": "BSV UVC驱动可用（未发现目标设备）",
+                "detected": False,
+                "device_detected": False,
+                "topology_bound": False,
+                "driver_available": True,
+                "auto_assignable": True,
+                "vid": BSV_UVC_VENDOR_ID,
+                "pid": BSV_UVC_PRODUCT_ID,
+                "compatible_roles": ["thermal_uvc"],
             })
         # Keep every standard logical slot assignable on startup.  These
         # placeholders never claim that a sensor is connected; they only hold
@@ -4124,24 +5094,38 @@ class AcquisitionManager:
                 "detected": False, "auto_assignable": True,
             })
         try:
-            import psutil
-
-            for name, addresses in psutil.net_if_addrs().items():
-                ipv4 = [
-                    str(address.address)
-                    for address in addresses
-                    if getattr(address, "family", None) == socket.AF_INET
-                    and not str(address.address).startswith("127.")
-                ]
+            network_targets = {
+                "plc": DEFAULT_PLC_IP,
+                "robot": DEFAULT_ABB_IP,
+            }
+            route_sources = {
+                "plc": _route_source_address(DEFAULT_PLC_IP, DEFAULT_PLC_PORT),
+                "robot": _route_source_address(DEFAULT_ABB_IP, 80),
+            }
+            for adapter in _network_adapter_snapshot():
+                name = str(adapter.get("name") or "")
+                ipv4_bindings = list(adapter.get("ipv4_bindings") or [])
+                ipv4 = [item["address"] for item in ipv4_bindings]
+                route_facts = network_interface_route_facts(
+                    name,
+                    str(adapter.get("description") or ""),
+                    ipv4_bindings,
+                    network_targets,
+                    route_sources,
+                )
                 physical_interfaces.append({
-                    "id": f"ethernet:{name}", "kind": "ethernet",
-                    "protocol": "ethernet", "endpoint": name,
+                    "id": str(adapter.get("id") or f"ethernet:{name}"), "kind": "ethernet",
+                    "protocol": "ethernet", "physical_transport_family": "ethernet",
+                    "endpoint": name,
                     "label": (
                         f"网卡 {name}（{', '.join(ipv4)}）"
                         if ipv4 else f"网卡 {name}（当前无 IPv4 地址）"
                     ),
-                    "name": name, "addresses": ipv4, "detected": True,
+                    "name": name,
+                    "description": str(adapter.get("description") or ""),
+                    "addresses": ipv4, "detected": True,
                     "shared_roles": ["plc", "robot"],
+                    **route_facts,
                 })
         except Exception as exc:
             error = f"{error}; 网卡枚举失败：{exc}" if error else f"网卡枚举失败：{exc}"
@@ -4181,6 +5165,16 @@ class AcquisitionManager:
             "plc_reachable": plc_reachable,
             "abb_reachable": abb_reachable,
             "uvc_dll_found": uvc_dll_found,
+            "camera_devices": [
+                {
+                    **item,
+                    "compatible_with_bsv_temperature": bool(
+                        item.get("vid") == BSV_UVC_VENDOR_ID
+                        and item.get("pid") == BSV_UVC_PRODUCT_ID
+                    ),
+                }
+                for item in camera_devices
+            ],
             "rtsp_reachable": rtsp_reachable,
             "thermocouple_reachable": bool(smrf_devices),
         }
@@ -4293,6 +5287,7 @@ class AcquisitionManager:
                     if not physical_verified else ""
                 )
             )
+            network_path: dict[str, Any] | None = None
             expected = [
                 name for name in config.interface_channel_assignments.get(interface_id, [])
                 if name in selected
@@ -4358,30 +5353,113 @@ class AcquisitionManager:
                     "state": state, "message": message, "ok": False,
                 })
                 continue
+            if role in {"plc", "robot"}:
+                network_path = validate_network_path(item)
+                if not network_path["ok"]:
+                    message = (
+                        "工业设备网络路径与所选网卡不一致："
+                        f"目标{network_path['target_address']}，"
+                        f"实际源地址{network_path['actual_source_address'] or '未知'}"
+                    )
+                    errors.append(f"{endpoint}：{message}")
+                    interface_results.append({
+                        "id": interface_id,
+                        "role": item.get("role", "custom"),
+                        "driver": item.get("driver", ""),
+                        "endpoint": endpoint,
+                        "physical_interface_id": physical_id,
+                        "physical_port_id": physical_port_id,
+                        "physical_interface_kind": physical_kind,
+                        "protocol": protocol,
+                        "physical_fallback": physical_fallback,
+                        "physical_verified": physical_verified,
+                        "physical_warning": physical_warning,
+                        "enabled": True,
+                        "expected_channels": expected,
+                        "detected_channels": [],
+                        "missing_channels": expected,
+                        "invalid_channels": [],
+                        "sample_counts": {},
+                        "invalid_sample_counts": {},
+                        "errors": [message],
+                        "state": "network_path_invalid",
+                        "message": message,
+                        "network_path": network_path,
+                        "ok": False,
+                    })
+                    continue
+            device_profile_status = device_profile_readiness(item)
+            if role in SHARED_DEVICE_PROFILES and not device_profile_status["ready"]:
+                missing_device_facts = list(
+                    device_profile_status["missing_device_facts"]
+                )
+                message = (
+                    "设备档缺少已批准的必需事实："
+                    + "、".join(missing_device_facts)
+                )
+                errors.append(f"{endpoint}：{message}")
+                interface_results.append({
+                    "id": interface_id,
+                    "role": item.get("role", "custom"),
+                    "driver": item.get("driver", ""),
+                    "endpoint": endpoint,
+                    "physical_interface_id": physical_id,
+                    "physical_port_id": physical_port_id,
+                    "physical_interface_kind": physical_kind,
+                    "protocol": protocol,
+                    "physical_fallback": physical_fallback,
+                    "physical_verified": physical_verified,
+                    "physical_warning": physical_warning,
+                    "enabled": True,
+                    "expected_channels": expected,
+                    "detected_channels": [],
+                    "missing_channels": expected,
+                    "invalid_channels": [],
+                    "sample_counts": {},
+                    "invalid_sample_counts": {},
+                    "errors": [message],
+                    "state": "device_profile_incomplete",
+                    "message": message,
+                    "ok": False,
+                    **device_profile_status,
+                })
+                continue
             detected: dict[str, int] = {}
             invalid: dict[str, int] = {}
+            channel_observations: dict[str, dict[str, Any]] = {}
             probe_errors: list[str] = []
             interface_driver = None
-            probe_started = time.time()
             try:
                 interface_driver = MultiInterfaceDriver(
                     [item], list(config.schema_sensors), config.source_file,
                     {interface_id: expected},
                 )
                 interface_driver.open()
+                probe_started = time.time()
                 while time.time() - probe_started < max(0.5, min(float(timeout_seconds), 1.5)):
                     sample = interface_driver.read_sample()
                     if sample:
+                        sample_timestamp = time.time()
                         for name in expected:
                             if name not in sample:
                                 continue
                             if _finite(sample[name]) is None:
                                 invalid[name] = invalid.get(name, 0) + 1
                                 invalid_received[name] += 1
+                                channel_observations[name] = {
+                                    "value": None,
+                                    "source_timestamp": sample_timestamp,
+                                    "quality": "invalid",
+                                }
                             else:
                                 detected[name] = detected.get(name, 0) + 1
                                 received[name] += 1
-                    if detected:
+                                channel_observations[name] = {
+                                    "value": _finite(sample[name]),
+                                    "source_timestamp": sample_timestamp,
+                                    "quality": "measured_new",
+                                }
+                    if expected and all(detected.get(name, 0) > 0 for name in expected):
                         break
                     time.sleep(0.01)
             except Exception as exc:
@@ -4392,13 +5470,32 @@ class AcquisitionManager:
                         interface_driver.close()
                     except Exception:
                         pass
+            if not detected and not probe_errors and interface_driver is not None:
+                worker_statuses = list(
+                    getattr(interface_driver, "final_worker_status", []) or []
+                )
+                worker_errors = [
+                    str(status.get("last_error") or "")
+                    for status in worker_statuses
+                    if str(status.get("last_error") or "")
+                ]
+                if worker_errors:
+                    probe_errors.extend(worker_errors)
             missing = [name for name in expected if detected.get(name, 0) <= 0]
             invalid_channels = [name for name in missing if invalid.get(name, 0) > 0]
             if detected:
-                state = "ok" if physical_verified else "physical_unverified"
+                if role in {"plc", "robot"} and (missing or invalid_channels):
+                    state = "partial_channels"
+                elif role in {"plc", "robot"} and physical_verified:
+                    state = "data_ready"
+                else:
+                    state = "ok" if physical_verified else "physical_unverified"
                 message = f"接口已收到有效数据：{'、'.join(sorted(detected))}"
                 if missing:
-                    message += f"；未收到通道不阻止采集：{'、'.join(missing)}"
+                    if role in {"plc", "robot"}:
+                        message += f"；缺少必需通道：{'、'.join(missing)}"
+                    else:
+                        message += f"；未收到通道不阻止采集：{'、'.join(missing)}"
                 if not physical_verified:
                     message += "；物理端口尚未与该实时设备关联，不能启动真实采集"
             elif probe_errors:
@@ -4407,13 +5504,55 @@ class AcquisitionManager:
                     state = classify_esr1001_probe_error(error_text)
                     message = f"ESR1001-A协议探针失败（{state}）：{error_text}"
                 else:
-                    state, message = "not_connected", f"接口无法打开或读取：{error_text}"
+                    state = classify_interface_probe_error(role, error_text)
+                    message = f"接口无法打开或读取：{error_text}"
             elif invalid_channels:
                 state, message = "invalid_data", f"收到非数值数据：{'、'.join(invalid_channels)}"
             else:
                 state, message = "no_data", f"未检测到采集数据：{'、'.join(missing)}"
-            if state != "ok":
+            if state not in {"ok", "data_ready"}:
                 errors.append(f"{endpoint}：{message}")
+            channel_results = {}
+            for name in expected:
+                observation = dict(channel_observations.get(name) or {})
+                channel_results[name] = {
+                    "value": observation.get("value"),
+                    "unit": str((SENSOR_CHANNEL_METADATA.get(name) or {}).get("unit") or ""),
+                    "source_timestamp": observation.get("source_timestamp"),
+                    "quality": str(observation.get("quality") or "missing"),
+                }
+            stages = {
+                "network_path": {
+                    "state": (
+                        "passed" if network_path and network_path.get("ok")
+                        else "not_applicable" if role not in {"plc", "robot"}
+                        else "failed"
+                    ),
+                    "evidence": deepcopy(network_path),
+                },
+                "protocol": {
+                    "state": (
+                        "failed" if probe_errors
+                        else "passed" if detected or invalid
+                        else "not_verified"
+                    ),
+                    "protocol": protocol,
+                },
+                "channels": {
+                    "state": "passed" if not missing and not invalid_channels else "failed",
+                    "passed": sorted(detected),
+                    "missing": list(missing),
+                    "invalid": list(invalid_channels),
+                },
+                "freshness": {
+                    "state": "passed" if detected and not missing else "failed",
+                    "freshness_seconds": float(
+                        (item.get("device_profile") or {}).get("freshness_seconds")
+                        or item.get("freshness_seconds")
+                        or 0.0
+                    ),
+                },
+            }
             interface_results.append({
                 "id": interface_id, "role": item.get("role", "custom"),
                 "driver": item.get("driver", ""), "endpoint": endpoint,
@@ -4427,7 +5566,10 @@ class AcquisitionManager:
                 "invalid_channels": invalid_channels, "sample_counts": detected,
                 "invalid_sample_counts": invalid, "errors": probe_errors,
                 "auxiliary_only": auxiliary_only, "state": state,
-                "message": message, "ok": state == "ok",
+                "message": message, "ok": state in {"ok", "data_ready"},
+                "network_path": deepcopy(network_path),
+                "stages": stages,
+                "channel_results": channel_results,
             })
         configuration_issues = list(getattr(config, "configuration_issues", []) or [])
         issues_by_interface: dict[str, list[dict[str, Any]]] = {}
@@ -4450,6 +5592,10 @@ class AcquisitionManager:
             issue_text = "；".join(str(issue.get("message") or "采集配置无效") for issue in interface_issues)
             probe_text = str(interface_result.get("probe_message") or "")
             interface_result["message"] = f"配置问题：{issue_text}" + (f"；探测结果：{probe_text}" if probe_text else "")
+
+        interface_results = [
+            normalize_interface_readiness(item) for item in interface_results
+        ]
 
         sensors = []
         for name in config.schema_sensors:
@@ -4486,7 +5632,16 @@ class AcquisitionManager:
         result["checked_at"] = time.time()
         with self.lock:
             self._latest_check_result = deepcopy(result)
+            if config.acquisition_mode == "real":
+                self._readiness_snapshot = ReadinessSnapshot.create(
+                    config, result, capabilities=config.helper_capabilities
+                )
         return result
+
+    def import_readiness_snapshot(self, payload: dict[str, Any]) -> None:
+        snapshot = ReadinessSnapshot.from_dict(payload)
+        with self.lock:
+            self._readiness_snapshot = snapshot
 
     def latest_check_result(self) -> dict[str, Any]:
         """Return the last completed interface check without probing hardware."""
@@ -4857,9 +6012,23 @@ class AcquisitionManager:
         """
         assert_config_contract(config, RELEASE_CONTRACT)
         if config.acquisition_mode == "real":
+            requires_readiness = False
             for item in config.interfaces or []:
                 if not item.get("enabled", True):
                     continue
+                role = str(item.get("role") or "")
+                if role in SHARED_DEVICE_PROFILES:
+                    requires_readiness = True
+                    profile_status = device_profile_readiness(item)
+                    if not profile_status["ready"]:
+                        raise RuntimeError(
+                            "device_profile_incomplete: "
+                            + str(item.get("id") or role)
+                            + ": "
+                            + ", ".join(profile_status["missing_device_facts"])
+                        )
+                if role in {"plc", "robot"}:
+                    item["network_path"] = require_network_path(item)
                 if item.get("physical_port_id") and not item.get("physical_interface_id"):
                     raise RuntimeError(
                         f"接口“{item.get('id', item.get('role', 'unknown'))}”："
@@ -4870,8 +6039,22 @@ class AcquisitionManager:
                         f"接口“{item.get('id', item.get('role', 'unknown'))}”尚未通过物理设备验证，"
                         "请先执行接口检查"
                     )
+            if requires_readiness:
+                with self.lock:
+                    snapshot = self._readiness_snapshot
+                if snapshot is None:
+                    raise RuntimeError("readiness_required: 请先执行当前配置的接口检查")
+                try:
+                    snapshot.validate(config)
+                except ValueError as exc:
+                    raise RuntimeError(f"readiness_required: {exc}") from exc
         with self.lifecycle_lock:
             with self.lock:
+                if self.capture_phase == "stop_timed_out" and not self.finalization_complete:
+                    raise RuntimeError(
+                        "previous_capture_stop_timed_out: "
+                        "上一采集仍有未退出的设备，请完成停止后再开始采集"
+                    )
                 active = self.thread is not None and self.thread.is_alive()
                 active_mode = (
                     self.config.acquisition_mode if self.config is not None else ""
@@ -5896,6 +7079,17 @@ class AcquisitionManager:
                     self.last_error
                     or "stop_timeout: 采集接口未能及时停止，工作文件已保留，尚未生成最终层文件"
                 )
+                self.capture_phase = "stop_timed_out"
+                return self.status()
+        if isinstance(self.driver, MultiInterfaceDriver):
+            self.driver.close()
+            pending_workers = self.driver.worker_status()
+            if pending_workers:
+                self.last_error = "stop_timeout: " + ", ".join(
+                    str(item.get("interface_id") or "unknown")
+                    for item in pending_workers
+                )
+                self.finalization_complete = False
                 self.capture_phase = "stop_timed_out"
                 return self.status()
         self.capture_phase = "finalizing"

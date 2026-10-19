@@ -88,15 +88,23 @@ def build_public_device_status(
     for definition in PUBLIC_INTERFACE_DEFINITIONS:
         source = source_by_role.get(definition["role"], {})
         state = str(source.get("state") or "unchecked").strip().lower()
-        if state not in _PUBLIC_STATE_MESSAGES:
-            state = "unchecked"
+        message = _PUBLIC_STATE_MESSAGES.get(
+            state,
+            f"接口检查失败（状态码：{state}）",
+        )
+        stages = source.get("stages") if isinstance(source.get("stages"), dict) else {}
         interfaces.append(
             {
                 **definition,
                 "state": state,
                 "ok": bool(source.get("ok", False)) if source else False,
                 "message_code": state,
-                "message": _PUBLIC_STATE_MESSAGES[state],
+                "message": message,
+                "stages": [
+                    {"name": str(name), "state": str(stage.get("state") or "unknown")}
+                    for name, stage in stages.items()
+                    if isinstance(stage, dict)
+                ],
                 "checked_at": checked_at,
                 "age_seconds": age,
             }

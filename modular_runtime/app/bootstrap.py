@@ -749,6 +749,12 @@ def main(root: Path, arguments: list[str] | None = None) -> None:
     parser.add_argument("--install-patch", default="")
     parser.add_argument("--rollback", action="store_true")
     parser.add_argument("--server-only", action="store_true")
+    parser.add_argument("--industrial-readonly-probe", action="store_true")
+    parser.add_argument("--industrial-interface-id", default="ethernet:以太网")
+    parser.add_argument("--industrial-probe-duration", type=float, default=10.0)
+    parser.add_argument("--industrial-probe-repeat", type=int, default=3)
+    parser.add_argument("--industrial-probe-role", choices=("both", "plc", "robot"), default="both")
+    parser.add_argument("--industrial-probe-output", default="D:/AFP_Capture/diagnostics/fix-plc-abb-uvc-real-acquisition")
     parser.add_argument("--pre-sensor-preflight", action="store_true")
     parser.add_argument("--pre-sensor-retry-mysql", action="store_true")
     parser.add_argument("--pre-sensor-capture-root", default="")
@@ -766,6 +772,21 @@ def main(root: Path, arguments: list[str] | None = None) -> None:
     parser.add_argument("--pre-sensor-output", default="")
     args = parser.parse_args(arguments)
     context, manager = initialize(root)
+
+    if args.industrial_readonly_probe:
+        probe = _legacy_module("industrial_acquisition_probe", context)
+        result, evidence_file = probe.run_probe(
+            args.industrial_probe_output, interface_id=args.industrial_interface_id,
+            duration_seconds=args.industrial_probe_duration, repeat=args.industrial_probe_repeat,
+            roles=probe.ROLE_SELECTION[args.industrial_probe_role],
+        )
+        _emit_command_result(context, "industrial-readonly-probe", {
+            "read_only_probe_passed": result["read_only_probe_passed"],
+            "evidence_file": str(evidence_file), "field_acceptance_passed": False,
+        })
+        if not result["read_only_probe_passed"]:
+            raise SystemExit(2)
+        return
 
     if args.install_patch or args.rollback:
         from update_manager import UpdateManager

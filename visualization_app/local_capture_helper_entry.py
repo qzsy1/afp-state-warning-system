@@ -24,7 +24,11 @@ from typing import Any
 from acquisition import AcquisitionConfig, MySQLSettings
 from helper_relay import normalize_pairing_code
 from local_capture_agent import HelperTransport, LocalCaptureAgent
-from release_contract import load_release_contract, release_manifest_helper_identity
+from release_contract import (
+    DEVICE_READINESS_CONTRACT,
+    load_release_contract,
+    release_manifest_helper_identity,
+)
 
 
 RELEASE_CONTRACT = load_release_contract(
@@ -576,6 +580,8 @@ def helper_capabilities(server_url: str = "") -> dict[str, Any]:
         "build_id": HELPER_BUILD_ID,
         "configuration_schema_version": RELEASE_CONTRACT.configuration_schema_version,
         "readiness_schema_version": RELEASE_CONTRACT.readiness_schema_version,
+        "device_readiness_contract": DEVICE_READINESS_CONTRACT,
+        "unified_device_readiness_v1": True,
         "command_lifecycle": "isolated_hardware_check",
         "hardware_check_timeout_seconds": HARDWARE_CHECK_TIMEOUT_SECONDS,
         "hardware_discovery": True,
