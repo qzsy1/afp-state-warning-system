@@ -182,7 +182,9 @@ def _show_desktop_window(context: Any, url: str) -> None:
         min_size=(1180, 760),
         text_select=True,
     )
-    webview.start(debug=False)
+    storage = context.paths.runtime_dir / "webview"
+    storage.mkdir(parents=True, exist_ok=True)
+    webview.start(debug=False, private_mode=True, storage_path=str(storage))
 
 
 def self_test(context: Any, manager: Any) -> dict[str, Any]:
@@ -579,20 +581,7 @@ def launch(context: Any, manager: Any, *, server_only: bool = False) -> None:
         if not config.open_desktop_window:
             thread.join()
             return
-        try:
-            import webview
-        except ImportError as exc:
-            raise RuntimeError("桌面界面组件缺失，请使用已打包的软件或安装 pywebview。") from exc
-        ui_config = context.config.get("ui", {})
-        webview.create_window(
-            str(ui_config.get("title", "AFP 实时预测、状态预警与模型训练系统（模块化版）")),
-            f"http://127.0.0.1:{config.port}/",
-            width=int(ui_config.get("width", 1660)),
-            height=int(ui_config.get("height", 1040)),
-            min_size=(1180, 760),
-            text_select=True,
-        )
-        webview.start(debug=False)
+        _show_desktop_window(context, f"http://127.0.0.1:{config.port}/")
     finally:
         server.shutdown()
         server.server_close()

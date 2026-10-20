@@ -419,6 +419,7 @@ function Invoke-AfpRuntimePromotion {
                 "public_web_security.sqlite3-wal",
                 "public_web_security.sqlite3-shm",
                 "helper_registry.json",
+                "interface-plans.json",
                 "server_target_capture_journal.sqlite3",
                 "server_target_capture_journal.sqlite3-wal",
                 "server_target_capture_journal.sqlite3-shm"

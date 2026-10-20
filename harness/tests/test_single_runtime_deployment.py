@@ -358,6 +358,9 @@ if ($migration.disk.free_bytes -ne 123456 -or -not $migration.rollback.ready) {{
             (state_dir / "helper_registry.json").write_text(
                 '{"helpers":{}}', encoding="utf-8"
             )
+            (state_dir / "interface-plans.json").write_text(
+                '{"active":"new_collection_v13_0","plans":{}}', encoding="utf-8"
+            )
             script = rf"""
 $ErrorActionPreference = 'Stop'
 Import-Module {_ps_quote(PATH_MODULE)} -Force
@@ -369,6 +372,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $paths.RuntimeRoot 'new.txt'))) {{ t
 if (Test-Path -LiteralPath (Join-Path $paths.RuntimeRoot 'old.txt')) {{ throw 'mixed runtime contents' }}
 if ((Get-Content -LiteralPath (Join-Path $paths.RuntimeRoot 'runtime\public-ingress-state.json') -Raw) -notmatch '7') {{ throw 'ingress generation state was not preserved' }}
 if (-not (Test-Path -LiteralPath (Join-Path $paths.RuntimeRoot 'runtime\helper_registry.json'))) {{ throw 'helper registry was not preserved' }}
+if ((Get-Content -LiteralPath (Join-Path $paths.RuntimeRoot 'runtime\interface-plans.json') -Raw) -notmatch 'new_collection_v13_0') {{ throw 'interface plans were not preserved' }}
 if (-not (Test-Path -LiteralPath (Join-Path $result.swap_path 'old.txt'))) {{ throw 'rollback material missing' }}
 Restore-AfpRuntimePromotion -Promotion $result -Paths $paths
 if (-not (Test-Path -LiteralPath (Join-Path $paths.RuntimeRoot 'old.txt'))) {{ throw 'old runtime not restored' }}

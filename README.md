@@ -2,7 +2,7 @@
 
 本项目面向自动铺丝（AFP）过程，集成多接口传感器采集、模拟回放、时序预测、在线健康指标、窗口级—铺层级—试样级状态预警、CSV/MySQL 保存、数据整合以及预测/预警模型训练。
 
-当前最新验收版本为 `2.0.5-rc.2`，Git 标签为 `v2.0.5-rc.2-joint-acquisition-20261020`，保留在本机任务分支 `codex/pc-b/integrate-tc64-vendor-protocol`。正式交付标识为 `2.0.5-rc.2-0dc42c4f2e45-wt01f6ff50-20261020T005627Z`，对应源码修订为 `0dc42c4f2e45+working-tree.01f6ff50b0bc`；文件摘要以 `harness/config/delivery-readonly-baseline.json` 为准。
+当前最新正式版本为 `2.0.5-rc.2`，Git 标签为 `v2.0.5-rc.2-desktop-config-20261020`，保留在本机任务分支 `codex/pc-b/integrate-tc64-vendor-protocol`。正式交付标识为 `2.0.5-rc.2-b8e481ba0291-wt505b4223-20261020T013137Z`，对应源码修订为 `b8e481ba0291+working-tree.505b42237924`；文件摘要以 `harness/config/delivery-readonly-baseline.json` 为准。
 
 桌面 EXE 作为稳定启动器，采集、驱动、存储、预测、健康指标、预警、训练、数据整合、界面和配置均保留为外部模块。普通业务修改不再需要重新生成整个 EXE。
 

@@ -116,6 +116,7 @@ from websocket_live import (
     websocket_handshake_headers,
 )
 from release_contract import load_release_contract
+from pre_sensor_config import InterfacePlanStore
 from thermocouple64 import (
     THERMOCOUPLE64_CHANNELS,
     THERMOCOUPLE64_DERIVED_CHANNELS,
@@ -5261,6 +5262,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 )
             )
             return
+        if parsed.path == "/api/admin/acquisition/interface-plans":
+            store = InterfacePlanStore(self.security_store.path.parent / "interface-plans.json")
+            self._send_json({"preferences": store.load()})
+            return
         if parsed.path == "/api/simulation/status":
             self._send_json(self.guest_manager.status(self._identity().guest_id))
             return
@@ -5660,6 +5665,11 @@ class AppHandler(BaseHTTPRequestHandler):
             payload = json.loads(body.decode("utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("请求体必须是JSON对象")
+            if parsed.path == "/api/admin/acquisition/interface-plans":
+                store = InterfacePlanStore(self.security_store.path.parent / "interface-plans.json")
+                store.save(payload)
+                self._send_json({"ok": True})
+                return
             if parsed.path == "/api/helper/pair/complete":
                 result = self.dashboard.helper_registry.complete_pairing(
                     str(payload.get("challenge") or ""),

@@ -8,6 +8,9 @@ environment and are never persisted in the repository templates.
 from __future__ import annotations
 
 import re
+import json
+import os
+import threading
 import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -51,6 +54,70 @@ _ROLE_MAP = {
 _REFERENCE_NAME = re.compile(r"^AFP_[A-Z0-9_]+$")
 _SECRET_KEY = re.compile(r"password|token|secret|credential|api[_-]?key", re.I)
 _T = TypeVar("_T")
+
+
+class InterfacePlanStore:
+    """本机管理员共享非敏感方案；不提供采集就绪授权。"""
+
+    _lock = threading.RLock()
+    fields = frozenset((
+        "id", "enabled", "role", "driver", "endpoint", "baudrate", "slave_id",
+        "data_mode", "calibration_profile", "bridge", "channel_count", "channel_map", "channels",
+        "physical_interface_id", "physical_port_id", "physical_interface_kind",
+        "physical_transport_family", "selection_origin",
+    ))
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+
+    @classmethod
+    def sanitize(cls, payload):
+        if not isinstance(payload, dict) or payload.get("active") not in ACQUISITION_SCHEMAS:
+            raise ValueError("接口方案无效")
+        plans = payload.get("plans")
+        if not isinstance(plans, dict) or len(plans) > len(ACQUISITION_SCHEMAS):
+            raise ValueError("接口方案目录无效")
+        def clean(value):
+            if isinstance(value, dict):
+                return {str(k): clean(v) for k, v in value.items() if not _SECRET_KEY.search(str(k))}
+            if isinstance(value, list):
+                return [clean(v) for v in value]
+            return value
+        result = {}
+        for schema, plan in plans.items():
+            if schema not in ACQUISITION_SCHEMAS or not isinstance(plan, dict):
+                raise ValueError("未知接口方案")
+            interfaces = plan.get("interfaces")
+            if not isinstance(interfaces, list) or not 1 <= len(interfaces) <= 32:
+                raise ValueError("接口数量无效")
+            if not all(isinstance(item, dict) for item in interfaces):
+                raise ValueError("接口配置无效")
+            result[schema] = {
+                "interfaces": [clean({k: v for k, v in item.items() if k in cls.fields}) for item in interfaces],
+                "processingMode": "capture_only" if plan.get("processingMode") == "capture_only" else "prediction_warning",
+                "mysqlEnabled": bool(plan.get("mysqlEnabled")),
+                "mysqlLocalEnabled": bool(plan.get("mysqlLocalEnabled")),
+            }
+        if payload["active"] not in result:
+            raise ValueError("缺少当前接口方案")
+        return {"active": payload["active"], "plans": result}
+
+    def load(self):
+        with self._lock:
+            try:
+                return self.sanitize(json.loads(self.path.read_text(encoding="utf-8")))
+            except (OSError, ValueError, TypeError):
+                return None
+
+    def save(self, payload):
+        rendered = json.dumps(self.sanitize(payload), ensure_ascii=False, allow_nan=False)
+        if len(rendered.encode("utf-8")) > 262144:
+            raise ValueError("接口方案过大")
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_suffix(".tmp")
+            temporary.write_text(rendered, encoding="utf-8")
+            os.replace(temporary, self.path)
 
 
 def _object(payload: Mapping[str, Any], name: str) -> Mapping[str, Any]:

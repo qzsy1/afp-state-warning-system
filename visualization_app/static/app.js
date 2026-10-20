@@ -3018,7 +3018,7 @@ function datasetInterfacePreferenceKey() {
 function saveDatasetInterfacePreferences() {
   if (!state.activeInterfaceSchema || controls.acquisitionMode?.value === "simulation") return;
   const fields = ["id", "enabled", "role", "driver", "endpoint", "baudrate", "slave_id",
-    "data_mode", "calibration_profile", "bridge", "channel_count", "channel_map",
+    "data_mode", "calibration_profile", "bridge", "channel_count", "channel_map", "channels",
     "physical_interface_id", "physical_port_id", "physical_interface_kind", "physical_transport_family", "selection_origin"];
   const interfaces = interfaceConfigs().interfaces.map(item => Object.fromEntries(
     fields.filter(key => item[key] !== undefined).map(key => [key, item[key]])
@@ -3029,16 +3029,42 @@ function saveDatasetInterfacePreferences() {
     mysqlEnabled: Boolean(controls.mysqlEnabled?.checked),
     mysqlLocalEnabled: Boolean(controls.mysqlLocalEnabled?.checked),
   };
+  const preferences = {
+    active: state.activeInterfaceSchema, plans: state.datasetInterfacePreferences,
+  };
+  queueSharedDatasetInterfacePreferences(preferences);
   try {
-    localStorage.setItem(datasetInterfacePreferenceKey(), JSON.stringify({
-      active: state.activeInterfaceSchema, plans: state.datasetInterfacePreferences,
-    }));
+    localStorage.setItem(datasetInterfacePreferenceKey(), JSON.stringify(preferences));
   } catch (_error) { /* 浏览器禁止本地存储时保留当前页面配置。 */ }
+}
+
+function queueSharedDatasetInterfacePreferences(preferences) {
+  if (state.accessRole !== "local_admin" || usesLocalCaptureHelper()) return;
+  window.clearTimeout(state.interfacePlanSaveTimer);
+  state.interfacePlanSaveTimer = window.setTimeout(() => {
+    postJson("/api/admin/acquisition/interface-plans", preferences)
+      .catch(error => toast(`接口方案未保存到本机：${error.message}`));
+  }, 300);
+}
+
+async function loadSharedDatasetInterfacePreferences() {
+  if (state.accessRole !== "local_admin" || usesLocalCaptureHelper()) return;
+  try {
+    const response = await fetch("/api/admin/acquisition/interface-plans", {cache: "no-store"});
+    if (!response.ok) throw new Error("本机方案读取失败");
+    const result = await response.json();
+    if (result.preferences) {
+      state.sharedInterfacePreferences = result.preferences;
+    }
+  } catch (error) {
+    toast(error.message);
+  }
 }
 
 function loadDatasetInterfacePreferences() {
   try {
-    const saved = JSON.parse(localStorage.getItem(datasetInterfacePreferenceKey()) || "null");
+    const saved = state.sharedInterfacePreferences
+      || JSON.parse(localStorage.getItem(datasetInterfacePreferenceKey()) || "null");
     if (!saved?.plans || !state.bootstrap.acquisition.schemas.some(item => item.id === saved.active)) return;
     state.datasetInterfacePreferences = saved.plans;
     state.restoredInterfaceSchema = saved.active;
@@ -4635,6 +4661,7 @@ async function initialize() {
     state.bootstrap = payload;
     state.defaults = payload.defaults;
     state.sensorTypeProfiles = payload.acquisition.sensor_types || [];
+    await loadSharedDatasetInterfacePreferences();
     loadDatasetInterfacePreferences();
     populatePredictionModelTypes();
     controls.specimen.replaceChildren(...payload.specimens.map((item) =>
@@ -5499,6 +5526,14 @@ document.addEventListener("change", (event) => {
   }
 });
 window.addEventListener("beforeunload", saveDatasetInterfacePreferences);
+window.addEventListener("pagehide", () => {
+  if (state.accessRole !== "local_admin" || usesLocalCaptureHelper()
+    || controls.acquisitionMode?.value === "simulation" || !state.activeInterfaceSchema) return;
+  window.clearTimeout(state.interfacePlanSaveTimer);
+  const preferences = {active: state.activeInterfaceSchema, plans: state.datasetInterfacePreferences};
+  navigator.sendBeacon?.("/api/admin/acquisition/interface-plans",
+    new Blob([JSON.stringify(preferences)], {type: "application/json"}));
+});
 initialize();
 
 // Unified sensor-interface cards.  The legacy driver/endpoint fields remain

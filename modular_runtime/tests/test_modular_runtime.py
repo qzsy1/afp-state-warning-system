@@ -310,6 +310,18 @@ class UpdateTests(unittest.TestCase):
 
 
 class LaunchTests(unittest.TestCase):
+    def test_desktop_private_cache_stays_in_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            context = RuntimeContext(Path(temporary), {})
+            fake = types.SimpleNamespace(create_window=MagicMock(), start=MagicMock())
+            with patch.dict(sys.modules, {"webview": fake}):
+                bootstrap._show_desktop_window(context, "http://127.0.0.1:8771/")
+            cache = context.paths.runtime_dir / "webview"
+            self.assertTrue(cache.is_dir())
+            fake.start.assert_called_once_with(
+                debug=False, private_mode=True, storage_path=str(cache)
+            )
+
     def test_existing_afp_server_probe_requires_healthy_json(self) -> None:
         response = MagicMock()
         response.__enter__.return_value = response

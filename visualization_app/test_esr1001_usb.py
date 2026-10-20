@@ -526,6 +526,41 @@ console.log(JSON.stringify({
         self.assertEqual(payload["profileApplications"], 1)
         self.assertEqual(payload["routeRefreshes"], 1)
 
+    def test_frontend_shared_plan_restores_empty_desktop_storage(self):
+        source = (Path(__file__).parent / "static/app.js").read_text(encoding="utf-8")
+        functions = source[source.index("function datasetInterfacePreferenceKey("):source.index("function switchDatasetInterfacePreferences(")]
+        script = r'''
+const assert=require("node:assert/strict");
+const normal="new_collection_v13_0";
+const expected={active:normal,plans:{[normal]:{interfaces:[{id:"esr",role:"esr1001_strain",driver:"esr1001_usb_ttl",baudrate:115200,enabled:true,data_mode:"raw_adc",channels:["CH1_ADC_signed"]}],processingMode:"capture_only"}}};
+const state={accessRole:"local_admin",bootstrap:{acquisition:{schemas:[{id:normal}]}}};
+const controls={acquisitionMode:{value:"real"},processingMode:{value:"capture_only"}};
+const localStorage={getItem:()=>null,setItem:()=>{throw Error("storage blocked")}};
+let queued,posted;
+const window={clearTimeout:()=>{},setTimeout:f=>{queued=f;return 1}};
+function usesLocalCaptureHelper(){return false}
+function toast(message){throw Error(message)}
+function interfaceConfigs(){return {interfaces:expected.plans[normal].interfaces}}
+async function fetch(path){assert.equal(path,"/api/admin/acquisition/interface-plans");return {ok:true,json:async()=>({preferences:expected})}}
+async function postJson(path,body){assert.equal(path,"/api/admin/acquisition/interface-plans");posted=structuredClone(body);return {ok:true}}
+(async()=>{
+ await loadSharedDatasetInterfacePreferences();
+ loadDatasetInterfacePreferences();
+ assert.equal(state.restoredInterfaceSchema,normal);
+ assert.deepEqual(state.interfaceCatalog,expected.plans[normal].interfaces);
+ assert.equal(state.hardwareCheck,undefined);
+ state.activeInterfaceSchema=normal;
+ saveDatasetInterfacePreferences();
+ await queued();
+ assert.equal(posted.plans[normal].interfaces[0].driver,"esr1001_usb_ttl");
+ assert.deepEqual(posted.plans[normal].interfaces[0].channels,["CH1_ADC_signed"]);
+ state.accessRole="authorized";queued=null;
+ queueSharedDatasetInterfacePreferences(expected);
+ assert.equal(queued,null);
+})().catch(error=>{console.error(error);process.exitCode=1});
+'''
+        subprocess.run(["node", "-e", functions + script], check=True, capture_output=True)
+
     def test_frontend_plan_roundtrips_reload_and_unbound_rediscovery(self):
         source = (Path(__file__).parent / "static/app.js").read_text(encoding="utf-8")
         functions = source[source.index("function datasetInterfacePreferenceKey("):source.index("function configureDatasetSchema(")]

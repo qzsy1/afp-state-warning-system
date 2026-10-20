@@ -378,6 +378,42 @@ class PublicWebAccessTests(unittest.TestCase):
 
 
 class PublicWebHttpTests(unittest.TestCase):
+    def test_local_interface_plans_persist_without_credentials_or_readiness(self):
+        route = "/api/admin/acquisition/interface-plans"
+        status, _, _ = self.request_json("GET", route)
+        self.assertEqual(status, 403)
+        plan = {
+            "active": "new_collection_v13_0",
+            "plans": {"new_collection_v13_0": {
+                "interfaces": [{"id": "esr", "role": "esr1001_strain",
+                    "driver": "esr1001_usb_ttl", "data_mode": "raw_adc",
+                    "endpoint": "COM91", "enabled": True, "baudrate": 115200,
+                    "channels": ["CH1_ADC_signed"],
+                    "password": "private-value", "physical_verified": True,
+                    "calibration_profile": {"secret": "private-value", "K": [1, 2, 3, 4]}}],
+                "processingMode": "capture_only", "mysqlEnabled": False,
+                "readiness_snapshot": {"ok": True},
+            }},
+            "token": "private-value",
+        }
+        status, _, _ = self.request_json("POST", route, plan)
+        self.assertEqual(status, 403)
+        with patch.object(self.server.RequestHandlerClass, "access_context", "local_admin"):
+            status, result, _ = self.request_json("POST", route, plan)
+            self.assertEqual(status, 200, result)
+            status, result, _ = self.request_json("GET", route)
+            self.assertEqual(status, 200, result)
+        from pre_sensor_config import InterfacePlanStore
+        stored = InterfacePlanStore(self.server.security_store.path.parent / "interface-plans.json").load()
+        self.assertEqual(result["preferences"], stored)
+        interface = stored["plans"][stored["active"]]["interfaces"][0]
+        self.assertEqual(interface["driver"], "esr1001_usb_ttl")
+        self.assertEqual(interface["channels"], ["CH1_ADC_signed"])
+        self.assertNotIn("physical_verified", interface)
+        rendered = json.dumps(stored)
+        self.assertNotIn("private-value", rendered)
+        self.assertNotIn("readiness_snapshot", rendered)
+
     def setUp(self) -> None:
         from app import RELEASE_CONTRACT, create_server
         from guest_simulation import GuestSimulationManager
