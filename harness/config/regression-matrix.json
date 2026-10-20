@@ -2,6 +2,7 @@
   "schema_version": 1,
   "profiles": ["quick", "full", "release"],
   "requirements": [
+    {"id": "ESR1001-USB-001", "title": "ESR1001原生USB协议、配置、诊断单位、标定、源帧保存与就绪失效合同", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "HARNESS-001", "title": "质量门禁配置、执行、报告和退出码可靠", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "STARTUP-001", "title": "软件启动、服务探测和前端加载保持可用", "mandatory": true, "profiles": ["full", "release"]},
     {"id": "SIMULATION-001", "title": "模拟采集导入、运行和结果链路保持可用", "mandatory": true, "profiles": ["full", "release"]},
@@ -46,11 +47,22 @@
     {"id": "PRE_SENSOR_INGRESS_CUTOVER-001", "title": "入口切换必须验证新入口、发布代际并确认客户端就绪后才能退役旧入口", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "PRE_SENSOR_HELPER_GENERATION-001", "title": "Helper 会话、命令和结果必须绑定当前入口代际并拒绝跨代际复用", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "PRE_SENSOR_MODEL_PROVENANCE-001", "title": "模型来源必须由发行合同管理的根目录判定并向界面显式报告", "mandatory": true, "profiles": ["quick", "full", "release"]},
-    {"id": "THERMOCOUPLE64-PROTOCOL-001", "title": "64路热电偶目录、映射、组均值和硬件事实门禁符合合同", "mandatory": true, "profiles": ["quick", "full", "release"]},
+    {"id": "THERMOCOUPLE64-PROTOCOL-001", "title": "64路热电偶Modbus协议、目录、映射、组均值及实机证据边界符合合同", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "THERMOCOUPLE64-LAYERS-001", "title": "64路异构层原始视图和同试样中位数派生范围保持分离", "mandatory": true, "profiles": ["quick", "full", "release"]},
     {"id": "THERMOCOUPLE64-FRONTEND-001", "title": "64路与8组均值页面、模型兼容状态和其他传感器区域符合合同", "mandatory": true, "profiles": ["quick", "full", "release"]}
   ],
   "checks": [
+    {
+      "id": "esr1001-native-usb-contracts",
+      "title": "ESR1001原生USB与原始ADC诊断合同",
+      "kind": "command",
+      "command": ["{python}", "-m", "unittest", "visualization_app.test_esr1001_usb", "-v"],
+      "cwd": ".", "timeout_seconds": 180,
+      "profiles": ["quick", "full", "release"], "environments": ["local", "ci"],
+      "blocking": true, "evidence_tier": "protocol_simulation",
+      "requirements": ["ESR1001-USB-001"],
+      "change_patterns": ["visualization_app/**", "pre_sensor/**", "modular_runtime/**", "openspec/changes/fix-esr1001-native-usb-acquisition/**"]
+    },
     {
       "id": "pre-sensor-readiness-contracts",
       "title": "传感器前发行、配置、预检和环境分类合同",
@@ -249,9 +261,9 @@
     },
     {
       "id": "thermocouple64-protocol-contracts",
-      "title": "64路热电偶模式、适配边界、组均值和实物发布门禁",
+      "title": "64路热电偶Modbus协议、适配边界、组均值和实机证据",
       "kind": "command",
-      "command": ["{python}", "-m", "unittest", "visualization_app.test_thermocouple64_contracts", "-v"],
+      "command": ["{python}", "-m", "unittest", "visualization_app.test_thermocouple64_contracts", "visualization_app.test_hp_thermocouple64", "-v"],
       "cwd": ".",
       "timeout_seconds": 120,
       "profiles": ["quick", "full", "release"],
@@ -259,7 +271,7 @@
       "blocking": true,
       "evidence_tier": "automated",
       "requirements": ["THERMOCOUPLE64-PROTOCOL-001"],
-      "change_patterns": ["visualization_app/acquisition.py", "visualization_app/thermocouple64.py", "visualization_app/test_thermocouple64_contracts.py", "openspec/changes/expand-thermocouple-to-64-channels/**"]
+      "change_patterns": ["visualization_app/acquisition.py", "visualization_app/thermocouple64.py", "visualization_app/hp_thermocouple64.py", "visualization_app/test_hp_thermocouple64.py", "visualization_app/test_thermocouple64_contracts.py", "openspec/changes/expand-thermocouple-to-64-channels/**"]
     },
     {
       "id": "thermocouple64-layer-projection-contracts",

@@ -11,7 +11,7 @@ if ($OutputDirectory -and $DeliveryRoot) {
     throw "Specify OutputDirectory or DeliveryRoot, not both."
 }
 if (-not $OutputDirectory -and -not $DeliveryRoot) {
-    $OutputDirectory = Join-Path "F:\new_AFP_exam\.afp-staging" ("helper-build-" + [guid]::NewGuid().ToString("N"))
+    $OutputDirectory = Join-Path "D:\AFP_Runtime\.afp-staging" ("helper-build-" + [guid]::NewGuid().ToString("N"))
 }
 $delivery = if ($OutputDirectory) {
     [IO.Path]::GetFullPath($OutputDirectory)
@@ -19,7 +19,7 @@ $delivery = if ($OutputDirectory) {
     Join-Path $DeliveryRoot "local_helper"
 }
 $watchdogSource = Join-Path $PSScriptRoot "tailscale_funnel_watchdog.ps1"
-$stagingRoot = [IO.Path]::GetFullPath("F:\new_AFP_exam\.afp-staging").TrimEnd('\')
+$stagingRoot = [IO.Path]::GetFullPath("D:\AFP_Runtime\.afp-staging").TrimEnd('\')
 $staging = Join-Path $stagingRoot ("afp-local-helper-build-" + [guid]::NewGuid().ToString("N"))
 
 if (-not (Test-Path -LiteralPath $entry)) {

@@ -7,7 +7,7 @@
 双击 `start_demo.ps1`，或在 PowerShell 中运行：
 
 ```powershell
-cd F:\AFP_Integrated_Modular_v2
+cd D:\AFP_Integrated_Modular_v2
 .\interface_monitor_demo\start_demo.ps1
 ```
 
@@ -81,7 +81,7 @@ M3232 当前演示路径支持矩阵帧异常的诊断展示，但真实接入�
 ## 测试
 
 ```powershell
-cd F:\AFP_Integrated_Modular_v2
+cd D:\AFP_Integrated_Modular_v2
 & .\interface_monitor_demo\.venv\Scripts\python.exe -m unittest discover -s .\interface_monitor_demo\tests -v
 node --check .\interface_monitor_demo\static\app.js
 .\interface_monitor_demo\start_demo.ps1 -SelfTest

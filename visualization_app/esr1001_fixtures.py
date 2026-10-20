@@ -1,4 +1,4 @@
-"""ESR1001-A Modbus RTU protocol fixtures used by contract tests."""
+"""ESR1001-A RS485 Modbus RTU与原生USB/TTL协议夹具。"""
 
 READ_REQUEST = bytes.fromhex("01 04 00 30 00 08 F1 C3")
 MANUAL_RESPONSE = bytes.fromhex(
@@ -9,3 +9,9 @@ START_RESPONSE = bytes.fromhex("01 05 00 09 FF 00 5C 38")
 STOP_RESPONSE = bytes.fromhex("01 05 00 09 00 00 1D C8")
 ILLEGAL_ADDRESS_RESPONSE = bytes.fromhex("01 84 02 C2 C1")
 ILLEGAL_VALUE_RESPONSE = bytes.fromhex("01 84 03 03 01")
+
+USB_PARAMETERS = bytes.fromhex("26 01 63 06 04 00 01 08 68 00 00 00 00 FF")
+USB_START_RESPONSE = bytes.fromhex("25 A1 01 00 00 00 00 00 00 00 00 00 00 FF")
+USB_STOP_RESPONSE = bytes.fromhex("25 A1 00 00 00 00 00 00 00 00 00 00 00 FF")
+USB_DATA = bytes.fromhex("24 FE 33 4F 01 0C BA FF 5E 62 FF 32 A4 FF")
+USB_EXPECTED_ADC = (68794, -41374, -52572, -117937)

@@ -1,17 +1,17 @@
 [CmdletBinding()]
 param(
     [string]$RepoRoot = "",
-    [string]$LabRoot = "F:\AFP_Client_Validation_Lab",
+    [string]$LabRoot = "D:\AFP_Client_Validation_Lab",
     [string]$HelperSource = "",
-    [string]$FixtureSource = "F:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv",
-    [string]$MySqlSource = "F:\softwawre\mysql",
+    [string]$FixtureSource = "D:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv",
+    [string]$MySqlSource = "D:\softwawre\mysql",
     [string]$VcRedistSource = "",
     [switch]$DescribeContract
 )
 
 $ErrorActionPreference = "Stop"
 
-$ExpectedLabRoot = "F:\AFP_Client_Validation_Lab"
+$ExpectedLabRoot = "D:\AFP_Client_Validation_Lab"
 $ExpectedHelperHash = "5216A6D110164BB23D8D1B2D29DBB335D998DA1DB176CB227339054586BCA5D6"
 $ExpectedFixtureHash = "58C9290EFD79B8967DD4806FE9CA13B15B4E5508835D3F019A5E943BADD78267"
 $AllowedMySqlEntries = @("bin", "lib", "share", "LICENSE")
@@ -98,7 +98,7 @@ if ($resolvedLabRoot -ieq $resolvedRepoRoot -or $resolvedRepoRoot.StartsWith($re
 }
 
 if ([string]::IsNullOrWhiteSpace($HelperSource)) {
-    $HelperSource = "F:\new_AFP_exam\AFP_Integrated_System_Modular\local_helper\AFP_Local_Capture_Helper.exe"
+    $HelperSource = "D:\AFP_Runtime\AFP_Integrated_System_Modular\local_helper\AFP_Local_Capture_Helper.exe"
 }
 $resolvedHelperSource = Get-NormalizedPath -Path $HelperSource
 $resolvedFixtureSource = Get-NormalizedPath -Path $FixtureSource

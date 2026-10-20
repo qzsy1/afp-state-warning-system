@@ -35,22 +35,22 @@ def _run_powershell(script: str) -> subprocess.CompletedProcess[str]:
 
 
 class SingleRuntimePathTests(unittest.TestCase):
-    def test_production_paths_are_fixed_under_f_workspace(self) -> None:
+    def test_production_paths_use_d_drive_and_existing_source_checkout(self) -> None:
         contract = json.loads(CONFIG.read_text(encoding="utf-8"))
 
-        self.assertEqual(contract["workspace_root"], r"F:\new_AFP_exam")
+        self.assertEqual(contract["workspace_root"], r"D:\AFP_Runtime")
         self.assertEqual(
-            contract["source_root"], r"F:\new_AFP_exam\AFP-Readiness-Repo"
+            contract["source_root"], r"D:\AFP_Integrated_Modular_v2"
         )
         self.assertEqual(
             contract["runtime_root"],
-            r"F:\new_AFP_exam\AFP_Integrated_System_Modular",
+            r"D:\AFP_Runtime\AFP_Integrated_System_Modular",
         )
         self.assertEqual(
-            contract["evidence_root"], r"F:\new_AFP_exam\AFP-Main-Evidence"
+            contract["evidence_root"], r"D:\AFP_Runtime\AFP-Main-Evidence"
         )
         self.assertEqual(
-            contract["staging_root"], r"F:\new_AFP_exam\.afp-staging"
+            contract["staging_root"], r"D:\AFP_Runtime\.afp-staging"
         )
 
     def test_rejects_outside_parent_glob_and_reparse_targets(self) -> None:

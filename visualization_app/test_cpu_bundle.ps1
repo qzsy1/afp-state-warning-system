@@ -1,5 +1,5 @@
 $ErrorActionPreference = "Continue"
-$bundle = "C:\Users\xlq\AppData\Local\Temp\AFPBuild\dist\AFP_State_Warning_System"
+$bundle = "D:\AFP_Runtime\.afp-staging\legacy-desktop-build\dist\AFP_State_Warning_System"
 $port = 8951
 Get-Process AFP_State_Warning_System -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Process -FilePath "$bundle\AFP_State_Warning_System.exe" -ArgumentList "--server","--no-browser","--port",$port -WorkingDirectory $bundle | Out-Null

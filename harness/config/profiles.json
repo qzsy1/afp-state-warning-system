@@ -2,6 +2,7 @@
   "schema_version": 1,
   "profiles": {
     "quick": [
+      "esr1001-native-usb-contracts",
       "harness-contracts",
       "pre-sensor-readiness-contracts",
       "public-ingress-cutover-contracts",
@@ -20,6 +21,7 @@
       "thermocouple64-frontend-contracts"
     ],
     "full": [
+      "esr1001-native-usb-contracts",
       "harness-contracts",
       "pre-sensor-readiness-contracts",
       "public-ingress-cutover-contracts",
@@ -51,6 +53,7 @@
       "thermocouple64-frontend-contracts"
     ],
     "release": [
+      "esr1001-native-usb-contracts",
       "harness-contracts",
       "pre-sensor-readiness-contracts",
       "public-ingress-cutover-contracts",

@@ -65,7 +65,7 @@ flowchart LR
 - 原始采集数据、个人数据库、日志、训练权重、生成的 EXE 和压缩包不直接提交源码历史；完整 Windows 软件与权重应放到 GitHub Release。
 - 修改前先提交或建立分支；修改后依次执行单元测试、模块健康检查、软件自检和对应业务链路测试。
 
-本机 Git 安装位置为 `F:\software\Git`。开发者可使用 `F:\software\Git\cmd\git.exe`，普通软件使用者不需要安装 Git。
+开发者使用系统 `PATH` 中的 Git；普通软件使用者不需要安装 Git。
 
 ## 5. 独立更新与回滚
 

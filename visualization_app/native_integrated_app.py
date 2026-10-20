@@ -13,7 +13,6 @@ import sys
 import threading
 import time
 import traceback
-import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
@@ -178,7 +177,10 @@ class LineChart(tk.Canvas):
         actual = self._pairs(xo, payload.get("actual", []))
         predicted = self._pairs(xo, payload.get("prediction_observed", []))
         future = self._pairs(xf, payload.get("prediction_future", []))
+        adc_series = [(item["name"], self._pairs(item.get("x_observed", []), item.get("actual", []))) for item in payload.get("adc_channels", [])]
         all_pairs = actual + predicted + future
+        for _, series in adc_series:
+            all_pairs.extend(series)
         if not all_pairs:
             self.create_text(width / 2, height / 2, text="当前尚无可绘制数据", fill=COLORS["muted"])
             return
@@ -217,12 +219,17 @@ class LineChart(tk.Canvas):
         draw(actual, COLORS["cyan"], 2)
         draw(predicted, COLORS["blue"], 2)
         draw(future, COLORS["orange"], 2)
+        for index, (name, series) in enumerate(adc_series):
+            color = ("#007c91", "#3755a5", "#c87000", "#8b3ba5")[index % 4]
+            draw(series, color, 2)
+            self.create_text(left + index * 140, height - 20, text=name.replace("_ADC_signed", ""), fill=color, anchor="w")
         zero_x = left + (0.0 - xmin) / (xmax - xmin) * (right - left)
         if left <= zero_x <= right:
             self.create_line(zero_x, top, zero_x, bottom, fill=COLORS["orange"], dash=(4, 3))
-        self.create_text(left, height - 20, text="实际", fill=COLORS["cyan"], anchor="w", font=("Microsoft YaHei UI", 9, "bold"))
-        self.create_text(left + 55, height - 20, text="历史预测", fill=COLORS["blue"], anchor="w", font=("Microsoft YaHei UI", 9, "bold"))
-        self.create_text(left + 135, height - 20, text="未来预测", fill=COLORS["orange"], anchor="w", font=("Microsoft YaHei UI", 9, "bold"))
+        if not adc_series:
+            self.create_text(left, height - 20, text="实际", fill=COLORS["cyan"], anchor="w", font=("Microsoft YaHei UI", 9, "bold"))
+            self.create_text(left + 55, height - 20, text="历史预测", fill=COLORS["blue"], anchor="w", font=("Microsoft YaHei UI", 9, "bold"))
+            self.create_text(left + 135, height - 20, text="未来预测", fill=COLORS["orange"], anchor="w", font=("Microsoft YaHei UI", 9, "bold"))
         self.create_text(width / 2, 12, text=f"{payload.get('name', '')}  实际 {_fmt(payload.get('actual_current'), 2)}  预测 {_fmt(payload.get('prediction_current'), 2)}  RMSE {_fmt(payload.get('rmse'), 3)}", fill=COLORS["navy"], font=("Microsoft YaHei UI", 10, "bold"))
 
 
@@ -311,7 +318,7 @@ class AcquisitionPanel(ttk.Frame):
         basic.grid(row=0, column=0, sticky="ew", pady=4)
         basic.columnconfigure(1, weight=1); basic.columnconfigure(3, weight=1)
         ttk.Label(basic, text="数据方案").grid(row=0, column=0, sticky="w", padx=3, pady=3)
-        self.schema_combo = ttk.Combobox(basic, textvariable=self._v("dataset_schema", "new_collection_v13_0"), state="readonly", values=("new_collection_v13_0", "new_collection_v12_0", "new_collection_v11_3", "legacy_original"), width=20)
+        self.schema_combo = ttk.Combobox(basic, textvariable=self._v("dataset_schema", "new_collection_v13_0"), state="readonly", values=("new_collection_v13_0", "new_collection_v12_0", "new_collection_v11_3", "legacy_original", "esr1001_raw_adc"), width=20)
         self.schema_combo.grid(row=0, column=1, columnspan=3, sticky="ew", padx=3, pady=3)
         self.schema_info = tk.StringVar(value="")
         ttk.Label(basic, textvariable=self.schema_info, foreground=COLORS["blue"]).grid(row=0, column=4, sticky="w", padx=4)
@@ -327,11 +334,11 @@ class AcquisitionPanel(ttk.Frame):
         interfaces.grid(row=5, column=0, columnspan=4, sticky="ew", padx=3, pady=4)
         interfaces.columnconfigure(3, weight=1)
         ttk.Button(interfaces, text="自动识别接口", command=self._discover_interfaces).grid(row=0, column=0, sticky="ew", padx=2)
-        ttk.Label(interfaces, text="勾选 / 角色 / 类型 / 地址 / 映射(JSON)").grid(row=0, column=1, columnspan=4, sticky="w")
+        ttk.Label(interfaces, text="勾选 / 角色 / 类型 / 地址 / 映射(JSON) / 波特率 / 仪表地址").grid(row=0, column=1, columnspan=6, sticky="w")
         self.interface_vars: list[dict[str, tk.Variable]] = []
         interface_defaults = default_capture_interfaces()
         role_values = tuple(item["role"] for item in interface_defaults)
-        driver_values = tuple(item["driver"] for item in interface_defaults)
+        driver_values = tuple(item["driver"] for item in interface_defaults) + ("esr1001_usb_ttl",)
         for index, item in enumerate(interface_defaults, start=1):
             values = {
                 "id": self._v(f"interface_{index}_id", item["id"]),
@@ -340,13 +347,29 @@ class AcquisitionPanel(ttk.Frame):
                 "baudrate": self._v(f"interface_{index}_baudrate", int(item.get("baudrate") or 0)),
                 "slave_id": self._v(f"interface_{index}_slave_id", int(item.get("slave_id") or 1)),
                 "map": self._v(f"interface_{index}_map", "{}"),
+                "data_mode": self._v(f"interface_{index}_data_mode", "raw_adc"),
+                "calibration_profile": self._v(f"interface_{index}_calibration", ""),
+                "bridge": self._v(f"interface_{index}_bridge", ""),
             }
             self.interface_vars.append(values)
             ttk.Checkbutton(interfaces, variable=values["enabled"]).grid(row=index, column=0)
             ttk.Combobox(interfaces, textvariable=values["role"], values=role_values, state="readonly", width=14).grid(row=index, column=1, padx=2)
-            ttk.Combobox(interfaces, textvariable=values["driver"], values=driver_values, state="readonly", width=20).grid(row=index, column=2, padx=2)
+            protocol_box = ttk.Combobox(interfaces, textvariable=values["driver"], values=driver_values, state="readonly", width=20)
+            protocol_box.grid(row=index, column=2, padx=2)
             ttk.Entry(interfaces, textvariable=values["endpoint"], width=15).grid(row=index, column=3, sticky="ew", padx=2)
             ttk.Entry(interfaces, textvariable=values["map"], width=22).grid(row=index, column=4, sticky="ew", padx=2)
+            ttk.Entry(interfaces, textvariable=values["baudrate"], width=8).grid(row=index, column=5, padx=2)
+            slave_widget = ttk.Entry(interfaces, textvariable=values["slave_id"], width=4)
+            slave_widget.grid(row=index, column=6, padx=2)
+            if item["role"] == "esr1001_strain":
+                ttk.Combobox(interfaces, textvariable=values["data_mode"], values=("raw_adc", "microstrain"), state="readonly", width=12).grid(row=index, column=7)
+                ttk.Entry(interfaces, textvariable=values["calibration_profile"], width=20).grid(row=index, column=8)
+                ttk.Entry(interfaces, textvariable=values["bridge"], width=10).grid(row=index, column=9)
+                def protocol_changed(_event, value=values, slave=slave_widget):
+                    usb = value["driver"].get() == "esr1001_usb_ttl"
+                    value["baudrate"].set(115200 if usb else 9600)
+                    slave.configure(state="disabled" if usb else "normal")
+                protocol_box.bind("<<ComboboxSelected>>", protocol_changed)
         self._entry(basic, "采样Hz", "sample_rate_hz", 10.0, 2, 2)
         self._entry(basic, "端点/模拟CSV", "endpoint", "", 3, 0, width=30)
         ttk.Button(basic, text="浏览", command=self._pick_endpoint).grid(row=3, column=2, columnspan=2, sticky="ew", padx=3)
@@ -431,7 +454,7 @@ class AcquisitionPanel(ttk.Frame):
         saving = ttk.LabelFrame(parent, text="本地与统一 MySQL 数据库", padding=8)
         saving.grid(row=5, column=0, sticky="ew", pady=4)
         saving.columnconfigure(1, weight=1); saving.columnconfigure(3, weight=1)
-        self._entry(saving, "保存根目录", "save_root", r"F:\AFP_Capture", 0, 0, width=28)
+        self._entry(saving, "保存根目录", "save_root", r"D:\AFP_Capture", 0, 0, width=28)
         ttk.Button(saving, text="选择", command=self._pick_save_root).grid(row=0, column=2, columnspan=2, sticky="ew", padx=3)
         ttk.Checkbutton(saving, text="保存到打开软件这台电脑的 MySQL", variable=self._v("mysql_local_enabled", False)).grid(row=1, column=0, columnspan=4, sticky="w")
         self._entry(saving, "本机地址", "mysql_local_host", "127.0.0.1", 2, 0)
@@ -596,6 +619,8 @@ class AcquisitionPanel(ttk.Frame):
         ports = result.get("ports", [])
         defaults = result.get("defaults", [])
         for values, item in zip(self.interface_vars, defaults):
+            if values["driver"].get() == "esr1001_usb_ttl":
+                continue
             values["endpoint"].set(item.get("endpoint", ""))
             values["role"].set(item.get("role", "other"))
             if item.get("driver"):
@@ -658,8 +683,15 @@ class AcquisitionPanel(ttk.Frame):
             baudrate = _safe_int(values["baudrate"].get(), 0, 0)
             if baudrate:
                 interface["baudrate"] = baudrate
-            if interface["driver"] in {"modbus_tcp", "modbus_rtu_esr1001"}:
+            if interface["driver"] in {"modbus_tcp", "modbus_rtu_esr1001", "huipu_tc64_modbus_rtu"}:
                 interface["slave_id"] = _safe_int(values["slave_id"].get(), 1, 1)
+            if interface["driver"] == "esr1001_usb_ttl":
+                from serial.tools import list_ports
+                interface.update(data_mode=str(values["data_mode"].get()), calibration_profile=str(values["calibration_profile"].get()).strip() or None, bridge=str(values["bridge"].get()).strip(), baudrate=115200)
+                ports = [p for p in list_ports.comports() if p.device.casefold() == interface["endpoint"].casefold()]
+                if ports:
+                    port = ports[0]
+                    interface.update(physical_interface_id=f"serial:{port.device.upper()}", physical_interface_kind="serial", physical_verified=True, device_identity={key: getattr(port, key, None) for key in ("vid", "pid", "serial_number", "location", "hwid")})
             interfaces.append(interface)
         simulation_source_type = str(self.vars["simulation_source_type"].get() or "single_csv")
         simulation_source_path = str(self.vars["simulation_source_path"].get()).strip()
@@ -884,7 +916,7 @@ class AcquisitionPanel(ttk.Frame):
         destination = filedialog.asksaveasfilename(
             parent=parent or self,
             title=f"导出{'本机' if local else '目标电脑'} MySQL 数据",
-            initialdir=str(self.vars["save_root"].get() or r"F:\AFP_Capture"),
+            initialdir=str(self.vars["save_root"].get() or r"D:\AFP_Capture"),
             initialfile=time.strftime(f"AFP{'本机' if local else '目标'}数据库导出_%Y%m%d_%H%M%S.csv"),
             defaultextension=".csv",
             filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
@@ -977,7 +1009,7 @@ class AcquisitionPanel(ttk.Frame):
         self._background("正在停止并保存完整试样/分层数据……", self.dashboard.acquisition.stop, done)
 
     def open_folder(self) -> None:
-        path = Path(str(self.vars["save_root"].get()) or r"F:\AFP_Capture")
+        path = Path(str(self.vars["save_root"].get()) or r"D:\AFP_Capture")
         path.mkdir(parents=True, exist_ok=True)
         os.startfile(path)
 
@@ -1204,6 +1236,11 @@ class AcquisitionPanel(ttk.Frame):
         self._last_live = payload
         acquisition = payload.get("acquisition", {})
         self.monitor_status.set(f"已采集 {acquisition.get('sample_count', 0)} 点｜窗口实时更新")
+        usb = next((item.get("usb_evidence") for item in acquisition.get("interfaces", []) if item.get("usb_evidence")), None)
+        if usb:
+            rate = usb.get("actual_source_rate_hz")
+            rate_text = f"{rate:.2f} Hz" if rate is not None else "帧率待确认"
+            self.monitor_status.set(f"源帧 {usb.get('source_frames', 0)}｜{rate_text}｜{usb.get('unit')}｜{usb.get('calibration_state')}")
         names = [item.get("name") for item in payload.get("channels", [])]
         if tuple(self.sensor_combo["values"]) != tuple(names): self.sensor_combo["values"] = names
         if self.sensor_display.get() not in names and names: self.sensor_display.set(names[0])
@@ -1228,6 +1265,10 @@ class AcquisitionPanel(ttk.Frame):
 
     def _refresh_chart(self) -> None:
         if not self._last_live: return
+        adc = [item for item in self._last_live.get("channels", []) if item.get("unit") == "adc_counts"]
+        if adc:
+            self.chart.set_channel({"name": "四通道原始ADC（adc_counts，标定未确认）", "adc_channels": adc})
+            return
         name = self.sensor_display.get()
         channel = next((item for item in self._last_live.get("channels", []) if item.get("name") == name), None)
         self.chart.set_channel(channel)
@@ -1237,7 +1278,7 @@ class TrainingPanel(ttk.Frame):
     def __init__(self, parent: tk.Misc, app: "IntegratedApp") -> None:
         super().__init__(parent, padding=8)
         self.app = app
-        self.manager = WebTrainingManager(Path(r"F:\AFP_Training_Models"))
+        self.manager = WebTrainingManager(Path(r"D:\AFP_Training_Models"))
         self.vars: dict[str, tk.Variable] = {}
         self.last_seq = 0
         self.loss_history: list[dict[str, Any]] = []
@@ -1302,7 +1343,7 @@ class TrainingPanel(ttk.Frame):
         self._field(train, "随机种子", "seed", 20260813, 2, 0); self._field(train, "任务名称", "task_name", "AFP训练任务", 2, 1, width=22)
         self._field(train, "已有模型（可留空）", "pretrained_model", "", 3, 0, width=35)
         ttk.Button(train, text="选择已有模型", command=self._pick_pretrained).grid(row=7, column=1, sticky="ew", padx=4)
-        self._field(train, "模型及整合CSV保存位置", "output_root", r"F:\AFP_Training_Models", 4, 0, width=38)
+        self._field(train, "模型及整合CSV保存位置", "output_root", r"D:\AFP_Training_Models", 4, 0, width=38)
         ttk.Button(train, text="选择保存位置", command=self._pick_output).grid(row=9, column=1, sticky="ew", padx=4)
         self.train_button = ttk.Button(train, text="开始训练", command=self.toggle_training, state="disabled"); self.train_button.grid(row=9, column=2, columnspan=2, sticky="ew", padx=4)
         self.precheck = tk.StringVar(value="尚未导入数据。")
@@ -1434,7 +1475,10 @@ class IntegratedApp:
             self.root.after(0, lambda: (self.acquisition_panel.attach_dashboard(dashboard, bootstrap), self.set_runtime("就绪")))
         except Exception:
             details = traceback.format_exc()
-            try: (Path.home() / "AFP_native_startup_error.log").write_text(details, encoding="utf-8")
+            try:
+                error_path = Path("D:/AFP_Runtime/logs/AFP_native_startup_error.log")
+                error_path.parent.mkdir(parents=True, exist_ok=True)
+                error_path.write_text(details, encoding="utf-8")
             except Exception: pass
             self.root.after(0, lambda: (self.set_runtime("初始化失败"), messagebox.showerror("初始化失败", details[-4000:])))
 
@@ -1464,7 +1508,7 @@ def main() -> None:
         report_root = (
             Path(sys.executable).resolve().parent / "verification"
             if getattr(sys, "frozen", False)
-            else Path(tempfile.gettempdir()) / "AFP_Integrated_Native_Verification"
+            else Path("D:/AFP_Runtime/.afp-staging/AFP_Integrated_Native_Verification")
         )
         report_root.mkdir(parents=True, exist_ok=True)
         dashboard = DashboardData()

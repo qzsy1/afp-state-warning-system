@@ -303,18 +303,18 @@ class LocalCaptureAgentTests(unittest.TestCase):
         self.assertEqual(result["values"]["pid_angle_deg"], 5.0)
         manager.read_process_parameters.assert_called_once_with(config)
 
-    @patch("local_capture_agent.select_capture_folder", return_value="F:\\AFP_Capture")
+    @patch("local_capture_agent.select_capture_folder", return_value="D:\\AFP_Capture")
     @patch("local_capture_agent.check_capture_save_root", return_value={"ok": True})
     def test_save_folder_operations_execute_on_helper_computer(self, check_root, select_folder):
         agent = LocalCaptureAgent(manager=Mock())
 
-        selected = agent.select_folder("F:\\")
-        checked = agent.check_save_root("F:\\AFP_Capture")
+        selected = agent.select_folder("D:\\")
+        checked = agent.check_save_root("D:\\AFP_Capture")
 
-        self.assertEqual(selected, {"selected": True, "path": "F:\\AFP_Capture"})
+        self.assertEqual(selected, {"selected": True, "path": "D:\\AFP_Capture"})
         self.assertTrue(checked["ok"])
-        select_folder.assert_called_once_with("F:\\")
-        check_root.assert_called_once_with("F:\\AFP_Capture")
+        select_folder.assert_called_once_with("D:\\")
+        check_root.assert_called_once_with("D:\\AFP_Capture")
 
 
 if __name__ == "__main__":

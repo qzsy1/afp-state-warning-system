@@ -122,7 +122,12 @@ BSV UVC 只有在厂商接口成功打开设备、启动流并连续取得符合
 - **THEN** 检查请求与启动请求 MUST 使用一致的执行位置字段和就绪指纹，正式启动 MUST 接受该有效快照；仅由页面在启动阶段补充默认执行位置 MUST NOT 造成指纹不匹配
 
 ### Requirement: 本机直连与远程 helper 必须使用同一设备合同
+
 `local_direct` 与 `remote_helper` SHALL 使用相同的设备档、端点字段、物理绑定语义、状态码、通道名称、单位、质量和门禁。helper MUST 在设备所在电脑执行发现与读取，服务器不得用自身接口替代。
+
+#### Scenario: PLC 和 ABB 与未标定 ESR 联合采集
+- **WHEN** 正常方案启用 PLC、ABB 与符合 ESR 原生 USB 合同的原始 ADC 接口，显式禁用 UVC 等其他接口
+- **THEN** 系统 MUST 分别验证三个启用接口，保留 PLC/ABB 网络和协议门禁，允许独立 ADC 名称及单位的仅采集会话；ESR 未标定不得报告为 PLC/ABB 通信失败，禁用接口不得冒充检查通过
 
 #### Scenario: 两种执行模式读取同一夹具
 - **WHEN** 本机路径和 helper 路径接收相同的 PLC、ABB 与 UVC 协议样本和错误

@@ -116,7 +116,7 @@ class Thermocouple64FrontendContractsTests(unittest.TestCase):
         self.assertIn("SENSOR_PANEL_SPLIT_STORAGE_KEY", script)
         self.assertIn("const defaultRatio = 0.42", script)
         self.assertIn('handle.addEventListener("dblclick", resetRatio)', script)
-        self.assertIn("20261017-thermocouple64-v13", html)
+        self.assertIn("20261019-thermocouple64-v14", html)
         self.assertIn("20261017-thermocouple64-v6", html)
 
     def test_group_drawing_has_eight_raw_lines_one_mean_and_preserves_gaps(self) -> None:

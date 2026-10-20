@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "release_revision": "complete-pre-sensor-readiness-v1",
+  "release_revision": "esr1001-native-usb-v1",
   "dataset_schema": "new_collection_v13_0",
   "mode": "remote_helper",
   "channels": [
@@ -83,7 +83,7 @@
     {"name": "应变4", "unit": "με", "interface_id": "esr1001-strain"}
   ],
   "interfaces": [
-    {"id": "thermocouple-64ch", "role": "thermocouple64", "driver": "thermocouple64_protocol_pending", "location": "remote_helper", "endpoint_ref": "AFP_INTERFACE_THERMOCOUPLE64", "hardware_facts": {}},
+    {"id": "thermocouple-64ch", "role": "thermocouple64", "driver": "huipu_tc64_modbus_rtu", "location": "remote_helper", "endpoint_ref": "AFP_INTERFACE_THERMOCOUPLE64", "baudrate": 115200, "slave_id": 1, "hardware_facts": {}},
     {"id": "plc-process", "role": "plc_process", "driver": "modbus_tcp", "location": "remote_helper", "endpoint_ref": "AFP_INTERFACE_PLC"},
     {"id": "uvc-temperature", "role": "uvc_temperature", "driver": "uvc_thermal", "location": "remote_helper", "endpoint_ref": "AFP_INTERFACE_UVC"},
     {"id": "abb-motion", "role": "abb_motion", "driver": "abb_robot", "location": "remote_helper", "endpoint_ref": "AFP_INTERFACE_ABB"},
@@ -95,7 +95,7 @@
     "pairing_profile_ref": "AFP_HELPER_PAIRING_PROFILE",
     "health_timeout_seconds": 5,
     "command_timeout_seconds": 30,
-    "required_capabilities": ["unified_frame_v2", "real_capture", "local_csv_save", "esr1001_modbus_rtu", "thermocouple64_hardware_gate"]
+    "required_capabilities": ["unified_frame_v2", "real_capture", "local_csv_save", "esr1001_modbus_rtu", "huipu_tc64_modbus_rtu"]
   },
   "storage": {
     "policy": "required",

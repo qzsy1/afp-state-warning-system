@@ -53,22 +53,29 @@ def run_hardware_fingerprint_script(assertions: str):
     return json.loads(result.stdout)
 
 
-class PlcAbbPhysicalBindingFrontendTests(unittest.TestCase):
-    def test_browser_check_then_start_keeps_the_same_readiness_configuration(self) -> None:
-        from visualization_app.real_acquisition import ReadinessSnapshot
+def run_real_start_script(assertions: str):
+    source = APP_JS.read_text(encoding="utf-8")
+    sections = [
+        ("function acquisitionConfig()", "function renderProcessParameterReadStatus"),
+        ("function readinessInterfaceFingerprint", "function hardwareStateLabel"),
+        ("async function testSensorConnection", "async function resetAndCheckHardware"),
+        ("async function startAcquisition()", "async function waitForHelperFlushComplete"),
+    ]
+    functions = "\n".join(
+        source[source.rindex(start):source.index(end, source.rindex(start))]
+        for start, end in sections
+    )
+    script = REAL_START_SCRIPT + assertions
+    result = subprocess.run(
+        ["node"], input=functions + script, check=False,
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    if result.returncode:
+        raise AssertionError(result.stderr)
+    return json.loads(result.stdout)
 
-        source = APP_JS.read_text(encoding="utf-8")
-        sections = [
-            ("function acquisitionConfig()", "function renderProcessParameterReadStatus"),
-            ("function readinessInterfaceFingerprint", "function hardwareStateLabel"),
-            ("async function testSensorConnection", "async function resetAndCheckHardware"),
-            ("async function startAcquisition()", "async function waitForHelperFlushComplete"),
-        ]
-        functions = "\n".join(
-            source[source.rindex(start):source.index(end, source.rindex(start))]
-            for start, end in sections
-        )
-        script = r'''
+
+REAL_START_SCRIPT = r'''
 const controls = new Proxy({
   acquisitionMode:{value:"real"}, processingMode:{value:"capture_only"},
   datasetSchema:{value:"new_collection_v11_3"}, sampleRate:{value:"10"},
@@ -79,8 +86,14 @@ const state = {accessRole:"local_admin", acquisitionStatus:{running:false},
   mysqlConnectionTests:{}};
 let helper = false;
 let requests = [];
+let messages = [];
+let clock = 0;
+const performance = {now:()=>clock};
+let failures = [];
+let mutateDuringCheck = false;
+let abbEndpoint = "192.168.125.1";
 const channels = ["温度","压力","张力","ABB_X","ABB_Y","ABB_Z","线速度"];
-const check = {ok:true, interfaces:[
+const check = {ok:true, readiness_snapshot:{ok:true,checked_at:1000,expires_at:1120}, interfaces:[
   {id:"plc",physical_interface_id:"ethernet:industrial",state:"data_ready",ok:true},
   {id:"abb",physical_interface_id:"ethernet:industrial",state:"data_ready",ok:true},
 ], sensors:channels.map(name=>({name,state:"ok",ok:true}))};
@@ -90,7 +103,7 @@ function isModernSchemaId(){return true;}
 function interfaceConfigs(){return {interfaces:[
   {id:"plc",enabled:true,role:"plc",driver:"modbus_tcp",endpoint:"192.168.125.5:502",
     physical_interface_id:"ethernet:industrial",physical_verified:true},
-  {id:"abb",enabled:true,role:"robot",driver:"abb_robot",endpoint:"192.168.125.1",
+  {id:"abb",enabled:true,role:"robot",driver:"abb_robot",endpoint:abbEndpoint,
     physical_interface_id:"ethernet:industrial",physical_verified:true},
 ],assignments:{plc:channels.slice(0,3),abb:channels.slice(3)}};}
 function validatePhysicalInterfaceBindings(){}
@@ -112,15 +125,32 @@ async function waitForEdgeFirstSample(){return {running:true};}
 function renderAcquisitionStatus(){}
 function configureDataMode(){}
 async function loadRealtime(){}
-function toast(message){throw new Error(message);}
+function toast(message){messages.push(message);}
 async function postJson(path,payload){
   requests.push({path,payload:structuredClone(payload)});
-  return path.endsWith("/test") ? structuredClone(check) : {running:true};
+  return dispatch(path.endsWith("/test"));
 }
 async function requestLocalHelper(command,payload){
   requests.push({path:command,payload:structuredClone(payload)});
-  return command==="check_capture" ? structuredClone(check) : {running:true};
+  return dispatch(command==="check_capture");
 }
+
+function dispatch(isCheck){
+  if (isCheck) {
+    if (mutateDuringCheck) abbEndpoint = "192.168.125.2";
+    return structuredClone(check);
+  }
+  if (failures.length) throw new Error(failures.shift());
+  return {running:true};
+}
+'''
+
+
+class PlcAbbPhysicalBindingFrontendTests(unittest.TestCase):
+    def test_browser_check_then_start_keeps_the_same_readiness_configuration(self) -> None:
+        from visualization_app.real_acquisition import ReadinessSnapshot
+
+        payload = run_real_start_script(r'''
 (async()=>{
   const results=[];
   for (helper of [false,true]) {
@@ -131,13 +161,7 @@ async function requestLocalHelper(command,payload){
   }
   console.log(JSON.stringify({check,results}));
 })().catch(error=>{console.error(error);process.exit(1);});
-'''
-        result = subprocess.run(
-            ["node"], input=functions + script, check=False,
-            capture_output=True, text=True, encoding="utf-8",
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        payload = json.loads(result.stdout)
+''')
         for flow in payload["results"]:
             with self.subTest(helper=flow["helper"]):
                 check_request, start_request = flow["requests"]
@@ -149,6 +173,119 @@ async function requestLocalHelper(command,payload){
                 changed["interfaces"][1]["endpoint"] = "192.168.125.2"
                 with self.assertRaisesRegex(ValueError, "fingerprint mismatch"):
                     snapshot.validate(changed)
+
+    def test_start_refreshes_expired_missing_and_unversioned_checks_on_both_hosts(self) -> None:
+        for helper in (False, True):
+            for situation in ("fresh", "expired", "near_expiry", "missing", "unversioned", "no_snapshot"):
+                with self.subTest(helper=helper, situation=situation):
+                    result = run_real_start_script(
+                        f"helper = {json.dumps(helper)};\n"
+                        + r'''
+(async()=>{
+  await testSensorConnection();
+  requests=[];
+''' + {
+                            "fresh": "clock=1000; Date.now=()=>1;",
+                            "expired": "clock=121000;",
+                            "near_expiry": "clock=115000;",
+                            "missing": "state.hardwareCheck=null;",
+                            "unversioned": "delete state.hardwareCheck.readinessDeadline;",
+                            "no_snapshot": "delete check.readiness_snapshot; await testSensorConnection(); requests=[];",
+                        }[situation] + r'''
+  await startAcquisition();
+  console.log(JSON.stringify({requests,messages,consumed:state.hardwareCheck===null}));
+})().catch(error=>{console.error(error);process.exit(1);});
+'''
+                    )
+                    check_path = "check_capture" if helper else "/api/acquisition/test"
+                    start_path = "start_capture" if helper else "/api/acquisition/start"
+                    expected = [start_path] if situation == "fresh" else [check_path, start_path]
+                    self.assertEqual([item["path"] for item in result["requests"]], expected)
+                    self.assertEqual(result["messages"], [])
+                    self.assertTrue(result["consumed"])
+
+    def test_stopping_and_starting_requires_new_check(self) -> None:
+        for helper in (False, True):
+            with self.subTest(helper=helper):
+                result = run_real_start_script(
+                    f"helper = {json.dumps(helper)};\n" + r'''
+(async()=>{
+  await testSensorConnection();
+  await startAcquisition();
+  requests=[];
+  await startAcquisition();
+  console.log(JSON.stringify({requests,messages}));
+})().catch(error=>{console.error(error);process.exit(1);});
+'''
+                )
+                self.assertEqual(len(result["requests"]), 2)
+                self.assertEqual(result["messages"], [])
+
+    def test_delayed_check_response_does_not_extend_reuse_window(self) -> None:
+        result = run_hardware_fingerprint_script(r'''
+const state = {};
+let clock=130000;
+const performance={now:()=>clock};
+rememberHardwareCheck({ok:true,readiness_snapshot:{ok:true,checked_at:1000,expires_at:1120}}, "config", 0);
+console.log(JSON.stringify({current:hardwareCheckIsCurrent("config")}));
+''')
+        self.assertFalse(result["current"])
+
+    def test_start_rechecks_once_for_readiness_rejections_only(self) -> None:
+        errors = (
+            "readiness_required: readiness snapshot expired",
+            "readiness_required: readiness snapshot fingerprint mismatch",
+            "readiness_required: 请先执行当前配置的接口检查",
+            "remote_readiness_required",
+            "remote_readiness_required: readiness snapshot expired",
+            "device_profile_incomplete: fixture",
+            "请求超时（30秒）",
+            "database_unavailable",
+        )
+        for helper in (False, True):
+            for error in errors:
+                for repeat in (False, True):
+                    with self.subTest(helper=helper, error=error, repeat=repeat):
+                        result = run_real_start_script(
+                            f"helper={json.dumps(helper)}; failures={json.dumps([error] * (2 if repeat else 1))};\n"
+                            + r'''
+(async()=>{
+  await testSensorConnection();
+  requests=[];
+  await startAcquisition();
+  console.log(JSON.stringify({requests,messages,busy:state.acquisitionStartBusy}));
+})().catch(error=>{console.error(error);process.exit(1);});
+'''
+                        )
+                        recoverable = "readiness_required" in error
+                        self.assertEqual(len(result["requests"]), 3 if recoverable else 1)
+                        self.assertEqual(len(result["messages"]), int(repeat or not recoverable))
+                        self.assertFalse(result["busy"])
+                        if recoverable and repeat:
+                            self.assertIn("自动重检后仍无法启动", result["messages"][0])
+
+    def test_failed_recheck_or_changed_configuration_blocks_start(self) -> None:
+        for helper in (False, True):
+            for situation in ("expired_failure", "retry_failure", "config_changed"):
+                with self.subTest(helper=helper, situation=situation):
+                    result = run_real_start_script(
+                        f"helper={json.dumps(helper)};\n" + r'''
+(async()=>{
+  await testSensorConnection();
+  requests=[];
+''' + {
+                            "expired_failure": "clock=121000; check.ok=false;",
+                            "retry_failure": 'failures=["readiness_required: readiness snapshot expired"]; check.ok=false;',
+                            "config_changed": "clock=121000; mutateDuringCheck=true;",
+                        }[situation] + r'''
+  await startAcquisition();
+  console.log(JSON.stringify({requests,messages}));
+})().catch(error=>{console.error(error);process.exit(1);});
+'''
+                    )
+                    starts = [item for item in result["requests"] if item["path"].endswith(("/start", "start_capture"))]
+                    self.assertEqual(len(starts), int(situation == "retry_failure"))
+                    self.assertEqual(len(result["messages"]), 1)
 
     def test_failed_check_identifies_execution_host_without_claiming_device_failure(self) -> None:
         source = APP_JS.read_text(encoding="utf-8")

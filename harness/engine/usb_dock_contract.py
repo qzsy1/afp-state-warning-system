@@ -9,6 +9,8 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from visualization_app.interface_transport_catalog import interface_transport_family
+
 
 TOPOLOGY_STATES = {"complete", "partial", "unavailable"}
 TOPOLOGY_SCHEMA_VERSION = 2
@@ -228,7 +230,9 @@ def validate_discovery_payload(payload: object) -> tuple[str, ...]:
         if kind in {"usb_hid", "usb_uvc"} and transport != "usb":
             issues.append(f"physical_interfaces[{index}] USB endpoint must use transport_family usb")
         if kind in {"serial", "com"}:
-            expected_transport = "usb" if parent else "serial_native"
+            identity = dict(item)
+            identity.pop("transport_family", None)
+            expected_transport = interface_transport_family(identity)
             if transport != expected_transport:
                 issues.append(
                     f"physical_interfaces[{index}] serial transport_family must be {expected_transport}"

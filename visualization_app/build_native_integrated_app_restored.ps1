@@ -1,7 +1,7 @@
 param(
     [string]$PythonExecutable = "",
-    [string]$TargetDir = "F:\AFP_Integrated_Native_InterfaceMapped\AFP_Integrated_System_SMRF_HID_Restored_20260824_v1.12.1\AFP_Integrated_System",
-    [string]$BasePackageDir = "F:\AFP_Integrated_Native_InterfaceMapped\AFP_Integrated_System_SMRF_HID_Restored_20260824_v1.12.1\AFP_Integrated_System"
+    [string]$TargetDir = "D:\AFP_Runtime\.afp-staging\native-integrated-v1.12.1",
+    [string]$BasePackageDir = "D:\AFP_Runtime\AFP_Integrated_System_Modular"
 )
 
 $ErrorActionPreference = "Stop"
@@ -36,7 +36,7 @@ if (-not $PythonExecutable) {
 $HardwareDllRoot = Join-Path $AppDir "hardware_dlls"
 $BsvUvcDll = Join-Path $HardwareDllRoot "BsvUvcNative.dll"
 $LibUsbDll = Join-Path $HardwareDllRoot "libusb-1.0.dll"
-$BuildRoot = Join-Path $env:TEMP "AFPIntegratedNativeBuild_v1_12_1"
+$BuildRoot = "D:\AFP_Runtime\.afp-staging\AFPIntegratedNativeBuild_v1_12_1"
 $StageRoot = Join-Path $BuildRoot "stage"
 $StageData = Join-Path $StageRoot "data"
 $StageDemo = Join-Path $StageRoot "new_collection_demo_v11_3"
@@ -59,7 +59,7 @@ foreach ($Required in @(
 
 # Recursive cleanup is restricted to this fixed directory below the Windows
 # temporary folder. Never remove or overwrite an existing user delivery.
-$ResolvedTemp = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\')
+$ResolvedTemp = [IO.Path]::GetFullPath("D:\AFP_Runtime\.afp-staging").TrimEnd('\')
 $ResolvedBuild = [IO.Path]::GetFullPath($BuildRoot).TrimEnd('\')
 if (-not $ResolvedBuild.StartsWith($ResolvedTemp + '\', [StringComparison]::OrdinalIgnoreCase)) {
     throw "Unsafe build directory: $ResolvedBuild"

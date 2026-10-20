@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "release_revision": "complete-pre-sensor-readiness-v1",
+  "release_revision": "esr1001-native-usb-v1",
   "dataset_schema": "new_collection_v13_0",
   "mode": "local_direct",
   "channels": [
@@ -83,7 +83,7 @@
     {"name": "应变4", "unit": "με", "interface_id": "esr1001-strain"}
   ],
   "interfaces": [
-    {"id": "thermocouple-64ch", "role": "thermocouple64", "driver": "thermocouple64_protocol_pending", "location": "local", "endpoint_ref": "AFP_INTERFACE_THERMOCOUPLE64", "hardware_facts": {}},
+    {"id": "thermocouple-64ch", "role": "thermocouple64", "driver": "huipu_tc64_modbus_rtu", "location": "local", "endpoint_ref": "AFP_INTERFACE_THERMOCOUPLE64", "baudrate": 115200, "slave_id": 1, "hardware_facts": {}},
     {"id": "plc-process", "role": "plc_process", "driver": "modbus_tcp", "location": "local", "endpoint_ref": "AFP_INTERFACE_PLC"},
     {"id": "uvc-temperature", "role": "uvc_temperature", "driver": "uvc_thermal", "location": "local", "endpoint_ref": "AFP_INTERFACE_UVC"},
     {"id": "abb-motion", "role": "abb_motion", "driver": "abb_robot", "location": "local", "endpoint_ref": "AFP_INTERFACE_ABB"},

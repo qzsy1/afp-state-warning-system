@@ -1704,8 +1704,8 @@ def add_sensor_feature_domains(
 
 
 def literature_rows() -> List[dict]:
-    reference_root = Path(r"F:\基于数字孪生的故障诊断\自动铺丝\状态预警")
-    manuscript = Path(r"F:\基于数字孪生的故障诊断\自动铺丝\常用资料\An Interactive Spatiotemporal Graph Attention Network for Thermal-mechanical Forecasting in Automated Fiber Placement.docx")
+    reference_root = Path(r"D:\基于数字孪生的故障诊断\自动铺丝\状态预警")
+    manuscript = Path(r"D:\基于数字孪生的故障诊断\自动铺丝\常用资料\An Interactive Spatiotemporal Graph Attention Network for Thermal-mechanical Forecasting in Automated Fiber Placement.docx")
     return [
         {
             "编号": "R1", "文献": "Zhao et al. (2024), Simulation and on-line monitoring using optical fiber Bragg grating sensors of temperature history during laser-assisted AFP",

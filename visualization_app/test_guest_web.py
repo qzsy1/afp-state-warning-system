@@ -66,16 +66,69 @@ class PublicDeviceStatusTests(unittest.TestCase):
         self.assertEqual(pressure["message"], "接口无法打开或设备未连接")
         self.assertEqual(pressure["age_seconds"], 1.0)
 
-    def test_public_status_always_lists_the_five_declared_interfaces(self):
+    def test_public_status_always_lists_the_six_declared_interfaces(self):
         module = self._module()
 
         payload = module.build_public_device_status({}, {}, {"running": False}, now=1.0)
 
         self.assertEqual(
             [item["role"] for item in payload["interfaces"]],
-            ["thermocouple", "plc", "thermal_uvc", "robot", "pressure"],
+            ["thermocouple", "plc", "thermal_uvc", "robot", "pressure", "esr1001_strain"],
         )
         self.assertTrue(all(item["state"] == "unchecked" for item in payload["interfaces"]))
+
+    def test_public_status_projects_the_checked_esr_driver_and_protocol(self):
+        module = self._module()
+
+        cases = (
+            ("modbus_rtu_esr1001", "modbus_rtu"),
+            ("esr1001_usb_ttl", "esr1001_usb_ttl"),
+        )
+        for driver, protocol in cases:
+            with self.subTest(driver=driver):
+                payload = module.build_public_device_status(
+                    {},
+                    {
+                        "checked_at": 100.0,
+                        "interfaces": [{
+                            "role": "esr1001_strain",
+                            "driver": driver,
+                            "protocol": protocol,
+                            "state": "data_ready",
+                            "ok": True,
+                        }],
+                    },
+                    {"running": False},
+                    now=101.0,
+                )
+                strain = next(
+                    item for item in payload["interfaces"]
+                    if item["role"] == "esr1001_strain"
+                )
+
+                self.assertEqual(strain["driver"], driver)
+                self.assertEqual(strain["protocol"], protocol)
+
+    def test_public_status_does_not_project_an_unknown_esr_driver(self):
+        module = self._module()
+        payload = module.build_public_device_status(
+            {},
+            {
+                "interfaces": [{
+                    "role": "esr1001_strain",
+                    "driver": "secret-driver-path",
+                    "protocol": "secret-protocol",
+                    "state": "device_open_failed",
+                    "ok": False,
+                }],
+            },
+            {"running": False},
+            now=1.0,
+        )
+        encoded = json.dumps(payload, ensure_ascii=False)
+
+        self.assertNotIn("secret-driver-path", encoded)
+        self.assertNotIn("secret-protocol", encoded)
 
     def test_public_status_preserves_unknown_failure_and_safe_stage_states(self):
         module = self._module()

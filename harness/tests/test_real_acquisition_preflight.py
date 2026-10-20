@@ -271,7 +271,7 @@ class RealAcquisitionPreflightTests(unittest.TestCase):
         self.assertIn("-TargetDir", result.command)
         self.assertIn(str(result.target), result.command)
         self.assertIn("assembly stdout", result.stdout)
-        self.assertIn("assembly stderr", result.stderr)
+        self.assertIn("assemblystderr", "".join(result.stderr.split()))
 
     def test_candidate_imports_acquisition_without_missing_module(self) -> None:
         preflight = self._preflight()

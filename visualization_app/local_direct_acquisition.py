@@ -20,7 +20,13 @@ _MINIMUM_POLL_SECONDS = {
     "rtsp_thermal": 0.03,
     "m3232_pressure": 0.005,
     "modbus_rtu_esr1001": 0.05,
+    "esr1001_usb_ttl": 0.0,
+    "huipu_tc64_modbus_rtu": 0.1,
 }
+
+_ESR1001_USB_DRIVER = "esr1001_usb_ttl"
+_DEFAULT_USB_RECONNECT_WINDOW_SECONDS = 60.0
+_MIN_WINDOW_RECONNECT_BACKOFF_SECONDS = 0.05
 
 
 def minimum_poll_interval(driver_name: str) -> float:
@@ -33,6 +39,16 @@ def _finite(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _driver_name(driver: Any) -> str:
+    try:
+        metadata = getattr(driver, "quality_metadata", {})
+    except Exception:
+        return ""
+    if not isinstance(metadata, Mapping):
+        return ""
+    return str(metadata.get("driver") or "").strip().lower()
 
 
 class LocalDirectAdapter:
@@ -52,6 +68,7 @@ class LocalDirectAdapter:
         reconnect_backoff_seconds: float = 0.05,
         max_reconnect_backoff_seconds: float = 1.0,
         max_reconnect_attempts: int = 5,
+        reconnect_window_seconds: float | None = None,
         before_open: Callable[[], Any] | None = None,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
@@ -69,6 +86,18 @@ class LocalDirectAdapter:
             float(max_reconnect_backoff_seconds),
         )
         self.max_reconnect_attempts = max(0, int(max_reconnect_attempts))
+        if reconnect_window_seconds is None:
+            reconnect_window_seconds = (
+                _DEFAULT_USB_RECONNECT_WINDOW_SECONDS
+                if _driver_name(driver) == _ESR1001_USB_DRIVER
+                else 0.0
+            )
+        self.reconnect_window_seconds = max(0.0, float(reconnect_window_seconds))
+        if self.reconnect_window_seconds > 0.0:
+            self.max_reconnect_backoff_seconds = max(
+                self.max_reconnect_backoff_seconds,
+                _MIN_WINDOW_RECONNECT_BACKOFF_SECONDS,
+            )
         self.before_open = before_open
         self.clock = clock
         self.wall_clock = wall_clock
@@ -81,6 +110,7 @@ class LocalDirectAdapter:
         self.read_calls = 0
         self.reconnect_attempts = 0
         self._consecutive_reconnect_attempts = 0
+        self._reconnect_window_started_monotonic: float | None = None
         self.consecutive_failures = 0
         self.last_error = ""
         self.last_sample_monotonic: float | None = None
@@ -98,7 +128,7 @@ class LocalDirectAdapter:
         )
         self.thread.start()
 
-    def _publish(self, payload: Mapping[str, Any]) -> bool:
+    def _publish(self, payload: Mapping[str, Any], record: Mapping[str, Any] | None = None) -> bool:
         accepted = [
             (str(name), raw_value)
             for name, raw_value in payload.items()
@@ -106,13 +136,16 @@ class LocalDirectAdapter:
         ]
         if not accepted:
             return False
-        received_monotonic = self.clock()
-        received_wall_time = self.wall_clock()
+        received_monotonic = float(record["host_monotonic"]) if record else self.clock()
+        received_wall_time = float(record["host_wall_time"]) if record else self.wall_clock()
         self.source_sequence += 1
         driver_metadata = getattr(self.driver, "quality_metadata", {})
+        if record and isinstance(driver_metadata, Mapping):
+            driver_metadata = dict(driver_metadata, latest_record=dict(record))
+        samples = []
         for name, raw_value in accepted:
             value = _finite(raw_value)
-            self.cache.publish(
+            samples.append(
                 ChannelSample(
                     interface_id=self.interface_id,
                     channel_name=str(name),
@@ -132,9 +165,18 @@ class LocalDirectAdapter:
                     ),
                 )
             )
+        self.cache.publish_batch(samples)
         self.last_sample_monotonic = received_monotonic
         self._consecutive_reconnect_attempts = 0
+        self._reconnect_window_started_monotonic = None
         return True
+
+    def _reconnect_window_remaining(self, now: float | None = None) -> float:
+        started = self._reconnect_window_started_monotonic
+        if started is None:
+            return 0.0
+        current = time.monotonic() if now is None else float(now)
+        return max(0.0, self.reconnect_window_seconds - (current - started))
 
     def _safe_close(self) -> None:
         with self._close_lock:
@@ -156,10 +198,15 @@ class LocalDirectAdapter:
                     self.state = "running"
                     while not self.stop_event.is_set():
                         self.read_calls += 1
-                        payload = self.driver.read_sample()
-                        if isinstance(payload, Mapping) and payload:
-                            if self._publish(payload):
-                                self.consecutive_failures = 0
+                        if hasattr(self.driver, "read_samples"):
+                            for payload, record in self.driver.read_samples():
+                                if self._publish(payload, record):
+                                    self.consecutive_failures = 0
+                        else:
+                            payload = self.driver.read_sample()
+                            if isinstance(payload, Mapping) and payload:
+                                if self._publish(payload):
+                                    self.consecutive_failures = 0
                         self.stop_event.wait(self.actual_poll_interval_seconds)
                     break
                 except Exception as exc:
@@ -168,7 +215,26 @@ class LocalDirectAdapter:
                     self._safe_close()
                     if self.stop_event.is_set():
                         break
-                    if self._consecutive_reconnect_attempts >= self.max_reconnect_attempts:
+                    now = time.monotonic()
+                    recovery_window_enabled = (
+                        self.max_reconnect_attempts > 0
+                        and self.reconnect_window_seconds > 0.0
+                        and self.last_sample_monotonic is not None
+                    )
+                    if (
+                        recovery_window_enabled
+                        and self._reconnect_window_started_monotonic is None
+                    ):
+                        self._reconnect_window_started_monotonic = now
+                    retry_by_attempts = (
+                        self._consecutive_reconnect_attempts
+                        < self.max_reconnect_attempts
+                    )
+                    retry_by_window = (
+                        recovery_window_enabled
+                        and self._reconnect_window_remaining(now) > 0.0
+                    )
+                    if not (retry_by_attempts or retry_by_window):
                         self.state = "failed"
                         break
                     self.reconnect_attempts += 1
@@ -177,8 +243,12 @@ class LocalDirectAdapter:
                     delay = min(
                         self.max_reconnect_backoff_seconds,
                         self.reconnect_backoff_seconds
-                        * (2 ** max(0, self.reconnect_attempts - 1)),
+                        * (2 ** min(30, max(0, self._consecutive_reconnect_attempts - 1))),
                     )
+                    if recovery_window_enabled:
+                        delay = max(delay, _MIN_WINDOW_RECONNECT_BACKOFF_SECONDS)
+                    if retry_by_window and not retry_by_attempts:
+                        delay = min(delay, self._reconnect_window_remaining(now))
                     self.stop_event.wait(delay)
         finally:
             self._safe_close()
@@ -216,7 +286,10 @@ class LocalDirectAdapter:
         reported_state = self.state
         if reported_state == "running" and not first_sample_received:
             reported_state = "waiting_first_sample"
+        reconnect_window_remaining = self._reconnect_window_remaining()
         return {
+            "driver_quality": dict(getattr(self.driver, "quality_metadata", {}) or {}),
+            "raw_file": str(self.driver.recorder.path) if getattr(self.driver, "recorder", None) else None,
             "mode": self.mode,
             "fault_domain": "local_device",
             "interface_id": self.interface_id,
@@ -228,6 +301,12 @@ class LocalDirectAdapter:
             "source_sequence": self.source_sequence,
             "reconnect_attempts": self.reconnect_attempts,
             "consecutive_reconnect_attempts": self._consecutive_reconnect_attempts,
+            "reconnect_window_seconds": self.reconnect_window_seconds,
+            "reconnect_window_active": (
+                self._reconnect_window_started_monotonic is not None
+                and reconnect_window_remaining > 0.0
+            ),
+            "reconnect_window_remaining_seconds": reconnect_window_remaining,
             "consecutive_failures": self.consecutive_failures,
             "actual_poll_interval_seconds": self.actual_poll_interval_seconds,
             "last_sample_monotonic": self.last_sample_monotonic,

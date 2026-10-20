@@ -146,15 +146,17 @@ class Thermocouple64ContractsTests(unittest.TestCase):
         self.assertFalse(readiness["ready"])
         self.assertEqual(set(readiness["missing_facts"]), set(HARDWARE_FACT_FIELDS))
         interface = acquisition.default_capture_interfaces()[0]
-        interface["physical_interface_id"] = "fixture:unconfirmed"
-        interface["physical_interface_kind"] = "unconfirmed"
-        with self.assertRaisesRegex(ValueError, "硬件事实"):
-            acquisition.AcquisitionConfig(
-                acquisition_mode="real",
-                dataset_schema="new_collection_v13_0",
-                interfaces=[interface],
-                selected_sensors=list(THERMOCOUPLE64_CHANNELS),
-            )
+        interface["physical_interface_id"] = "serial:COM7"
+        interface["physical_interface_kind"] = "serial"
+        interface["endpoint"] = "COM7"
+        config = acquisition.AcquisitionConfig(
+            acquisition_mode="real",
+            dataset_schema="new_collection_v13_0",
+            interfaces=[interface],
+            selected_sensors=list(THERMOCOUPLE64_CHANNELS),
+        )
+        self.assertEqual(config.interfaces[0]["driver"], "huipu_tc64_modbus_rtu")
+        self.assertFalse(hardware_release_readiness(interface["hardware_facts"])["ready"])
         simulation = acquisition.AcquisitionConfig(
             acquisition_mode="simulation",
             dataset_schema="new_collection_v13_0",

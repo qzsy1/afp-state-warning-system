@@ -20,7 +20,7 @@ if (-not (Test-Path (Join-Path $DeliveryRoot "AFP_Integrated_System_Modular.exe"
 $AppExe = Join-Path $DeliveryRoot "AFP_Integrated_System_Modular.exe"
 $HelperRoot = Join-Path $DeliveryRoot "local_helper"
 $HelperExe = Join-Path $HelperRoot "AFP_Local_Capture_Helper.exe"
-$CloudflaredExe = "F:\softwawre\cloudflared\cloudflared.exe"
+$CloudflaredExe = "D:\softwawre\cloudflared\cloudflared.exe"
 $CloudflaredRoot = Split-Path -Parent $CloudflaredExe
 $TunnelLog = Join-Path $CloudflaredRoot "quick-tunnel-watchdog.log"
 $TunnelUrlFile = Join-Path $CloudflaredRoot "quick-tunnel-url.txt"

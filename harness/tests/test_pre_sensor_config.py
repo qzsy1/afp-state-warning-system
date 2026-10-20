@@ -226,7 +226,7 @@ class PreSensorConfigurationValidationTests(unittest.TestCase):
             "device_readiness_contract": "plc_abb_uvc_readiness_v1",
             "unified_device_readiness_v1": True,
             "unified_frame_v2": True,
-            "thermocouple64_hardware_gate": True,
+            "huipu_tc64_modbus_rtu": True,
             "real_capture": True,
             "local_csv_save": True,
             "esr1001_modbus_rtu": True,

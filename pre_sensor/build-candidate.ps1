@@ -113,8 +113,6 @@ try {
         -DataSource (Join-Path $BuildSourceRoot "visualization_app\data") `
         -NewCollectionSource (Join-Path $BuildSourceRoot "visualization_app\new_collection_demo_v11_3") `
         -ModelRuntimeSource (Join-Path $BuildSourceRoot "visualization_app\model_runtime") `
-        -SoftConsistencySource (Join-Path $BuildSourceRoot "outputs_tc_hi_soft_consistency_v13_8") `
-        -CausalConsistencySource (Join-Path $BuildSourceRoot "outputs_causal_online_consistency_v13_9") `
         -HelperExecutable $HelperExecutable `
         -ReleaseContract $contractPath `
         -CandidateId $candidateId `

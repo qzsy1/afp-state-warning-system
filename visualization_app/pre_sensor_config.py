@@ -25,7 +25,9 @@ from acquisition import (  # noqa: E402
     AcquisitionConfig,
     SENSOR_CHANNEL_METADATA,
     SENSOR_INTERFACE_PROFILES,
+    STRAIN_SENSOR_COLUMNS,
 )
+from esr1001_usb import RAW_CHANNELS
 from release_contract import (  # noqa: E402
     ReleaseContractError,
     assert_helper_contract,
@@ -210,8 +212,9 @@ def validate_pre_sensor_config(
         raise PreSensorConfigError("schema_version does not match the release contract")
     if str(payload.get("release_revision") or "") != contract.release_revision:
         raise PreSensorConfigError("release_revision does not match the release contract")
-    if str(payload.get("dataset_schema") or "") != "new_collection_v13_0":
-        raise PreSensorConfigError("dataset_schema must be new_collection_v13_0")
+    dataset_schema = str(payload.get("dataset_schema") or "")
+    if dataset_schema not in {"new_collection_v13_0", "esr1001_raw_adc"}:
+        raise PreSensorConfigError("dataset_schema must be new_collection_v13_0 or esr1001_raw_adc")
 
     mode = str(payload.get("mode") or "").strip()
     if mode not in {"local_direct", "remote_helper"}:
@@ -244,7 +247,7 @@ def validate_pre_sensor_config(
             raise PreSensorConfigError(f"interface {interface_id} role is unsupported")
         expected_driver = str(SENSOR_INTERFACE_PROFILES[role]["driver"])
         driver = str(raw.get("driver") or "").strip()
-        if driver != expected_driver:
+        if driver != expected_driver and not (role == "esr1001_strain" and driver == "esr1001_usb_ttl"):
             raise PreSensorConfigError(
                 f"interface {interface_id} driver must be {expected_driver}"
             )
@@ -260,8 +263,12 @@ def validate_pre_sensor_config(
                 "driver": driver,
                 "endpoint_ref": endpoint_ref,
                 "baudrate": int(raw.get("baudrate") or 0),
-                "slave_id": int(raw.get("slave_id") or 1),
+                "slave_id": int(raw.get("slave_id", 1)),
                 "hardware_facts": dict(raw.get("hardware_facts") or {}),
+                "data_mode": raw.get("data_mode", "microstrain"),
+                "calibration_profile": raw.get("calibration_profile"),
+                "bridge": raw.get("bridge", ""),
+                "device_identity": dict(raw.get("device_identity") or {}),
             }
         )
 
@@ -290,21 +297,26 @@ def validate_pre_sensor_config(
         channels.append(name)
         assignments[interface_id].append(name)
     required_channels = set(
-        (ACQUISITION_SCHEMAS.get("new_collection_v13_0") or {}).get("sensors", [])
+        (ACQUISITION_SCHEMAS.get(dataset_schema) or {}).get("sensors", [])
     )
+    if dataset_schema == "new_collection_v13_0" and any(
+        item["driver"] == "esr1001_usb_ttl" and item["data_mode"] == "raw_adc"
+        for item in interface_specs
+    ):
+        required_channels.difference_update(STRAIN_SENSOR_COLUMNS)
+        required_channels.update(RAW_CHANNELS)
     if set(channels) != required_channels:
         missing = sorted(required_channels - set(channels))
         raise PreSensorConfigError(f"channel contract is incomplete: {missing}")
     thermocouple_specs = [
         item for item in interface_specs if item["role"] == "thermocouple64"
     ]
-    if len(thermocouple_specs) != 1:
+    if dataset_schema == "new_collection_v13_0" and len(thermocouple_specs) != 1:
         raise PreSensorConfigError("exactly one thermocouple64 interface is required")
-    thermocouple_readiness = hardware_release_readiness(
-        thermocouple_specs[0]["hardware_facts"]
-    )
-    if not thermocouple_readiness["ready"]:
-        raise PreSensorConfigError(str(thermocouple_readiness["message"]))
+    if thermocouple_specs:
+        thermocouple_readiness = hardware_release_readiness(thermocouple_specs[0]["hardware_facts"])
+        if not thermocouple_readiness["ready"]:
+            raise PreSensorConfigError(str(thermocouple_readiness["message"]))
 
     _validate_operational_limits(payload)
     storage = _object(payload, "storage")
@@ -336,7 +348,12 @@ def validate_pre_sensor_config(
             }
         if spec["baudrate"]:
             interface["baudrate"] = spec["baudrate"]
-        if spec["driver"] == "modbus_rtu_esr1001":
+        if spec["driver"] == "esr1001_usb_ttl":
+            if spec["baudrate"] != 115200:
+                raise PreSensorConfigError("原生USB必须使用115200-8-N-1")
+            for key in ("data_mode", "calibration_profile", "bridge", "device_identity"):
+                interface[key] = spec[key]
+        if spec["driver"] in {"modbus_rtu_esr1001", "huipu_tc64_modbus_rtu"}:
             interface["slave_id"] = spec["slave_id"]
         interfaces.append(interface)
 
@@ -409,7 +426,7 @@ def validate_pre_sensor_config(
             acquisition_mode="real",
             real_acquisition_mode=mode,
             processing_mode="capture_only",
-            dataset_schema="new_collection_v13_0",
+            dataset_schema=dataset_schema,
             interfaces=interfaces,
             interface_channel_assignments=assignments,
             selected_sensors=channels,

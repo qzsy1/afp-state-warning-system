@@ -27,8 +27,24 @@ if (-not $ModelsSource) { $ModelsSource = Join-Path $LegacySource "models" }
 if (-not $DataSource) { $DataSource = Join-Path $LegacySource "data" }
 if (-not $NewCollectionSource) { $NewCollectionSource = Join-Path $LegacySource "new_collection_demo_v11_3" }
 if (-not $ModelRuntimeSource) { $ModelRuntimeSource = Join-Path $LegacySource "model_runtime" }
-if (-not $SoftConsistencySource) { $SoftConsistencySource = Join-Path $RepoRoot "outputs_tc_hi_soft_consistency_v13_8" }
-if (-not $CausalConsistencySource) { $CausalConsistencySource = Join-Path $RepoRoot "outputs_causal_online_consistency_v13_9" }
+if (-not $SoftConsistencySource) {
+    $sourceCandidate = Join-Path $RepoRoot "outputs_tc_hi_soft_consistency_v13_8"
+    $referenceCandidate = Join-Path $ReferenceRelease "app\outputs_tc_hi_soft_consistency_v13_8"
+    $SoftConsistencySource = if (Test-Path -LiteralPath $sourceCandidate -PathType Container) {
+        $sourceCandidate
+    } else {
+        $referenceCandidate
+    }
+}
+if (-not $CausalConsistencySource) {
+    $sourceCandidate = Join-Path $RepoRoot "outputs_causal_online_consistency_v13_9"
+    $referenceCandidate = Join-Path $ReferenceRelease "app\outputs_causal_online_consistency_v13_9"
+    $CausalConsistencySource = if (Test-Path -LiteralPath $sourceCandidate -PathType Container) {
+        $sourceCandidate
+    } else {
+        $referenceCandidate
+    }
+}
 
 if ($LauncherSourceDir -and $ExistingExecutable) {
     throw "Specify LauncherSourceDir or ExistingExecutable, not both."
@@ -201,7 +217,7 @@ foreach ($fieldDocument in @("FIELD-OPERATIONS.md", "real-device-only-checklist.
 }
 
 $legacyFiles = @(
-    "app.py", "interface_agent.py", "agentic_diagnosis.py", "diagnostic_tools.py", "acquisition.py", "real_acquisition.py", "local_direct_acquisition.py", "smrf_hid.py", "mysql_storage.py",
+    "app.py", "interface_agent.py", "agentic_diagnosis.py", "diagnostic_tools.py", "acquisition.py", "real_acquisition.py", "local_direct_acquisition.py", "esr1001_usb.py", "smrf_hid.py", "mysql_storage.py",
     "online_inference.py", "atavn.py", "online_health_features.py",
     "causal_online_runtime.py", "runtime_scaler.py", "new_collection_health.py",
     "runtime_health_primitives.py", "web_training.py", "web_training_pipeline.py",
@@ -212,7 +228,7 @@ $legacyFiles = @(
     "public_demo_bundles.py",
     "remote_mysql_setup.py", "server_target_mysql.py", "server_capture_journal.py", "generate_pressure_simulation.py",
     "web_auth.py", "web_access.py", "public_status.py", "guest_simulation.py", "control_lease.py", "json_safety.py",
-    "diagnosis_jobs.py", "simulation_packages.py", "thermocouple64.py", "industrial_acquisition_probe.py"
+    "diagnosis_jobs.py", "simulation_packages.py", "thermocouple64.py", "hp_thermocouple64.py", "industrial_acquisition_probe.py"
 )
 foreach ($name in $legacyFiles) {
     $source = Join-Path $LegacySource $name

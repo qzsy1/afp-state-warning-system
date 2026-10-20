@@ -6,9 +6,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-FIXED_RUNTIME = r"F:\new_AFP_exam\AFP_Integrated_System_Modular"
-FIXED_EVIDENCE = r"F:\new_AFP_exam\AFP-Main-Evidence"
-STAGING_ROOT = r"F:\new_AFP_exam\.afp-staging"
+FIXED_RUNTIME = r"D:\AFP_Runtime\AFP_Integrated_System_Modular"
+FIXED_EVIDENCE = r"D:\AFP_Runtime\AFP-Main-Evidence"
+STAGING_ROOT = r"D:\AFP_Runtime\.afp-staging"
 LEGACY_MARKERS = (
     "AFP_Integrated_System_Modular_v2.0.4_Agentic",
     r"F:\AFP_Integrated_Modular_v2",

@@ -37,6 +37,11 @@ import pandas as pd
 
 from mysql_storage import MySQLCaptureStore, MySQLSettings, validate_database_name
 from smrf_hid import SmrfHidDriver, enumerate_smrf_hid_devices
+from hp_thermocouple64 import HpThermocouple64Driver
+from esr1001_usb import (
+    USB_DRIVER, RAW_CHANNELS, Esr1001UsbDriver, RawCaptureWriter,
+    load_calibration, UsbProtocolError, probe_usb,
+)
 from simulation_replay import MonotonicReplayScheduler
 from real_acquisition import (
     AcquisitionQualityMetrics,
@@ -58,7 +63,6 @@ from thermocouple64 import (
     THERMOCOUPLE64_ROLE,
     THERMOCOUPLE64_DERIVED_CHANNELS,
     Thermocouple64Snapshot,
-    hardware_release_readiness,
     project_specimen_layers,
     raw_catalog,
 )
@@ -75,7 +79,7 @@ except ImportError:  # Compatibility with older modular runtimes.
 APP_DIR = Path(os.environ.get("AFP_LEGACY_APP_DIR") or Path(__file__).resolve().parent).resolve()
 RELEASE_CONTRACT = load_release_contract(start=__file__)
 WORKSPACE_DIR = APP_DIR.parents[1]
-DEFAULT_CAPTURE_ROOT = Path(WORKSPACE_DIR.anchor) / "AFP_Capture"
+DEFAULT_CAPTURE_ROOT = Path("D:/AFP_Capture") if os.name == "nt" else Path(WORKSPACE_DIR.anchor) / "AFP_Capture"
 _DATA_DIR = Path(os.environ.get("AFP_DATA_DIR") or APP_DIR / "data").resolve()
 _NATIVE_DLL_DIR = Path(os.environ.get("AFP_NATIVE_DLL_DIR") or APP_DIR).resolve()
 _PACKAGED_SIMULATOR_FILE = _DATA_DIR / "原文件.csv"
@@ -133,7 +137,7 @@ CURRENT_COLLECTION_SENSOR_COLUMNS = [
 ]
 ALL_SENSOR_COLUMNS = list(
     dict.fromkeys(
-        [*LEGACY_SENSOR_COLUMNS, *LATEST_COLLECTION_SENSOR_COLUMNS, *CURRENT_COLLECTION_SENSOR_COLUMNS]
+        [*LEGACY_SENSOR_COLUMNS, *LATEST_COLLECTION_SENSOR_COLUMNS, *CURRENT_COLLECTION_SENSOR_COLUMNS, *RAW_CHANNELS]
     )
 )
 PROCESS_PARAMETER_COLUMNS = [
@@ -195,6 +199,11 @@ CURRENT_COLLECTION_COLUMNS = [
     "layer_id",
 ]
 ACQUISITION_SCHEMAS = {
+    "esr1001_raw_adc": {
+        "label": "ESR1001-A 原始 ADC 诊断（adc_counts，标定未确认）",
+        "sensors": list(RAW_CHANNELS),
+        "raw_columns": [*RAW_CHANNELS, "cycle", "file", "root", "run_id", "specimen_id", "condition_id", "replicate", "layer_id"],
+    },
     "legacy_original": {
         "label": "旧数据兼容方案（原12传感器）",
         "sensors": LEGACY_SENSOR_COLUMNS,
@@ -1073,7 +1082,7 @@ SENSOR_CHANNEL_METADATA: dict[str, dict[str, str]] = {
         f"温度{index}": {
             "unit": "°C",
             "dtype": "float32",
-            "source": f"64路热电偶适配器规范通道 CH{index}（设备协议待确认）",
+            "source": f"慧谱TCP64 Modbus RTU CH{index}（摄氏度）",
             "alias": f"temperature_{index}",
             "display_group": f"TC-G{((index - 1) // 8) + 1:02d}",
         }
@@ -1083,16 +1092,16 @@ SENSOR_CHANNEL_METADATA: dict[str, dict[str, str]] = {
         f"应变{index}": {
             "unit": "με",
             "dtype": "float32",
-            "source": f"ESR1001-A CH{index}（独立RS485接口）",
+            "source": f"ESR1001-A CH{index}（所选USB/TTL或RS485接口）",
             "alias": f"strain_{index}",
         }
         for index in range(1, 5)
     },
 }
 
-# Selecting a sensor type is the routing authority: the type fixes its driver,
-# default endpoint, decoding rule and compatible canonical channels.  Only the
-# custom JSON profile permits manual driver/channel-map editing.
+SENSOR_CHANNEL_METADATA.update({name: {"unit": "adc_counts", "dtype": "int24", "source": "ESR1001-A原生USB原始数据", "alias": name} for name in RAW_CHANNELS})
+
+# 角色限定可用协议和通道；应变角色显式支持USB及RS485。
 SENSOR_INTERFACE_PROFILES: dict[str, dict[str, Any]] = {
     "thermocouple": {
         "label": "历史八通道热电偶（只读兼容）",
@@ -1109,13 +1118,15 @@ SENSOR_INTERFACE_PROFILES: dict[str, dict[str, Any]] = {
         "historical_only": True,
     },
     THERMOCOUPLE64_ROLE: {
-        "label": "64路热电偶（硬件协议待确认）",
+        "label": "慧谱TCP64热电偶（64路 Modbus RTU）",
         "driver": THERMOCOUPLE64_DRIVER,
-        "protocol": "unconfirmed",
-        "physical_kind": "unconfirmed",
+        "protocol": "modbus_rtu",
+        "physical_kind": "serial",
         "endpoint": "",
+        "baudrate": 115200,
+        "slave_id": 1,
         "channels": list(THERMOCOUPLE64_CHANNELS),
-        "processing": "厂商无关64路适配合同；设备协议确认前禁止真实采集发布",
+        "processing": "仪表选Modbus模式，115200-8-N-1；FC03读取64路20寄存器记录，温度低字在前；K/F转换为°C；现场验证独立记录",
     },
     "plc": {
         "label": "松下PLC过程传感器",
@@ -1166,13 +1177,14 @@ SENSOR_INTERFACE_PROFILES: dict[str, dict[str, Any]] = {
     "esr1001_strain": {
         "label": "ESR1001-A四通道应变",
         "driver": "modbus_rtu_esr1001",
+        "allowed_drivers": ["modbus_rtu_esr1001", USB_DRIVER],
         "protocol": "modbus_rtu",
         "physical_kind": "serial",
         "endpoint": "",
         "baudrate": ESR1001_BAUDRATE,
         "slave_id": ESR1001_DEFAULT_SLAVE_ID,
         "channels": list(ESR1001_CHANNELS),
-        "processing": "Modbus RTU FC04读取0x0030的8个寄存器；CH4、CH1、CH2、CH3重排为应变1～应变4",
+        "processing": "RS485：Modbus RTU FC04读取0x0030的8个寄存器；USB/TTL：115200-8-N-1连续上传24位ADC；微应变需要有效逐通道K/B",
     },
     "custom": {
         "label": "自定义JSON传感器",
@@ -1275,6 +1287,10 @@ def default_capture_interfaces() -> list[dict[str, Any]]:
             "role": THERMOCOUPLE64_ROLE,
             "driver": THERMOCOUPLE64_DRIVER,
             "endpoint": "",
+            "baudrate": 115200,
+            "slave_id": 1,
+            "timeout": 0.5,
+            "freshness_seconds": 1.0,
             "channels": list(THERMOCOUPLE64_CHANNELS),
             "channel_map": {},
             "hardware_facts": {},
@@ -1351,7 +1367,21 @@ def _apply_sensor_interface_profile(interface: dict[str, Any]) -> dict[str, Any]
     sensor_type = _canonical_sensor_type(interface.get("role"), interface.get("driver"))
     profile = SENSOR_INTERFACE_PROFILES[sensor_type]
     interface["role"] = sensor_type
-    if not profile.get("editable_driver"):
+    usb_strain = sensor_type == "esr1001_strain" and interface.get("driver") == USB_DRIVER
+    if usb_strain:
+        interface["protocol"] = USB_DRIVER
+        interface["baudrate"] = 115200
+        interface["data_mode"] = str(interface.get("data_mode") or "raw_adc")
+        if interface["data_mode"] not in {"raw_adc", "microstrain"}:
+            raise ValueError("USB数据模式必须是raw_adc或microstrain")
+        interface["channel_count"] = 4
+        calibration = interface.get("calibration_profile")
+        if calibration:
+            profile_data = json.loads(Path(calibration).read_text(encoding="utf-8")) if isinstance(calibration, str) else calibration
+            interface["calibration_digest"] = hashlib.sha256(json.dumps(profile_data, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+        else:
+            interface["calibration_digest"] = ""
+    elif not profile.get("editable_driver"):
         interface["driver"] = str(profile["driver"])
     else:
         interface["driver"] = str(interface.get("driver") or profile["driver"])
@@ -1364,7 +1394,7 @@ def _apply_sensor_interface_profile(interface: dict[str, Any]) -> dict[str, Any]
         )
     ):
         interface["endpoint"] = str(profile.get("endpoint") or "")
-    if profile.get("baudrate"):
+    if profile.get("baudrate") and sensor_type not in {THERMOCOUPLE64_ROLE, "esr1001_strain"}:
         interface["baudrate"] = int(profile["baudrate"])
     if profile.get("channel_types") and not interface.get("channel_types"):
         interface["channel_types"] = list(profile["channel_types"])
@@ -1374,7 +1404,15 @@ def _apply_sensor_interface_profile(interface: dict[str, Any]) -> dict[str, Any]
         interface["slave_id"] = int(
             interface.get("slave_id") or DEFAULT_PLC_SLAVE_ID
         )
+    elif sensor_type == THERMOCOUPLE64_ROLE:
+        slave_id = int(interface.get("slave_id", 1))
+        if not 1 <= slave_id <= 247:
+            raise ValueError("慧谱仪表地址必须在1到247之间")
+        interface["slave_id"] = slave_id
+        interface["freshness_seconds"] = float(interface.get("freshness_seconds") or 1.0)
     elif sensor_type == "esr1001_strain":
+        if not usb_strain:
+            interface["baudrate"] = int(interface.get("baudrate") or ESR1001_BAUDRATE)
         interface["slave_id"] = int(
             interface.get("slave_id") or ESR1001_DEFAULT_SLAVE_ID
         )
@@ -1438,7 +1476,7 @@ def _physical_interface_binding_issues(
         profile = SENSOR_INTERFACE_PROFILES.get(role, SENSOR_INTERFACE_PROFILES["custom"])
         expected_driver = str(profile.get("driver") or "")
         actual_driver = str(item.get("driver") or "")
-        if not profile.get("editable_driver") and actual_driver != expected_driver:
+        if not profile.get("editable_driver") and actual_driver not in profile.get("allowed_drivers", [expected_driver]):
             message = (
                 f"接口“{item.get('id', role)}”的协议/驱动与传感器类型不匹配："
                 f"{actual_driver or '未填写'}，应为{expected_driver}"
@@ -1533,7 +1571,8 @@ def _resolve_interface_channel_assignments(
         profile = SENSOR_INTERFACE_PROFILES.get(
             role, SENSOR_INTERFACE_PROFILES["custom"]
         )
-        allowed = set(profile.get("channels") or []) & capture_set
+        raw_usb = item.get("driver") == USB_DRIVER and item.get("data_mode") == "raw_adc"
+        allowed = set(RAW_CHANNELS if raw_usb else profile.get("channels") or []) & capture_set
         if role == "custom":
             channel_map = item.get("channel_map") or {}
             if isinstance(channel_map, dict):
@@ -1707,6 +1746,7 @@ class AcquisitionConfig:
     driver: str = "simulator"
     endpoint: str = ""
     baudrate: int = 115200
+    slave_id: int = 1
     # Multiple physical interfaces can be used in one acquisition.
     interfaces: list[dict[str, Any]] | None = None
     interface_channel_assignments: dict[str, list[str]] | None = None
@@ -1877,6 +1917,11 @@ class AcquisitionConfig:
             )
         if self.dataset_schema not in ACQUISITION_SCHEMAS:
             raise ValueError(f"未知数据采集方案：{self.dataset_schema}")
+        if self.dataset_schema == "esr1001_raw_adc":
+            if self.processing_mode != "capture_only":
+                raise ValueError("原始ADC诊断只允许capture_only，不允许模型输入")
+            if self.mysql_enabled or self.mysql_local_enabled:
+                raise ValueError("原始ADC诊断保存为独立CSV，不写入规范微应变MySQL表")
         if self.interfaces is None:
             self.interfaces = [{
                 "id": "interface_1", "enabled": True,
@@ -1894,9 +1939,11 @@ class AcquisitionConfig:
             role_hint = _canonical_sensor_type(interface.get("role"), interface.get("driver"))
             profile_hint = SENSOR_INTERFACE_PROFILES.get(role_hint, SENSOR_INTERFACE_PROFILES["custom"])
             requested_driver = str(interface.get("driver") or "").strip()
+            if role_hint == THERMOCOUPLE64_ROLE and requested_driver == "thermocouple64_protocol_pending":
+                requested_driver = THERMOCOUPLE64_DRIVER
             if requested_driver and not profile_hint.get("editable_driver"):
                 expected_driver = str(profile_hint.get("driver") or "")
-                if requested_driver != expected_driver:
+                if requested_driver != expected_driver and not (role_hint == "esr1001_strain" and requested_driver == USB_DRIVER):
                     message = (
                         f"接口“{interface['id']}”的协议/驱动与传感器类型不匹配："
                         f"{requested_driver}，应为{expected_driver}"
@@ -1910,8 +1957,8 @@ class AcquisitionConfig:
                 if role_hint != "custom" else self.driver
             )
             interface["endpoint"] = str(interface.get("endpoint") or "").strip()
-            interface["baudrate"] = int(interface.get("baudrate") or self.baudrate)
-            interface["timeout"] = max(0.01, min(float(interface.get("timeout") or 0.05), 2.0))
+            interface["baudrate"] = int(interface.get("baudrate") or (ESR1001_BAUDRATE if role_hint == "esr1001_strain" and interface["driver"] != USB_DRIVER else self.baudrate))
+            interface["timeout"] = max(0.01, min(float(interface.get("timeout") or (0.5 if role_hint == THERMOCOUPLE64_ROLE else 0.05)), 2.0))
             interface["role"] = _canonical_sensor_type(
                 interface.get("role"), interface.get("driver")
             )
@@ -1931,11 +1978,10 @@ class AcquisitionConfig:
                 if isinstance(register_map, dict) else {}
             )
             interface["slave_id"] = int(
-                interface.get("slave_id")
-                or (
+                interface.get("slave_id") if interface.get("slave_id") is not None else (
                     ESR1001_DEFAULT_SLAVE_ID
                     if role_hint == "esr1001_strain"
-                    else DEFAULT_PLC_SLAVE_ID
+                    else 1 if role_hint == THERMOCOUPLE64_ROLE else DEFAULT_PLC_SLAVE_ID
                 )
             )
             _apply_sensor_interface_profile(interface)
@@ -1975,6 +2021,16 @@ class AcquisitionConfig:
         if not normalized_interfaces:
             raise ValueError("至少配置一个采集接口")
         self.interfaces = normalized_interfaces
+        for item in normalized_interfaces:
+            if not item.get("enabled", True):
+                continue
+            raw = item.get("driver") == USB_DRIVER and item.get("data_mode") == "raw_adc"
+            if self.dataset_schema == "esr1001_raw_adc" and not raw:
+                raise ValueError("独立ADC诊断方案只允许USB原始接口")
+            if raw and self.dataset_schema != "esr1001_raw_adc" and self.dataset_schema not in MODERN_COLLECTION_SCHEMAS:
+                raise ValueError("原始ADC联合采集需要正常数据方案")
+            if raw and self.processing_mode != "capture_only":
+                raise ValueError("原始ADC只允许capture_only，不允许模型输入")
         binding_issues = _physical_interface_binding_issues(normalized_interfaces, self.acquisition_mode)
         self.configuration_issues.extend(binding_issues)
         if binding_issues and not diagnostic_validation:
@@ -2016,29 +2072,11 @@ class AcquisitionConfig:
                     })
                 else:
                     raise ValueError(message)
-            for item in enabled:
-                if item.get("role") != THERMOCOUPLE64_ROLE:
-                    continue
-                readiness = hardware_release_readiness(item.get("hardware_facts"))
-                if readiness["ready"]:
-                    continue
-                message = str(readiness["message"])
-                if diagnostic_validation:
-                    self.configuration_issues.append({
-                        "code": "thermocouple64_hardware_facts_missing",
-                        "message": message,
-                        "interface_ids": [str(item.get("id") or THERMOCOUPLE64_INTERFACE_ID)],
-                        "missing_facts": list(readiness["missing_facts"]),
-                    })
-                else:
-                    raise ValueError(message)
             self.source_file = ""
             self.simulation_source_path = ""
         else:
             self.source_file = self.simulation_source_path
-        allowed_sensors = list(
-            ACQUISITION_SCHEMAS[self.dataset_schema]["sensors"]
-        )
+        allowed_sensors = self.schema_sensors
         if self.selected_sensors is None:
             self.selected_sensors = allowed_sensors.copy()
         self.selected_sensors = [
@@ -2190,17 +2228,32 @@ class AcquisitionConfig:
 
     @property
     def schema_sensors(self) -> list[str]:
-        return list(ACQUISITION_SCHEMAS[self.dataset_schema]["sensors"])
+        return self._effective_adc_columns(ACQUISITION_SCHEMAS[self.dataset_schema]["sensors"])
+
+    def _effective_adc_columns(self, columns: list[str]) -> list[str]:
+        """按有效接口用途生成通道，原始计数不占用规范微应变列。"""
+        raw_enabled = any(
+            item.get("enabled", True) and item.get("driver") == USB_DRIVER
+            and item.get("data_mode") == "raw_adc"
+            for item in (self.interfaces or [])
+        )
+        if not raw_enabled or self.dataset_schema not in MODERN_COLLECTION_SCHEMAS:
+            return list(columns)
+        replacements = dict(zip(STRAIN_SENSOR_COLUMNS, RAW_CHANNELS))
+        result = [replacements.get(name, name) for name in columns]
+        if not any(name in result for name in RAW_CHANNELS):
+            result = [*RAW_CHANNELS, *result]
+        return result
 
     @property
     def raw_columns(self) -> list[str]:
         """Return only selected sensor columns plus identity/process fields."""
         definition = ACQUISITION_SCHEMAS[self.dataset_schema]
         selected = set(self.selected_sensors or [])
-        sensor_names = set(definition["sensors"])
+        sensor_names = set(self.schema_sensors)
         return [
             name
-            for name in definition["raw_columns"]
+            for name in self._effective_adc_columns(definition["raw_columns"])
             if name not in sensor_names or name in selected
         ]
 
@@ -2268,6 +2321,8 @@ def _safe_component(value: Any, max_length: int = 40) -> str:
 
 
 def _parameter_token(config: AcquisitionConfig) -> str:
+    if config.dataset_schema == "esr1001_raw_adc":
+        return "ESR1001_ADC_" + _safe_component(config.specimen_id, max_length=48)
     # Keep the physical condition and independent replicate visible in the
     # folder name.  The layer files and complete-specimen snapshot inherit
     # this prefix, so files from different conditions/replicates cannot be
@@ -3417,6 +3472,8 @@ def normalize_interface_readiness(
 ) -> dict[str, Any]:
     """Return one explicit readiness schema without erasing raw evidence."""
     result = deepcopy(interface_result)
+    if result.get("driver") == USB_DRIVER and result.get("readiness_report"):
+        return result
     role = str(result.get("role") or "")
     final_state = str(result.get("state") or "not_connected")
     existing = result.get("stages") if isinstance(result.get("stages"), dict) else {}
@@ -4228,6 +4285,27 @@ class MultiInterfaceDriver(SampleDriver):
                         int(item.get("matrix_rows") or 0),
                         int(item.get("matrix_cols") or 0),
                     )
+                elif driver_name == THERMOCOUPLE64_DRIVER:
+                    driver = HpThermocouple64Driver(
+                        str(item.get("endpoint") or ""),
+                        int(item.get("baudrate") or 115200),
+                        int(item.get("slave_id", 1)),
+                        float(item.get("timeout") or 0.5),
+                    )
+                elif driver_name == USB_DRIVER:
+                    recorder = None
+                    if item.get("_raw_capture_root"):
+                        recorder = RawCaptureWriter(item["_raw_capture_root"], {
+                            "interface_id": item.get("id"), "endpoint": item.get("endpoint"),
+                            "device_binding": item.get("device_identity") or {},
+                            "data_mode": item.get("data_mode"), "bridge": item.get("bridge"),
+                            "calibration_digest": item.get("calibration_digest"),
+                        })
+                    driver = Esr1001UsbDriver(
+                        str(item.get("endpoint") or ""), data_mode=item.get("data_mode", "raw_adc"),
+                        calibration=item.get("calibration_profile"), binding=item.get("device_identity"),
+                        bridge=str(item.get("bridge") or ""), recorder=recorder,
+                    )
                 elif driver_name == "modbus_rtu_esr1001":
                     driver = Esr1001StrainDriver(
                         str(item.get("endpoint") or ""),
@@ -4314,6 +4392,8 @@ class MultiInterfaceDriver(SampleDriver):
 
     def close(self) -> None:
         pending: list[LocalDirectAdapter] = []
+        if not self.workers:
+            return
         for worker in self.workers:
             if not worker.stop(timeout_seconds=0.5):
                 pending.append(worker)
@@ -4324,6 +4404,14 @@ class MultiInterfaceDriver(SampleDriver):
             for metadata in [getattr(worker.driver, "quality_metadata", {})]
             if isinstance(metadata, dict)
         }
+        for worker in self.workers:
+            recorder = getattr(worker.driver, "recorder", None)
+            if recorder is not None and worker not in pending:
+                recorder.close(worker.driver.quality_metadata)
+                self.interface_quality_metadata.setdefault(worker.interface_id, {}).update({
+                    "raw_file": str(recorder.path), "raw_metadata_file": str(recorder.metadata_path),
+                    "saved_source_rows": recorder.rows, "writer_error": recorder.error,
+                })
         self.workers = pending
         if not pending:
             self.drivers = []
@@ -4383,12 +4471,20 @@ def build_driver(config: AcquisitionConfig) -> SampleDriver:
             int(getattr(config, "matrix_rows", 0) or 0),
             int(getattr(config, "matrix_cols", 0) or 0),
         )
+    if config.driver == THERMOCOUPLE64_DRIVER:
+        return HpThermocouple64Driver(
+            config.endpoint,
+            config.baudrate or 115200,
+            config.slave_id,
+        )
     if config.driver == "modbus_rtu_esr1001":
         return Esr1001StrainDriver(
             config.endpoint,
             config.baudrate or ESR1001_BAUDRATE,
             ESR1001_DEFAULT_SLAVE_ID,
         )
+    if config.driver == USB_DRIVER:
+        return Esr1001UsbDriver(config.endpoint)
     raise ValueError(f"不支持的采集驱动：{config.driver}")
 
 
@@ -4828,6 +4924,7 @@ class AcquisitionManager:
             "***" if config.simulation_mysql_password else ""
         )
         for item in payload.get("interfaces") or []:
+            item.pop("_raw_capture_root", None)
             if item.get("role") == "robot":
                 item["credential_identifier"] = _credential_identifier(
                     str(item.get("username") or DEFAULT_ABB_USER),
@@ -4843,6 +4940,7 @@ class AcquisitionManager:
             {"id": "simulator", "label": "模拟采集（CSV数据源）"},
             {"id": "serial_json", "label": "串口 JSON Lines"},
             {"id": "smrf_hid", "label": "SMRF八通道温度巡检仪（USB HID）"},
+            {"id": THERMOCOUPLE64_DRIVER, "label": "慧谱TCP64热电偶（64路 Modbus RTU）"},
             {"id": "tcp_json", "label": "TCP JSON Lines"},
             {"id": "modbus_tcp", "label": "Modbus TCP（松下PLC）"},
             {"id": "abb_robot", "label": "ABB机器人 RWS"},
@@ -4850,6 +4948,7 @@ class AcquisitionManager:
             {"id": "rtsp_thermal", "label": "IP热像仪 RTSP"},
             {"id": "m3232_pressure", "label": "M3232薄膜压力（115200，矩阵自动识别）"},
             {"id": "modbus_rtu_esr1001", "label": "ESR1001-A应变（Modbus RTU 9600-8-N-1）"},
+            {"id": USB_DRIVER, "label": "ESR1001-A原生USB/TTL（115200-8-N-1）"},
         ]
 
     def read_process_parameters(self, config: AcquisitionConfig) -> dict[str, Any]:
@@ -4912,6 +5011,9 @@ class AcquisitionManager:
                     "manufacturer": str(item.manufacturer or ""),
                     "vid": item.vid,
                     "pid": item.pid,
+                    "esr1001_usb_candidate": item.vid == 0x1A86 and item.pid in {0x7523, 0x5523},
+                    "identity_confirmed": False,
+                    "device_identity": {"vid": item.vid, "pid": item.pid, "serial_number": item.serial_number, "location": getattr(item, "location", None), "hwid": getattr(item, "hwid", None)},
                     "serial": str(item.serial_number or ""),
                     "hwid": str(getattr(item, "hwid", "") or ""),
                     "location": str(getattr(item, "location", "") or ""),
@@ -5195,6 +5297,9 @@ class AcquisitionManager:
         self, config: AcquisitionConfig, timeout_seconds: float = 2.5
     ) -> dict:
         """Check source readiness and report the exact missing endpoint/channel."""
+        with self.lock:
+            if self.thread is not None and self.thread.is_alive() and self.config and self.config.acquisition_mode == "real":
+                raise RuntimeError("port_busy: 已有真实采集会话，不能启动临时探针")
         selected = set(config.selected_sensors or [])
         received = {name: 0 for name in ALL_SENSOR_COLUMNS}
         invalid_received = {name: 0 for name in ALL_SENSOR_COLUMNS}
@@ -5275,7 +5380,7 @@ class AcquisitionManager:
             physical_id = str(item.get("physical_interface_id") or "")
             physical_port_id = str(item.get("physical_port_id") or "")
             physical_kind = str(item.get("physical_interface_kind") or profile.get("physical_kind") or "")
-            protocol = str(profile.get("protocol") or item.get("driver") or "")
+            protocol = USB_DRIVER if item.get("driver") == USB_DRIVER else str(profile.get("protocol") or item.get("driver") or "")
             physical_fallback = bool(item.get("physical_fallback", False))
             physical_verified = item.get("physical_verified") is not False
             physical_warning = (
@@ -5307,6 +5412,19 @@ class AcquisitionManager:
                 })
                 continue
             auxiliary_only = str(item.get("role") or "") == "thermal_rtsp"
+            issues = [issue for issue in getattr(config, "configuration_issues", []) if interface_id in (issue.get("interface_ids") or [])]
+            if issues:
+                interface_results.append({**item, "state": "configuration_invalid", "ok": False, "errors": [issue["message"] for issue in issues], "expected_channels": expected, "detected_channels": [], "missing_channels": expected})
+                errors.extend(issue["message"] for issue in issues)
+                continue
+            if item.get("driver") == USB_DRIVER:
+                result = probe_usb(item)
+                interface_results.append(result)
+                for name in expected:
+                    received[name] += int(result.get("sample_counts", {}).get(name, 0))
+                if not result["ok"]:
+                    errors.extend(result["errors"])
+                continue
             if not expected:
                 interface_results.append({
                     "id": interface_id, "role": item.get("role", "custom"),
@@ -5631,11 +5749,12 @@ class AcquisitionManager:
         }
         result["checked_at"] = time.time()
         with self.lock:
-            self._latest_check_result = deepcopy(result)
             if config.acquisition_mode == "real":
                 self._readiness_snapshot = ReadinessSnapshot.create(
                     config, result, capabilities=config.helper_capabilities
                 )
+                result["readiness_snapshot"] = self._readiness_snapshot.to_dict()
+            self._latest_check_result = deepcopy(result)
         return result
 
     def import_readiness_snapshot(self, payload: dict[str, Any]) -> None:
@@ -6000,6 +6119,11 @@ class AcquisitionManager:
                 "protocol_error_counts": protocol_error_counts,
                 "last_protocol_error": str(interface_metadata.get("last_error") or ""),
             }
+        if isinstance(self.driver, MultiInterfaceDriver):
+            summary["esr1001_usb"] = {
+                key: dict(value) for key, value in self.driver.interface_quality_metadata.items()
+                if value.get("driver") == USB_DRIVER
+            }
         return summary
 
     def start(self, config: AcquisitionConfig) -> dict:
@@ -6017,6 +6141,8 @@ class AcquisitionManager:
                 if not item.get("enabled", True):
                     continue
                 role = str(item.get("role") or "")
+                if item.get("driver") == USB_DRIVER:
+                    requires_readiness = True
                 if role in SHARED_DEVICE_PROFILES:
                     requires_readiness = True
                     profile_status = device_profile_readiness(item)
@@ -6067,6 +6193,9 @@ class AcquisitionManager:
                 if stopped.get("running"):
                     raise RuntimeError("上一模拟采集未能停止，请稍后重试")
             result = self._start_new(config)
+            if config.acquisition_mode == "real":
+                with self.lock:
+                    self._readiness_snapshot = None
             if replaced_simulation:
                 result["replaced_active_simulation"] = True
             return result
@@ -6264,6 +6393,11 @@ class AcquisitionManager:
                     f"{uuid.uuid4().hex[:8]}"
                 )
                 config.capture_uuid = self.capture_uuid
+            for item in config.interfaces or []:
+                if item.get("enabled", True) and item.get("driver") == USB_DRIVER:
+                    if self.capture_record_dir is None:
+                        raise RuntimeError("原生USB采集需要可写原始证据目录")
+                    item["_raw_capture_root"] = str(self.capture_record_dir)
             self.driver = build_driver(config)
             try:
                 self.driver.open()
@@ -6626,7 +6760,11 @@ class AcquisitionManager:
                             name: sample.get(name, "")
                             for name in config.selected_sensors
                         }
-                        if config.dataset_schema in MODERN_COLLECTION_SCHEMAS:
+                        if config.dataset_schema == "esr1001_raw_adc":
+                            row.update({"cycle": config.cycle, "file": self.raw_path.name if self.raw_path else "", "root": config.root,
+                                        "run_id": config.run_id, "specimen_id": config.specimen_id, "condition_id": config.condition_id,
+                                        "replicate": config.replicate, "layer_id": config.layer + 1})
+                        elif config.dataset_schema in MODERN_COLLECTION_SCHEMAS:
                             row.update(
                                 {
                                     "时间": datetime.fromtimestamp(now).isoformat(
@@ -7092,6 +7230,16 @@ class AcquisitionManager:
                 self.finalization_complete = False
                 self.capture_phase = "stop_timed_out"
                 return self.status()
+        usb_errors = []
+        if isinstance(self.driver, MultiInterfaceDriver):
+            for evidence in self.driver.interface_quality_metadata.values():
+                if evidence.get("driver") == USB_DRIVER:
+                    if evidence.get("writer_error"):
+                        usb_errors.append(str(evidence["writer_error"]))
+                    if evidence.get("stop_error"):
+                        usb_errors.append(str(evidence["stop_error"]))
+                    if evidence.get("saved_source_rows") != evidence.get("source_frames"):
+                        usb_errors.append("raw_source_row_mismatch: 源帧与原始文件行数不一致")
         self.capture_phase = "finalizing"
         with self.lock:
             if self.finalization_complete:
@@ -7482,6 +7630,10 @@ class AcquisitionManager:
                     self.capture_phase = "database_pending_retry"
                 else:
                     self.capture_phase = "completed"
+        if usb_errors:
+            self.last_error = "; ".join(usb_errors)
+            self.capture_phase = "finalization_failed"
+            self.finalization_complete = False
         return self.status()
 
     def status(self) -> dict:
@@ -7501,7 +7653,7 @@ class AcquisitionManager:
                     sensor_state = "waiting"
                 elif observed <= 0:
                     sensor_state = "no_data"
-                elif running and (age is None or age > 2.0):
+                elif running and (age is None or age > (0.25 if name in RAW_CHANNELS or name in STRAIN_SENSOR_COLUMNS else 2.0)):
                     sensor_state = "stale"
                 else:
                     sensor_state = "ok"
@@ -7534,6 +7686,8 @@ class AcquisitionManager:
                     }
                 except Exception:
                     worker_by_interface = {}
+            if any(int(item.get("reconnect_attempts") or 0) > 0 for item in worker_by_interface.values()):
+                self._readiness_snapshot = None
             if self.config is not None and self.config.acquisition_mode == "real":
                 for item in self.config.interfaces or []:
                     interface_id = str(item.get("id") or "")
@@ -7582,6 +7736,20 @@ class AcquisitionManager:
                     ]
                     adapter_status = worker_by_interface.get(interface_id, {})
                     adapter_state = str(adapter_status.get("state") or "")
+                    usb_evidence = adapter_status.get("driver_quality") or (getattr(self.driver, "interface_quality_metadata", {}) or {}).get(interface_id, {})
+                    if item.get("driver") == USB_DRIVER and usb_evidence:
+                        frames = int(usb_evidence.get("source_frames") or 0)
+                        latest = usb_evidence.get("latest_record") or {}
+                        frame_age = max(0.0, time.monotonic() - float(latest.get("host_monotonic") or 0)) if latest else None
+                        message += f"；源帧 {frames}；单位 {usb_evidence.get('unit')}"
+                        source_rate = usb_evidence.get("actual_source_rate_hz")
+                        message += f"；实际帧率 {source_rate:.2f} Hz" if source_rate is not None else "；实际帧率待确认"
+                        message += f"；帧龄 {frame_age:.3f}秒" if frame_age is not None else "；尚无新鲜帧"
+                        message += f"；{usb_evidence.get('calibration_state')}"
+                        if running and frame_age is not None and frame_age > 0.25:
+                            state = "stale"
+                        if usb_evidence.get("overflows") or usb_evidence.get("writer_error"):
+                            state = "usb_overflow"
                     if adapter_state in {"failed", "stop_timed_out"}:
                         state = adapter_state
                         message = str(adapter_status.get("last_error") or adapter_state)
@@ -7598,6 +7766,8 @@ class AcquisitionManager:
                         "reconnect_attempts": int(adapter_status.get("reconnect_attempts") or 0),
                         "last_error": str(adapter_status.get("last_error") or ""),
                         "poll_interval_seconds": adapter_status.get("actual_poll_interval_seconds"),
+                        "usb_evidence": usb_evidence if item.get("driver") == USB_DRIVER else None,
+                        "raw_file": adapter_status.get("raw_file") or usb_evidence.get("raw_file"),
                     })
             model_inputs = (
                 self.config.model_input_sensors

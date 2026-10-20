@@ -12,7 +12,7 @@ from typing import Any, Iterable, Mapping, Sequence
 THERMOCOUPLE64_MODE_ID = "new_collection_v13_0"
 THERMOCOUPLE64_INTERFACE_ID = "thermocouple_64ch"
 THERMOCOUPLE64_ROLE = "thermocouple64"
-THERMOCOUPLE64_DRIVER = "thermocouple64_protocol_pending"
+THERMOCOUPLE64_DRIVER = "huipu_tc64_modbus_rtu"
 THERMOCOUPLE64_CHANNELS = tuple(f"温度{index}" for index in range(1, 65))
 THERMOCOUPLE64_GROUP_IDS = tuple(f"TC-G{index:02d}" for index in range(1, 9))
 THERMOCOUPLE64_DERIVED_CHANNELS = tuple(
@@ -116,7 +116,7 @@ def hardware_release_readiness(facts: Mapping[str, Any] | None) -> dict[str, Any
         "message": (
             "64路热电偶硬件事实已完整记录"
             if not missing
-            else "64路热电偶真实采集被阻断；缺少硬件事实：" + ", ".join(missing)
+            else "64路热电偶实机验收资料不完整；缺少硬件事实：" + ", ".join(missing)
         ),
     }
 

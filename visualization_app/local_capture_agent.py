@@ -22,6 +22,7 @@ from typing import Any
 
 from acquisition import (
     AcquisitionManager,
+    DEFAULT_CAPTURE_ROOT,
     MySQLSettings,
     check_capture_save_root,
     select_capture_folder,
@@ -44,7 +45,7 @@ from interface_transport_catalog import (
 
 
 _ROLE_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("thermocouple64", "unconfirmed", ("thermocouple64_protocol_pending",)),
+    ("thermocouple64", "serial", ("huipu_tc64_modbus_rtu",)),
     ("plc_process", "ethernet", ("ethernet",)),
     ("uvc_temperature", "usb_uvc", ("uvc",)),
     ("abb_motion", "ethernet", ("ethernet",)),
@@ -64,12 +65,7 @@ class LocalCaptureAgent:
         simulation_cache_root: str | Path | None = None,
     ) -> None:
         self.manager = manager or AcquisitionManager()
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        default_cache_root = (
-            Path(local_app_data)
-            if local_app_data
-            else Path.home() / "AppData" / "Local"
-        ) / "AFP_Local_Capture_Helper" / "simulation-cache"
+        default_cache_root = DEFAULT_CAPTURE_ROOT / ".helper" / "simulation-cache"
         self._simulation_cache = SimulationSourceCache(
             simulation_cache_root or default_cache_root
         )
@@ -149,12 +145,12 @@ class LocalCaptureAgent:
                     "physical_port_id": (candidate or {}).get("parent_port_id") or None,
                     "physical_kind": kind,
                     "protocol": (
-                        "modbus_rtu" if role == "esr1001_strain" else protocols[0]
+                        "modbus_rtu" if role in {"esr1001_strain", "thermocouple64"} else protocols[0]
                     ),
                     "driver": (
                         "modbus_rtu_esr1001"
                         if role == "esr1001_strain"
-                        else None
+                        else "huipu_tc64_modbus_rtu" if role == "thermocouple64" else None
                     ),
                     "interface_detected": detected,
                     "driver_available": driver_available,
@@ -211,10 +207,14 @@ class LocalCaptureAgent:
                 "local_csv_save": True,
                 "local_mysql_save": True,
                 "esr1001_modbus_rtu": True,
+                "esr1001_usb_ttl": True,
+                "esr1001_raw_adc_capture": True,
+                "esr1001_calibration_v1": True,
+                "huipu_tc64_modbus_rtu": True,
                 "interface_roles": [item[0] for item in _ROLE_SPECS],
                 "drivers": [
                     "smrf_hid", "modbus_tcp", "uvc_thermal", "abb_robot",
-                    "m3232_pressure", "modbus_rtu_esr1001",
+                    "m3232_pressure", "modbus_rtu_esr1001", "esr1001_usb_ttl", "huipu_tc64_modbus_rtu",
                 ],
             },
             "warnings": [discovered["error"]] if discovered.get("error") else [],
@@ -379,6 +379,8 @@ class LocalCaptureAgent:
         return result
 
     def start_capture(self, config: Any) -> dict[str, Any]:
+        from esr1001_usb import require_helper_capabilities
+        require_helper_capabilities(config)
         if (
             str(getattr(config, "acquisition_mode", "")) == "real"
             and str(getattr(config, "real_acquisition_mode", "")) == "remote_helper"
@@ -590,6 +592,8 @@ class LocalCaptureAgent:
             }
 
     def check_capture(self, config: Any) -> dict[str, Any]:
+        from esr1001_usb import require_helper_capabilities
+        require_helper_capabilities(config)
         result = self.manager.test_connection(config)
         response = dict(result) if isinstance(result, dict) else {"ok": False, "result": result}
         response["device_readiness_contract"] = DEVICE_READINESS_CONTRACT
@@ -601,7 +605,7 @@ class LocalCaptureAgent:
                 **dict(getattr(config, "helper_capabilities", None) or {}),
                 "unified_frame_v1": True,
                 "unified_frame_v2": True,
-                "thermocouple64_hardware_gate": True,
+                "huipu_tc64_modbus_rtu": True,
                 "unified_frame_contract": "unified_frame_v2",
                 "device_readiness_contract": DEVICE_READINESS_CONTRACT,
                 "unified_device_readiness_v1": True,

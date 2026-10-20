@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import sys
 
-sys.path.append(r"F:\program\XJUsorceopen")  # 保持你原来的路径
+sys.path.append(r"D:\program\XJUsorceopen")
 from shijie.model_mine import I_modernTCN_GAT_abalation as train_model
 
 

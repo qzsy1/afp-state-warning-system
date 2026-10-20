@@ -54,10 +54,19 @@ class UnifiedDeviceReadinessTests(unittest.TestCase):
                 manager.start(config)
             checked = manager.test_connection(config)
             self.assertTrue(checked["ok"], checked)
+            snapshot = checked["readiness_snapshot"]
+            self.assertTrue(snapshot["ok"])
+            self.assertEqual(snapshot["expires_at"] - snapshot["checked_at"], 120.0)
+            self.assertEqual(manager.latest_check_result()["readiness_snapshot"], snapshot)
+            with patch("real_acquisition.time.time", return_value=snapshot["expires_at"] + 1):
+                with self.assertRaisesRegex(RuntimeError, "readiness snapshot expired"):
+                    manager.start(config)
+            start_new.assert_not_called()
+            manager.test_connection(config)
             self.assertTrue(manager.start(config)["running"])
             start_new.reset_mock()
             config.interfaces[0]["endpoint"] = "192.168.125.6:502"
-            with self.assertRaisesRegex(RuntimeError, "fingerprint"):
+            with self.assertRaisesRegex(RuntimeError, "readiness_required"):
                 manager.start(config)
             start_new.assert_not_called()
 

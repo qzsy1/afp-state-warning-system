@@ -8,8 +8,8 @@ integration, UI and configuration remain external.
 ## Source-mode checks
 
 ```powershell
-& "F:\program\channel_independent_MTSF-main\.venv\Scripts\python.exe" .\modular_runtime\launcher_entry.py --module-status
-& "F:\program\channel_independent_MTSF-main\.venv\Scripts\python.exe" .\modular_runtime\launcher_entry.py --self-test
+& "D:\program\channel_independent_MTSF-main\.venv\Scripts\python.exe" .\modular_runtime\launcher_entry.py --module-status
+& "D:\program\channel_independent_MTSF-main\.venv\Scripts\python.exe" .\modular_runtime\launcher_entry.py --self-test
 ```
 
 The packaged delivery also supports `--integration-smoke` for the embedded UI
@@ -60,7 +60,7 @@ http://127.0.0.1:8770`. The resulting
 computer restarts. Run `tailscale_funnel_watchdog.ps1 -Mode Install` from the
 delivery directory after the first Funnel succeeds; it keeps the origin,
 Funnel and local capture helper available and records status under
-`F:\softwawre\tailscale`. Its public-health decision resolves the hostname
+`D:\softwawre\tailscale`. Its public-health decision resolves the hostname
 through public DNS and forces HTTPS to a public edge address so split DNS or a
 tailnet-private route cannot report a false public success. Do not enable
 router port forwarding or open WAN port 8770.
@@ -70,7 +70,7 @@ HTTPS URL when unlocking from LAN or the Internet; direct LAN HTTP remains
 guest-only. Revoke any previously exposed SiliconFlow key, enter a newly
 created key locally, and verify it is absent from browser responses and logs.
 If Funnel is unavailable, continue with the local desktop or LAN guest URL and
-inspect `F:\softwawre\tailscale\funnel-status.json`. Installing the Funnel
+inspect `D:\softwawre\tailscale\funnel-status.json`. Installing the Funnel
 watchdog does not stop or unregister an existing public-ingress fallback. Only
 after a phone or second computer proves the new public URL may an operator
 explicitly retire the previous ingress. A changed temporary URL invalidates

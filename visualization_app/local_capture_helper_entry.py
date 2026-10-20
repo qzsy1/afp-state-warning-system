@@ -208,16 +208,14 @@ class HelperResultOutbox:
 
 
 def default_runtime_config_path() -> Path:
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    root = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
-    return root / "AFP_Local_Capture_Helper" / "config.json"
+    return Path("D:/AFP_Runtime/AFP_Local_Capture_Helper/config.json")
 
 
 def default_server_hint_path() -> Path:
     configured = os.environ.get("AFP_PUBLIC_TUNNEL_URL_FILE")
     if configured:
         return Path(configured)
-    return Path("F:/softwawre/tailscale/funnel-url.txt")
+    return Path("D:/softwawre/tailscale/funnel-url.txt")
 
 
 def load_current_server_hint(*, path: str | Path | None = None) -> str:
@@ -592,15 +590,19 @@ def helper_capabilities(server_url: str = "") -> dict[str, Any]:
         "simulation_replay_v1": True,
         "simulation_prefetch_v1": True,
         "unified_frame_v1": True,
+        "unified_frame_v2": True,
         "unified_frame_contract": RELEASE_CONTRACT.unified_frame_contract,
         "esr1001_modbus_rtu": True,
+        "esr1001_usb_ttl": True,
+        "esr1001_raw_adc_capture": True,
+        "esr1001_calibration_v1": True,
         "interface_roles": [
             "thermocouple_8ch", "plc_process", "uvc_temperature",
             "abb_motion", "m3232_pressure", "esr1001_strain",
         ],
         "drivers": [
             "smrf_hid", "modbus_tcp", "uvc_thermal", "abb_robot",
-            "m3232_pressure", "modbus_rtu_esr1001",
+            "m3232_pressure", "modbus_rtu_esr1001", "esr1001_usb_ttl",
         ],
         "local_mysql_profile": local_mysql_profile_metadata(),
     }

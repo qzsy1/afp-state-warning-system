@@ -150,7 +150,7 @@ def _candidate_paths(start: Path | None) -> tuple[Path, ...]:
     search_roots = [base, *base.parents]
     if getattr(sys, "frozen", False):
         executable_root = Path(sys.executable).resolve().parent
-        search_roots.extend((executable_root, *executable_root.parents))
+        search_roots = [executable_root, *executable_root.parents, *search_roots]
     for parent in dict.fromkeys(search_roots):
         candidates.append(parent / "RELEASE-MANIFEST.json")
         candidates.append(parent / "pre_sensor" / "release-contract.json")

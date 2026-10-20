@@ -904,6 +904,8 @@ class PublicWebHttpTests(unittest.TestCase):
                 "unified_frame_contract": contract.unified_frame_contract,
                 "configuration_schema_version": contract.configuration_schema_version,
                 "readiness_schema_version": contract.readiness_schema_version,
+                "device_readiness_contract": "plc_abb_uvc_readiness_v1",
+                "unified_device_readiness_v1": True,
             },
         })
         handler = self.server.RequestHandlerClass
@@ -1113,7 +1115,8 @@ class PublicWebHttpTests(unittest.TestCase):
         encoded = json.dumps(payload, ensure_ascii=False)
         self.assertNotIn("COM-secret", encoded)
         self.assertNotIn("secret driver path", encoded)
-        self.assertEqual(len(payload["interfaces"]), 5)
+        self.assertEqual(len(payload["interfaces"]), 6)
+        self.assertIn("esr1001_strain", {item["role"] for item in payload["interfaces"]})
 
     def test_guest_simulation_uses_server_profile_and_never_starts_hardware(self):
         self.request_json("GET", "/api/auth/session")
@@ -1213,7 +1216,7 @@ class PublicWebHttpTests(unittest.TestCase):
         self.assertEqual(
             {item["role"]: item["driver"] for item in acquisition.get("interface_defaults", [])},
             {
-                "thermocouple64": "thermocouple64_protocol_pending",
+                "thermocouple64": "huipu_tc64_modbus_rtu",
                 "plc": "modbus_tcp",
                 "thermal_uvc": "uvc_thermal",
                 "robot": "abb_robot",

@@ -337,6 +337,7 @@ def readiness_config_fingerprint(config: Any) -> str:
                 "source_address", "device_subnet", "network_interface_name",
                 "profile_id", "profile_version", "protocol_verified",
                 "channel_types", "channel_types_confirmed", "roi", "dll_path",
+                "data_mode", "channel_count", "calibration_digest", "calibration_profile", "bridge",
             )
         }
         interface_facts.update({
@@ -600,6 +601,12 @@ class ChannelSampleCache:
             self._latest[sample.channel_name] = sample
             self._updates[sample.channel_name] += 1
 
+    def publish_batch(self, samples: Iterable[ChannelSample]) -> None:
+        """同一次源观测的各通道对快照读者原子可见。"""
+        with self._lock:
+            for sample in samples:
+                self.publish(sample)
+
     def latest(self, channel_name: str) -> ChannelSample | None:
         with self._lock:
             return self._latest.get(channel_name)
@@ -622,6 +629,10 @@ class ChannelSampleCache:
     def snapshot(self) -> dict[str, ChannelSample]:
         with self._lock:
             return dict(self._latest)
+
+    def snapshot_at_or_before(self, channels: Iterable[str], deadline: float) -> dict[str, ChannelSample | None]:
+        with self._lock:
+            return {name: self.latest_at_or_before(name, deadline) for name in channels}
 
     def events(self) -> tuple[ChannelSample, ...]:
         """Return the bounded diagnostic window without exposing mutable storage."""
@@ -875,6 +886,9 @@ class UnifiedFrame:
                 "protocol_ok": sample.protocol_ok,
                 "error": sample.error,
             }
+            if sample.metadata.get("driver") == "esr1001_usb_ttl":
+                metadata["adc_source"] = dict(sample.metadata.get("latest_record") or {})
+                metadata["calibration_digest"] = sample.metadata.get("calibration_digest")
             if any(value not in (None, "") for value in metadata.values()):
                 source[str(index)] = metadata
         return {
@@ -1035,6 +1049,7 @@ class UnifiedFrame:
                 ),
                 protocol_ok=item.get("protocol_ok"),
                 error=str(item.get("error") or ""),
+                metadata={"adc_source": item.get("adc_source"), "calibration_digest": item.get("calibration_digest")},
             )
         return cls(
             capture_sequence=sequence,
@@ -1131,8 +1146,9 @@ class FrameAssembler:
         if missed:
             self.deadline_misses += 1
         channel_values: dict[str, ChannelSample] = {}
+        sources = cache.snapshot_at_or_before(self.channels, deadline)
         for channel in self.channels:
-            source = cache.latest_at_or_before(channel, deadline)
+            source = sources[channel]
             if source is None:
                 channel_values[channel] = ChannelSample(
                     interface_id="",

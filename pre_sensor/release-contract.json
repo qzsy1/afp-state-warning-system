@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
   "identity": {
-    "application_version": "2.0.5-rc.1",
-    "helper_version": "2.0.5-rc.1",
-    "launcher_version": "2.0.5-rc.1",
-    "release_revision": "complete-pre-sensor-readiness-v1"
+    "application_version": "2.0.5-rc.2",
+    "helper_version": "2.0.5-rc.2",
+    "launcher_version": "2.0.5-rc.2",
+    "release_revision": "esr1001-native-usb-v1"
   },
   "contracts": {
     "helper_protocol_version": 2,
@@ -57,9 +57,10 @@
       }
     ],
     "drivers": [
-      {"id": "thermocouple64_protocol_pending", "required_for": "thermocouple64", "release_gate": "hardware_facts_and_protocol_required"},
+      {"id": "huipu_tc64_modbus_rtu", "required_for": "thermocouple64", "release_gate": "protocol_readback_and_physical_acceptance_required"},
       {"id": "serial_port", "required_for": "m3232_pressure"},
       {"id": "modbus_rtu_esr1001", "required_for": "esr1001_strain"},
+      {"id": "esr1001_usb_ttl", "required_for": "esr1001_strain_usb", "capabilities": ["esr1001_raw_adc_capture", "esr1001_calibration_v1"], "source_file": "app/legacy/esr1001_usb.py"},
       {"id": "ethernet", "required_for": "plc_process_and_abb_motion"},
       {"id": "uvc", "required_for": "uvc_temperature"}
     ]

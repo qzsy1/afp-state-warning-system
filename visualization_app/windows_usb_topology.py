@@ -1019,13 +1019,10 @@ def _host_port_registry_path() -> Path | None:
     override = str(os.environ.get("AFP_USB_HOST_PORT_REGISTRY") or "").strip()
     if override:
         return Path(override).expanduser()
-    local_app_data = str(os.environ.get("LOCALAPPDATA") or "").strip()
-    if local_app_data:
-        return Path(local_app_data) / "AFP_Integrated_System" / "usb_host_ports.json"
     runtime_dir = str(os.environ.get("AFP_RUNTIME_DIR") or "").strip()
     if runtime_dir:
         return Path(runtime_dir) / "usb_host_ports.json"
-    return None
+    return Path("D:/AFP_Runtime/AFP_Integrated_System_Modular/runtime/usb_host_ports.json")
 
 
 def _load_known_host_port_ids(path: Path | None) -> set[str]:

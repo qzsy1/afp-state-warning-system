@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$PythonExecutable,
-    [string]$OutputRoot = (Join-Path $env:TEMP "AFP_Modular_Launcher_v2")
+    [string]$OutputRoot = "D:\AFP_Runtime\.afp-staging\AFP_Modular_Launcher_v2"
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,7 +16,7 @@ foreach ($required in @($PythonExecutable, $LauncherEntry)) {
     }
 }
 
-$resolvedTemp = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\')
+$resolvedTemp = [IO.Path]::GetFullPath("D:\AFP_Runtime\.afp-staging").TrimEnd('\')
 $resolvedOutput = [IO.Path]::GetFullPath($OutputRoot).TrimEnd('\')
 if (-not $resolvedOutput.StartsWith($resolvedTemp + '\', [StringComparison]::OrdinalIgnoreCase)) {
     throw "Unsafe launcher build directory: $resolvedOutput"

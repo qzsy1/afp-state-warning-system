@@ -352,6 +352,10 @@ def helper_real_capture_payload(
     clean["execution_host"] = "helper_local"
     clean["helper_session_id"] = str(helper_session_id or "")
     clean["helper_capabilities"] = dict(helper_capabilities or {})
+    if helper_capabilities is not None and str(clean.get("acquisition_mode") or "real") == "real":
+        from types import SimpleNamespace
+        from esr1001_usb import require_helper_capabilities
+        require_helper_capabilities(SimpleNamespace(**clean))
     return clean
 
 
@@ -731,12 +735,14 @@ LIVE_SENSOR_UNITS = {
     "ABB_Y": "mm",
     "ABB_Z": "mm",
     **{f"温度{index}": "°C" for index in range(1, 9)},
+    **{f"CH{index}_ADC_signed": "adc_counts" for index in range(1, 5)},
+    **{f"应变{index}": "με" for index in range(1, 5)},
 }
 NEW_DEMO_ROOT = Path(
     os.environ.get("AFP_NEW_DEMO_DIR") or APP_DIR / "new_collection_demo_v11_3"
 ).resolve()
 SUPPLIED_SIMULATION_SOURCE = Path(
-    r"F:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv"
+    r"D:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv"
 ).resolve()
 THERMOCOUPLE64_SIMULATION_SOURCE = (
     APP_DIR / "simulation_packages" / "thermocouple64_v13_0" / "quick_240.csv"
@@ -1138,7 +1144,7 @@ class DashboardData:
         self.live_layer_health_path = (
             self.acquisition.capture_root / "specimen_layer_health.json"
         )
-        self.web_training = WebTrainingManager(Path(r"F:\AFP_Training_Models"))
+        self.web_training = WebTrainingManager(Path(r"D:\AFP_Training_Models"))
         self.live_layer_health = self._load_live_layer_health()
 
         if len(self.windows) != len(self.actual) or len(self.index) != len(self.actual):

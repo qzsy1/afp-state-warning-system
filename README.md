@@ -2,12 +2,15 @@
 
 本项目面向自动铺丝（AFP）过程，集成多接口传感器采集、模拟回放、时序预测、在线健康指标、窗口级—铺层级—试样级状态预警、CSV/MySQL 保存、数据整合以及预测/预警模型训练。
 
-当前开发分支 `feature/modular-runtime-v2` 已完成模块化改造：桌面 EXE 作为稳定启动器，采集、驱动、存储、预测、健康指标、预警、训练、数据整合、界面和配置均保留为外部模块。普通业务修改不再需要重新生成整个 EXE。
+当前最新验收版本为 `2.0.5-rc.2`，Git 标签为 `v2.0.5-rc.2-joint-acquisition-20261020`，保留在本机任务分支 `codex/pc-b/integrate-tc64-vendor-protocol`。正式交付标识为 `2.0.5-rc.2-0dc42c4f2e45-wt01f6ff50-20261020T005627Z`，对应源码修订为 `0dc42c4f2e45+working-tree.01f6ff50b0bc`；文件摘要以 `harness/config/delivery-readonly-baseline.json` 为准。
+
+桌面 EXE 作为稳定启动器，采集、驱动、存储、预测、健康指标、预警、训练、数据整合、界面和配置均保留为外部模块。普通业务修改不再需要重新生成整个 EXE。
 
 ## 主要功能
 
-- 当前 `new_collection_v12_0` 采集模式包含六个逻辑接口和 21 个传感器通道；模型仍按检查点元数据使用 16 个输入通道；
-- ESR1001-A 通过独立 RS485 串口以 Modbus RTU 读取四个微应变通道；
+- 当前 `new_collection_v13_0` 完整采集模式包含六个逻辑接口和 77 个传感器通道；历史采集模式保持兼容，模型按检查点元数据选择输入；
+- ESR1001-A 支持原生 USB/TTL 和独立 RS485 Modbus RTU；正常方案可与 PLC、ABB 联合采集，未确认标定时四路数据独立命名为 `CH1_ADC_signed`～`CH4_ADC_signed`，单位为 `adc_counts`，使用仅采集模式；合法标定后才输出 `应变1`～`应变4 / με`；
+- 正常与 ADC 诊断方案分别保存接口协议、物理绑定、启用状态和数据模式，检查与启动使用当前配置；
 - 真实采集与模拟采集严格分离，支持多接口、接口角色和通道双向映射；
 - CSV 单文件、采集文件夹和采集格式 MySQL 数据源；
 - 多算法预测模型与权重匹配，支持预测步长 1–600；
@@ -54,7 +57,7 @@ AFP_Integrated_System_Modular.exe --functional-smoke
 
 完整 Windows 软件文件夹可直接复制到其它 Windows 电脑，目标电脑不需要另装 Python 或 PyTorch，但必须保持 EXE、`_internal`、`app`、`config`、`models` 和 `native_dll` 的相对位置。使用 MySQL 时需要可访问的 MySQL Server；使用真实传感器时需要相应设备、驱动、通信参数与权限。
 
-本机只维护一个受支持的完整运行目录：`F:\new_AFP_exam\AFP_Integrated_System_Modular`。源码固定在 `F:\new_AFP_exam\AFP-Readiness-Repo`，脱敏证据固定在 `F:\new_AFP_exam\AFP-Main-Evidence`。构建中间产物只能进入 `F:\new_AFP_exam\.afp-staging`，发布完成或失败后受控清理；candidate ID 只作为 manifest 和审计身份，不再作为长期目录名。
+本机只维护一个受支持的完整运行目录：`D:\AFP_Runtime\AFP_Integrated_System_Modular`。源码固定在 `D:\AFP_Integrated_Modular_v2`，脱敏证据固定在 `D:\AFP_Runtime\AFP-Main-Evidence`。构建中间产物只能进入 `D:\AFP_Runtime\.afp-staging`，发布完成或失败后受控清理；candidate ID 只作为 manifest 和审计身份，不再作为长期目录名。
 
 另一台电脑首次同步需要安装 Git LFS：
 
@@ -71,8 +74,8 @@ git lfs pull
 git switch main
 git pull --ff-only origin main
 git lfs pull
-& 'F:\new_AFP_exam\AFP_Integrated_System_Modular\AFP_Integrated_System_Modular.exe' --verify-files
-& 'F:\new_AFP_exam\AFP_Integrated_System_Modular\AFP_Integrated_System_Modular.exe' --self-test
+& 'D:\AFP_Runtime\AFP_Integrated_System_Modular\AFP_Integrated_System_Modular.exe' --verify-files
+& 'D:\AFP_Runtime\AFP_Integrated_System_Modular\AFP_Integrated_System_Modular.exe' --self-test
 ```
 
 更新流程先在 `.afp-staging` 完成组装、完整性、自检和模块检查；随后输出准确的监听进程、目录、影响和恢复方法，等待“切换审批”。只有明确批准后才停止已锁定的旧 AFP 进程，并以同卷目录交换方式提升到固定运行目录。服务门禁全部通过后，启动项修改仍需单独授权。
@@ -83,4 +86,4 @@ git lfs pull
 
 模拟采集、OOD 和弱标签预警只表示模型或协议证据，不等同于真实传感器或真实双机验收。只有尚未执行的真实传感器现场项可以标记 `physical_sensor_pending`；Helper、网络、MySQL、Windows readiness 等未完成项必须使用 `blocked` 或 `failed`。生产部署和论文结论应使用真实传感器、独立缺陷检测或力学性能证据重新确认阈值、精度和适用范围。
 
-ESR1001-A 现场接线使用设备独占的 USB-RS485 或原生串口，参数为 9600、8N1、默认从站地址 1。必须核对 A/B 极性、总线终端条件和设备固件对 FC04 `0x0030` 实数寄存器的支持；软件测试通过不替代逐通道已知输入和 600 秒实物验收。
+ESR1001-A 原生 USB/TTL 使用 115200、8N1，通过实际枚举、物理绑定、合法参数应答和四路数据确认设备。RS485 使用独占串口、9600、8N1、默认从站地址 1，并核对 A/B 极性、总线终端条件和设备固件对 FC04 `0x0030` 实数寄存器的支持。实物连续采集、拔插恢复、标定换算与量值精度按各自证据判定。

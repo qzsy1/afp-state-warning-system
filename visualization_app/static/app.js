@@ -788,21 +788,31 @@ function applySensorTypeProfile(row, resetEndpoint = true) {
   const baudrate = row.querySelector(".interface-baudrate");
   const detail = row.querySelector(".interface-profile-detail");
   const profile = sensorTypeProfile(role?.value || "custom");
+  const strain = role?.value === "esr1001_strain";
   if (driver) {
-    driver.value = profile.driver || "serial_json";
-    driver.disabled = !profile.editable_driver;
+    if (!strain || resetEndpoint || !["modbus_rtu_esr1001", "esr1001_usb_ttl"].includes(driver.value)) driver.value = profile.driver || "serial_json";
+    driver.disabled = !profile.editable_driver && !strain;
   }
+  const usb = strain && driver?.value === "esr1001_usb_ttl";
   if (endpoint && (resetEndpoint || !endpoint.value.trim())) {
     endpoint.value = profile.endpoint || "";
   }
-  if (baudrate && profile.baudrate) baudrate.value = String(profile.baudrate);
-  row.dataset.slaveId = String(profile.slave_id || row.dataset.slaveId || 1);
+  if (usb && baudrate) baudrate.value = "115200";
+  else if (baudrate && profile.baudrate && (resetEndpoint || !Number(baudrate.value) || (!strain && profile.id !== "thermocouple64"))) baudrate.value = String(profile.baudrate);
+  row.querySelector(".interface-usb-options")?.classList.toggle("hidden", !usb);
+  row.dataset.slaveId = String((resetEndpoint ? profile.slave_id : row.dataset.slaveId) || profile.slave_id || 1);
+  const slave = row.querySelector(".interface-slave-id");
+  if (slave) {
+    if (resetEndpoint) slave.value = row.dataset.slaveId;
+    slave.closest(".interface-slave-label")?.classList.toggle("hidden", usb || !["thermocouple64", "esr1001_strain"].includes(role?.value));
+  }
   if (map) map.disabled = !profile.editable_driver;
   if (mapLabel) mapLabel.classList.toggle("hidden", !profile.editable_driver);
   if (detail) {
-    const channels = (profile.channels || []).join("、")
+    const channels = (usb && row.querySelector(".interface-data-mode")?.value === "raw_adc" ? ["CH1_ADC_signed", "CH2_ADC_signed", "CH3_ADC_signed", "CH4_ADC_signed"] : profile.channels || []).join("、")
       || (profile.id === "thermal_rtsp" ? "无数值通道（仅视频）" : "需显式映射");
-    detail.textContent = `数据通道：${channels}；${profile.processing || ""}`;
+    const processing = usb ? "原生USB/TTL 115200-8-N-1；连续上传四路有符号24位ADC；微应变需要有效逐通道K/B" : profile.processing || "";
+    detail.textContent = `数据通道：${channels}；${processing}`;
   }
 }
 
@@ -1400,7 +1410,7 @@ function updateDatasetMeta() {
   const schema = state.bootstrap.acquisition.schemas.find(
     (item) => item.id === (controls.datasetSchema.value || "legacy_original")
   );
-  const sensorCount = schema?.sensors?.length || 0;
+  const sensorCount = schema ? effectiveDatasetSensors(schema).length : 0;
   const schemaLabel = schema?.label || controls.datasetSchema.value;
   const captureOnly = controls.processingMode.value === "capture_only";
   const algorithm = controls.predictionModelType?.selectedOptions?.[0]?.textContent
@@ -2553,12 +2563,13 @@ async function startAcquisition() {
         throw new Error("接口与传感器通道检查正在进行，请等待检查完成");
       }
       const fingerprint = hardwareConfigFingerprint();
-      if (!state.hardwareCheck || state.hardwareCheckFingerprint !== fingerprint || !state.hardwareCheck.ok) {
-        const check = await testSensorConnection({automatic: false});
+      if (!hardwareCheckIsCurrent(fingerprint)) {
+        const check = await testSensorConnection({automatic: true});
         if (!check?.ok) {
           throw new Error("接口或传感器通道检查未通过，已阻止开始采集；请按上方异常明细处理后重检");
         }
       }
+      requireUnchangedHardwareCheck();
     }
     const nextScope = liveEvidenceScopeKey();
     if (state.liveScopeKey !== null && nextScope !== state.liveScopeKey) {
@@ -2571,18 +2582,43 @@ async function startAcquisition() {
     const executionHost = simulation
       ? (simulationSelection?.execution_host || "server")
       : (helperBackedCapture ? "helper_local" : "server");
-    const captureConfig = {
+    const captureConfig = () => ({
       ...acquisitionConfig(),
       execution_host: executionHost,
       ...(simulationSelection?.explicit_fallback
         ? {simulation_execution_choice: "server_explicit"}
         : {}),
-    };
-    const result = helperBackedCapture
-      ? await requestLocalHelper("start_capture", captureConfig, {
+    });
+    const sendStart = () => helperBackedCapture
+      ? requestLocalHelper("start_capture", captureConfig(), {
         timeoutMs: helperBackedSimulation ? 10000 : 30000,
       })
-      : await postJson("/api/acquisition/start", captureConfig);
+      : postJson("/api/acquisition/start", captureConfig());
+    let result;
+    try {
+      result = await sendStart();
+    } catch (error) {
+      if (simulation || !isRecoverableReadinessError(error)) throw error;
+      state.hardwareCheck = null;
+      state.hardwareCheckFingerprint = "";
+      const check = await testSensorConnection({automatic: true});
+      if (!check?.ok) {
+        throw new Error("启动前自动重检未通过，已阻止采集；请按接口和通道检查明细处理后重检");
+      }
+      requireUnchangedHardwareCheck();
+      try {
+        result = await sendStart();
+      } catch (retryError) {
+        if (!isRecoverableReadinessError(retryError)) throw retryError;
+        state.hardwareCheck = null;
+        state.hardwareCheckFingerprint = "";
+        throw new Error("接口检查结果在启动前失效，自动重检后仍无法启动，请重新检查接口后再试");
+      }
+    }
+    if (!simulation) {
+      state.hardwareCheck = null;
+      state.hardwareCheckFingerprint = "";
+    }
     if (helperBackedCapture) validateHelperStartResult(result);
     state.acquisitionExecutionHost = executionHost;
     result.execution_host = result.execution_host || executionHost;
@@ -2975,12 +3011,106 @@ function configureProcessingMode() {
   if (controls.dataMode.value === "live") loadRealtime();
 }
 
+function datasetInterfacePreferenceKey() {
+  return `afp-interface-plans-v1:${usesLocalCaptureHelper() ? "helper_local" : "server"}`;
+}
+
+function saveDatasetInterfacePreferences() {
+  if (!state.activeInterfaceSchema || controls.acquisitionMode?.value === "simulation") return;
+  const fields = ["id", "enabled", "role", "driver", "endpoint", "baudrate", "slave_id",
+    "data_mode", "calibration_profile", "bridge", "channel_count", "channel_map",
+    "physical_interface_id", "physical_port_id", "physical_interface_kind", "physical_transport_family", "selection_origin"];
+  const interfaces = interfaceConfigs().interfaces.map(item => Object.fromEntries(
+    fields.filter(key => item[key] !== undefined).map(key => [key, item[key]])
+  ));
+  state.datasetInterfacePreferences ||= {};
+  state.datasetInterfacePreferences[state.activeInterfaceSchema] = {
+    interfaces, processingMode: controls.processingMode.value,
+    mysqlEnabled: Boolean(controls.mysqlEnabled?.checked),
+    mysqlLocalEnabled: Boolean(controls.mysqlLocalEnabled?.checked),
+  };
+  try {
+    localStorage.setItem(datasetInterfacePreferenceKey(), JSON.stringify({
+      active: state.activeInterfaceSchema, plans: state.datasetInterfacePreferences,
+    }));
+  } catch (_error) { /* 浏览器禁止本地存储时保留当前页面配置。 */ }
+}
+
+function loadDatasetInterfacePreferences() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(datasetInterfacePreferenceKey()) || "null");
+    if (!saved?.plans || !state.bootstrap.acquisition.schemas.some(item => item.id === saved.active)) return;
+    state.datasetInterfacePreferences = saved.plans;
+    state.restoredInterfaceSchema = saved.active;
+    state.interfaceCatalog = saved.plans[saved.active]?.interfaces || [];
+    state.restoringInterfacePreferences = true;
+  } catch (_error) { /* 无效缓存不提供就绪授权。 */ }
+}
+
+function switchDatasetInterfacePreferences(schemaId) {
+  if (controls.acquisitionMode?.value === "simulation" || state.activeInterfaceSchema === schemaId) return;
+  saveDatasetInterfacePreferences();
+  const saved = state.datasetInterfacePreferences?.[schemaId];
+  state.activeInterfaceSchema = schemaId;
+  if (saved?.interfaces?.length) {
+    state.interfaceCatalog = autoAssignPhysicalInterfaces(saved.interfaces.map(item => ({...item})));
+    renderInterfacePanel(state.interfaceCatalog);
+    controls.processingMode.value = saved.processingMode || "capture_only";
+    if (controls.mysqlEnabled) controls.mysqlEnabled.checked = Boolean(saved.mysqlEnabled);
+    if (controls.mysqlLocalEnabled) controls.mysqlLocalEnabled.checked = Boolean(saved.mysqlLocalEnabled);
+  } else {
+    applyDatasetInterfaceRequirements(schemaId);
+  }
+  markHardwareCheckStale("方案配置已恢复，请重新检查");
+}
+
+function effectiveDatasetSensors(schema) {
+  const rows = [...(controls.interfacePanel?.querySelectorAll(".interface-config-row") || [])];
+  const raw = controls.acquisitionMode?.value !== "simulation" && rows.some(row =>
+    row.querySelector(".interface-enabled")?.checked !== false
+    && row.querySelector(".interface-driver")?.value === "esr1001_usb_ttl"
+    && row.querySelector(".interface-data-mode")?.value === "raw_adc");
+  if (!raw || !isModernSchemaId(schema.id)) return schema.sensors;
+  const channels = ["CH1_ADC_signed", "CH2_ADC_signed", "CH3_ADC_signed", "CH4_ADC_signed"];
+  const sensors = schema.sensors.map(name => /^应变[1-4]$/.test(name) ? channels[Number(name.slice(-1)) - 1] : name);
+  return sensors.includes(channels[0]) ? sensors : [...channels, ...sensors];
+}
+
+function applyDatasetInterfaceRequirements(schemaId) {
+  if (String(schemaId || "") !== "esr1001_raw_adc") return;
+
+  controls.processingMode.value = "capture_only";
+  if (controls.mysqlEnabled) controls.mysqlEnabled.checked = false;
+  if (controls.mysqlLocalEnabled) controls.mysqlLocalEnabled.checked = false;
+  if (controls.acquisitionMode?.value === "simulation") return;
+
+  const rows = [...(controls.interfacePanel?.querySelectorAll(".interface-config-row") || [])];
+  rows.forEach((row) => {
+    const role = row.querySelector(".interface-role")?.value || "";
+    const enabled = row.querySelector(".interface-enabled");
+    const isEsr1001 = role === "esr1001_strain";
+    if (enabled) enabled.checked = isEsr1001;
+    if (!isEsr1001) return;
+
+    const driver = row.querySelector(".interface-driver");
+    const baudrate = row.querySelector(".interface-baudrate");
+    const dataMode = row.querySelector(".interface-data-mode");
+    if (driver) driver.value = "esr1001_usb_ttl";
+    if (baudrate) baudrate.value = "115200";
+    if (dataMode) dataMode.value = "raw_adc";
+    applySensorTypeProfile(row, false);
+  });
+  refreshInterfaceCardsForSelection();
+}
+
 function configureDatasetSchema(useDefaults = true) {
   const schema = state.bootstrap.acquisition.schemas.find(
     (item) => item.id === controls.datasetSchema.value
   );
   if (!schema) return;
-  if (useDefaults && schema.id === "new_collection_v13_0") {
+  switchDatasetInterfacePreferences(schema.id);
+  const effectiveSensors = effectiveDatasetSensors(schema);
+  if (useDefaults && schema.id === "new_collection_v13_0" && !state.datasetInterfacePreferences?.[schema.id]) {
     controls.processingMode.value = "capture_only";
     $("acquisitionSection").open = true;
     $("sensorSettingsSection").open = true;
@@ -3005,11 +3135,11 @@ function configureDatasetSchema(useDefaults = true) {
     : "自动建立“试样名_p功率_v速度_pr压实力”文件夹，同时保存分层文件、完整试样快照和采集记录。";
   document.querySelector(".save-rule-note").textContent =
     "文件夹按工况与独立重复命名；每层保留分层文件，完整试样始终覆盖为同一份当前数据文件。";
-  buildSensorChecklist(schema.sensors);
+  buildSensorChecklist(effectiveSensors);
   if (controls.acquisitionMode?.value === "simulation" && state.simulationSourceChannels.length) {
     autoEnableSimulationChannels(state.simulationSourceChannels);
   }
-  controls.sensor.replaceChildren(...schema.sensors.map((name, index) =>
+  controls.sensor.replaceChildren(...effectiveSensors.map((name, index) =>
     option(index, name)
   ));
   controls.sensor.value = "0";
@@ -3061,6 +3191,7 @@ function configureDatasetSchema(useDefaults = true) {
   configureProcessingMode();
   configureAutomaticIndicator(true);
   updateDatasetMeta();
+  saveDatasetInterfacePreferences();
 }
 
 function configureDataMode() {
@@ -4504,6 +4635,7 @@ async function initialize() {
     state.bootstrap = payload;
     state.defaults = payload.defaults;
     state.sensorTypeProfiles = payload.acquisition.sensor_types || [];
+    loadDatasetInterfacePreferences();
     populatePredictionModelTypes();
     controls.specimen.replaceChildren(...payload.specimens.map((item) =>
       option(item.id, `${item.id} · ${item.true_state_label}`)
@@ -4554,6 +4686,7 @@ async function initialize() {
     ) ? "new_collection_v12_0" : payload.acquisition.schemas.some(
       (item) => item.id === "new_collection_v11_3"
     ) ? "new_collection_v11_3" : "legacy_original";
+    if (state.restoredInterfaceSchema) controls.datasetSchema.value = state.restoredInterfaceSchema;
     configureDatasetSchema(true);
     state.liveScopeKey = liveEvidenceScopeKey();
     controls.dataMode.value = payload.defaults.data_mode || "live";
@@ -5360,6 +5493,12 @@ initializeVerticalPanelResizer();
 initializeSensorPanelResizer();
 initializeSensorChecklistResizer();
 initializeThermocouple64Controls();
+document.addEventListener("change", (event) => {
+  if (event.target?.closest?.(".interface-config-row") || [controls.processingMode, controls.mysqlEnabled, controls.mysqlLocalEnabled].includes(event.target)) {
+    saveDatasetInterfacePreferences();
+  }
+});
+window.addEventListener("beforeunload", saveDatasetInterfacePreferences);
 initialize();
 
 // Unified sensor-interface cards.  The legacy driver/endpoint fields remain
@@ -5409,7 +5548,12 @@ function interfaceConfigs() {
       driver: row.querySelector(".interface-driver")?.value || "serial_json",
       endpoint: row.querySelector(".interface-endpoint")?.value?.trim() || "",
       baudrate: Number(row.querySelector(".interface-baudrate")?.value) || 115200,
-      slave_id: Number(row.dataset.slaveId || 1),
+      slave_id: Number(row.querySelector(".interface-slave-id")?.value ?? row.dataset.slaveId ?? 1),
+      data_mode: row.querySelector(".interface-data-mode")?.value || "raw_adc",
+      calibration_profile: (()=>{const text=row.querySelector(".interface-calibration")?.value?.trim() || ""; return text.startsWith("{") ? JSON.parse(text) : text || null;})(),
+      calibration_digest: (state.hardwareCheck?.interfaces || []).find(item=>item.id===row.dataset.interfaceId)?.usb_evidence?.calibration_digest || "",
+      bridge: row.querySelector(".interface-bridge")?.value?.trim() || "",
+      channel_count: 4,
       physical_interface_id: selectedPhysical?.dataset?.liveId
         || (!selectedPhysical?.dataset?.portId ? physicalSelect?.value || "" : ""),
       physical_port_id: selectedPhysical?.dataset?.portId || "",
@@ -5419,7 +5563,7 @@ function interfaceConfigs() {
       physical_verified: selectedPhysical?.dataset?.detected === "true",
       physical_fallback: selectedPhysical?.dataset?.fallback === "true",
       credential_identifier: String(catalogItem.credential_identifier || ""),
-      device_identity: parseDatasetObject(selectedPhysical?.dataset?.deviceIdentity),
+      device_identity: parseDatasetObject(selectedPhysical?.dataset?.deviceIdentity || JSON.stringify(catalogItem.device_identity || {})),
       driver_state: parseDatasetObject(selectedPhysical?.dataset?.driverState),
       device_profile: catalogItem.device_profile || {},
       selection_origin: row.dataset.selectionOrigin || "manual",
@@ -5466,6 +5610,7 @@ function currentInterfaceItems() {
       id: row.dataset.interfaceId,
       role: row.querySelector(".interface-role")?.value || "other",
       driver: row.querySelector(".interface-driver")?.value || "serial_json",
+      data_mode: row.querySelector(".interface-data-mode")?.value || "raw_adc",
       endpoint: row.querySelector(".interface-endpoint")?.value?.trim() || "",
       enabled: row.querySelector(".interface-enabled")?.checked !== false,
     }))
@@ -5476,7 +5621,7 @@ function defaultInterfaceForChannel(channel) {
   const items = currentInterfaceItems();
   const preferred = items.find((item) => {
     const profile = sensorTypeProfile(item.role);
-    return (profile.channels || []).includes(channel);
+    return interfaceAcceptsChannel(item, channel);
   }) || items.find((item) => sensorTypeProfile(item.role).editable_driver);
   return (preferred || items[0])?.id || "";
 }
@@ -5490,7 +5635,7 @@ function refreshInterfaceEndpointOptions() {
     });
 }
 
-const USB_SENSOR_ROLES = new Set(["thermocouple", "thermal_uvc", "pressure", "esr1001_strain"]);
+const USB_SENSOR_ROLES = new Set(["thermocouple", "thermocouple64", "thermal_uvc", "pressure", "esr1001_strain"]);
 
 function interfaceTransportFamily(item) {
   const explicit = String(item?.transport_family || "");
@@ -5644,7 +5789,7 @@ function physicalCandidatesForRole(role) {
     .map((item) => ({...item, kind: item.kind || item.interface_kind || item.type || ""}));
   if (USB_SENSOR_ROLES.has(role)) {
     const candidates = usbPhysicalCandidatesForRole(role);
-    if (role === "pressure" || role === "esr1001_strain") {
+    if (role === "pressure" || role === "esr1001_strain" || role === "thermocouple64") {
       physical.filter((item) => interfaceTransportFamily(item) === "serial_native")
         .forEach((item) => candidates.push({
           ...item,
@@ -5723,6 +5868,7 @@ function autoAssignPhysicalInterfaces(configs, {allowSerialFallback = true} = {}
     let selected = desired ? candidates.find((candidate) =>
       [candidate.id, candidate.physical_port_id, candidate.physical_interface_id].map(String).includes(desired),
     ) : null;
+    if (!selected && role === "esr1001_strain" && item.driver === "esr1001_usb_ttl") return;
     if (!selected && desired && ["manual", "saved"].includes(item.selection_origin)) {
       const keptResource = String(item.physical_port_id || item.physical_interface_id || "");
       if (keptResource && !(role === "plc" || role === "robot")) used.add(keptResource);
@@ -5757,7 +5903,7 @@ function autoAssignPhysicalInterfaces(configs, {allowSerialFallback = true} = {}
     ) {
       item.endpoint = selected.endpoint;
     }
-    item.enabled = true;
+    item.enabled = item.enabled !== false;
     if (interfaceTransportFamily(selected) === "ethernet") assigned.ethernet = selected;
     if (!(role === "plc" || role === "robot")) used.add(resourceId(selected));
   });
@@ -5869,8 +6015,7 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
     : "请选择实际接口；允许先选择空端口，正式启动仍需通过设备与数据检查";
   const enabled = row.querySelector(".interface-enabled");
   if (enabled) {
-    enabled.disabled = !selected?.value;
-    if (enabled.disabled) enabled.checked = false;
+    enabled.disabled = false;
   }
   let warning = row.querySelector(".interface-physical-warning");
   if (!warning) {
@@ -5895,7 +6040,7 @@ function defaultInterfaceCatalog() {
   return [
     {
       id: "thermocouple_64ch", enabled: true, role: "thermocouple64",
-      driver: "thermocouple64_protocol_pending", endpoint: "",
+      driver: "huipu_tc64_modbus_rtu", endpoint: "", baudrate: 115200, slave_id: 1,
       channels: Array.from({length: 64}, (_, index) => `温度${index + 1}`), channel_map: {},
     },
     { id: "plc_process", enabled: true, role: "plc", driver: "modbus_tcp", endpoint: "192.168.125.5:502", channel_map: {} },
@@ -5963,14 +6108,31 @@ function renderInterfacePanel(configs) {
     const canonicalRole = item.role === "thermal" ? (item.driver === "rtsp_thermal" ? "thermal_rtsp" : "thermal_uvc") : (["other", "new_sensor"].includes(item.role) ? "custom" : item.role);
     role.value = state.sensorTypeProfiles.some((profile) => profile.id === canonicalRole) ? canonicalRole : "custom";
     const driver = document.createElement("select"); driver.className = "interface-driver";
-    [["thermocouple64_protocol_pending", "64路热电偶协议待确认"], ["smrf_hid", "SMRF USB HID"], ["serial_json", "串口 JSON"], ["tcp_json", "TCP JSON"], ["modbus_tcp", "Modbus TCP(PLC)"], ["modbus_rtu_esr1001", "ESR1001-A Modbus RTU"], ["abb_robot", "ABB RWS"], ["uvc_thermal", "BSV UVC热像仪"], ["rtsp_thermal", "IP热像仪 RTSP"], ["m3232_pressure", "M3232薄膜压力"], ["simulator", "CSV 模拟"]].forEach(([value, text]) => {
+    [["huipu_tc64_modbus_rtu", "慧谱TCP64 64路 Modbus RTU"], ["smrf_hid", "SMRF USB HID"], ["serial_json", "串口 JSON"], ["tcp_json", "TCP JSON"], ["modbus_tcp", "Modbus TCP(PLC)"], ["modbus_rtu_esr1001", "ESR1001-A Modbus RTU"], ["abb_robot", "ABB RWS"], ["uvc_thermal", "BSV UVC热像仪"], ["rtsp_thermal", "IP热像仪 RTSP"], ["m3232_pressure", "M3232薄膜压力"], ["simulator", "CSV 模拟"]].forEach(([value, text]) => {
       const option = document.createElement("option"); option.value = value; option.textContent = text; driver.append(option);
     });
     driver.value = item.driver || "serial_json";
+    driver.append(option("esr1001_usb_ttl", "ESR1001-A 原生USB/TTL 115200"));
+    driver.value = item.driver || "serial_json";
+    const usbOptions = document.createElement("div"); usbOptions.className = "interface-usb-options";
+    const dataMode = document.createElement("select"); dataMode.className = "interface-data-mode";
+    dataMode.append(option("raw_adc", "原始ADC（adc_counts，标定未确认）"), option("microstrain", "标定微应变（με）"));
+    dataMode.value = item.data_mode || "raw_adc";
+    const calibration = document.createElement("input"); calibration.className = "interface-calibration";
+    calibration.placeholder = "设备所在主机的K/B档案JSON路径"; calibration.value = typeof item.calibration_profile === "string" ? item.calibration_profile : item.calibration_profile ? JSON.stringify(item.calibration_profile) : "";
+    const bridge = document.createElement("input"); bridge.className = "interface-bridge";
+    bridge.placeholder = "与标定档案一致的桥路"; bridge.value = item.bridge || "";
+    usbOptions.append(dataMode, calibration, bridge);
+    [dataMode, calibration, bridge].forEach((control) => control.addEventListener("change", () => {
+      markHardwareCheckStale("USB数据用途或标定已变化"); configureDatasetSchema(false);
+    }));
+    row.append(usbOptions);
     const endpoint = document.createElement("input"); endpoint.className = "interface-endpoint"; endpoint.type = "text";
     const currentEndpoint = String(item.endpoint || "");
     endpoint.value = currentEndpoint;
     const baud = document.createElement("input"); baud.className = "interface-baudrate"; baud.type = "number"; baud.min = "1200"; baud.value = String(Number(item.baudrate || 115200));
+    const slave = document.createElement("input"); slave.className = "interface-slave-id"; slave.type = "number"; slave.min = "1"; slave.max = "247"; slave.value = String(item.slave_id ?? 1);
+    slave.addEventListener("change", () => { row.dataset.slaveId = slave.value; markHardwareCheckStale("仪表地址已变化"); });
     const physical = document.createElement("select"); physical.className = "interface-physical";
     const map = document.createElement("input"); map.className = "interface-map"; map.type = "text"; map.value = typeof item.channel_map === "string" ? item.channel_map : JSON.stringify(item.channel_map || {}); map.placeholder = '{"force":"压力"}';
     const summary = document.createElement("div"); summary.className = "interface-channel-summary";
@@ -5987,7 +6149,7 @@ function renderInterfacePanel(configs) {
       refreshInterfaceEndpointOptions();
       markHardwareCheckStale("接口配置已删除");
     });
-    row.append(addLabel(`接口 ${index + 1} · 启用`, enabled), addLabel("传感器类型", role), addLabel("实际物理接口", physical, "interface-physical-label"), addLabel("自动驱动/协议", driver), addLabel("连接地址", endpoint), addLabel("波特率", baud), addLabel("通道映射（仅自定义JSON）", map, "interface-map-label"), profileDetail, summary, removeButton);
+    row.append(addLabel(`接口 ${index + 1} · 启用`, enabled), addLabel("传感器类型", role), addLabel("实际物理接口", physical, "interface-physical-label"), addLabel("自动驱动/协议", driver), addLabel("连接地址", endpoint), addLabel("波特率", baud), addLabel("仪表地址", slave, "interface-slave-label"), addLabel("通道映射（仅自定义JSON）", map, "interface-map-label"), profileDetail, summary, removeButton);
     role.addEventListener("change", () => {
       row.dataset.selectionOrigin = "auto";
       physical.value = "";
@@ -5997,12 +6159,15 @@ function renderInterfacePanel(configs) {
       markHardwareCheckStale("接口类型已变化");
     });
     driver.addEventListener("change", () => {
+      if (role.value === "esr1001_strain") baud.value = driver.value === "esr1001_usb_ttl" ? "115200" : "9600";
+      applySensorTypeProfile(row, false);
+      markHardwareCheckStale("协议已变化");
       if (controls.acquisitionMode?.value !== "simulation" && driver.value === "simulator") {
         driver.value = "serial_json";
         toast("真实接口采集模式不允许使用本地模拟驱动");
       }
       refreshInterfaceEndpointOptions();
-      refreshChannelInterfaceOptions();
+      configureDatasetSchema(false);
     });
     endpoint.addEventListener("change", () => { refreshInterfaceEndpointOptions(); refreshChannelInterfaceOptions(); });
     physical.addEventListener("change", () => {
@@ -6023,7 +6188,7 @@ function renderInterfacePanel(configs) {
       refreshChannelInterfaceOptions();
       markHardwareCheckStale("实际物理接口已变化");
     });
-    enabled.addEventListener("change", refreshChannelInterfaceOptions);
+    enabled.addEventListener("change", () => configureDatasetSchema(false));
     createInterfaceChannelEditor(row, row.dataset.interfaceId);
     applySensorTypeProfile(row, false);
     refreshPhysicalInterfaceOptions(row, item.physical_port_id || item.physical_interface_id || "");
@@ -6039,18 +6204,19 @@ function renderInterfacePanel(configs) {
 function mergeRememberedInterfaceSelections(defaults) {
   let remembered = Array.isArray(state.interfaceCatalog) ? state.interfaceCatalog : [];
   const rows = controls.interfacePanel?.querySelectorAll(".interface-config-row") || [];
-  if (controls.acquisitionMode?.value !== "simulation" && rows.length) {
+  if (controls.acquisitionMode?.value !== "simulation" && rows.length && !state.restoringInterfacePreferences) {
     remembered = interfaceConfigs().interfaces;
   }
   const byId = new Map(remembered.map((item) => [String(item.id || ""), item]));
   const bindingFields = [
+    "enabled", "driver", "data_mode", "calibration_profile", "bridge", "calibration_digest", "channel_count", "channel_map",
     "physical_interface_id", "physical_port_id", "physical_interface_kind",
     "physical_transport_family", "physical_verified", "physical_fallback",
-    "selection_origin", "endpoint",
+    "selection_origin", "endpoint", "baudrate", "slave_id",
   ];
   return (defaults || []).map((item) => {
     const previous = byId.get(String(item.id || ""));
-    if (!previous || !(previous.physical_port_id || previous.physical_interface_id)) return {...item};
+    if (!previous) return {...item};
     const merged = {...item};
     bindingFields.forEach((field) => {
       if (previous[field] !== undefined) merged[field] = previous[field];
@@ -6127,6 +6293,7 @@ async function discoverInterfaces() {
         if (resourceId) helperAssignedResources.set(String(resourceId), String(item.role || ""));
       });
       state.interfaceCatalog = allocated.map((item) => {
+        if (item.driver === "esr1001_usb_ttl" && !(item.physical_interface_id || item.physical_port_id)) return {...item, enabled: false};
         const binding = bindings.get(String(item.role || ""));
         let physicalId = item.physical_interface_id || binding?.physical_interface_id || "";
         let physicalPortId = item.physical_port_id || binding?.physical_port_id || "";
@@ -6148,7 +6315,7 @@ async function discoverInterfaces() {
           physical_port_id: physicalPortId,
           physical_interface_kind: binding?.physical_kind || item.physical_interface_kind || "",
           physical_verified: Boolean(item.physical_verified || binding?.interface_detected || binding?.driver_available),
-          enabled: Boolean(physicalId || physicalPortId),
+          enabled: item.enabled !== false,
         };
       });
       state.realInterfaceSnapshot = {
@@ -6161,6 +6328,8 @@ async function discoverInterfaces() {
       };
       state.realInterfaceSnapshotAt = Date.now();
       renderInterfacePanel(state.interfaceCatalog);
+      state.restoringInterfacePreferences = false;
+      if (state.activeInterfaceSchema) configureDatasetSchema(false);
       markHardwareCheckStale("本机辅助程序接口识别结果已更新");
       if (controls.interfaceDiscoveryStatus) {
         controls.interfaceDiscoveryStatus.textContent = physical.length
@@ -6190,6 +6359,8 @@ async function discoverInterfaces() {
       mergeRememberedInterfaceSelections(defaults.length ? defaults : defaultInterfaceCatalog())
     );
     renderInterfacePanel(state.interfaceCatalog);
+    state.restoringInterfacePreferences = false;
+    if (state.activeInterfaceSchema) configureDatasetSchema(false);
     markHardwareCheckStale("接口识别结果已更新");
     const ports = state.physicalInterfaces;
     const assigned = (state.interfaceCatalog || [])
@@ -7166,6 +7337,7 @@ function isTemperatureChannel(channel) {
 
 function interfaceAcceptsChannel(item, channel) {
   if (!item) return false;
+  if (item.driver === "esr1001_usb_ttl" && (item.data_mode || "raw_adc") === "raw_adc") return /^CH[1-4]_ADC_signed$/.test(channel);
   const profile = sensorTypeProfile(item.role);
   return Boolean(profile.editable_driver)
     || (profile.channels || []).includes(channel);
@@ -7182,8 +7354,7 @@ function createInterfaceChannelEditor(row, interfaceId) {
   const role = row.querySelector(".interface-role")?.value || "custom";
   const profile = sensorTypeProfile(role);
   const channels = selectedAcquisitionChannelsForInterfaces().filter(
-    (channel) => Boolean(profile.editable_driver)
-      || (profile.channels || []).includes(channel)
+    (channel) => interfaceAcceptsChannel({role, driver: row.querySelector(".interface-driver")?.value, data_mode: row.querySelector(".interface-data-mode")?.value}, channel)
   );
   channels.forEach((channel) => {
     const label = document.createElement("label");
@@ -7314,6 +7485,11 @@ function readinessInterfaceFingerprint(item) {
     endpoint: item?.endpoint,
     baudrate: item?.baudrate,
     slave_id: item?.slave_id,
+    data_mode: item?.data_mode,
+    channel_count: item?.channel_count,
+    calibration_profile: item?.calibration_profile,
+    calibration_digest: item?.calibration_digest,
+    bridge: item?.bridge,
     physical_interface_id: item?.physical_interface_id,
     physical_port_id: item?.physical_port_id,
     physical_interface_kind: item?.physical_interface_kind,
@@ -7371,6 +7547,36 @@ function hardwareConfigFingerprint() {
   }
 }
 
+function hardwareCheckIsCurrent(fingerprint) {
+  const check = state.hardwareCheck;
+  return Boolean(check?.ok
+    && state.hardwareCheckFingerprint === fingerprint
+    && Number.isFinite(check.readinessDeadline)
+    && performance.now() < check.readinessDeadline);
+}
+
+function rememberHardwareCheck(result, fingerprint, requestStartedAt) {
+  const snapshot = result?.readiness_snapshot;
+  const lifetime = Number(snapshot?.expires_at) - Number(snapshot?.checked_at);
+  state.hardwareCheck = {
+    ...result,
+    readinessDeadline: result?.ok && snapshot?.ok && Number.isFinite(lifetime)
+      ? requestStartedAt + Math.max(0, lifetime - 5) * 1000 : 0,
+  };
+  state.hardwareCheckFingerprint = fingerprint;
+}
+
+function isRecoverableReadinessError(error) {
+  return /^(?:remote_)?readiness_required(?:$|:\s*(?:readiness snapshot (?:expired|fingerprint mismatch)|请先执行当前配置的接口检查)$)/
+    .test(String(error?.code || error?.message || ""));
+}
+
+function requireUnchangedHardwareCheck() {
+  if (state.hardwareCheckFingerprint !== hardwareConfigFingerprint()) {
+    throw new Error("检查期间采集配置已变化，请按当前配置重新检查后再开始采集");
+  }
+}
+
 function hardwareStateLabel(value) {
   const stateCode = String(value || "unknown_failure");
   return ({
@@ -7380,6 +7586,27 @@ function hardwareStateLabel(value) {
     authentication_failed: "认证失败", resource_not_found: "RWS资源不存在",
     resource_invalid: "RWS资源内容无效", invalid_json: "响应JSON无效",
     driver_incompatible: "驱动不兼容", device_open_failed: "设备打开失败",
+    port_not_present: "所选串口当前不存在，请重新识别设备",
+    port_access_denied: "串口访问被拒绝，请关闭占用程序或检查权限",
+    port_busy: "串口被其他采集会话占用",
+    device_disconnected: "USB设备已断开",
+    device_identity_mismatch: "USB设备身份或参数已变化，请重新检查",
+    usb_parameters_invalid: "USB参数应答无效",
+    usb_parameters_timeout: "USB参数查询超时",
+    usb_mode_invalid: "设备未处于USB/TTL模式",
+    usb_start_timeout: "USB开始采集应答超时",
+    usb_stop_timeout: "USB停止采集应答超时",
+    usb_stop_failed: "USB停止采集失败，端口将释放",
+    usb_probe_timeout: "USB接口检查超时",
+    usb_no_valid_frame: "USB未取得有效四通道数据帧",
+    usb_frame_invalid: "USB数据帧结构无效",
+    usb_consumer_overflow: "USB源数据消费队列过载",
+    usb_overflow: "USB缓冲或保存发生过载",
+    raw_writer_failed: "原始ADC文件写入失败",
+    raw_writer_overflow: "原始ADC写入队列过载",
+    calibration_missing: "原始通信可用，微应变标定待确认",
+    calibration_invalid: "微应变标定档案无效",
+    calibration_mismatch: "微应变标定与设备条件不匹配",
     no_valid_frame: "未取得有效温度帧",
     invalid_temperature_matrix: "温度矩阵无效",
     native_call_timeout: "厂商驱动调用超时",
@@ -7688,6 +7915,8 @@ async function testSensorConnection({automatic = false} = {}) {
   if (controls.acquisitionMode?.value === "simulation") {
     return checkSimulationSourceReadiness({automatic});
   }
+  const checkedFingerprint = hardwareConfigFingerprint();
+  const checkStartedAt = performance.now();
   if (usesLocalCaptureHelper() && controls.acquisitionMode?.value !== "simulation") {
     state.hardwareCheckInProgress = true;
     const node = controls.hardwareCheckStatus;
@@ -7708,8 +7937,7 @@ async function testSensorConnection({automatic = false} = {}) {
           {timeoutMs: 120000},
         ),
       );
-      state.hardwareCheck = result;
-      state.hardwareCheckFingerprint = hardwareConfigFingerprint();
+      rememberHardwareCheck(result, checkedFingerprint, checkStartedAt);
       renderHardwareCheckResult(result, {automatic});
       updateAgentFromHardwareResult(result, {automatic});
       return result;
@@ -7757,8 +7985,7 @@ async function testSensorConnection({automatic = false} = {}) {
     if (controls.processingMode.value !== "capture_only") {
       applyPredictionModelProfile(result.prediction_model, false);
     }
-    state.hardwareCheck = result;
-    state.hardwareCheckFingerprint = hardwareConfigFingerprint();
+    rememberHardwareCheck(result, checkedFingerprint, checkStartedAt);
     renderHardwareCheckResult(result, {automatic});
     updateAgentFromHardwareResult(result, {automatic});
     if (!result.ok && !automatic) toast("检查发现接口或传感器通道异常，详情已列出");

@@ -36,10 +36,25 @@ PUBLIC_INTERFACE_DEFINITIONS = (
         "driver": "m3232_pressure",
         "protocol": "串口",
     },
+    {"role": "esr1001_strain", "label": "ESR1001-A四通道应变", "driver": "", "protocol": "USB TTL / RS485"},
 )
 
 
+_ESR1001_CHECKED_PROTOCOLS = {
+    "esr1001_usb_ttl": ({"esr1001_usb_ttl"}, "esr1001_usb_ttl"),
+    "modbus_rtu_esr1001": ({"modbus_rtu", "modbus_rtu_esr1001"}, "modbus_rtu"),
+}
+
+
 _PUBLIC_STATE_MESSAGES = {
+    "data_ready": "接口数据就绪，请核对采集单位及标定状态",
+    "usb_no_valid_frame": "USB未取得有效数据帧",
+    "port_access_denied": "串口访问被拒绝，请关闭占用程序或检查权限",
+    "port_busy": "串口被其他采集会话占用",
+    "usb_overflow": "USB缓冲或保存过载",
+    "usb_parameters_invalid": "USB参数应答无效",
+    "calibration_missing": "原始通信可用，标定待确认",
+    "calibration_mismatch": "标定与设备条件不匹配",
     "ok": "接口在线并已收到有效数据",
     "not_connected": "接口无法打开或设备未连接",
     "no_data": "接口已打开但未检测到数据",
@@ -85,9 +100,27 @@ def build_public_device_status(
             source_by_role[role] = item
 
     interfaces: list[dict[str, Any]] = []
+    if acquisition.get("running"):
+        for item in acquisition.get("interfaces") or []:
+            if isinstance(item, dict) and item.get("role"):
+                source_by_role[str(item["role"])] = item
     for definition in PUBLIC_INTERFACE_DEFINITIONS:
         source = source_by_role.get(definition["role"], {})
         state = str(source.get("state") or "unchecked").strip().lower()
+        driver = definition["driver"]
+        protocol = definition["protocol"]
+        if definition["role"] == "esr1001_strain":
+            checked_driver = str(source.get("driver") or "").strip().lower()
+            protocol_contract = _ESR1001_CHECKED_PROTOCOLS.get(checked_driver)
+            if protocol_contract is not None:
+                allowed_protocols, default_protocol = protocol_contract
+                checked_protocol = str(source.get("protocol") or "").strip().lower()
+                driver = checked_driver
+                protocol = (
+                    checked_protocol
+                    if checked_protocol in allowed_protocols
+                    else default_protocol
+                )
         message = _PUBLIC_STATE_MESSAGES.get(
             state,
             f"接口检查失败（状态码：{state}）",
@@ -96,6 +129,8 @@ def build_public_device_status(
         interfaces.append(
             {
                 **definition,
+                "driver": driver,
+                "protocol": protocol,
                 "state": state,
                 "ok": bool(source.get("ok", False)) if source else False,
                 "message_code": state,
@@ -107,6 +142,9 @@ def build_public_device_status(
                 ],
                 "checked_at": checked_at,
                 "age_seconds": age,
+                "data_mode": str((source.get("usb_evidence") or {}).get("data_mode") or ""),
+                "unit": str((source.get("usb_evidence") or {}).get("unit") or ""),
+                "calibration_state": str((source.get("usb_evidence") or {}).get("calibration_state") or ""),
             }
         )
 

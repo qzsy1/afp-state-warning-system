@@ -15,6 +15,7 @@ def run_candidate_script(assertions: str) -> dict:
     end = source.index("function refreshPhysicalInterfaceOptions", start)
     profiles = {
         "thermocouple": {"label": "八通道热电偶", "physical_kind": "usb_hid"},
+        "thermocouple64": {"label": "慧谱TCP64", "physical_kind": "serial"},
         "thermal_uvc": {"label": "UVC", "physical_kind": "usb_uvc"},
         "pressure": {"label": "M3232", "physical_kind": "serial"},
         "esr1001_strain": {"label": "ESR1001-A四通道应变", "physical_kind": "serial"},
@@ -53,6 +54,17 @@ def run_logical_interface_script(assertions: str) -> dict:
 
 
 class UsbInterfaceCandidateTests(unittest.TestCase):
+    def test_tc64_lists_usb_serial_and_native_serial_without_hid(self) -> None:
+        result = run_candidate_script(r'''
+state.physicalInterfaces = [
+  {id:"serial:COM3", kind:"serial", endpoint:"COM3", vid:6790, pid:29987, detected:true},
+  {id:"serial:COM1", kind:"serial", endpoint:"COM1", detected:true},
+  {id:"hid:other", kind:"usb_hid", endpoint:"HID", detected:true},
+];
+console.log(JSON.stringify(physicalCandidatesForRole("thermocouple64").filter(x=>x.compatible).map(x=>x.endpoint)));
+''')
+        self.assertEqual(set(result), {"COM3", "COM1"})
+
     def test_unconfirmed_usb_hub_remains_visible_without_dock_label(self) -> None:
         result = run_candidate_script(
             r"""

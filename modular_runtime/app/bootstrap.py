@@ -422,7 +422,7 @@ def functional_smoke(context: Any, manager: Any) -> dict[str, Any]:
 
     dashboard = legacy_app.DashboardData()
     # A packaged diagnostic must never inherit or mutate the operator's
-    # durable F:\\AFP_Capture recovery state.  Use a fresh, candidate-local
+    # durable D:\\AFP_Capture recovery state.  Use a fresh, candidate-local
     # capture root so repeated release checks are independent and reproducible.
     dashboard.acquisition = acquisition.AcquisitionManager(
         capture_root, recovery_scan=True
@@ -638,7 +638,7 @@ def _launch_public_web(
     )
     capture_root = Path(getattr(dashboard.acquisition, "capture_root", context.paths.runtime_dir / "capture"))
     source_candidates = [
-        Path(r"F:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv"),
+        Path(r"D:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv"),
         context.paths.legacy_dir / "new_collection_demo_v11_3" / "simulator_stream.csv",
         context.paths.data_dir / "dashboard_candidate_catalog.csv",
     ]
