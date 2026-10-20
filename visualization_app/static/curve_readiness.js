@@ -81,9 +81,9 @@
       return {start_request_id: this.id, capture_generation: this.generation,
         clock_domain: "client_performance_ms", input: this.input,
         selected_channels: this.channels, complete: this.complete,
-        elapsed_ms: elapsed, target_ms: 3000, maximum_ms: 5000,
+        elapsed_ms: elapsed, target_ms: 3000, maximum_ms: 3000,
         target_pass: this.complete && elapsed <= 3000,
-        pass: this.complete && elapsed <= 5000,
+        pass: this.complete && elapsed <= 3000,
         pending_channels: this.channels.filter(name => !this.drawn.has(name)),
         displayed: Object.fromEntries(this.drawn), observations: Object.fromEntries(this.proofs),
         presentations: Object.fromEntries(this.presentations), events: this.events};

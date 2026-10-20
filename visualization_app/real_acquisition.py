@@ -338,7 +338,8 @@ def readiness_config_fingerprint(config: Any) -> str:
                 "source_address", "device_subnet", "network_interface_name",
                 "profile_id", "profile_version", "protocol_verified",
                 "channel_types", "channel_types_confirmed", "roi", "dll_path",
-                "data_mode", "channel_count", "calibration_digest", "calibration_profile", "bridge",
+                "protocol_profile", "matrix_rows", "matrix_cols", "first_frame_timeout_seconds", "frame_timeout_seconds", "max_buffer_bytes",
+        "data_mode", "channel_count", "calibration_digest", "calibration_profile", "bridge",
                 "read_profile", "timeout", "channel_settings", "scan_timeout_seconds",
                 "freshness_seconds", "poll_interval_seconds", "reconnect_window_seconds",
             )
@@ -892,6 +893,13 @@ class UnifiedFrame:
             if sample.metadata.get("driver") == "esr1001_usb_ttl":
                 metadata["adc_source"] = dict(sample.metadata.get("latest_record") or {})
                 metadata["calibration_digest"] = sample.metadata.get("calibration_digest")
+            if sample.metadata.get("driver") == "m3232_pressure":
+                record = sample.metadata.get("latest_record") or {}
+                metadata["matrix_source"] = {k: record.get(k) for k in (
+                    "connection_generation", "receive_sequence", "host_monotonic", "host_wall_time",
+                    "byte_offset", "sha256", "raw_total", "unit", "calibration_digest")}
+                metadata["received_monotonic"] = sample.received_monotonic
+                metadata["received_wall_time"] = sample.received_wall_time
             if any(value not in (None, "") for value in metadata.values()):
                 source[str(index)] = metadata
         return {
@@ -1043,8 +1051,8 @@ class UnifiedFrame:
                 value=value,
                 quality=quality,
                 device_timestamp=item.get("source_timestamp"),
-                received_wall_time=frame_time,
-                received_monotonic=target_monotonic,
+                received_wall_time=float(item.get("received_wall_time", frame_time)),
+                received_monotonic=float(item.get("received_monotonic", target_monotonic)),
                 source_sequence=(
                     int(item["source_sequence"])
                     if item.get("source_sequence") is not None
@@ -1052,7 +1060,8 @@ class UnifiedFrame:
                 ),
                 protocol_ok=item.get("protocol_ok"),
                 error=str(item.get("error") or ""),
-                metadata={"adc_source": item.get("adc_source"), "calibration_digest": item.get("calibration_digest")},
+                metadata={"adc_source": item.get("adc_source"), "calibration_digest": item.get("calibration_digest"),
+                          **({"driver": "m3232_pressure", "matrix_source": item["matrix_source"]} if item.get("matrix_source") else {})},
             )
         return cls(
             capture_sequence=sequence,

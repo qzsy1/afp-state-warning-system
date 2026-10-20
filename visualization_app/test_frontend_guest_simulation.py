@@ -1059,8 +1059,8 @@ discoverInterfaces().then(()=>console.log(JSON.stringify(state.interfaceCatalog)
 state.physicalInterfaces=[{id:"serial:COM91",kind:"serial",endpoint:"COM91",detected:true}];
 console.log(JSON.stringify(autoAssignPhysicalInterfaces([{id:"pressure",role:"pressure",enabled:false}])));
 ''')
-        self.assertEqual(result[0]["physical_interface_id"], "serial:COM91")
-        self.assertEqual(result[0]["endpoint"], "COM91")
+        self.assertNotIn("physical_interface_id", result[0])
+        self.assertNotIn("endpoint", result[0])
         self.assertFalse(result[0]["enabled"])
 
     def test_switching_to_simulation_rebuilds_logical_catalog_instead_of_reusing_real_bindings(self):

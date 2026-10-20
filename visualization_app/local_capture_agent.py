@@ -136,7 +136,7 @@ class LocalCaptureAgent:
             role_candidates = [p for p in physical if p.get("kind") == kind
                                and p.get("protocol") in protocols
                                and (not p.get("compatible_roles") or role in p["compatible_roles"])]
-            if role == "thermocouple64":
+            if role in {"thermocouple64", "m3232_pressure"}:
                 candidate = None
             physical_id = str(candidate.get("id") or "") if candidate else ""
             if candidate and not allow_used:
@@ -216,6 +216,8 @@ class LocalCaptureAgent:
                 "esr1001_modbus_rtu": True,
                 "esr1001_usb_ttl": True,
                 "esr1001_raw_adc_capture": True,
+                "m3232_uart_text_v1": True,
+                "m3232_matrix_csv_v1": True,
                 "esr1001_calibration_v1": True,
                 "huipu_tc64_modbus_rtu": True,
                 "interface_roles": [item[0] for item in _ROLE_SPECS],
@@ -388,6 +390,8 @@ class LocalCaptureAgent:
     def start_capture(self, config: Any) -> dict[str, Any]:
         from esr1001_usb import require_helper_capabilities
         require_helper_capabilities(config)
+        from m3232_serial import require_helper_capabilities as require_m3232_capabilities
+        require_m3232_capabilities(config)
         if (
             str(getattr(config, "acquisition_mode", "")) == "real"
             and str(getattr(config, "real_acquisition_mode", "")) == "remote_helper"
@@ -619,6 +623,8 @@ class LocalCaptureAgent:
     def check_capture(self, config: Any) -> dict[str, Any]:
         from esr1001_usb import require_helper_capabilities
         require_helper_capabilities(config)
+        from m3232_serial import require_helper_capabilities as require_m3232_capabilities
+        require_m3232_capabilities(config)
         result = self.manager.test_connection(config)
         response = dict(result) if isinstance(result, dict) else {"ok": False, "result": result}
         response["device_readiness_contract"] = DEVICE_READINESS_CONTRACT

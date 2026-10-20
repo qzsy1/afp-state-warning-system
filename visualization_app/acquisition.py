@@ -42,6 +42,9 @@ from esr1001_usb import (
     USB_DRIVER, RAW_CHANNELS, Esr1001UsbDriver, RawCaptureWriter,
     load_calibration, UsbProtocolError, probe_usb,
 )
+from m3232_serial import (M3232PressureDriver, MatrixRecorder, normalize_config as normalize_m3232,
+    matrix_csv_path,
+    BAUDRATE as M3232_BAUDRATE, RAW_CHANNEL as M3232_RAW_CHANNEL)
 from simulation_replay import MonotonicReplayScheduler
 from real_acquisition import (
     AcquisitionQualityMetrics,
@@ -138,7 +141,7 @@ CURRENT_COLLECTION_SENSOR_COLUMNS = [
 ]
 ALL_SENSOR_COLUMNS = list(
     dict.fromkeys(
-        [*LEGACY_SENSOR_COLUMNS, *LATEST_COLLECTION_SENSOR_COLUMNS, *CURRENT_COLLECTION_SENSOR_COLUMNS, *RAW_CHANNELS]
+        [*LEGACY_SENSOR_COLUMNS, *LATEST_COLLECTION_SENSOR_COLUMNS, *CURRENT_COLLECTION_SENSOR_COLUMNS, *RAW_CHANNELS, M3232_RAW_CHANNEL]
     )
 )
 PROCESS_PARAMETER_COLUMNS = [
@@ -1141,11 +1144,6 @@ BSV_UVC_DLL_NAME = "BsvUvcNative.dll"
 BSV_UVC_VENDOR_ID = 0x2BDF
 BSV_UVC_PRODUCT_ID = 0x0102
 DEFAULT_RTSP_URL = "rtsp://192.168.125.2:554/"
-# The vendor operation manual specifies 115200 baud.  The vendor packet
-# framing is not documented, so the driver accepts JSON matrix frames for the
-# simulator/probe path and still needs one raw hardware capture for final
-# protocol validation.
-M3232_BAUDRATE = 115200
 ESR1001_BAUDRATE = 9600
 ESR1001_BYTESIZE = 8
 ESR1001_PARITY = "N"
@@ -1192,6 +1190,8 @@ SENSOR_CHANNEL_METADATA: dict[str, dict[str, str]] = {
         for index in range(1, 5)
     },
 }
+
+SENSOR_CHANNEL_METADATA[M3232_RAW_CHANNEL] = {"unit": "raw", "dtype": "float64", "source": "M3232完整矩阵直接合计（未标定）"}
 
 SENSOR_CHANNEL_METADATA.update({name: {"unit": "adc_counts", "dtype": "int24", "source": "ESR1001-A原生USB原始数据", "alias": name} for name in RAW_CHANNELS})
 
@@ -1261,12 +1261,12 @@ SENSOR_INTERFACE_PROFILES: dict[str, dict[str, Any]] = {
     "pressure": {
         "label": "M3232薄膜压力",
         "driver": "m3232_pressure",
-        "protocol": "m3232_serial",
+        "protocol": "m3232_uart_text_v1",
         "physical_kind": "serial",
-        "endpoint": "COM8",
+        "endpoint": "",
         "baudrate": M3232_BAUDRATE,
-        "channels": ["薄膜压力"],
-        "processing": "串口矩阵（行列自动识别）→有效像素合计→中值滤波（N）；坐标/零点按设备校准",
+        "channels": [M3232_RAW_CHANNEL], "data_mode": "raw_matrix", "protocol_profile": "m3232_uart_text_v1",
+        "processing": "230400/8N1；32×32明文矩阵及LF；原始合计raw（未标定），N需要匹配标定档",
     },
     "esr1001_strain": {
         "label": "ESR1001-A四通道应变",
@@ -1421,9 +1421,9 @@ def default_capture_interfaces() -> list[dict[str, Any]]:
         {
             "id": "m3232_pressure", "enabled": True,
             "role": "pressure", "driver": "m3232_pressure",
-            "endpoint": "COM8", "baudrate": M3232_BAUDRATE,
-            "matrix_rows": 0, "matrix_cols": 0,
-            "channels": ["薄膜压力"], "channel_map": {},
+            "endpoint": "", "baudrate": M3232_BAUDRATE,
+            "matrix_rows": 32, "matrix_cols": 32,
+            "channels": [M3232_RAW_CHANNEL], "data_mode": "raw_matrix", "protocol_profile": "m3232_uart_text_v1", "channel_map": {},
         },
         {
             "id": "esr1001_strain", "enabled": True,
@@ -1491,7 +1491,7 @@ def _apply_sensor_interface_profile(interface: dict[str, Any]) -> dict[str, Any]
         )
     ):
         interface["endpoint"] = str(profile.get("endpoint") or "")
-    if profile.get("baudrate") and sensor_type not in {THERMOCOUPLE64_ROLE, "esr1001_strain"}:
+    if profile.get("baudrate") and sensor_type not in {THERMOCOUPLE64_ROLE, "esr1001_strain", "pressure"}:
         interface["baudrate"] = int(profile["baudrate"])
     if profile.get("channel_types") and not interface.get("channel_types"):
         interface["channel_types"] = list(profile["channel_types"])
@@ -1512,6 +1512,9 @@ def _apply_sensor_interface_profile(interface: dict[str, Any]) -> dict[str, Any]
             raise ValueError("慧谱通道设置必须为对象")
         interface["reconnect_window_seconds"] = max(0.0, min(float(interface.get("reconnect_window_seconds", 60.0)), 300.0))
         interface["freshness_seconds"] = float(interface.get("freshness_seconds") or 1.0)
+    elif sensor_type == "pressure":
+        if interface.get("enabled", True):
+            normalize_m3232(interface)
     elif sensor_type == "esr1001_strain":
         if not usb_strain:
             interface["baudrate"] = int(interface.get("baudrate") or ESR1001_BAUDRATE)
@@ -1674,7 +1677,7 @@ def _resolve_interface_channel_assignments(
             role, SENSOR_INTERFACE_PROFILES["custom"]
         )
         raw_usb = item.get("driver") == USB_DRIVER and item.get("data_mode") == "raw_adc"
-        allowed = set(RAW_CHANNELS if raw_usb else profile.get("channels") or []) & capture_set
+        allowed = set(RAW_CHANNELS if raw_usb else item.get("channels") if item.get("driver") == "m3232_pressure" else profile.get("channels") or []) & capture_set
         if role == "custom":
             channel_map = item.get("channel_map") or {}
             if isinstance(channel_map, dict):
@@ -1847,7 +1850,13 @@ class AcquisitionConfig:
     use_best_prediction_override: bool = False
     driver: str = "simulator"
     endpoint: str = ""
-    baudrate: int = 115200
+    baudrate: int = 0
+    matrix_rows: int = 32
+    matrix_cols: int = 32
+    protocol_profile: str = "m3232_uart_text_v1"
+    data_mode: str = "raw_matrix"
+    device_identity: dict[str, Any] | None = None
+    calibration_profile: Any = None
     slave_id: int = 1
     read_profile: str = "channel_temperature"
     timeout: float = 0.5
@@ -2035,7 +2044,10 @@ class AcquisitionConfig:
                 "id": "interface_1", "enabled": True,
                 "driver": self.driver, "endpoint": self.endpoint,
                 "baudrate": self.baudrate,
-                "role": THERMOCOUPLE64_ROLE if self.driver == THERMOCOUPLE64_DRIVER else "other",
+                "role": THERMOCOUPLE64_ROLE if self.driver == THERMOCOUPLE64_DRIVER else "pressure" if self.driver == "m3232_pressure" else "other",
+                **({"matrix_rows": self.matrix_rows, "matrix_cols": self.matrix_cols, "protocol_profile": self.protocol_profile,
+                    "data_mode": self.data_mode, "device_identity": self.device_identity or {}, "calibration_profile": self.calibration_profile}
+                   if self.driver == "m3232_pressure" else {}),
                 **({"read_profile": self.read_profile, "timeout": self.timeout,
                     "slave_id": self.slave_id, "channel_settings": deepcopy(self.channel_settings or {})}
                    if self.driver == THERMOCOUPLE64_DRIVER else {}),
@@ -2069,7 +2081,7 @@ class AcquisitionConfig:
                 if role_hint != "custom" else self.driver
             )
             interface["endpoint"] = str(interface.get("endpoint") or "").strip()
-            interface["baudrate"] = int(interface.get("baudrate") or (ESR1001_BAUDRATE if role_hint == "esr1001_strain" and interface["driver"] != USB_DRIVER else self.baudrate))
+            interface["baudrate"] = int(interface.get("baudrate") or (ESR1001_BAUDRATE if role_hint == "esr1001_strain" and interface["driver"] != USB_DRIVER else M3232_BAUDRATE if role_hint == "pressure" else self.baudrate or 115200))
             interface["timeout"] = max(0.01, min(float(interface.get("timeout") or (0.5 if role_hint == THERMOCOUPLE64_ROLE else 0.05)), 2.0))
             interface["role"] = _canonical_sensor_type(
                 interface.get("role"), interface.get("driver")
@@ -2097,6 +2109,8 @@ class AcquisitionConfig:
                 )
             )
             _apply_sensor_interface_profile(interface)
+            if self.acquisition_mode == "simulation" and interface.get("driver") == "m3232_pressure":
+                interface["channels"] = ["薄膜压力"]
             authoritative_device_profile = SHARED_DEVICE_PROFILES.get(interface["role"])
             if authoritative_device_profile is not None:
                 interface["device_profile"] = deepcopy(authoritative_device_profile)
@@ -2188,6 +2202,9 @@ class AcquisitionConfig:
             self.simulation_source_path = ""
         else:
             self.source_file = self.simulation_source_path
+        if self.acquisition_mode == "real" and "薄膜压力" in (self.selected_sensors or []) and any(
+            i.get("enabled", True) and i.get("driver") == "m3232_pressure" and i.get("data_mode") == "raw_matrix" for i in self.interfaces):
+            raise ValueError("M3232原始矩阵未标定，N通道不可用；请选择薄膜压力原始响应/raw或提供有效标定档")
         allowed_sensors = self.schema_sensors
         if self.selected_sensors is None:
             self.selected_sensors = allowed_sensors.copy()
@@ -2280,6 +2297,7 @@ class AcquisitionConfig:
             name
             for name in self.model_input_sensors
             if name in allowed_sensors and name in self.selected_sensors
+            and not (self.acquisition_mode == "real" and name in {M3232_RAW_CHANNEL, "薄膜压力"})
         ]
         if self.prediction_sensors is None:
             self.prediction_sensors = self.selected_sensors.copy()
@@ -2344,6 +2362,12 @@ class AcquisitionConfig:
 
     def _effective_adc_columns(self, columns: list[str]) -> list[str]:
         """按有效接口用途生成通道，原始计数不占用规范微应变列。"""
+        if self.acquisition_mode == "real" and any(
+            i.get("enabled", True) and i.get("driver") == "m3232_pressure" and i.get("data_mode") == "raw_matrix"
+            for i in self.interfaces or []):
+            columns = [M3232_RAW_CHANNEL if n == "薄膜压力" else n for n in columns]
+            if M3232_RAW_CHANNEL not in columns:
+                columns = [*columns, M3232_RAW_CHANNEL]
         raw_enabled = any(
             item.get("enabled", True) and item.get("driver") == USB_DRIVER
             and item.get("data_mode") == "raw_adc"
@@ -2363,11 +2387,15 @@ class AcquisitionConfig:
         definition = ACQUISITION_SCHEMAS[self.dataset_schema]
         selected = set(self.selected_sensors or [])
         sensor_names = set(self.schema_sensors)
-        return [
+        columns = [
             name
             for name in self._effective_adc_columns(definition["raw_columns"])
             if name not in sensor_names or name in selected
         ]
+        missing = selected.difference(columns)
+        if missing:
+            raise ValueError("selected_channels_missing_from_csv: " + ", ".join(sorted(missing)))
+        return columns
 
     @property
     def process_columns(self) -> list[str]:
@@ -4187,152 +4215,6 @@ class RtspThermalDriver(SampleDriver):
             self.capture = None
 
 
-class M3232PressureDriver(SampleDriver):
-    """Serial pressure reader with variable-size JSON matrix compatibility.
-
-    The supplied vendor manual confirms 115200 baud and automatic X/Y/zero
-    calibration, but does not publish the packet framing.  JSON arrays and
-    ``{"matrix": ...}`` frames are therefore supported as a documented
-    simulator/probe interchange format; hardware framing remains configurable
-    after a raw serial capture.
-    """
-
-    def __init__(
-        self,
-        endpoint: str = "COM8",
-        baudrate: int = M3232_BAUDRATE,
-        matrix_rows: int = 0,
-        matrix_cols: int = 0,
-    ) -> None:
-        self.endpoint = str(endpoint or "COM8").strip()
-        self.baudrate = int(baudrate or M3232_BAUDRATE)
-        self.matrix_rows = max(0, int(matrix_rows or 0))
-        self.matrix_cols = max(0, int(matrix_cols or 0))
-        self.matrix_shape: tuple[int, int] = (0, 0)
-        self.serial = None
-        self.rx_buffer = ""
-        self.last_data_time: float | None = None
-        self.latest_pressure = 0.0
-        self.latest_pressure_peak = 0.0
-        self.latest_contact_area = 0
-        self.latest_valid_fraction = 0.0
-        self.median_window: list[float] = []
-
-    def open(self) -> None:
-        import serial
-        self.serial = serial.Serial(
-            self.endpoint, self.baudrate, bytesize=8,
-            parity="N", stopbits=1, timeout=0,
-        )
-        self.rx_buffer = ""
-        self.last_data_time = None
-        self.serial.write(b"begin\n")
-
-    def _extract_frames(self) -> list[list[list[float]]]:
-        """Extract complete rectangular JSON matrices from a fragmented stream."""
-        frames: list[list[list[float]]] = []
-        decoder = json.JSONDecoder()
-        while True:
-            starts = [index for index in (self.rx_buffer.find("["), self.rx_buffer.find("{")) if index >= 0]
-            start = min(starts) if starts else -1
-            if start < 0:
-                self.rx_buffer = self.rx_buffer[-1024:]
-                break
-            try:
-                payload, end = decoder.raw_decode(self.rx_buffer[start:])
-            except json.JSONDecodeError:
-                self.rx_buffer = self.rx_buffer[start:]
-                break
-            self.rx_buffer = self.rx_buffer[start + end:]
-            if isinstance(payload, dict):
-                for key in ("matrix", "data", "values"):
-                    if key in payload:
-                        payload = payload[key]
-                        break
-            if not isinstance(payload, list) or not payload or not all(isinstance(row, list) for row in payload):
-                continue
-            width = len(payload[0])
-            if width <= 0 or not all(len(row) == width for row in payload):
-                continue
-            if self.matrix_rows and len(payload) != self.matrix_rows:
-                continue
-            if self.matrix_cols and width != self.matrix_cols:
-                continue
-            try:
-                matrix = [[float(value) for value in row] for row in payload]
-            except (TypeError, ValueError):
-                continue
-            self.matrix_shape = (len(matrix), width)
-            frames.append(matrix)
-        return frames
-
-    @staticmethod
-    def _frame_metrics(matrix: list[list[float]]) -> dict[str, float | int]:
-        values = [float(value) for row in matrix for value in row]
-        finite = [value for value in values if math.isfinite(value)]
-        # Zero is the device's no-signal/background value.  Keep it in the
-        # matrix for shape/peak calculations but exclude it from the quality
-        # ratio so a disconnected matrix is distinguishable from valid data.
-        valid = [value for value in finite if value > 0.0]
-        active = sorted(value for value in finite if value > 5.0)
-        trim_count = max(1, int(len(active) * 0.9)) if active else 0
-        return {
-            "pressure_total": round(sum(active[:trim_count]), 2) if active else 0.0,
-            "pressure_peak": round(max(finite), 2) if finite else 0.0,
-            "contact_area": int(len(active)),
-            "valid_fraction": round(len(valid) / len(values), 6) if values else 0.0,
-        }
-
-    @staticmethod
-    def _frame_pressure(matrix: list[list[float]]) -> float:
-        """Backward-compatible scalar pressure helper."""
-        return float(M3232PressureDriver._frame_metrics(matrix)["pressure_total"])
-
-    def _update_matrix_metrics(self, matrix: list[list[float]]) -> float:
-        metrics = self._frame_metrics(matrix)
-        value = float(metrics["pressure_total"])
-        self.latest_pressure_peak = float(metrics["pressure_peak"])
-        self.latest_contact_area = int(metrics["contact_area"])
-        self.latest_valid_fraction = float(metrics["valid_fraction"])
-        return value
-
-    def read_sample(self) -> dict[str, float] | None:
-        if self.serial is None:
-            return None
-        pending = int(getattr(self.serial, "in_waiting", 0) or 0)
-        if pending > 0:
-            chunk = self.serial.read(min(pending, 16384))
-            if chunk:
-                self.last_data_time = time.time()
-                self.rx_buffer += chunk.decode("utf-8", errors="ignore")
-        for matrix in self._extract_frames():
-            value = self._update_matrix_metrics(matrix)
-            self.median_window.append(value)
-            self.median_window = self.median_window[-9:]
-            ordered = sorted(self.median_window)
-            self.latest_pressure = ordered[len(ordered) // 2]
-        if self.last_data_time is None or time.time() - self.last_data_time > 2.0:
-            return None
-        return {
-            "压力": round(float(self.latest_pressure), 2),
-            "压力峰值": round(float(self.latest_pressure_peak), 2),
-            "压力接触面积": int(self.latest_contact_area),
-            "压力有效像素比例": round(float(self.latest_valid_fraction), 6),
-        }
-
-    def close(self) -> None:
-        if self.serial is None:
-            return
-        try:
-            self.serial.write(b"end\n")
-        except Exception:
-            pass
-        try:
-            self.serial.close()
-        finally:
-            self.serial = None
-
-
 class MultiInterfaceDriver(SampleDriver):
     """Run physical interfaces independently and expose their latest samples."""
     def __init__(self, configs: list[dict[str, Any]], selected_sensors: list[str], source_file: str = "", assignments: dict[str, list[str]] | None = None, usb_startup_profiles: dict | None = None) -> None:
@@ -4412,11 +4294,15 @@ class MultiInterfaceDriver(SampleDriver):
                     )
                 elif driver_name == "m3232_pressure":
                     driver = M3232PressureDriver(
-                        str(item.get("endpoint") or "COM8"),
-                        int(item.get("baudrate") or M3232_BAUDRATE),
-                        int(item.get("matrix_rows") or 0),
-                        int(item.get("matrix_cols") or 0),
+                        str(item.get("endpoint") or ""), int(item.get("baudrate") or M3232_BAUDRATE),
+                        **{k: item[k] for k in ("matrix_rows", "matrix_cols", "protocol_profile", "data_mode", "device_identity",
+                            "calibration_profile", "first_frame_timeout_seconds", "freshness_seconds", "frame_timeout_seconds", "max_buffer_bytes") if k in item},
                     )
+                    if item.get("_raw_capture_root"):
+                        driver.recorder = MatrixRecorder(item["_raw_capture_root"], {
+                            "interface_id": item.get("id"), "configuration": {k:v for k,v in item.items() if not k.startswith("_")},
+                            **dict(item.get("_matrix_csv_context") or {}),
+                        }, csv_path=item.get("_matrix_csv_work_path"))
                 elif driver_name == THERMOCOUPLE64_DRIVER:
                     driver = HpThermocouple64Driver(
                         str(item.get("endpoint") or ""),
@@ -4549,13 +4435,15 @@ class MultiInterfaceDriver(SampleDriver):
         for worker in workers:
             if not worker.stop(timeout_seconds=max(0.0, deadline-time.monotonic())):
                 pending.append(worker)
-        self.final_worker_status = [worker.status() for worker in workers]
-        self.interface_quality_metadata = {
+        statuses = {row["interface_id"]: row for row in self.final_worker_status}
+        statuses.update({worker.interface_id: worker.status() for worker in workers})
+        self.final_worker_status = list(statuses.values())
+        self.interface_quality_metadata.update({
             worker.interface_id: dict(metadata)
             for worker in workers
             for metadata in [getattr(worker.driver, "quality_metadata", {})]
             if isinstance(metadata, dict)
-        }
+        })
         for worker in workers:
             recorder = getattr(worker.driver, "recorder", None)
             if recorder is not None and worker not in pending:
@@ -4563,6 +4451,8 @@ class MultiInterfaceDriver(SampleDriver):
                 self.interface_quality_metadata.setdefault(worker.interface_id, {}).update({
                     "raw_file": str(recorder.path), "raw_metadata_file": str(recorder.metadata_path),
                     "saved_source_rows": recorder.rows, "writer_error": recorder.error,
+                    **({"matrix_csv_file": str(recorder.csv_path).removesuffix(".partial"), "saved_matrix_csv_rows": recorder.csv_rows}
+                       if isinstance(recorder, MatrixRecorder) and recorder.csv_path else {}),
                 })
         self.workers = pending
         if not pending:
@@ -4619,10 +4509,11 @@ def build_driver(config: AcquisitionConfig) -> SampleDriver:
         return RtspThermalDriver(config.endpoint or DEFAULT_RTSP_URL)
     if config.driver == "m3232_pressure":
         return M3232PressureDriver(
-            config.endpoint or "COM8",
+            config.endpoint,
             config.baudrate or M3232_BAUDRATE,
-            int(getattr(config, "matrix_rows", 0) or 0),
-            int(getattr(config, "matrix_cols", 0) or 0),
+            config.matrix_rows,
+            config.matrix_cols,
+            data_mode=config.data_mode, device_identity=config.device_identity, calibration_profile=config.calibration_profile,
         )
     if config.driver == THERMOCOUPLE64_DRIVER:
         return HpThermocouple64Driver(
@@ -5095,7 +4986,9 @@ class AcquisitionManager(AcquisitionStartMixin):
             "***" if config.simulation_mysql_password else ""
         )
         for item in payload.get("interfaces") or []:
-            item.pop("_raw_capture_root", None)
+            for key in list(item):
+                if key.startswith("_"):
+                    item.pop(key, None)
             if item.get("role") == "robot":
                 item["credential_identifier"] = _credential_identifier(
                     str(item.get("username") or DEFAULT_ABB_USER),
@@ -5117,7 +5010,7 @@ class AcquisitionManager(AcquisitionStartMixin):
             {"id": "abb_robot", "label": "ABB机器人 RWS"},
             {"id": "uvc_thermal", "label": "BSV UVC热像仪（ROI温度）"},
             {"id": "rtsp_thermal", "label": "IP热像仪 RTSP"},
-            {"id": "m3232_pressure", "label": "M3232薄膜压力（115200，矩阵自动识别）"},
+            {"id": "m3232_pressure", "label": "M3232薄膜压力（230400/8N1，32×32，原始未标定）"},
             {"id": "modbus_rtu_esr1001", "label": "ESR1001-A应变（Modbus RTU 9600-8-N-1）"},
             {"id": USB_DRIVER, "label": "ESR1001-A原生USB/TTL（115200-8-N-1）"},
         ]
@@ -5412,7 +5305,7 @@ class AcquisitionManager(AcquisitionStartMixin):
         if not any(item.get("kind") == "serial" for item in physical_interfaces):
             physical_interfaces.append({
                 "id": "serial:auto", "kind": "serial", "protocol": "serial",
-                "endpoint": "COM8", "label": "串口（待识别，启动后检查）",
+                "endpoint": "", "label": "串口（待识别，启动后检查）",
                 "detected": False, "auto_assignable": True,
                 "identity_confirmed": False,
                 "compatible_roles": ["thermocouple64", "pressure", "esr1001_strain", "custom"],
@@ -5767,7 +5660,7 @@ class AcquisitionManager(AcquisitionStartMixin):
                 )
                 interface_driver.open()
                 probe_started = time.time()
-                while time.time() - probe_started < max(0.5, min(float(timeout_seconds), 1.5)):
+                while time.time() - probe_started < (float(item.get("first_frame_timeout_seconds", 2.0)) + 0.2 if item.get("driver") == "m3232_pressure" else max(0.5, min(float(timeout_seconds), 1.5))):
                     sample = interface_driver.read_sample()
                     if sample:
                         sample_timestamp = time.time()
@@ -6037,9 +5930,12 @@ class AcquisitionManager(AcquisitionStartMixin):
         if self.session_dir is None:
             return None
         candidates = self._layer_files(specimen_folder_name)
+        candidates.extend(matrix_csv_path(path) for path in list(candidates) if matrix_csv_path(path).exists())
         combined = self.session_dir / f"{specimen_folder_name}_完整试样.CSV"
         if combined.exists():
             candidates.append(combined)
+            if matrix_csv_path(combined).exists():
+                candidates.append(matrix_csv_path(combined))
         candidates.extend(
             path
             for path in self.session_dir.glob(f"{specimen_folder_name}_完整试样_派生.*")
@@ -6077,7 +5973,7 @@ class AcquisitionManager(AcquisitionStartMixin):
 
     def _archive_failed_working_files(self) -> str | None:
         archived: list[Path] = []
-        for path in (self.raw_work_path, self.timestamp_work_path):
+        for path in (self.raw_work_path, self.timestamp_work_path, getattr(self, "matrix_work_path", None)):
             if path is not None and path.exists():
                 target = self._archive_existing(path, "无有效数据")
                 if target is not None:
@@ -6199,11 +6095,14 @@ class AcquisitionManager(AcquisitionStartMixin):
         for working, final in (
             (self.raw_work_path, self.raw_path),
             (self.timestamp_work_path, self.timestamp_path),
+            (getattr(self, "matrix_work_path", None), getattr(self, "matrix_path", None)),
         ):
             if working is None or final is None or not working.exists():
                 continue
             with working.open("r+b") as handle:
                 os.fsync(handle.fileno())
+            if final == getattr(self, "matrix_path", None) and final.exists():
+                self._archive_existing(final, "中断采集")
             os.replace(working, final)
 
     @staticmethod
@@ -6362,6 +6261,7 @@ class AcquisitionManager(AcquisitionStartMixin):
                 key: dict(value) for key, value in self.driver.interface_quality_metadata.items()
                 if value.get("driver") == USB_DRIVER
             }
+            summary["m3232"] = {key: dict(value) for key, value in self.driver.interface_quality_metadata.items() if value.get("driver") == "m3232_pressure"}
             summary["thermocouple64"] = {
                 key: dict(value) for key, value in self.driver.interface_quality_metadata.items()
                 if value.get("driver") == THERMOCOUPLE64_DRIVER
@@ -6732,6 +6632,8 @@ class AcquisitionManager(AcquisitionStartMixin):
         self.timestamp_path = None
         self.raw_work_path = None
         self.timestamp_work_path = None
+        self.matrix_path = None
+        self.matrix_work_path = None
         self.started_at = time.time()
         self.stopped_at = None
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -6783,11 +6685,24 @@ class AcquisitionManager(AcquisitionStartMixin):
                 f"{uuid.uuid4().hex[:8]}"
             )
             config.capture_uuid = self.capture_uuid
+        if self.save_enabled:
+            self._prepare_capture_identity(config, specimen_folder_name)
         for item in config.interfaces or []:
-            if item.get("enabled", True) and item.get("driver") == USB_DRIVER:
+            if item.get("enabled", True) and item.get("driver") in {USB_DRIVER, "m3232_pressure"}:
                 if self.capture_record_dir is None:
                     raise RuntimeError("原生USB采集需要可写原始证据目录")
                 item["_raw_capture_root"] = str(self.capture_record_dir)
+                if item.get("driver") == "m3232_pressure":
+                    if [item.get("matrix_rows"), item.get("matrix_cols")] != [32, 32]:
+                        raise ValueError("完整矩阵CSV需要32×32配置")
+                    self.matrix_path = matrix_csv_path(self.raw_path)
+                    self.matrix_work_path = self.matrix_path.with_name(self.matrix_path.name + ".partial")
+                    self._archive_orphan_partial(self.matrix_work_path)
+                    item["_matrix_csv_work_path"] = str(self.matrix_work_path)
+                    item["_matrix_csv_context"] = {
+                        "capture_uuid": self.capture_uuid, "capture_generation": config.capture_generation,
+                        "run_id": config.run_id, "layer_id": config.layer + 1, "main_csv": self.raw_path.name,
+                    }
         config._session_usb_profiles = self.usb_startup_profiles(config)
         self.driver = build_driver(config)
         self.record_start_event("storage_paths_end")
@@ -6799,7 +6714,6 @@ class AcquisitionManager(AcquisitionStartMixin):
             self._assert_start_not_cancelled()
             if self.save_enabled:
                 self.record_start_event("capture_identity_begin")
-                self._prepare_capture_identity(config, specimen_folder_name)
                 self.record_start_event("capture_identity_end")
                 self.raw_work_path = self.raw_path.with_name(
                     f"{self.raw_path.name}.partial"
@@ -6825,6 +6739,8 @@ class AcquisitionManager(AcquisitionStartMixin):
                         "working_layer_file": str(self.raw_work_path),
                         "timestamp_file": str(self.timestamp_path),
                         "working_timestamp_file": str(self.timestamp_work_path),
+                        "matrix_csv_file": str(self.matrix_path) if self.matrix_path else None,
+                        "channel_units": {name: (SENSOR_CHANNEL_METADATA.get(name) or {}).get("unit", "") for name in config.selected_sensors},
                         "archived_previous_session": self.archived_previous_session,
                         "whole_specimen_rule": (
                             f"{specimen_folder_name}_完整试样.CSV（每层结束后原子覆盖更新）"
@@ -6910,6 +6826,10 @@ class AcquisitionManager(AcquisitionStartMixin):
             )
             counter += 1
         path.replace(archived)
+        if path.suffix.casefold() == ".csv":
+            paired = matrix_csv_path(path)
+            if paired.exists():
+                paired.replace(matrix_csv_path(archived))
         return archived
 
     def _rebuild_whole_specimen(self) -> Path | None:
@@ -6969,6 +6889,23 @@ class AcquisitionManager(AcquisitionStartMixin):
             if temporary.exists():
                 temporary.unlink(missing_ok=True)
         self.full_specimen_path = combined_path
+        matrices = [matrix_csv_path(path) for _, path in available if matrix_csv_path(path).is_file()]
+        if matrices:
+            combined_matrix = matrix_csv_path(combined_path)
+            work_matrix = combined_matrix.with_name(combined_matrix.name + ".partial")
+            self._archive_orphan_partial(work_matrix)
+            with work_matrix.open("x", encoding="utf-8-sig", newline="") as output:
+                matrix_writer = None
+                for path in matrices:
+                    with path.open(encoding="utf-8-sig", newline="") as source:
+                        reader = csv.DictReader(source)
+                        if matrix_writer is None:
+                            matrix_writer = csv.DictWriter(output, fieldnames=reader.fieldnames)
+                            matrix_writer.writeheader()
+                        matrix_writer.writerows(reader)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(work_matrix, combined_matrix)
         if self.config.dataset_schema == THERMOCOUPLE64_MODE_ID:
             layer_payloads: list[dict[str, Any]] = []
             for layer_index, layer_path in available:
@@ -7068,6 +7005,9 @@ class AcquisitionManager(AcquisitionStartMixin):
                         "channel_quality_json",
                         "channel_source_time_json",
                         "channel_age_seconds_json",
+                        "channel_source_sequence_json",
+                        "channel_interface_json",
+                        "channel_source_record_json",
                     ],
                 )
                 writer.writeheader()
@@ -7100,6 +7040,11 @@ class AcquisitionManager(AcquisitionStartMixin):
                     else None
                 )
                 while not self.stop_event.is_set():
+                    if isinstance(self.driver, MultiInterfaceDriver):
+                        for device in self.driver.drivers:
+                            recorder = getattr(device, "recorder", None)
+                            if recorder is not None and recorder.error:
+                                raise RuntimeError("source_writer_failed: " + recorder.error)
                     frame: UnifiedFrame | None = None
                     quality: dict[str, str] = {}
                     source_times: dict[str, float | None] = {}
@@ -7239,6 +7184,9 @@ class AcquisitionManager(AcquisitionStartMixin):
                             "channel_age_seconds_json": json.dumps(
                                 ages, ensure_ascii=False, separators=(",", ":")
                             ),
+                            "channel_source_sequence_json": json.dumps({name: ch.source_sequence for name, ch in frame.channels.items()} if frame else {}, ensure_ascii=False),
+                            "channel_interface_json": json.dumps({name: ch.interface_id for name, ch in frame.channels.items()} if frame else {}, ensure_ascii=False),
+                            "channel_source_record_json": json.dumps({name: {key: (ch.metadata.get("latest_record") or {}).get(key) for key in ("connection_generation", "receive_sequence", "sha256", "byte_offset")} for name, ch in frame.channels.items() if ch.metadata.get("latest_record")} if frame else {}, ensure_ascii=False),
                         }
                         capture_writer.submit(row, timestamp_row)
                         self.persistence_queue_depth = capture_writer.pending_rows
@@ -7669,13 +7617,17 @@ class AcquisitionManager(AcquisitionStartMixin):
         usb_errors = []
         if isinstance(self.driver, MultiInterfaceDriver):
             for evidence in self.driver.interface_quality_metadata.values():
-                if evidence.get("driver") == USB_DRIVER:
+                if evidence.get("driver") in {USB_DRIVER, "m3232_pressure"}:
                     if evidence.get("writer_error"):
                         usb_errors.append(str(evidence["writer_error"]))
                     if evidence.get("stop_error"):
                         usb_errors.append(str(evidence["stop_error"]))
-                    if evidence.get("saved_source_rows") != evidence.get("source_frames"):
+                    if evidence.get("saved_source_rows") != evidence.get("valid_frames" if evidence.get("driver") == "m3232_pressure" else "source_frames"):
                         usb_errors.append("raw_source_row_mismatch: 源帧与原始文件行数不一致")
+                    if evidence.get("driver") == "m3232_pressure" and evidence.get("saved_matrix_csv_rows") != evidence.get("valid_frames"):
+                        usb_errors.append("matrix_csv_row_mismatch: 源帧与完整矩阵CSV行数不一致")
+        if usb_errors:
+            self.persistence_failed = True
         self.capture_phase = "finalizing"
         with self.lock:
             if self.finalization_complete:
@@ -7777,6 +7729,7 @@ class AcquisitionManager(AcquisitionStartMixin):
                             for path in (
                                 self.raw_work_path,
                                 self.timestamp_work_path,
+                                getattr(self, "matrix_work_path", None),
                             )
                             if path is not None
                         }
@@ -7887,6 +7840,7 @@ class AcquisitionManager(AcquisitionStartMixin):
                         and self.quality_sidecar_path.is_file()
                         else None
                     ),
+                    "matrix_csv": _file_integrity(self.matrix_path) if self.capture_saved and getattr(self, "matrix_path", None) and self.matrix_path.is_file() else None,
                 }
                 self.last_data_quality = data_quality
                 self.last_file_integrity = integrity
@@ -8188,6 +8142,9 @@ class AcquisitionManager(AcquisitionStartMixin):
                             state = "stale"
                         if usb_evidence.get("overflows") or usb_evidence.get("writer_error"):
                             state = "usb_overflow"
+                    if item.get("driver") == "m3232_pressure" and usb_evidence:
+                        message += f"；{usb_evidence.get('baudrate')}/8N1；{usb_evidence.get('matrix_shape')}；{usb_evidence.get('unit')}；有效矩阵 {usb_evidence.get('valid_frames')}；拒绝 {usb_evidence.get('rejected_frames')}"
+                        if not usb_evidence.get("calibrated"): message += "；原始响应未标定"
                     if adapter_state in {"failed", "stop_timed_out"}:
                         state = adapter_state
                         message = str(adapter_status.get("last_error") or adapter_state)
@@ -8206,6 +8163,7 @@ class AcquisitionManager(AcquisitionStartMixin):
                         "poll_interval_seconds": adapter_status.get("actual_poll_interval_seconds"),
                         "start_events": adapter_status.get("start_events", []),
                         "usb_evidence": usb_evidence if item.get("driver") == USB_DRIVER else None,
+                        "m3232_evidence": usb_evidence if item.get("driver") == "m3232_pressure" else None,
                         "raw_file": adapter_status.get("raw_file") or usb_evidence.get("raw_file"),
                     })
             model_inputs = (
@@ -8276,6 +8234,8 @@ class AcquisitionManager(AcquisitionStartMixin):
                     if self.save_enabled and (running or self.capture_saved) and self.raw_path
                     else None
                 ),
+                "matrix_csv_file": str(self.matrix_path) if getattr(self, "matrix_path", None) and self.capture_saved else None,
+                "matrix_csv_work_file": str(self.matrix_work_path) if getattr(self, "matrix_work_path", None) and running else None,
                 "full_specimen_file": (
                     str(self.full_specimen_path)
                     if self.capture_saved and self.full_specimen_path

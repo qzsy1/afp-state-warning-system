@@ -352,8 +352,9 @@ class LocalCaptureAgentTests(unittest.TestCase):
         self.assertNotIn("thermocouple_8ch", [item["role"] for item in result["sensor_bindings"]])
         self.assertEqual(result["sensor_bindings"][1]["physical_interface_id"], "ethernet:工控网卡")
         self.assertEqual(result["sensor_bindings"][3]["physical_interface_id"], "ethernet:工控网卡")
-        self.assertEqual(result["sensor_bindings"][4]["physical_interface_id"], "serial:COM3")
-        self.assertIsNone(result["sensor_bindings"][5]["physical_interface_id"])
+        self.assertIsNone(result["sensor_bindings"][4]["physical_interface_id"])
+        self.assertFalse(result["sensor_bindings"][4]["identity_confirmed"])
+        self.assertEqual(result["sensor_bindings"][5]["physical_interface_id"], "serial:COM3")
         self.assertEqual(result["sensor_bindings"][5]["protocol"], "modbus_rtu")
 
     @patch("local_capture_agent.AcquisitionManager")

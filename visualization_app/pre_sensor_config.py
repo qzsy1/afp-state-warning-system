@@ -64,6 +64,7 @@ class InterfacePlanStore:
     _lock = threading.RLock()
     fields = frozenset((
         "id", "enabled", "role", "driver", "endpoint", "baudrate", "slave_id",
+        "protocol_profile", "matrix_rows", "matrix_cols", "first_frame_timeout_seconds", "frame_timeout_seconds", "max_buffer_bytes",
         "data_mode", "calibration_profile", "bridge", "channel_count", "channel_map", "channels",
         "physical_interface_id", "physical_port_id", "physical_interface_kind",
         "physical_transport_family", "selection_origin",
@@ -335,9 +336,9 @@ def validate_pre_sensor_config(
                 "endpoint_ref": endpoint_ref,
                 "baudrate": int(raw.get("baudrate") or 0),
                 "slave_id": int(raw.get("slave_id", 1)),
-                **{k: deepcopy(raw[k]) for k in ("read_profile", "timeout", "channel_settings", "scan_timeout_seconds", "freshness_seconds", "poll_interval_seconds", "reconnect_window_seconds") if k in raw},
+                **{k: deepcopy(raw[k]) for k in ("protocol_profile", "matrix_rows", "matrix_cols", "first_frame_timeout_seconds", "frame_timeout_seconds", "max_buffer_bytes", "read_profile", "timeout", "channel_settings", "scan_timeout_seconds", "freshness_seconds", "poll_interval_seconds", "reconnect_window_seconds") if k in raw},
                 "hardware_facts": dict(raw.get("hardware_facts") or {}),
-                "data_mode": raw.get("data_mode", "microstrain"),
+                "data_mode": raw.get("data_mode", "raw_matrix" if driver == "m3232_pressure" else "microstrain"),
                 "calibration_profile": raw.get("calibration_profile"),
                 "bridge": raw.get("bridge", ""),
                 "device_identity": dict(raw.get("device_identity") or {}),
@@ -371,6 +372,9 @@ def validate_pre_sensor_config(
     required_channels = set(
         (ACQUISITION_SCHEMAS.get(dataset_schema) or {}).get("sensors", [])
     )
+    if any(item["driver"] == "m3232_pressure" and item["data_mode"] == "raw_matrix" for item in interface_specs):
+        required_channels.discard("薄膜压力")
+        required_channels.add("薄膜压力原始响应")
     if dataset_schema == "new_collection_v13_0" and any(
         item["driver"] == "esr1001_usb_ttl" and item["data_mode"] == "raw_adc"
         for item in interface_specs
@@ -427,6 +431,9 @@ def validate_pre_sensor_config(
                 interface[key] = spec[key]
         if spec["driver"] in {"modbus_rtu_esr1001", "huipu_tc64_modbus_rtu"}:
             interface["slave_id"] = spec["slave_id"]
+        if spec["driver"] == "m3232_pressure":
+            for key in ("protocol_profile", "matrix_rows", "matrix_cols", "first_frame_timeout_seconds", "frame_timeout_seconds", "max_buffer_bytes", "freshness_seconds", "data_mode", "calibration_profile", "device_identity"):
+                if key in spec: interface[key] = deepcopy(spec[key])
         if spec["driver"] == "huipu_tc64_modbus_rtu":
             for key in ("read_profile", "timeout", "channel_settings", "device_identity", "scan_timeout_seconds", "freshness_seconds", "poll_interval_seconds", "reconnect_window_seconds"):
                 if key in spec:

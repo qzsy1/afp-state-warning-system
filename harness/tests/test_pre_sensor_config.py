@@ -46,7 +46,7 @@ class PreSensorConfigurationTemplateTests(unittest.TestCase):
 
     def test_two_complete_mutually_exclusive_templates(self) -> None:
         expected_channels = {
-            "温度", "压力", "薄膜压力", "ROI平均温度", "张力", "线速度",
+            "温度", "压力", "薄膜压力原始响应", "ROI平均温度", "张力", "线速度",
             "ABB_X", "ABB_Y", "ABB_Z",
             *{f"温度{index}" for index in range(1, 65)},
             *{f"应变{index}" for index in range(1, 5)},

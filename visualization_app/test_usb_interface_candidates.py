@@ -385,7 +385,8 @@ console.log(JSON.stringify({
         )
         self.assertEqual(len(set(result["usb"])), 3)
         self.assertEqual(result["network"], ["ethernet:lan", "ethernet:lan"])
-        self.assertEqual(result["origins"], ["auto"] * 5)
+        self.assertEqual(result["origins"], ["auto", "auto", None, "auto", "auto"])
+        self.assertIsNone(result["usb"][2])
         self.assertEqual(result["verified"], [False, False, False])
 
     def test_missing_manual_port_is_preserved_instead_of_migrated(self) -> None:

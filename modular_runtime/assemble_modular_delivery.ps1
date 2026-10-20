@@ -217,7 +217,7 @@ foreach ($fieldDocument in @("FIELD-OPERATIONS.md", "real-device-only-checklist.
 }
 
 $legacyFiles = @(
-    "app.py", "interface_agent.py", "agentic_diagnosis.py", "diagnostic_tools.py", "acquisition.py", "acquisition_start.py", "acquisition_readiness.py", "real_acquisition.py", "local_direct_acquisition.py", "esr1001_usb.py", "smrf_hid.py", "mysql_storage.py",
+    "app.py", "interface_agent.py", "agentic_diagnosis.py", "diagnostic_tools.py", "acquisition.py", "acquisition_start.py", "acquisition_readiness.py", "real_acquisition.py", "local_direct_acquisition.py", "esr1001_usb.py", "m3232_serial.py", "render_evidence.py", "smrf_hid.py", "mysql_storage.py",
     "online_inference.py", "atavn.py", "online_health_features.py",
     "causal_online_runtime.py", "runtime_scaler.py", "new_collection_health.py",
     "runtime_health_primitives.py", "web_training.py", "web_training_pipeline.py",

@@ -15,6 +15,71 @@ from real_acquisition import ChannelQuality, ChannelSample, UnifiedFrame
 
 
 class CurveReadinessTests(unittest.TestCase):
+    def test_main_matrix_renders_zero_and_central_pixel_without_aggregation_loss(self):
+        source = (Path(__file__).parent / "static" / "app.js").read_text(encoding="utf-8")
+        function = source[source.index("function renderM3232Matrix(status)"):source.index("function renderAcquisitionStatus(status)")]
+        script = r'''
+const assert = require('assert');
+const paints=[], callbacks=[];
+const nodes=Object.fromEntries(['m3232MatrixPanel','m3232MatrixCanvas','m3232MatrixStatus','m3232MatrixValues','m3232MatrixData'].map(id=>[id,{textContent:'',dataset:{},classList:{toggle(){}},getContext(){return {clearRect(){paints.length=0},fillRect(x,y,w,h){paints.push({x,y,color:this.fillStyle})}}}}]));
+const document={getElementById:id=>nodes[id]};
+const window={afpCurveTrace:{accepts:s=>s.capture_generation==='current'}};
+const requestAnimationFrame=f=>callbacks.push(f);
+const originalCurveCanvasVisible=()=>true;
+const performance={now:()=>120};let saved=0;
+const persistCurveRenderEvidence=()=>saved++;
+''' + function + r'''
+const evidence={protocol_verified:true,connection_generation:'connection',frame_age_seconds:.01,valid_frame_rate_hz:8,matrix_shape:[32,32],latest_matrix:{connection_generation:'connection',receive_sequence:1,raw_total:0,matrix:Array.from({length:32},()=>Array(32).fill(0))}};
+const status={running:true,capture_generation:'current',start_request_id:'click',interfaces:[{enabled:true,driver:'m3232_pressure',m3232_evidence:evidence}]};
+renderM3232Matrix(status);assert.equal(paints.length,1024);assert.match(nodes.m3232MatrixValues.textContent,/完整全零帧/);
+while(callbacks.length)callbacks.shift()();assert.equal(saved,1);
+evidence.latest_matrix.matrix[15][16]=27;evidence.latest_matrix.receive_sequence=2;evidence.latest_matrix.raw_total=27;
+renderM3232Matrix(status);assert.equal(paints.length,2048);
+assert.notEqual(paints[1024+15*32+16].color,paints[1024].color);
+assert.match(nodes.m3232MatrixValues.textContent,/0 \/ 27 \/ 0 \/ 0/);assert.match(nodes.m3232MatrixData.textContent,/27/);
+while(callbacks.length)callbacks.shift()();assert.equal(window.afpM3232MatrixEvidence.source_sequence,2);
+evidence.frame_age_seconds=3;renderM3232Matrix(status);assert.equal(paints.length,0);assert.equal(window.afpM3232MatrixEvidence,null);
+evidence.frame_age_seconds=.01;status.capture_generation='old';renderM3232Matrix(status);assert.equal(paints.length,0);
+status.capture_generation='current';evidence.latest_matrix.matrix[0]=[NaN];renderM3232Matrix(status);assert.equal(paints.length,0);
+'''
+        result = subprocess.run(["node", "-"], input=script, text=True, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_status_update_refreshes_current_m3232_matrix(self):
+        source = (Path(__file__).parent / "static" / "app.js").read_text(encoding="utf-8")
+        begin = source.index("function renderAcquisitionStatus(status)")
+        end = source.index("  if (status?.save_status)", begin)
+        self.assertIn("renderM3232Matrix(status)",source[begin:end])
+
+    def test_render_evidence_requires_current_real_source_and_keeps_three_second_failure(self):
+        from render_evidence import save_render_evidence
+        from copy import deepcopy
+        with tempfile.TemporaryDirectory() as root:
+            manager = AcquisitionManager(Path(root), recovery_scan=False)
+            cfg = config(root)
+            cfg.selected_sensors = ["压力"]
+            cfg.start_request_id = "trusted-click"
+            manager.config = cfg
+            manager._begin_capture_timeline(cfg)
+            manager.capture_record_dir = Path(root)
+            points = [dict(interface_id="one", source_sequence=i, received_monotonic=100+i,
+                           capture_generation=cfg.capture_generation, start_request_id=cfg.start_request_id,
+                           quality="measured_new", after_start=True, protocol_ok=True) for i in (1,2)]
+            manager._curve_start_observations = {"压力":points}
+            trace = dict(start_request_id=cfg.start_request_id, capture_generation=cfg.capture_generation,
+                         complete=True, input=dict(valid=True,trusted=True,timestamp=100),
+                         selected_channels=["压力"], displayed={"压力":3100.1}, observations={"压力":points})
+            payload = {"trace":trace}
+            result = save_render_evidence(manager,payload)
+            self.assertFalse(result["pass"])
+            self.assertAlmostEqual(result["elapsed_ms"],3000.1)
+            self.assertTrue(Path(result["path"]).is_file())
+            for field,value in [("capture_generation","old"),("input",dict(valid=False,trusted=False,timestamp=100)),
+                                ("observations",{"压力":[dict(p,source_sequence=99) for p in points]})]:
+                invalid = deepcopy(payload)
+                invalid["trace"][field] = value
+                with self.assertRaises(ValueError):save_render_evidence(manager,invalid)
+
     def test_usb_profile_requires_current_session_stability_and_matching_handshakes(self):
         from real_acquisition import ReadinessSnapshot, readiness_config_fingerprint
         from esr1001_usb import USB_DRIVER, BOUNDED_START_PARAMETER_HEX
@@ -190,10 +255,10 @@ trace.confirmDisplayed(['B'],false);assert.equal(trace.complete,false);
 now=3200;trace.confirmDisplayed(['B'],true,{surface:'thermocouple64_group',canvas_width:300,canvas_height:200});
 assert.equal(trace.snapshot().presentations.A.surface,'sensor_card');
 assert.equal(trace.snapshot().presentations.B.surface,'thermocouple64_group');
-assert.equal(trace.snapshot().elapsed_ms,3100);assert.equal(trace.snapshot().pass,true);
+assert.equal(trace.snapshot().elapsed_ms,3100);assert.equal(trace.snapshot().pass,false);
 assert.equal(trace.snapshot().target_pass,false);
-now=5100;trace.drawn.set('B',now);assert.equal(trace.snapshot().pass,true);
-now=5100.1;trace.drawn.set('B',now);assert.equal(trace.snapshot().pass,false);
+now=3100;trace.drawn.set('B',now);assert.equal(trace.snapshot().pass,true);
+now=3100.1;trace.drawn.set('B',now);assert.equal(trace.snapshot().pass,false);
 const synthetic=new CurveTrace({isTrusted:false,timeStamp:100},cfg,{clock,id:'script'});
 synthetic.accepts({start_request_id:'script',capture_generation:'gen'});
 synthetic.drawnChannel(channel,canvas,true);synthetic.confirmDisplayed(['A'],true);

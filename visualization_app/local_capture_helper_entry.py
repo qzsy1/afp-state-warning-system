@@ -596,6 +596,8 @@ def helper_capabilities(server_url: str = "") -> dict[str, Any]:
         "esr1001_modbus_rtu": True,
         "esr1001_usb_ttl": True,
         "esr1001_raw_adc_capture": True,
+                "m3232_uart_text_v1": True,
+                "m3232_matrix_csv_v1": True,
         "esr1001_calibration_v1": True,
         "interface_roles": [
             "thermocouple_8ch", "plc_process", "uvc_temperature",

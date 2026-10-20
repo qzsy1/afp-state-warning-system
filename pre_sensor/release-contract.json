@@ -4,7 +4,7 @@
     "application_version": "2.0.5-rc.3",
     "helper_version": "2.0.5-rc.3",
     "launcher_version": "2.0.5-rc.3",
-    "release_revision": "native-sensor-acquisition-v2"
+    "release_revision": "m3232-matrix-csv-v1"
   },
   "contracts": {
     "helper_protocol_version": 2,
@@ -59,7 +59,7 @@
     ],
     "drivers": [
       {"id": "huipu_tc64_modbus_rtu", "required_for": "thermocouple64", "release_gate": "protocol_readback_and_physical_acceptance_required"},
-      {"id": "serial_port", "required_for": "m3232_pressure"},
+      {"id": "serial_port", "required_for": "m3232_pressure", "capabilities": ["m3232_uart_text_v1", "m3232_matrix_csv_v1"], "source_file": "app/legacy/m3232_serial.py"},
       {"id": "modbus_rtu_esr1001", "required_for": "esr1001_strain"},
       {"id": "esr1001_usb_ttl", "required_for": "esr1001_strain_usb", "capabilities": ["esr1001_raw_adc_capture", "esr1001_calibration_v1"], "source_file": "app/legacy/esr1001_usb.py"},
       {"id": "ethernet", "required_for": "plc_process_and_abb_motion"},

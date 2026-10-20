@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
-  "release_revision": "native-sensor-acquisition-v2",
+  "release_revision": "m3232-matrix-csv-v1",
   "dataset_schema": "new_collection_v13_0",
   "mode": "remote_helper",
   "channels": [
     {"name": "温度", "unit": "°C", "interface_id": "plc-process"},
     {"name": "压力", "unit": "N", "interface_id": "plc-process"},
-    {"name": "薄膜压力", "unit": "N", "interface_id": "m3232-pressure"},
+    {"name": "薄膜压力原始响应", "unit": "raw", "interface_id": "m3232-pressure"},
     {"name": "ROI平均温度", "unit": "°C", "interface_id": "uvc-temperature"},
     {"name": "张力", "unit": "N", "interface_id": "plc-process"},
     {"name": "线速度", "unit": "mm/s", "interface_id": "abb-motion"},
@@ -87,7 +87,7 @@
     {"id": "plc-process", "role": "plc_process", "driver": "modbus_tcp", "location": "remote_helper", "endpoint_ref": "AFP_INTERFACE_PLC"},
     {"id": "uvc-temperature", "role": "uvc_temperature", "driver": "uvc_thermal", "location": "remote_helper", "endpoint_ref": "AFP_INTERFACE_UVC"},
     {"id": "abb-motion", "role": "abb_motion", "driver": "abb_robot", "location": "remote_helper", "endpoint_ref": "AFP_INTERFACE_ABB"},
-    {"id": "m3232-pressure", "role": "m3232_pressure", "driver": "m3232_pressure", "location": "remote_helper", "endpoint_ref": "AFP_INTERFACE_M3232"},
+    {"id": "m3232-pressure", "role": "m3232_pressure", "driver": "m3232_pressure", "location": "remote_helper", "endpoint_ref": "AFP_INTERFACE_M3232", "baudrate": 230400, "protocol_profile": "m3232_uart_text_v1", "matrix_rows": 32, "matrix_cols": 32, "data_mode": "raw_matrix"},
     {"id": "esr1001-strain", "role": "esr1001_strain", "driver": "modbus_rtu_esr1001", "location": "remote_helper", "endpoint_ref": "AFP_INTERFACE_ESR1001", "baudrate": 9600, "slave_id": 1}
   ],
   "helper": {

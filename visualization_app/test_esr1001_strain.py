@@ -937,7 +937,7 @@ class Esr1001CatalogTests(unittest.TestCase):
             real_acquisition_mode="local_direct",
             dataset_schema="new_collection_v13_0",
             interfaces=real_interfaces("local"),
-            selected_sensors=acquisition.LATEST_COLLECTION_SENSOR_COLUMNS.copy(),
+            selected_sensors=["薄膜压力原始响应" if n == "薄膜压力" else n for n in acquisition.LATEST_COLLECTION_SENSOR_COLUMNS],
             processing_mode="capture_only",
         )
         remote = acquisition.AcquisitionConfig(
@@ -948,12 +948,12 @@ class Esr1001CatalogTests(unittest.TestCase):
             helper_capabilities={"unified_frame_v1": True, "unified_frame_v2": True},
             dataset_schema="new_collection_v13_0",
             interfaces=real_interfaces("remote_helper"),
-            selected_sensors=acquisition.LATEST_COLLECTION_SENSOR_COLUMNS.copy(),
+            selected_sensors=["薄膜压力原始响应" if n == "薄膜压力" else n for n in acquisition.LATEST_COLLECTION_SENSOR_COLUMNS],
             processing_mode="capture_only",
         )
         self.assertEqual(
             simulation.interface_channel_assignments,
-            local.interface_channel_assignments,
+            {key:["薄膜压力" if n == "薄膜压力原始响应" else n for n in names] for key,names in local.interface_channel_assignments.items()},
         )
         self.assertEqual(local.interface_channel_assignments, remote.interface_channel_assignments)
         self.assertEqual(

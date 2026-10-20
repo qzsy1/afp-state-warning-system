@@ -482,6 +482,13 @@
             </div>
             <div class="channel-panel-content">
               <div id="sensorCardsViewport" class="sensor-cards-viewport">
+                <section id="m3232MatrixPanel" class="m3232-matrix-panel hidden" aria-label="M3232 完整原始矩阵">
+                  <div class="m3232-matrix-heading"><strong>M3232 · 32×32 原始矩阵</strong><span>未标定 · 像素值不代表 N/kPa</span></div>
+                  <div class="m3232-matrix-body">
+                    <canvas id="m3232MatrixCanvas" width="256" height="256" aria-label="当前会话32×32原始矩阵热图"></canvas>
+                    <div><p id="m3232MatrixStatus" role="status">等待当前会话完整矩阵</p><p id="m3232MatrixValues"></p><p>曲线“薄膜压力原始响应”为每帧1024个像素的合计；完整空间分布见左图。颜色按当前帧最大绝对值缩放，零值为蓝色。</p><details id="m3232MatrixNumbers"><summary>查看当前帧全部数值（行、列从1计）</summary><pre id="m3232MatrixData"></pre></details></div>
+                  </div>
+                </section>
                 <div id="sensorCards" class="sensor-grid"></div>
               </div>
             </div>

@@ -794,12 +794,21 @@ function applySensorTypeProfile(row, resetEndpoint = true) {
     driver.disabled = !profile.editable_driver && !strain;
   }
   const usb = strain && driver?.value === "esr1001_usb_ttl";
+  const film = role?.value === "pressure";
+  const mode = row.querySelector(".interface-data-mode");
+  if (mode) {
+    const valid = film ? ["raw_matrix","calibrated_force"] : ["raw_adc","microstrain"];
+    for (const option of mode.options || []) option.hidden = !valid.includes(option.value);
+    if (!valid.includes(mode.value)) mode.value = valid[0];
+  }
+  const confirm = row.querySelector(".m3232-confirm");
+  if (confirm) confirm.hidden = !film;
   if (endpoint && (resetEndpoint || !endpoint.value.trim())) {
     endpoint.value = profile.endpoint || "";
   }
   if (usb && baudrate) baudrate.value = "115200";
-  else if (baudrate && profile.baudrate && (resetEndpoint || !Number(baudrate.value) || (!strain && profile.id !== "thermocouple64"))) baudrate.value = String(profile.baudrate);
-  row.querySelector(".interface-usb-options")?.classList.toggle("hidden", !usb);
+  else if (baudrate && profile.baudrate && (resetEndpoint || !Number(baudrate.value) || (!strain && !["thermocouple64", "pressure"].includes(profile.id)))) baudrate.value = String(profile.baudrate);
+  row.querySelector(".interface-usb-options")?.classList.toggle("hidden", !usb && role?.value !== "pressure");
   row.dataset.slaveId = String((resetEndpoint ? profile.slave_id : row.dataset.slaveId) || profile.slave_id || 1);
   const slave = row.querySelector(".interface-slave-id");
   if (slave) {
@@ -1100,6 +1109,70 @@ function formatTransportMetrics(status, runtimeMetrics = {}) {
   return ` · ${parts.join(" · ")}`;
 }
 
+async function persistCurveRenderEvidence() {
+  const trace = window.afpCurveTrace;
+  if (!trace?.complete || usesLocalCaptureHelper()) return;
+  const matrix = window.afpM3232MatrixEvidence;
+  const key = matrix?.capture_generation === trace.generation ? "matrix" : "curve";
+  trace.persistedEvidence ||= {};
+  if (trace.persistedEvidence[key]) return;
+  trace.persistedEvidence[key] = "pending";
+  try {
+    trace.persistedEvidence[key] = await postJson("/api/acquisition/render-evidence", {trace: trace.snapshot(), matrix: key === "matrix" ? matrix : null});
+    const node = document.getElementById("hardwareCheckStatus");
+    if (node) node.textContent += `；真实绘制 ${trace.snapshot().elapsed_ms.toFixed(0)} ms（≤3000ms：${trace.snapshot().pass ? "通过" : "未通过"}）`;
+  } catch (error) { trace.persistedEvidence[key] = null; trace.event("evidence_write_failed", {message:error.message}); }
+}
+
+function renderM3232Matrix(status) {
+  const panel = document.getElementById("m3232MatrixPanel");
+  const canvas = document.getElementById("m3232MatrixCanvas");
+  if (!panel || !canvas) return;
+  const item = (status.interfaces || []).find(i => i.driver === "m3232_pressure" && i.enabled !== false);
+  panel.classList.toggle("hidden", !item || status.config?.acquisition_mode === "simulation");
+  const evidence = item?.m3232_evidence;
+  const record = evidence?.latest_matrix;
+  const matrix = record?.matrix;
+  const trace = window.afpCurveTrace;
+  const label = document.getElementById("m3232MatrixStatus");
+  const stats = document.getElementById("m3232MatrixValues");
+  const numbers = document.getElementById("m3232MatrixData");
+  const valid = status.running && evidence?.protocol_verified && status.capture_generation
+    && record?.connection_generation === evidence.connection_generation
+    && Number.isFinite(evidence.frame_age_seconds) && evidence.frame_age_seconds <= 2
+    && Array.isArray(matrix) && matrix.length === 32
+    && matrix.every(line => Array.isArray(line) && line.length === 32 && line.every(Number.isFinite))
+    && (!trace || trace.accepts(status));
+  if (!valid) {
+    canvas.getContext("2d").clearRect(0,0,256,256);
+    canvas.dataset.frame = "";
+    window.afpM3232MatrixEvidence = null;
+    label.textContent = !status.running ? "采集已停止 · 无当前实时矩阵" : "等待当前会话完整新矩阵 · 无数据或数据已过期";
+    stats.textContent = ""; numbers.textContent = "";
+    return;
+  }
+  label.textContent = `完整矩阵 · 来源帧 ${record.receive_sequence} · ${Number(evidence.valid_frame_rate_hz || 0).toFixed(2)} 帧/秒 · 数据年龄 ${Math.round(evidence.frame_age_seconds*1000)} ms`;
+  const key = `${status.capture_generation}:${record.connection_generation}:${record.receive_sequence}`;
+  if (canvas.dataset.frame === key) return;
+  const context = canvas.getContext("2d"); const values = matrix.flat();
+  const peak = Math.max(1, ...values.map(Math.abs));
+  matrix.forEach((line,y) => line.forEach((value,x) => {
+    context.fillStyle = `rgb(${Math.round(255*Math.max(0,value)/peak)},${Math.round(80+100*Math.abs(value)/peak)},${Math.round(220*(1-Math.abs(value)/peak))})`;
+    context.fillRect(x*8,y*8,8,8);
+  }));
+  stats.textContent = `像素合计 ${record.raw_total} raw · 最大值 ${Math.max(...values)} · 非零像素 ${values.filter(v => v !== 0).length}/1024 · 中心(16,16)/(16,17)/(17,16)/(17,17)：${[matrix[15][15],matrix[15][16],matrix[16][15],matrix[16][16]].join(" / ")}${values.every(v => v === 0) ? " · 已收到完整全零帧" : ""}`;
+  numbers.textContent = matrix.map((line,y) => `${y+1}: ${line.join(", ")}`).join("\n");
+  canvas.dataset.frame = key;
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (canvas.dataset.frame !== key || !originalCurveCanvasVisible(canvas)) return;
+    window.afpM3232MatrixEvidence = {start_request_id: status.start_request_id, capture_generation: status.capture_generation,
+      connection_generation: record.connection_generation, source_sequence: record.receive_sequence,
+      host_monotonic: record.host_monotonic, sha256: record.sha256, matrix_shape: evidence.matrix_shape,
+      displayed_monotonic_ms: performance.now(), surface: "m3232_matrix", visible: true};
+    persistCurveRenderEvidence();
+  }));
+}
+
 function renderAcquisitionStatus(status) {
   if (controls.acquisitionMode?.value === "real" && window.afpCurveTrace
       && !window.afpCurveTrace.accepts(status)) return;
@@ -1107,6 +1180,7 @@ function renderAcquisitionStatus(status) {
       && Number.isFinite(status.status_monotonic) && Number.isFinite(state.acquisitionStatus?.status_monotonic)
       && status.status_monotonic < state.acquisitionStatus.status_monotonic) return;
   state.acquisitionStatus = status;
+  if (typeof renderM3232Matrix === "function") renderM3232Matrix(status);
   const evidence = state.hardwareCheck;
   const sameReadinessSession = status.readiness_session_id === evidence?.readiness_session_id;
   const outdatedReadiness = sameReadinessSession && Number.isFinite(status.readiness_version)
@@ -2512,7 +2586,8 @@ async function startAcquisition() {
     const frozenConfig = !simulation ? JSON.parse(JSON.stringify(acquisitionConfig({allowUnverifiedPhysical: true}))) : null;
     const frozenFingerprint = frozenConfig ? hardwareConfigFingerprint(frozenConfig) : "";
     window.afpCurveTrace = null;
-    if (!simulation && !usesLocalCaptureHelper() && window.AFP_CURVE_READINESS) {
+    window.afpM3232MatrixEvidence = null;
+    if (!simulation && window.AFP_CURVE_READINESS) {
       window.afpCurveTrace = new window.AFP_CURVE_READINESS.CurveTrace(event, frozenConfig, {handlerEntered});
       window.afpCurveTrace.event("configuration_frozen", {fingerprint: frozenFingerprint});
     }
@@ -3144,7 +3219,7 @@ function datasetInterfacePreferenceKey() {
 function saveDatasetInterfacePreferences() {
   if (!state.activeInterfaceSchema || controls.acquisitionMode?.value === "simulation") return;
   const fields = ["id", "enabled", "role", "driver", "endpoint", "baudrate", "slave_id",
-    "data_mode", "calibration_profile", "bridge", "channel_count", "channel_map", "channels",
+    "protocol_profile", "matrix_rows", "matrix_cols", "first_frame_timeout_seconds", "frame_timeout_seconds", "max_buffer_bytes", "data_mode", "calibration_profile", "bridge", "channel_count", "channel_map", "channels",
     "physical_interface_id", "physical_port_id", "physical_interface_kind", "physical_transport_family", "selection_origin",
     "read_profile", "timeout", "channel_settings", "device_identity", "scan_timeout_seconds", "freshness_seconds", "poll_interval_seconds", "reconnect_window_seconds"];
   const interfaces = interfaceConfigs().interfaces.map(item => Object.fromEntries(
@@ -3218,6 +3293,10 @@ function switchDatasetInterfacePreferences(schemaId) {
 }
 
 function effectiveDatasetSensors(schema) {
+  if (controls.acquisitionMode?.value !== "simulation" && [...(controls.interfacePanel?.querySelectorAll(".interface-config-row") || [])].some(row => row.querySelector(".interface-enabled")?.checked !== false && row.querySelector(".interface-driver")?.value === "m3232_pressure" && row.querySelector(".interface-data-mode")?.value === "raw_matrix")) {
+    const sensors = schema.sensors.map(n => n === "薄膜压力" ? "薄膜压力原始响应" : n);
+    schema = {...schema, sensors: sensors.includes("薄膜压力原始响应") ? sensors : [...sensors, "薄膜压力原始响应"]};
+  }
   const rows = [...(controls.interfacePanel?.querySelectorAll(".interface-config-row") || [])];
   const raw = controls.acquisitionMode?.value !== "simulation" && rows.some(row =>
     row.querySelector(".interface-enabled")?.checked !== false
@@ -4176,6 +4255,7 @@ function confirmOriginalCurveFrame(canvas, channels, surface) {
     if (window.afpCurveTrace !== trace || trace.generation !== generation
         || canvas.dataset.curveFrameToken !== token) return;
     trace.confirmDisplayed(names, originalCurveCanvasVisible(canvas), presentation);
+    if (typeof persistCurveRenderEvidence === "function") persistCurveRenderEvidence();
   });
 }
 
@@ -5876,7 +5956,14 @@ function interfaceConfigs() {
       physical_verified: selectedPhysical?.dataset?.detected === "true",
       physical_fallback: selectedPhysical?.dataset?.fallback === "true",
       credential_identifier: String(catalogItem.credential_identifier || ""),
-      device_identity: parseDatasetObject(selectedPhysical?.dataset?.deviceIdentity || JSON.stringify(catalogItem.device_identity || {})),
+      device_identity: row.querySelector(".interface-role")?.value === "pressure"
+        ? parseDatasetObject(row.dataset.m3232Binding || JSON.stringify(catalogItem.device_identity || {}))
+        : parseDatasetObject(selectedPhysical?.dataset?.deviceIdentity || JSON.stringify(catalogItem.device_identity || {})),
+      protocol_profile: catalogItem.protocol_profile || "m3232_uart_text_v1",
+      matrix_rows: Number(catalogItem.matrix_rows || 32), matrix_cols: Number(catalogItem.matrix_cols || 32),
+      first_frame_timeout_seconds: Number(catalogItem.first_frame_timeout_seconds || 2),
+      frame_timeout_seconds: Number(catalogItem.frame_timeout_seconds || 2),
+      max_buffer_bytes: Number(catalogItem.max_buffer_bytes || 262144),
       driver_state: parseDatasetObject(selectedPhysical?.dataset?.driverState),
       device_profile: catalogItem.device_profile || {},
       selection_origin: row.dataset.selectionOrigin || "manual",
@@ -6179,6 +6266,10 @@ function autoAssignPhysicalInterfaces(configs, {allowSerialFallback = true} = {}
     const role = item.role || "custom";
     const candidates = physicalCandidatesForRole(role);
     const desired = String(item.physical_port_id || item.physical_interface_id || "");
+    if (role === "pressure") {
+      item.physical_verified = Boolean(desired && candidates.some(c => [c.id, c.physical_interface_id, c.physical_port_id].map(String).includes(desired)));
+      return;
+    }
     if (role === "thermocouple64") {
       const identity = item.device_identity || {};
       const matches = identity.serial_number ? candidates.filter(c => {
@@ -6400,7 +6491,7 @@ function defaultInterfaceCatalog() {
     { id: "plc_process", enabled: true, role: "plc", driver: "modbus_tcp", endpoint: "192.168.125.5:502", channel_map: {} },
     { id: "uvc_temperature", enabled: true, role: "thermal_uvc", driver: "uvc_thermal", endpoint: "BSV UVC (WinUSB)", channel_map: {} },
     { id: "abb_motion", enabled: true, role: "robot", driver: "abb_robot", endpoint: "192.168.125.1", channel_map: {} },
-    { id: "m3232_pressure", enabled: true, role: "pressure", driver: "m3232_pressure", endpoint: "COM8", baudrate: 115200, channel_map: {} },
+    { id: "m3232_pressure", enabled: true, role: "pressure", driver: "m3232_pressure", endpoint: "", baudrate: 230400, protocol_profile: "m3232_uart_text_v1", matrix_rows: 32, matrix_cols: 32, data_mode: "raw_matrix", channel_map: {} },
     { id: "esr1001_strain", enabled: true, role: "esr1001_strain", driver: "modbus_rtu_esr1001", endpoint: "", baudrate: 9600, slave_id: 1, channel_map: {} },
   ];
 }
@@ -6470,8 +6561,8 @@ function renderInterfacePanel(configs) {
     driver.value = item.driver || "serial_json";
     const usbOptions = document.createElement("div"); usbOptions.className = "interface-usb-options";
     const dataMode = document.createElement("select"); dataMode.className = "interface-data-mode";
-    dataMode.append(option("raw_adc", "原始ADC（adc_counts，标定未确认）"), option("microstrain", "标定微应变（με）"));
-    dataMode.value = item.data_mode || "raw_adc";
+    dataMode.append(option("raw_matrix", "原始矩阵响应（raw，未标定）"), option("calibrated_force", "标定力值（N，需有效档案）"), option("raw_adc", "原始ADC（adc_counts，标定未确认）"), option("microstrain", "标定微应变（με）"));
+    dataMode.value = item.data_mode || (canonicalRole === "pressure" ? "raw_matrix" : "raw_adc");
     const calibration = document.createElement("input"); calibration.className = "interface-calibration";
     calibration.placeholder = "设备所在主机的K/B档案JSON路径"; calibration.value = typeof item.calibration_profile === "string" ? item.calibration_profile : item.calibration_profile ? JSON.stringify(item.calibration_profile) : "";
     const bridge = document.createElement("input"); bridge.className = "interface-bridge";
@@ -6481,6 +6572,19 @@ function renderInterfacePanel(configs) {
       markHardwareCheckStale("USB数据用途或标定已变化"); configureDatasetSchema(false);
     }));
     row.append(usbOptions);
+    const confirmM3232 = document.createElement("button"); confirmM3232.type = "button";
+    confirmM3232.className = "m3232-confirm";
+    confirmM3232.textContent = "已用接线/拔插确认此串口连接M3232";
+    confirmM3232.hidden = canonicalRole !== "pressure";
+    confirmM3232.addEventListener("click", () => {
+      const selected = row.querySelector(".interface-physical")?.selectedOptions?.[0];
+      const identity = JSON.parse(selected?.dataset?.deviceIdentity || "{}");
+      if (!identity.location && !identity.serial_number) { toast("缺少USB位置或序列号，请刷新实际接口"); return; }
+      row.dataset.m3232Binding = JSON.stringify({...identity, endpoint: row.querySelector(".interface-endpoint").value.trim(), confirmed: true, confirmation: "operator_wiring_unplug"});
+      markHardwareCheckStale("M3232归属已确认，请检查协议数据");
+    });
+    if (item.device_identity?.confirmed) row.dataset.m3232Binding = JSON.stringify(item.device_identity);
+    row.append(confirmM3232);
     const endpoint = document.createElement("input"); endpoint.className = "interface-endpoint"; endpoint.type = "text";
     const currentEndpoint = String(item.endpoint || "");
     endpoint.value = currentEndpoint;
@@ -6592,7 +6696,7 @@ function mergeRememberedInterfaceSelections(defaults) {
   }
   const byId = new Map(remembered.map((item) => [String(item.id || ""), item]));
   const bindingFields = [
-    "enabled", "driver", "data_mode", "calibration_profile", "bridge", "calibration_digest", "channel_count", "channel_map",
+    "enabled", "driver", "protocol_profile", "matrix_rows", "matrix_cols", "first_frame_timeout_seconds", "frame_timeout_seconds", "max_buffer_bytes", "data_mode", "calibration_profile", "bridge", "calibration_digest", "channel_count", "channel_map",
     "physical_interface_id", "physical_port_id", "physical_interface_kind",
     "physical_transport_family", "physical_verified", "physical_fallback",
     "selection_origin", "endpoint", "baudrate", "slave_id", "device_identity",
@@ -7722,6 +7826,7 @@ function isTemperatureChannel(channel) {
 
 function interfaceAcceptsChannel(item, channel) {
   if (!item) return false;
+  if (item.driver === "m3232_pressure") return channel === (controls.acquisitionMode?.value === "simulation" ? "薄膜压力" : (item.data_mode || "raw_matrix") === "raw_matrix" ? "薄膜压力原始响应" : "薄膜压力");
   if (item.driver === "esr1001_usb_ttl" && (item.data_mode || "raw_adc") === "raw_adc") return /^CH[1-4]_ADC_signed$/.test(channel);
   const profile = sensorTypeProfile(item.role);
   return Boolean(profile.editable_driver)
@@ -7877,6 +7982,8 @@ function readinessInterfaceFingerprint(item) {
     freshness_seconds: item?.freshness_seconds,
     poll_interval_seconds: item?.poll_interval_seconds,
     reconnect_window_seconds: item?.reconnect_window_seconds,
+    protocol_profile: item?.protocol_profile, matrix_rows: item?.matrix_rows, matrix_cols: item?.matrix_cols,
+    first_frame_timeout_seconds: item?.first_frame_timeout_seconds, frame_timeout_seconds: item?.frame_timeout_seconds, max_buffer_bytes: item?.max_buffer_bytes,
     data_mode: item?.data_mode,
     channel_count: item?.channel_count,
     calibration_profile: item?.calibration_profile,

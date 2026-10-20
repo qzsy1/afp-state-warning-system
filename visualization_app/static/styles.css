@@ -702,6 +702,13 @@ canvas { display: block; width: 100%; }
 .channel-panel > .panel-header { margin: 0; padding: 7px 9px; border-bottom: 1px solid var(--line); }
 .channel-panel-content { display: grid; height: 100%; min-height: 0; }
 .sensor-grid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); align-content: start; gap: 10px; }
+.m3232-matrix-panel { margin-bottom: 10px; padding: 10px; border: 1px solid #bcd3e2; border-radius: 5px; background: #f7fbfe; }
+.m3232-matrix-heading { display: flex; flex-wrap: wrap; gap: 8px; color: var(--navy); font-size: 12px; }
+.m3232-matrix-heading span, .m3232-matrix-body { color: #526e83; font-size: 11px; }
+.m3232-matrix-body { display: grid; grid-template-columns: minmax(128px, 220px) minmax(0,1fr); gap: 12px; margin-top: 8px; }
+.m3232-matrix-body canvas { width: 100%; height: auto; aspect-ratio: 1; image-rendering: pixelated; }
+.m3232-matrix-body p { margin: 0 0 8px; line-height: 1.5; }
+.m3232-matrix-body pre { max-height: 200px; overflow: auto; font-size: 10px; }
 .sensor-panel-resizer { position: relative; z-index: 4; min-width: 0; cursor: row-resize; touch-action: none; user-select: none; }
 .sensor-panel-resizer::before { content: ""; position: absolute; top: 50%; right: 0; left: 0; height: 2px; background: #a9c3d5; transform: translateY(-50%); transition: height .15s ease, background .15s ease, box-shadow .15s ease; }
 .sensor-panel-resizer-grip { position: absolute; top: 50%; left: 50%; z-index: 2; display: grid; place-items: center; width: 54px; height: 10px; color: #477b9d; background: #f7fbfe; border: 1px solid #9dbed3; border-radius: 6px; box-shadow: 0 2px 7px rgba(24,63,94,.16); font-size: 10px; letter-spacing: 3px; transform: translate(-50%, -50%); }

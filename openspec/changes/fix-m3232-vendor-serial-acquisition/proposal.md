@@ -28,4 +28,5 @@
 - 驱动与采集：`visualization_app/acquisition.py`、拟新增独立 `m3232_serial.py`、`local_direct_acquisition.py`、`real_acquisition.py`。
 - 配置、界面与传输：现有 USB 拓扑和接口目录、`pre_sensor_config.py`、`pre_sensor/config`、`static/app.js`、`native_integrated_app.py`、`local_capture_agent.py`、`local_capture_helper_entry.py`、就绪与公共状态模块。
 - 验证和交付：现有 M3232/采集完整性/Helper 测试、Harness 对应合同、模块清单和装配脚本、`docs/M3232压力传感器集成说明.md`。复用 pyserial，不引入商家 EXE、.NET 或未经提供的 SDK。
-- 本次产物为检查与集成方案。协议未提供的设备标识、物理量标定和实际帧率保留实物确认条件；不授权安装驱动、改写设备参数或更新正式运行目录。
+- 实施包含代码、验证和固定正式运行目录更新；按仓库常规更新授权执行，不安装驱动或改写设备参数。协议未提供的物理量标定与计量精度须独立验收。
+- 从用户点击开始到当前会话真实有效图像/曲线首次完成绘制 MUST ≤3秒，覆盖完整启动链路；首次及至少五次停止后重启逐次测量并存证。

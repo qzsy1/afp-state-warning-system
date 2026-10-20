@@ -40,7 +40,7 @@ New-Item -ItemType Directory -Path $staging | Out-Null
 $previousPyInstallerConfig = $env:PYINSTALLER_CONFIG_DIR
 $env:PYINSTALLER_CONFIG_DIR = Join-Path $staging "pyinstaller-config"
 try {
-    & $pythonCommand @pythonPrefix -m PyInstaller --noconfirm --clean --onefile --console `
+    & $pythonCommand @pythonPrefix -m PyInstaller --noconfirm --clean --onefile --console --runtime-tmpdir $stagingRoot `
         --hidden-import websocket --name "AFP_Local_Capture_Helper" --distpath $staging --workpath (Join-Path $staging "build") `
         --specpath $staging $entry
     if ($LASTEXITCODE -ne 0) {

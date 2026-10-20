@@ -477,9 +477,9 @@
     },
     {
       "id": "real-acquisition-protocol-contracts",
-      "title": "ESR1001-A协议、21通道数据链路与六接口契约",
+      "title": "M3232及ESR1001-A协议、通道与六接口契约",
       "kind": "command",
-      "command": ["{python}", "-m", "unittest", "visualization_app.test_esr1001_strain", "-v"],
+      "command": ["{python}", "-m", "unittest", "visualization_app.test_esr1001_strain", "visualization_app.test_m3232_pressure", "-v"],
       "cwd": ".",
       "timeout_seconds": 180,
       "profiles": ["quick", "full", "release"],

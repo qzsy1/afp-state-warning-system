@@ -88,6 +88,7 @@ AUTHORIZED_POST = {
     "/api/acquisition/test",
     "/api/acquisition/reset-check",
     "/api/acquisition/start",
+    "/api/acquisition/render-evidence",
     "/api/acquisition/stop",
     "/api/acquisition/process-parameters",
     "/api/acquisition/select-folder",

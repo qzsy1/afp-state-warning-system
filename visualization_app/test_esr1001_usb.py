@@ -694,8 +694,9 @@ class UsbIntegrationTests(unittest.TestCase):
         config.dataset_schema = "new_collection_v12_0"
         config.interfaces[0]["data_mode"] = "microstrain"
         config.interfaces.append(dict(config.interfaces[0], id="other", role="pressure", driver="m3232_pressure"))
-        config.selected_sensors = ["应变1", "应变2", "应变3", "应变4", "薄膜压力"]
+        config.selected_sensors = ["应变1", "应变2", "应变3", "应变4", "薄膜压力原始响应"]
         config.interface_channel_assignments = {}
+        config.interfaces[-1]["data_mode"] = "raw_matrix"
         config = AcquisitionConfig(diagnostic_validation=True, **__import__("dataclasses").asdict(config))
         with tempfile.TemporaryDirectory() as root, patch("serial.Serial") as serial:
             manager = AcquisitionManager(Path(root), recovery_scan=False)

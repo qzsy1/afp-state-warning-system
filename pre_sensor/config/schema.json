@@ -52,7 +52,7 @@
           "reconnect_window_seconds": {"type": "number", "minimum": 0, "maximum": 300},
           "channel_settings": {"type": "object"},
           "hardware_facts": {"type": "object"}
-          ,"data_mode": {"enum": ["raw_adc", "microstrain"]}
+          ,"data_mode": {"enum": ["raw_adc", "microstrain", "raw_matrix", "calibrated_force"]}
           ,"calibration_profile": {"type": ["string", "object", "null"]}
           ,"bridge": {"type": "string"}
           ,"device_identity": {"type": "object"}

@@ -729,6 +729,7 @@ LIVE_SENSOR_UNITS = {
     "位移": "mm",
     "压力": "N / device unit",
     "薄膜压力": "N",
+    "薄膜压力原始响应": "raw",
     "振动": "device unit",
     "温度": "°C",
     "ROI平均温度": "°C",
@@ -5941,6 +5942,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 )
                 return
             controlled_paths = {
+                "/api/acquisition/render-evidence",
                 "/api/acquisition/test",
                 "/api/acquisition/reset-check",
                 "/api/acquisition/start",
@@ -6719,6 +6721,10 @@ class AppHandler(BaseHTTPRequestHandler):
                     str(payload.get("query", "")),
                 )
                 self._send_json(result)
+                return
+            if parsed.path == "/api/acquisition/render-evidence":
+                from render_evidence import save_render_evidence
+                self._send_json(save_render_evidence(self.dashboard.acquisition, payload))
                 return
             if parsed.path == "/api/acquisition/start":
                 identity = self._identity()

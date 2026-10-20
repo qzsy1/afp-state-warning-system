@@ -282,13 +282,13 @@ class AcquisitionIntegrityTests(unittest.TestCase):
         ]
         config = AcquisitionConfig(
             acquisition_mode="real", dataset_schema="new_collection_v11_3",
-            selected_sensors=["温度", "压力", "薄膜压力", "ROI平均温度", "张力", "线速度", "ABB_X", "ABB_Y", "ABB_Z"],
+            selected_sensors=["温度", "压力", "薄膜压力原始响应", "ROI平均温度", "张力", "线速度", "ABB_X", "ABB_Y", "ABB_Z"],
             interfaces=interfaces,
             interface_channel_assignments={
                 "plc_process": ["温度", "压力", "张力"],
                 "uvc_temperature": ["ROI平均温度"],
                 "abb_motion": ["线速度", "ABB_X", "ABB_Y", "ABB_Z"],
-                "m3232_pressure": ["薄膜压力"],
+                "m3232_pressure": ["薄膜压力原始响应"],
             },
         )
         self.assertEqual(config.interfaces[0]["physical_interface_id"], config.interfaces[2]["physical_interface_id"])

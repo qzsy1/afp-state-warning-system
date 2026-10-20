@@ -347,10 +347,11 @@ class AcquisitionPanel(ttk.Frame):
                 "baudrate": self._v(f"interface_{index}_baudrate", int(item.get("baudrate") or 0)),
                 "slave_id": self._v(f"interface_{index}_slave_id", int(item.get("slave_id") or 1)),
                 "map": self._v(f"interface_{index}_map", "{}"),
-                "data_mode": self._v(f"interface_{index}_data_mode", "raw_adc"),
+                "data_mode": self._v(f"interface_{index}_data_mode", item.get("data_mode", "raw_adc")),
                 "calibration_profile": self._v(f"interface_{index}_calibration", ""),
                 "bridge": self._v(f"interface_{index}_bridge", ""),
             }
+            values["m3232_binding"] = self._v(f"interface_{index}_m3232_binding", "{}")
             self.interface_vars.append(values)
             ttk.Checkbutton(interfaces, variable=values["enabled"]).grid(row=index, column=0)
             ttk.Combobox(interfaces, textvariable=values["role"], values=role_values, state="readonly", width=14).grid(row=index, column=1, padx=2)
@@ -361,6 +362,10 @@ class AcquisitionPanel(ttk.Frame):
             ttk.Entry(interfaces, textvariable=values["baudrate"], width=8).grid(row=index, column=5, padx=2)
             slave_widget = ttk.Entry(interfaces, textvariable=values["slave_id"], width=4)
             slave_widget.grid(row=index, column=6, padx=2)
+            if item["role"] == "pressure":
+                ttk.Combobox(interfaces, textvariable=values["data_mode"], values=("raw_matrix", "calibrated_force"), state="readonly", width=16).grid(row=index, column=7)
+                ttk.Entry(interfaces, textvariable=values["calibration_profile"], width=20).grid(row=index, column=8)
+                ttk.Button(interfaces, text="确认M3232接线归属", command=lambda v=values: self._confirm_m3232_binding(v)).grid(row=index, column=9)
             if item["role"] == "esr1001_strain":
                 ttk.Combobox(interfaces, textvariable=values["data_mode"], values=("raw_adc", "microstrain"), state="readonly", width=12).grid(row=index, column=7)
                 ttk.Entry(interfaces, textvariable=values["calibration_profile"], width=20).grid(row=index, column=8)
@@ -572,6 +577,9 @@ class AcquisitionPanel(ttk.Frame):
     def _schema_changed(self) -> None:
         schema = str(self.vars["dataset_schema"].get())
         sensors = list(ACQUISITION_SCHEMAS[schema]["sensors"])
+        if str(self.vars["driver"].get()) != "simulator" and any(v["enabled"].get() and v["driver"].get() == "m3232_pressure" and v["data_mode"].get() == "raw_matrix" for v in getattr(self,"interface_vars",[])):
+            sensors = ["薄膜压力原始响应" if n == "薄膜压力" else n for n in sensors]
+            if "薄膜压力原始响应" not in sensors: sensors.append("薄膜压力原始响应")
         self.schema_info.set(
             f"{len(sensors)} 个传感器通道"
             if schema.startswith("new_collection_")
@@ -619,7 +627,7 @@ class AcquisitionPanel(ttk.Frame):
         ports = result.get("ports", [])
         defaults = result.get("defaults", [])
         for values, item in zip(self.interface_vars, defaults):
-            if values["driver"].get() == "esr1001_usb_ttl":
+            if values["driver"].get() in {"esr1001_usb_ttl", "m3232_pressure"}:
                 continue
             values["endpoint"].set(item.get("endpoint", ""))
             values["role"].set(item.get("role", "other"))
@@ -630,6 +638,19 @@ class AcquisitionPanel(ttk.Frame):
             if item.get("slave_id"):
                 values["slave_id"].set(int(item["slave_id"]))
         self.status_text.set(f"发现 {len(ports)} 个串口；六个逻辑接口配置已更新，可继续核对端点和通道映射")
+
+    def _confirm_m3232_binding(self, values) -> None:
+        from serial.tools import list_ports
+        endpoint = str(values["endpoint"].get()).strip()
+        port = next((p for p in list_ports.comports() if p.device.casefold() == endpoint.casefold()), None)
+        if port is None or not (port.location or port.serial_number):
+            messagebox.showerror("M3232归属", "请填写存在且具有USB位置或序列号的实际端口")
+            return
+        if messagebox.askyesno("M3232归属", f"已通过接线/拔插确认{endpoint}连接M3232？"):
+            binding = {k:getattr(port,k,None) for k in ("vid","pid","serial_number","location")}
+            binding.update(endpoint=endpoint, confirmed=True, confirmation="operator_wiring_unplug")
+            values["m3232_binding"].set(json.dumps(binding))
+            self._schema_changed()
 
     def _pick_endpoint(self) -> None:
         selected = filedialog.askopenfilename(title="选择模拟采集CSV", filetypes=[("CSV", "*.csv"), ("所有文件", "*.*")])
@@ -685,6 +706,9 @@ class AcquisitionPanel(ttk.Frame):
                 interface["baudrate"] = baudrate
             if interface["driver"] in {"modbus_tcp", "modbus_rtu_esr1001", "huipu_tc64_modbus_rtu"}:
                 interface["slave_id"] = _safe_int(values["slave_id"].get(), 1, 1)
+            if interface["driver"] == "m3232_pressure":
+                interface.update(data_mode=str(values["data_mode"].get()), calibration_profile=str(values["calibration_profile"].get()).strip() or None,
+                    device_identity=json.loads(str(values["m3232_binding"].get())), physical_interface_id="serial:"+interface["endpoint"], physical_interface_kind="serial")
             if interface["driver"] == "esr1001_usb_ttl":
                 from serial.tools import list_ports
                 interface.update(data_mode=str(values["data_mode"].get()), calibration_profile=str(values["calibration_profile"].get()).strip() or None, bridge=str(values["bridge"].get()).strip(), baudrate=115200)

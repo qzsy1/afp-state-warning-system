@@ -89,7 +89,7 @@ class LocalDirectAdapter:
         if reconnect_window_seconds is None:
             reconnect_window_seconds = (
                 _DEFAULT_USB_RECONNECT_WINDOW_SECONDS
-                if _driver_name(driver) in {_ESR1001_USB_DRIVER, "huipu_tc64_modbus_rtu"}
+                if _driver_name(driver) in {_ESR1001_USB_DRIVER, "huipu_tc64_modbus_rtu", "m3232_pressure"}
                 else 0.0
             )
         self.reconnect_window_seconds = max(0.0, float(reconnect_window_seconds))
@@ -234,7 +234,7 @@ class LocalDirectAdapter:
                     self._safe_close()
                     if self.stop_event.is_set():
                         break
-                    if _driver_name(self.driver) == "huipu_tc64_modbus_rtu" and getattr(exc, "code", "") == "binding_unconfirmed":
+                    if (_driver_name(self.driver) == "huipu_tc64_modbus_rtu" and getattr(exc, "code", "") == "binding_unconfirmed") or "binding_unconfirmed:" in str(exc):
                         self.state = "failed"
                         break
                     now = time.monotonic()
