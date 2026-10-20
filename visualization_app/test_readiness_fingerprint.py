@@ -10,6 +10,21 @@ except ModuleNotFoundError:
 
 
 class ReadinessFingerprintTests(unittest.TestCase):
+    def test_tc64_parameters_and_missing_profile_migration_revoke_readiness(self):
+        config = self._config()
+        config["interfaces"][0].update(role="thermocouple64", driver="huipu_tc64_modbus_rtu")
+        baseline = readiness_config_fingerprint(config)
+        for key, value in {
+            "read_profile": "channel_temperature", "timeout": .28,
+            "channel_settings": {"confirmed": True, "channels": {"温度64": {"unit": 2}}},
+            "baudrate": 9600, "slave_id": 2, "enabled": False,
+            "freshness_seconds": 3, "scan_timeout_seconds": 60,
+            "poll_interval_seconds": .5, "reconnect_window_seconds": 30,
+        }.items():
+            changed = copy.deepcopy(config)
+            changed["interfaces"][0][key] = value
+            self.assertNotEqual(readiness_config_fingerprint(changed), baseline, key)
+
     def _config(self) -> dict:
         return {
             "application_version": "2.0.0",

@@ -175,6 +175,9 @@ class PreSensorConfigurationValidationTests(unittest.TestCase):
     def test_valid_templates_map_to_existing_acquisition_config(self) -> None:
         payload = deepcopy(self.local)
         payload["interfaces"][0]["hardware_facts"] = _hardware_facts()
+        payload["interfaces"][0].update(read_profile="full_record_block", timeout=.28,
+            channel_settings={"confirmed": True, "channels": {"温度64": {"unit": 2, "input_type": 0, "switch": 0}}},
+            freshness_seconds=5, reconnect_window_seconds=45)
         local = validate_pre_sensor_config(
             payload,
             references={
@@ -189,6 +192,10 @@ class PreSensorConfigurationValidationTests(unittest.TestCase):
             },
         )
         self.assertEqual(local.real_acquisition_mode, "local_direct")
+        self.assertEqual(local.interfaces[0]["read_profile"], "full_record_block")
+        self.assertEqual(local.interfaces[0]["timeout"], .28)
+        self.assertEqual(local.interfaces[0]["channel_settings"], payload["interfaces"][0]["channel_settings"])
+        self.assertEqual(local.interfaces[0]["reconnect_window_seconds"], 45)
         self.assertEqual(local.sample_rate_hz, 10.0)
         self.assertEqual(set(local.selected_sensors), {item["name"] for item in self.local["channels"]})
 

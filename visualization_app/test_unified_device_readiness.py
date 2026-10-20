@@ -13,6 +13,28 @@ from local_capture_agent import LocalCaptureAgent  # noqa: E402
 
 
 class UnifiedDeviceReadinessTests(unittest.TestCase):
+    def test_tc64_protocol_and_temperature_readiness_are_separate(self):
+        from test_hp_thermocouple64 import InstrumentSerial
+        interface = acquisition.default_capture_interfaces()[0]
+        interface.update(endpoint="COM17", physical_interface_id="serial:COM17", physical_interface_kind="serial", physical_verified=True, timeout=.01)
+        config = acquisition.AcquisitionConfig(acquisition_mode="real", dataset_schema="new_collection_v13_0", interfaces=[interface], selected_sensors=["温度1", "温度64"])
+        manager = acquisition.AcquisitionManager(recovery_scan=False)
+        port = InstrumentSerial()
+        port.metadata_exception = True
+        with patch("serial.Serial", return_value=port):
+            checked = manager.test_connection(config)
+        result = checked["interfaces"][0]
+        self.assertTrue(result["protocol_verified"])
+        self.assertEqual(result["stages"]["protocol"]["state"], "passed")
+        self.assertEqual(result["stages"]["channels"]["state"], "failed")
+        self.assertFalse(result["temperature_valid"])
+        self.assertFalse(checked["ok"])
+        self.assertEqual(result["driver_diagnostics"]["valid_temperature_count"], 0)
+        config.interfaces[0]["enabled"] = False
+        disabled = manager.test_connection(config)["interfaces"][0]
+        self.assertEqual(disabled["state"], "disabled")
+        self.assertEqual(disabled["detected_channels"], [])
+
     def test_formal_start_rejects_unapproved_uvc_profile_before_driver_construction(self) -> None:
         config = self._config()
         config.interfaces = [config.interfaces[2]]
@@ -59,10 +81,9 @@ class UnifiedDeviceReadinessTests(unittest.TestCase):
             self.assertEqual(snapshot["expires_at"] - snapshot["checked_at"], 120.0)
             self.assertEqual(manager.latest_check_result()["readiness_snapshot"], snapshot)
             with patch("real_acquisition.time.time", return_value=snapshot["expires_at"] + 1):
-                with self.assertRaisesRegex(RuntimeError, "readiness snapshot expired"):
-                    manager.start(config)
-            start_new.assert_not_called()
-            manager.test_connection(config)
+                self.assertTrue(manager.start(config)["running"])
+            start_new.assert_called_once()
+            start_new.reset_mock()
             self.assertTrue(manager.start(config)["running"])
             start_new.reset_mock()
             config.interfaces[0]["endpoint"] = "192.168.125.6:502"

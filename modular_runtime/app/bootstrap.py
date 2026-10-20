@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -16,6 +17,7 @@ from typing import Any
 
 APP_VERSION = "2.0.1-dev"
 API_VERSION = "2.0"
+_PROCESS_SERVER_STARTUP_LOCK = threading.Lock()
 
 
 def _runtime_revision(root: Path) -> str:
@@ -115,6 +117,52 @@ def _afp_server_available(
     if expected_revision is not None:
         return str(payload.get("runtime_revision") or "") == expected_revision
     return True
+
+
+@contextmanager
+def _afp_server_startup_lock(name: str, timeout_seconds: float = 60.0):
+    """Serialize the fixed listener probe-and-bind sequence across launchers."""
+
+    timeout = max(0.1, float(timeout_seconds))
+    if os.name != "nt":
+        acquired = _PROCESS_SERVER_STARTUP_LOCK.acquire(timeout=timeout)
+        if not acquired:
+            raise TimeoutError("AFP server startup lock timed out")
+        try:
+            yield
+        finally:
+            _PROCESS_SERVER_STARTUP_LOCK.release()
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    safe_name = "".join(character if character.isalnum() else "_" for character in str(name))
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+    kernel32.ReleaseMutex.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.CreateMutexW(None, False, f"Local\\{safe_name}")
+    if not handle:
+        raise OSError("AFP server startup mutex could not be created")
+    wait_result = kernel32.WaitForSingleObject(
+        handle, min(int(timeout * 1000), 0xFFFFFFFE)
+    )
+    if wait_result not in (0x00000000, 0x00000080):
+        kernel32.CloseHandle(handle)
+        if wait_result == 0x00000102:
+            raise TimeoutError("AFP server startup lock timed out")
+        raise OSError("AFP server startup mutex wait failed")
+    try:
+        yield
+    finally:
+        kernel32.ReleaseMutex(handle)
+        kernel32.CloseHandle(handle)
 
 
 def _stop_stale_local_afp_servers(
@@ -587,25 +635,15 @@ def launch(context: Any, manager: Any, *, server_only: bool = False) -> None:
         server.server_close()
 
 
-def _launch_public_web(
-    context: Any, manager: Any, *, server_only: bool = False
-) -> None:
+def _prepare_public_web_servers(context: Any, config: Any):
     from lan_web import discover_lan_endpoints
-    from public_web import PublicWebConfig, public_web_urls
+    from public_web import public_web_urls
 
-    config = PublicWebConfig.from_mapping(context.config.get("public_web", {}))
-    if not config.enabled:
-        return
     existing_admin_url = f"http://127.0.0.1:{config.local_admin_port}/"
     health_url = existing_admin_url + "api/health"
     expected_revision = os.environ.get("AFP_RUNTIME_REVISION") or _runtime_revision(context.root)
     if _afp_server_available(health_url, expected_revision=expected_revision):
-        # The watchdog may already own the shared acquisition server.  A
-        # second desktop launch reuses it instead of creating another server
-        # process that can disagree about capture state or fail on the port.
-        if not server_only and config.open_desktop_window:
-            _show_desktop_window(context, existing_admin_url)
-        return
+        return None
     if _afp_server_available(health_url):
         stopped = _stop_stale_local_afp_servers(
             {config.public_port, config.local_admin_port},
@@ -702,6 +740,31 @@ def _launch_public_web(
         "application_version": str(context.config.get("application_version", APP_VERSION)),
     }
     _persist_lan_web_status(context, status)
+    return servers, threads, urls
+
+
+def _launch_public_web(
+    context: Any, manager: Any, *, server_only: bool = False
+) -> None:
+    from public_web import PublicWebConfig
+
+    config = PublicWebConfig.from_mapping(context.config.get("public_web", {}))
+    if not config.enabled:
+        return
+    lock_name = (
+        f"AFP_Public_Web_Startup_{config.public_port}_{config.local_admin_port}"
+    )
+    with _afp_server_startup_lock(lock_name):
+        prepared = _prepare_public_web_servers(context, config)
+    if prepared is None:
+        # A watchdog or another desktop launch owns the shared acquisition
+        # server.  Every additional desktop window uses that same backend.
+        if not server_only and config.open_desktop_window:
+            _show_desktop_window(
+                context, f"http://127.0.0.1:{config.local_admin_port}/"
+            )
+        return
+    servers, threads, urls = prepared
     try:
         if server_only or not config.open_desktop_window:
             threads[1].join()

@@ -7,6 +7,8 @@ environment and are never persisted in the repository templates.
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 import re
 import json
 import os
@@ -65,6 +67,8 @@ class InterfacePlanStore:
         "data_mode", "calibration_profile", "bridge", "channel_count", "channel_map", "channels",
         "physical_interface_id", "physical_port_id", "physical_interface_kind",
         "physical_transport_family", "selection_origin",
+        "read_profile", "timeout", "channel_settings", "device_identity", "scan_timeout_seconds",
+        "freshness_seconds", "poll_interval_seconds", "reconnect_window_seconds",
     ))
 
     def __init__(self, path: Path):
@@ -331,6 +335,7 @@ def validate_pre_sensor_config(
                 "endpoint_ref": endpoint_ref,
                 "baudrate": int(raw.get("baudrate") or 0),
                 "slave_id": int(raw.get("slave_id", 1)),
+                **{k: deepcopy(raw[k]) for k in ("read_profile", "timeout", "channel_settings", "scan_timeout_seconds", "freshness_seconds", "poll_interval_seconds", "reconnect_window_seconds") if k in raw},
                 "hardware_facts": dict(raw.get("hardware_facts") or {}),
                 "data_mode": raw.get("data_mode", "microstrain"),
                 "calibration_profile": raw.get("calibration_profile"),
@@ -422,6 +427,10 @@ def validate_pre_sensor_config(
                 interface[key] = spec[key]
         if spec["driver"] in {"modbus_rtu_esr1001", "huipu_tc64_modbus_rtu"}:
             interface["slave_id"] = spec["slave_id"]
+        if spec["driver"] == "huipu_tc64_modbus_rtu":
+            for key in ("read_profile", "timeout", "channel_settings", "device_identity", "scan_timeout_seconds", "freshness_seconds", "poll_interval_seconds", "reconnect_window_seconds"):
+                if key in spec:
+                    interface[key] = deepcopy(spec[key])
         interfaces.append(interface)
 
     mysql_args: dict[str, Any] = {"mysql_enabled": False}

@@ -56,10 +56,12 @@ def run_hardware_fingerprint_script(assertions: str):
 def run_real_start_script(assertions: str):
     source = APP_JS.read_text(encoding="utf-8")
     sections = [
+        ("function hardwareCheckTimeoutMs", "async function checkSimulationSourceReadiness"),
         ("function acquisitionConfig()", "function renderProcessParameterReadStatus"),
         ("function readinessInterfaceFingerprint", "function hardwareStateLabel"),
         ("async function testSensorConnection", "async function resetAndCheckHardware"),
         ("async function startAcquisition()", "async function waitForHelperFlushComplete"),
+        ("async function stopAcquisition()", "function buildSensorChecklist"),
     ]
     functions = "\n".join(
         source[source.rindex(start):source.index(end, source.rindex(start))]
@@ -76,6 +78,7 @@ def run_real_start_script(assertions: str):
 
 
 REAL_START_SCRIPT = r'''
+const window = {};
 const controls = new Proxy({
   acquisitionMode:{value:"real"}, processingMode:{value:"capture_only"},
   datasetSchema:{value:"new_collection_v11_3"}, sampleRate:{value:"10"},
@@ -96,6 +99,7 @@ const channels = ["温度","压力","张力","ABB_X","ABB_Y","ABB_Z","线速度"
 const check = {ok:true, readiness_snapshot:{ok:true,checked_at:1000,expires_at:1120}, interfaces:[
   {id:"plc",physical_interface_id:"ethernet:industrial",state:"data_ready",ok:true},
   {id:"abb",physical_interface_id:"ethernet:industrial",state:"data_ready",ok:true},
+  {id:"disabled",physical_interface_id:"",state:"disabled",ok:true},
 ], sensors:channels.map(name=>({name,state:"ok",ok:true}))};
 function usesLocalCaptureHelper(){return helper;}
 function usesBrowserLocalExport(){return false;}
@@ -105,6 +109,8 @@ function interfaceConfigs(){return {interfaces:[
     physical_interface_id:"ethernet:industrial",physical_verified:true},
   {id:"abb",enabled:true,role:"robot",driver:"abb_robot",endpoint:abbEndpoint,
     physical_interface_id:"ethernet:industrial",physical_verified:true},
+  {id:"disabled",enabled:false,role:"custom",driver:"serial_json",endpoint:"",
+    physical_interface_id:"",physical_verified:false},
 ],assignments:{plc:channels.slice(0,3),abb:channels.slice(3)}};}
 function validatePhysicalInterfaceBindings(){}
 function selectedLiveSensors(){return channels;}
@@ -220,6 +226,39 @@ class PlcAbbPhysicalBindingFrontendTests(unittest.TestCase):
                 )
                 self.assertEqual(len(result["requests"]), 2)
                 self.assertEqual(result["messages"], [])
+
+    def test_normal_stop_save_and_next_layer_reuse_versioned_session_detection(self):
+        for helper in (False, True):
+            with self.subTest(helper=helper):
+                result = run_real_start_script(f"helper={json.dumps(helper)};\n" + r'''
+check.readiness_session_id='backend';check.readiness_version=3;
+controls.newLayer={value:'0'};
+renderAcquisitionStatus=status=>{state.acquisitionStatus=status;};
+const originalPost=postJson, originalHelper=requestLocalHelper;
+const finished={running:false,capture_saved:true,finalization_complete:true,completed_layers:[1]};
+postJson=async(path,payload)=>{
+  if(path.endsWith('/stop')){requests.push({path,payload});return finished;}
+  return originalPost(path,payload);
+};
+requestLocalHelper=async(command,payload)=>{
+  if(command==='stop_capture'){requests.push({path:command,payload});return finished;}
+  return originalHelper(command,payload);
+};
+function stopLocalSimulationReplay(){}
+function renderMysqlStatus(){}
+async function saveFinishedCaptureLocally(){}
+async function waitForHelperFlushComplete(result){return result;}
+async function waitForServerTargetSave(result){return result;}
+(async()=>{
+  await testSensorConnection();requests=[];
+  await startAcquisition();await stopAcquisition();await startAcquisition();
+  console.log(JSON.stringify({paths:requests.map(item=>item.path),layer:controls.newLayer.value,ready:!!state.hardwareCheck?.ok,messages}));
+})().catch(error=>{console.error(error);process.exit(1);});
+''')
+                self.assertEqual(result["paths"], ["start_capture", "stop_capture", "start_capture"] if helper
+                                 else ["/api/acquisition/start", "/api/acquisition/stop", "/api/acquisition/start"])
+                self.assertEqual(result["layer"], "1")
+                self.assertTrue(result["ready"])
 
     def test_delayed_check_response_does_not_extend_reuse_window(self) -> None:
         result = run_hardware_fingerprint_script(r'''

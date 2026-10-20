@@ -89,7 +89,7 @@ class LocalDirectAdapter:
         if reconnect_window_seconds is None:
             reconnect_window_seconds = (
                 _DEFAULT_USB_RECONNECT_WINDOW_SECONDS
-                if _driver_name(driver) == _ESR1001_USB_DRIVER
+                if _driver_name(driver) in {_ESR1001_USB_DRIVER, "huipu_tc64_modbus_rtu"}
                 else 0.0
             )
         self.reconnect_window_seconds = max(0.0, float(reconnect_window_seconds))
@@ -115,6 +115,11 @@ class LocalDirectAdapter:
         self.last_error = ""
         self.last_sample_monotonic: float | None = None
         self.state = "idle"
+        self.start_events = []
+
+    def _event(self, stage):
+        if len(self.start_events) < 64:
+            self.start_events.append({"stage": stage, "server_monotonic": self.clock()})
 
     def start(self) -> None:
         if self.thread is not None and self.thread.is_alive():
@@ -140,6 +145,9 @@ class LocalDirectAdapter:
         received_wall_time = float(record["host_wall_time"]) if record else self.wall_clock()
         self.source_sequence += 1
         driver_metadata = getattr(self.driver, "quality_metadata", {})
+        if isinstance(driver_metadata, Mapping) and driver_metadata.get("driver") == "huipu_tc64_modbus_rtu":
+            received_monotonic = float(driver_metadata.get("received_monotonic") or received_monotonic)
+            received_wall_time = float(driver_metadata.get("received_wall_time") or received_wall_time)
         if record and isinstance(driver_metadata, Mapping):
             driver_metadata = dict(driver_metadata, latest_record=dict(record))
         samples = []
@@ -166,6 +174,8 @@ class LocalDirectAdapter:
                 )
             )
         self.cache.publish_batch(samples)
+        if self.source_sequence <= 2:
+            self._event("source_first" if self.source_sequence == 1 else "source_second")
         self.last_sample_monotonic = received_monotonic
         self._consecutive_reconnect_attempts = 0
         self._reconnect_window_started_monotonic = None
@@ -191,9 +201,18 @@ class LocalDirectAdapter:
             while not self.stop_event.is_set():
                 try:
                     self.state = "opening" if self.reconnect_attempts == 0 else "reconnecting"
+                    self._event("open_begin")
                     if self.before_open is not None:
+                        self._event("network_path_begin")
                         self.before_open()
+                        self._event("network_path_end")
+                    reset_cancel = getattr(self.driver, "reset_open_cancellation", None)
+                    if callable(reset_cancel):
+                        reset_cancel()
+                    if self.stop_event.is_set():
+                        break
                     self.driver.open()
+                    self._event("protocol_open_end")
                     self.opened.set()
                     self.state = "running"
                     while not self.stop_event.is_set():
@@ -214,6 +233,9 @@ class LocalDirectAdapter:
                     self.consecutive_failures += 1
                     self._safe_close()
                     if self.stop_event.is_set():
+                        break
+                    if _driver_name(self.driver) == "huipu_tc64_modbus_rtu" and getattr(exc, "code", "") == "binding_unconfirmed":
+                        self.state = "failed"
                         break
                     now = time.monotonic()
                     recovery_window_enabled = (
@@ -258,6 +280,9 @@ class LocalDirectAdapter:
     def stop(self, timeout_seconds: float = 0.5) -> bool:
         deadline = time.monotonic() + max(0.0, float(timeout_seconds))
         self.stop_event.set()
+        cancel = getattr(self.driver, "cancel_open", None)
+        if callable(cancel):
+            cancel()
         close_thread = self._stop_close_thread
         if close_thread is None or not close_thread.is_alive():
             close_thread = threading.Thread(
@@ -311,4 +336,5 @@ class LocalDirectAdapter:
             "actual_poll_interval_seconds": self.actual_poll_interval_seconds,
             "last_sample_monotonic": self.last_sample_monotonic,
             "last_error": self.last_error,
+            "start_events": list(self.start_events),
         }

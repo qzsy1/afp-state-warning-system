@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import sys
 import unittest
+import tempfile
+import time
+import csv
+import json
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -12,6 +16,82 @@ from local_capture_agent import HelperTransport  # noqa: E402
 
 
 class LocalCaptureAgentTests(unittest.TestCase):
+    def test_tc64_short_scan_csv_mysql_and_helper_frames_agree(self):
+        from acquisition import AcquisitionConfig, AcquisitionManager, default_capture_interfaces
+        from local_capture_helper_entry import helper_capabilities
+        from test_hp_thermocouple64 import InstrumentSerial
+        from real_acquisition import UnifiedFrame
+        from thermocouple64 import THERMOCOUPLE64_CHANNELS, strict_group_means
+        saved = []
+        ports = []
+        class Store:
+            def __init__(self, settings): pass
+            def preflight(self, **kwargs): return {"ok": True}
+            def save_layer(self, config, **kwargs):
+                saved.append(list(kwargs["rows"]))
+                return {"ok": True, "saved_rows": len(saved[-1])}
+        def serial_factory(**kwargs):
+            port = InstrumentSerial()
+            port.short_only = True
+            ports.append(port)
+            self.assertEqual(kwargs["port"], "COM17")
+            return port
+        with tempfile.TemporaryDirectory() as temporary, patch("serial.Serial", side_effect=serial_factory), patch("acquisition.MySQLCaptureStore", Store):
+            root = Path(temporary)
+            interface = default_capture_interfaces()[0]
+            interface.update(endpoint="COM17", physical_interface_id="serial:COM17", physical_interface_kind="serial", physical_verified=True)
+            config = AcquisitionConfig(acquisition_mode="real", real_acquisition_mode="remote_helper", execution_host="helper_local",
+                helper_session_id="fixture", helper_capabilities=helper_capabilities(), dataset_schema="new_collection_v13_0",
+                interfaces=[interface], selected_sensors=list(THERMOCOUPLE64_CHANNELS), processing_mode="capture_only", save_root=str(root), mysql_enabled=True)
+            manager = AcquisitionManager(root, recovery_scan=False)
+            agent = LocalCaptureAgent(manager, simulation_cache_root=root/"cache")
+            checked = agent.check_capture(config)
+            self.assertTrue(checked["ok"], checked)
+            self.assertEqual(checked["interfaces"][0]["driver_diagnostics"]["read_profile"], "channel_temperature")
+            self.assertTrue(checked["interfaces"][0]["protocol_verified"])
+            agent.start_capture(config)
+            try:
+                deadline = time.monotonic()+2
+                while manager.status()["sample_count"] < 3 and time.monotonic()<deadline:
+                    time.sleep(.01)
+                batch = agent.next_sample_batch()
+                self.assertTrue(batch["frames"])
+                self.assertEqual(manager.driver.drivers[0].read_profile, "channel_temperature")
+                for raw, frame, stamp in zip(batch["rows"], batch["frames"], batch["timestamps"]):
+                    restored = UnifiedFrame.from_envelope_v2(frame, expected_session_id=batch["capture_uuid"], expected_mode_id="new_collection_v13_0", catalog=batch["frame_catalog"])
+                    self.assertEqual(restored.values(), {n:raw[n] for n in THERMOCOUPLE64_CHANNELS})
+                    self.assertEqual(restored.target_wall_time, stamp)
+                    self.assertEqual(strict_group_means(restored.values())["热电偶均值8"]["value"], 34.875)
+                    self.assertTrue(all(s.source_sequence == 1 for s in restored.channels.values()))
+                self.assertTrue(agent.ack_sample_batch(batch["capture_uuid"], batch["sequence"]))
+            finally:
+                stopped = agent.stop_capture()
+            self.assertTrue(stopped["finalization_complete"], stopped)
+            with manager.raw_path.open(encoding="gb18030", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(len(rows), len(saved[0]))
+            for csv_row, mysql_row in zip(rows, saved[0]):
+                for i, name in enumerate(THERMOCOUPLE64_CHANNELS):
+                    self.assertEqual(float(csv_row[name]), 20+i/4)
+                    self.assertEqual(float(csv_row[name]), float(mysql_row[name]))
+            with Path(stopped["timestamp_file"]).open(encoding="utf-8-sig", newline="") as handle:
+                timestamps = list(csv.DictReader(handle))
+            self.assertEqual(len(timestamps), len(rows))
+            self.assertTrue(all(json.loads(row["channel_quality_json"])["温度64"] in ("measured_new", "held_within_freshness") for row in timestamps))
+            self.assertTrue(all(p.closed for p in ports))
+
+    def test_tc64_candidates_use_serial_transport_without_claiming_identity(self):
+        for order in ([6, 7], [7, 6]):
+            manager = Mock()
+            manager.discover_interfaces.return_value = {"physical_interfaces": [
+                {"id": f"serial:COM{n}", "endpoint": f"COM{n}", "kind": "serial", "protocol": "serial",
+                 "detected": True, "compatible_roles": ["thermocouple64", "esr1001_strain"]}
+                for n in order]}
+            tc = LocalCaptureAgent(manager=manager).discover()["sensor_bindings"][0]
+            self.assertIsNone(tc["physical_interface_id"])
+            self.assertEqual({p["endpoint"] for p in tc["candidates"]}, {"COM6", "COM7"})
+            self.assertFalse(tc["identity_confirmed"])
+
     def test_discover_forwards_usb_topology_and_keeps_empty_ports_out_of_bindings(self):
         topology = {
             "schema_version": 1,

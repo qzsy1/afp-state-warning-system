@@ -7,6 +7,7 @@ import sys
 import time
 import threading
 import subprocess
+import io
 from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
@@ -72,6 +73,26 @@ class StreamingSerial(SerialStub):
 
 
 class UsbProtocolTests(unittest.TestCase):
+    def test_current_freshness_recovers_without_erasing_historical_gap(self):
+        from esr1001_usb import current_stream_is_stable
+
+        driver = SimpleNamespace(
+            recent_intervals=(0.08, 0.09, 0.08),
+            max_interval=0.41,
+            gaps=[{"after_sequence": 12, "interval_seconds": 0.41}],
+            parser=SimpleNamespace(discarded_bytes=0, overflows=0),
+        )
+        self.assertTrue(current_stream_is_stable(driver, 9.9, now=10.0))
+        self.assertEqual(driver.max_interval, 0.41)
+        self.assertEqual(len(driver.gaps), 1)
+
+        driver.recent_intervals = (0.08, 0.31, 0.08)
+        self.assertFalse(current_stream_is_stable(driver, 9.9, now=10.0))
+        driver.recent_intervals = (0.08, 0.09)
+        self.assertFalse(current_stream_is_stable(driver, 9.9, now=10.0))
+        driver.recent_intervals = (0.08, 0.09, 0.08)
+        self.assertFalse(current_stream_is_stable(driver, 9.7, now=10.0))
+
     def test_independent_sample_and_sign_boundaries(self):
         self.assertEqual(decode_adc(USB_DATA), (68794, -41374, -52572, -117937))
         raw = bytes.fromhex("24 80 00 00 7F FF FF 00 00 00 FF FF FF FF")
@@ -142,6 +163,94 @@ class UsbProtocolTests(unittest.TestCase):
         self.assertEqual(stub.writes, [QUERY, START, STOP])
         self.assertFalse(stub.is_open)
         self.assertEqual(driver.sequence, 3)
+
+    def test_bounded_start_rejects_buffered_old_responses_and_invalid_parameters(self):
+        with patch("esr1001_usb.PORT_READY_GUARD_SECONDS", 0), patch("esr1001_usb.QUERY_START_SPACING_SECONDS", 0):
+            stale = SerialStub()
+            stale.buffer.extend(USB_PARAMETERS + USB_START_RESPONSE)
+            stale.write = lambda data: stale.writes.append(data)
+            driver, _ = self.driver(stale, startup_policy="bounded_response")
+            with self.assertRaisesRegex(UsbProtocolError, "usb_parameters_timeout"):
+                driver.open()
+            self.assertFalse(driver.protocol_verified)
+            self.assertNotIn(START, stale.writes)
+            self.assertFalse(stale.is_open)
+            invalid = SerialStub()
+            write = invalid.write
+            def respond(data):
+                write(data)
+                if data == QUERY:
+                    invalid.buffer[4] = 2
+            invalid.write = respond
+            driver, _ = self.driver(invalid, startup_policy="bounded_response")
+            with self.assertRaisesRegex(UsbProtocolError, "partial_channels"):
+                driver.open()
+            self.assertNotIn(START, invalid.writes)
+
+    def test_bounded_spacing_uses_command_clock_with_a_slow_matching_reply(self):
+        clock = [100.0]
+        class Event:
+            cancelled = False
+            def is_set(self): return self.cancelled
+            def set(self): self.cancelled = True
+            def wait(self, seconds): clock[0] += seconds; return self.cancelled
+        class DelayedSerial(SerialStub):
+            ready = None
+            def write(self, data):
+                if data == QUERY:
+                    self.writes.append(data)
+                    self.ready = clock[0] + .4
+                else:
+                    super().write(data)
+            def read(self, size):
+                clock[0] += .01
+                if self.ready is not None and clock[0] >= self.ready:
+                    self.buffer.extend(USB_PARAMETERS)
+                    self.ready = None
+                return super().read(size)
+        driver, _ = self.driver(DelayedSerial(), startup_policy="bounded_response")
+        driver.command_timeout = .5
+        driver._cancel_open = Event()
+        with patch("esr1001_usb.time.monotonic", side_effect=lambda: clock[0]):
+            driver.open()
+            try:
+                commands = list(driver.command_evidence)
+                self.assertAlmostEqual(commands[1]["host_monotonic"] - commands[0]["host_monotonic"], 1.3)
+                self.assertTrue(commands[0]["matched_response_hex"])
+                self.assertTrue(commands[1]["matched_response_hex"])
+            finally:
+                driver.close()
+
+    def test_cancel_bounded_wait_releases_port_without_late_start(self):
+        driver, stub = self.driver(startup_policy="bounded_response")
+        errors = []
+        def open_driver():
+            try:
+                driver.open()
+            except Exception as exc:
+                errors.append(str(exc))
+        with patch("esr1001_usb.PORT_READY_GUARD_SECONDS", 0), patch("esr1001_usb.QUERY_START_SPACING_SECONDS", 3):
+            worker = threading.Thread(target=open_driver)
+            worker.start()
+            try:
+                deadline = time.monotonic() + 1
+                while not driver.command_evidence and time.monotonic() < deadline:
+                    time.sleep(.001)
+                cancelled = time.monotonic()
+                driver.cancel_open()
+                worker.join(.5)
+                self.assertFalse(worker.is_alive())
+                self.assertLess(time.monotonic()-cancelled, .5)
+                self.assertTrue(any("capture_start_cancelled" in error for error in errors))
+                self.assertNotIn(START, stub.writes)
+                self.assertFalse(stub.is_open)
+                replacement, _ = self.driver(startup_policy="bounded_response")
+                with patch("esr1001_usb.QUERY_START_SPACING_SECONDS", 0):
+                    replacement.open()
+                    replacement.close()
+            finally:
+                driver.cancel_open()
+                worker.join(1)
 
     def test_port_and_parameter_settle_before_start(self):
         driver, stub = self.driver()
@@ -393,6 +502,190 @@ class UsbIntegrationTests(unittest.TestCase):
             for row in rows:
                 self.assertEqual(tuple(int(row[k]) for k in RAW_CHANNELS), decode_adc(bytes.fromhex(row["raw_hex"])))
             self.assertTrue(all(not s.is_open for s in serials))
+
+    def test_concurrent_identical_checks_share_one_hardware_probe(self):
+        from acquisition import AcquisitionManager
+
+        started = threading.Event()
+        release = threading.Event()
+        call_lock = threading.Lock()
+        probe_calls = 0
+
+        def probe(interface):
+            nonlocal probe_calls
+            with call_lock:
+                probe_calls += 1
+            started.set()
+            self.assertTrue(release.wait(2.0))
+            return {
+                **interface,
+                "enabled": True,
+                "state": "data_ready",
+                "final_status": "data_ready",
+                "message": "四路原始数据可用，标定未确认",
+                "ok": True,
+                "expected_channels": list(RAW_CHANNELS),
+                "detected_channels": list(RAW_CHANNELS),
+                "missing_channels": [],
+                "invalid_channels": [],
+                "sample_counts": {name: 3 for name in RAW_CHANNELS},
+                "errors": [],
+            }
+
+        with tempfile.TemporaryDirectory() as root, patch("acquisition.probe_usb", side_effect=probe):
+            manager = AcquisitionManager(Path(root), recovery_scan=False)
+            config = self.config(save_root=root)
+            results = []
+            failures = []
+
+            def run_check():
+                try:
+                    results.append(manager.test_connection(config))
+                except Exception as exc:
+                    failures.append(exc)
+
+            first = threading.Thread(target=run_check)
+            second = threading.Thread(target=run_check)
+            first.start()
+            self.assertTrue(started.wait(1.0))
+            second.start()
+            time.sleep(0.05)
+            release.set()
+            first.join(2.0)
+            second.join(2.0)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(failures, [])
+        self.assertEqual(probe_calls, 1)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result["ok"] for result in results))
+        self.assertEqual(results[0]["checked_at"], results[1]["checked_at"])
+
+    def test_different_check_fingerprints_queue_behind_one_physical_probe(self):
+        from acquisition import AcquisitionManager
+
+        first_started = threading.Event()
+        release_first = threading.Event()
+        second_started = threading.Event()
+        release_second = threading.Event()
+        guard = threading.Lock()
+        calls = []
+        active = 0
+        max_active = 0
+
+        def probe(interface):
+            nonlocal active, max_active
+            endpoint = interface["endpoint"]
+            with guard:
+                calls.append(endpoint)
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                if endpoint == "COM91":
+                    first_started.set()
+                    self.assertTrue(release_first.wait(2.0))
+                else:
+                    second_started.set()
+                    self.assertTrue(release_second.wait(2.0))
+                return {
+                    **interface,
+                    "enabled": True,
+                    "state": "data_ready",
+                    "message": "ready",
+                    "ok": True,
+                    "expected_channels": list(RAW_CHANNELS),
+                    "detected_channels": list(RAW_CHANNELS),
+                    "missing_channels": [],
+                    "invalid_channels": [],
+                    "sample_counts": {name: 3 for name in RAW_CHANNELS},
+                    "errors": [],
+                }
+            finally:
+                with guard:
+                    active -= 1
+
+        with tempfile.TemporaryDirectory() as root, patch("acquisition.probe_usb", side_effect=probe):
+            manager = AcquisitionManager(Path(root), recovery_scan=False)
+            first_config = self.config(save_root=root)
+            second_config = self.config(save_root=root)
+            second_config.interfaces[0].update(
+                endpoint="COM92",
+                physical_interface_id="serial:COM92",
+            )
+            results = []
+            failures = []
+
+            def run(config):
+                try:
+                    results.append(manager.test_connection(config))
+                except Exception as exc:
+                    failures.append(exc)
+
+            threads = [
+                threading.Thread(target=run, args=(first_config,)),
+                threading.Thread(target=run, args=(first_config,)),
+                threading.Thread(target=run, args=(second_config,)),
+            ]
+            threads[0].start()
+            self.assertTrue(first_started.wait(1.0))
+            threads[1].start()
+            threads[2].start()
+            time.sleep(0.05)
+            self.assertFalse(second_started.is_set())
+            release_first.set()
+            self.assertTrue(second_started.wait(1.0))
+            release_second.set()
+            for thread in threads:
+                thread.join(2.0)
+
+        self.assertEqual(failures, [])
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(calls.count("COM91"), 1)
+        self.assertEqual(calls.count("COM92"), 1)
+        self.assertEqual(max_active, 1)
+        self.assertEqual(len(results), 3)
+
+    def test_native_frontend_reuses_matching_fixed_local_backend(self):
+        from native_frontend_launcher import discover_shared_ui_url
+
+        expected = {
+            "status": "ok",
+            "version": "2.0.5-rc.2",
+            "build_id": "esr1001-native-usb-v2",
+            "runtime_revision": "revision-2",
+        }
+        requests = []
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                self.close()
+
+        def opener(request, timeout):
+            requests.append((request.full_url, timeout))
+            return Response(json.dumps(expected).encode("utf-8"))
+
+        self.assertEqual(
+            discover_shared_ui_url(
+                "http://127.0.0.1:8771/",
+                expected_health=expected,
+                opener=opener,
+            ),
+            "http://127.0.0.1:8771/",
+        )
+        self.assertEqual(requests[0][0], "http://127.0.0.1:8771/api/health")
+
+        mismatch = dict(expected, runtime_revision="old-revision")
+        self.assertIsNone(
+            discover_shared_ui_url(
+                "http://127.0.0.1:8771/",
+                expected_health=mismatch,
+                opener=opener,
+            )
+        )
 
     def test_duplicate_port_rejected_before_probe_and_snapshot_invalidated(self):
         from acquisition import AcquisitionConfig, AcquisitionManager

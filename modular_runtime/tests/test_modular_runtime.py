@@ -310,6 +310,115 @@ class UpdateTests(unittest.TestCase):
 
 
 class LaunchTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "win32", "Windows named mutex contract")
+    def test_public_web_startup_lock_coordinates_separate_processes(self) -> None:
+        staging = Path(r"D:\AFP_Runtime\.afp-staging")
+        staging.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=staging) as temporary:
+            root = Path(temporary)
+            entered = root / "entered"
+            release = root / "release"
+            code = (
+                "import sys,time; from pathlib import Path; "
+                f"sys.path.insert(0,{str(RUNTIME_ROOT / 'app')!r}); "
+                "import bootstrap; "
+                "root=Path(sys.argv[1]); "
+                "lock=bootstrap._afp_server_startup_lock('AFP_Test_'+root.name,timeout_seconds=5); "
+                "lock.__enter__(); (root/'entered').write_text('ready'); "
+                "exec('while not (root/\"release\").exists(): time.sleep(0.01)'); "
+                "lock.__exit__(None,None,None)"
+            )
+            child = subprocess.Popen([sys.executable, "-c", code, str(root)],
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                deadline = time.monotonic() + 5
+                while not entered.exists() and child.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(entered.exists(), "Child failed to acquire startup mutex")
+                with self.assertRaises(TimeoutError):
+                    with bootstrap._afp_server_startup_lock(
+                        "AFP_Test_" + root.name, timeout_seconds=0.1
+                    ):
+                        self.fail("A second process entered the startup critical section")
+                release.write_text("release", encoding="utf-8")
+                _, error = child.communicate(timeout=5)
+                self.assertEqual(child.returncode, 0, error.decode(errors="replace"))
+                with bootstrap._afp_server_startup_lock("AFP_Test_" + root.name, timeout_seconds=1):
+                    pass
+            finally:
+                if child.poll() is None:
+                    child.terminate()
+                    child.communicate(timeout=5)
+
+    def test_public_web_startup_lock_serializes_competing_launches(self) -> None:
+        active = 0
+        peak = 0
+        state_lock = threading.Lock()
+        first_entered = threading.Event()
+        release_first = threading.Event()
+
+        def worker(first: bool) -> None:
+            nonlocal active, peak
+            with bootstrap._afp_server_startup_lock(
+                f"AFP_Public_Web_Test_{Path(self.id()).name}", timeout_seconds=2.0
+            ):
+                with state_lock:
+                    active += 1
+                    peak = max(peak, active)
+                if first:
+                    first_entered.set()
+                    release_first.wait(1.0)
+                with state_lock:
+                    active -= 1
+
+        first = threading.Thread(target=worker, args=(True,))
+        second = threading.Thread(target=worker, args=(False,))
+        first.start()
+        self.assertTrue(first_entered.wait(1.0))
+        second.start()
+        time.sleep(0.05)
+        with state_lock:
+            self.assertEqual(active, 1)
+        release_first.set()
+        first.join(2.0)
+        second.join(2.0)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(peak, 1)
+
+    def test_public_web_rechecks_shared_server_inside_startup_lock(self) -> None:
+        events = []
+
+        class RecordedLock:
+            def __enter__(self):
+                events.append("lock-enter")
+
+            def __exit__(self, *_args):
+                events.append("lock-exit")
+
+        config = {
+            "public_web": {
+                "enabled": True,
+                "public_port": 8770,
+                "local_admin_port": 8771,
+                "open_desktop_window": True,
+            }
+        }
+        context = types.SimpleNamespace(config=config)
+        with patch.object(
+            bootstrap, "_afp_server_startup_lock", return_value=RecordedLock()
+        ), patch.object(
+            bootstrap,
+            "_prepare_public_web_servers",
+            side_effect=lambda *_args: events.append("prepare"),
+        ), patch.object(
+            bootstrap,
+            "_show_desktop_window",
+            side_effect=lambda *_args: events.append("window"),
+        ):
+            bootstrap._launch_public_web(context, MagicMock())
+        self.assertEqual(events, ["lock-enter", "prepare", "lock-exit", "window"])
+
     def test_desktop_private_cache_stays_in_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             context = RuntimeContext(Path(temporary), {})

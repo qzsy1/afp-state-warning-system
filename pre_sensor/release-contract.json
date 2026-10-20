@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
   "identity": {
-    "application_version": "2.0.5-rc.2",
-    "helper_version": "2.0.5-rc.2",
-    "launcher_version": "2.0.5-rc.2",
-    "release_revision": "esr1001-native-usb-v1"
+    "application_version": "2.0.5-rc.3",
+    "helper_version": "2.0.5-rc.3",
+    "launcher_version": "2.0.5-rc.3",
+    "release_revision": "native-sensor-acquisition-v2"
   },
   "contracts": {
     "helper_protocol_version": 2,
@@ -16,6 +16,7 @@
     "required": [
       "app/ui/index.html",
       "app/ui/app.js",
+      "app/ui/curve_readiness.js",
       "app/ui/styles.css",
       "app/ui/mysql_visibility.js",
       "app/ui/process_parameters.js",

@@ -37,7 +37,7 @@ import pandas as pd
 
 from mysql_storage import MySQLCaptureStore, MySQLSettings, validate_database_name
 from smrf_hid import SmrfHidDriver, enumerate_smrf_hid_devices
-from hp_thermocouple64 import HpThermocouple64Driver
+from hp_thermocouple64 import HpThermocouple64Driver, normalize_read_profile
 from esr1001_usb import (
     USB_DRIVER, RAW_CHANNELS, Esr1001UsbDriver, RawCaptureWriter,
     load_calibration, UsbProtocolError, probe_usb,
@@ -52,6 +52,7 @@ from real_acquisition import (
     FrameAssembler,
     ReadinessSnapshot,
     UnifiedFrame,
+    readiness_config_fingerprint,
 )
 from local_direct_acquisition import LocalDirectAdapter, minimum_poll_interval
 from release_contract import assert_config_contract, load_release_contract
@@ -388,7 +389,41 @@ def _network_adapter_snapshot() -> list[dict[str, Any]]:
     return result
 
 
+_WINDOWS_ADAPTER_LOCK = threading.RLock()
+_WINDOWS_ADAPTER_CACHE = None
+
+
+def _windows_network_signature():
+    """Read the current IPv4/index bindings without starting PowerShell."""
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        size = ctypes.c_ulong(0)
+        query = ctypes.windll.iphlpapi.GetIpAddrTable
+        if query(None, ctypes.byref(size), False) != 122:
+            return None
+        buffer = ctypes.create_string_buffer(size.value)
+        if query(buffer, ctypes.byref(size), False):
+            return None
+        count = struct.unpack_from("<I", buffer.raw)[0]
+        rows = tuple(sorted(struct.unpack_from("<5I2H", buffer.raw, 4 + 24 * index) for index in range(count)))
+        return rows, tuple(socket.if_nameindex())
+    except (AttributeError, OSError, ValueError, struct.error):
+        return None
+
+
 def _windows_network_adapter_snapshot() -> list[dict[str, Any]]:
+    global _WINDOWS_ADAPTER_CACHE
+    signature = _windows_network_signature()
+    with _WINDOWS_ADAPTER_LOCK:
+        if signature is not None and _WINDOWS_ADAPTER_CACHE is not None and _WINDOWS_ADAPTER_CACHE[0] == signature:
+            return deepcopy(_WINDOWS_ADAPTER_CACHE[1])
+        rows = _query_windows_network_adapters()
+        _WINDOWS_ADAPTER_CACHE = (signature, deepcopy(rows)) if signature is not None and rows else None
+        return rows
+
+
+def _query_windows_network_adapters() -> list[dict[str, Any]]:
     """Read Windows IPv4 adapter identities without requiring psutil."""
     if not sys.platform.startswith("win"):
         return []
@@ -648,7 +683,12 @@ def validate_network_path(
 
 
 def require_network_path(interface: dict[str, Any]) -> dict[str, Any]:
+    global _WINDOWS_ADAPTER_CACHE
     result = validate_network_path(interface)
+    if not result["ok"] and _WINDOWS_ADAPTER_CACHE is not None:
+        with _WINDOWS_ADAPTER_LOCK:
+            _WINDOWS_ADAPTER_CACHE = None
+        result = validate_network_path(interface)
     if not result["ok"]:
         raise RuntimeError(
             "network_path_invalid: "
@@ -658,6 +698,60 @@ def require_network_path(interface: dict[str, Any]) -> dict[str, Any]:
             f"source={result['actual_source_address']}"
         )
     return result
+
+
+def reusable_network_path(
+    interface: dict[str, Any], readiness_interfaces: list[dict[str, Any]] | tuple
+) -> dict[str, Any] | None:
+    interface_id = str(interface.get("id") or "")
+    physical_id = str(interface.get("physical_interface_id") or "")
+    role = str(interface.get("role") or "")
+    driver = str(interface.get("driver") or "")
+    target_host, target_port = _network_endpoint(
+        str(interface.get("endpoint") or ""), role
+    )
+    evidence = next(
+        (
+            item for item in readiness_interfaces
+            if isinstance(item, dict)
+            and str(item.get("id") or "") == interface_id
+            and str(item.get("physical_interface_id") or "") == physical_id
+            and str(item.get("role") or "") == role
+            and str(item.get("driver") or "") == driver
+            and item.get("ok") is True
+            and str(item.get("state") or "").lower()
+            in {"ok", "ready", "passed", "data_ready"}
+        ),
+        None,
+    )
+    path = (evidence or {}).get("network_path") or {}
+    if not isinstance(path, dict):
+        return None
+    configured_path = interface.get("network_path") or {}
+    if not isinstance(configured_path, dict):
+        configured_path = {}
+    try:
+        observed_target_port = int(path.get("target_port") or 0)
+    except (TypeError, ValueError):
+        return None
+    expected_source = str(
+        interface.get("source_address")
+        or configured_path.get("actual_source_address")
+        or ""
+    )
+    actual_source = str(path.get("actual_source_address") or "")
+    if not (
+        path.get("ok") is True
+        and path.get("status") == "network_path_ready"
+        and str(path.get("target_address") or "") == target_host
+        and observed_target_port == target_port
+        and str(path.get("selected_interface_id") or "") == physical_id
+        and str(path.get("actual_interface_id") or "") == physical_id
+        and actual_source
+        and (not expected_source or actual_source == expected_source)
+    ):
+        return None
+    return deepcopy(path)
 
 PROCESS_PARAMETER_DEFINITIONS = (
     ("initial_compaction_force_N", "初始压实力", "N"),
@@ -1290,6 +1384,9 @@ def default_capture_interfaces() -> list[dict[str, Any]]:
             "baudrate": 115200,
             "slave_id": 1,
             "timeout": 0.5,
+            "read_profile": "channel_temperature",
+            "channel_settings": {},
+            "reconnect_window_seconds": 60.0,
             "freshness_seconds": 1.0,
             "channels": list(THERMOCOUPLE64_CHANNELS),
             "channel_map": {},
@@ -1409,6 +1506,11 @@ def _apply_sensor_interface_profile(interface: dict[str, Any]) -> dict[str, Any]
         if not 1 <= slave_id <= 247:
             raise ValueError("慧谱仪表地址必须在1到247之间")
         interface["slave_id"] = slave_id
+        interface["read_profile"] = normalize_read_profile(interface.get("read_profile"))
+        interface["channel_settings"] = deepcopy(interface.get("channel_settings") or {})
+        if not isinstance(interface["channel_settings"], dict):
+            raise ValueError("慧谱通道设置必须为对象")
+        interface["reconnect_window_seconds"] = max(0.0, min(float(interface.get("reconnect_window_seconds", 60.0)), 300.0))
         interface["freshness_seconds"] = float(interface.get("freshness_seconds") or 1.0)
     elif sensor_type == "esr1001_strain":
         if not usb_strain:
@@ -1747,6 +1849,9 @@ class AcquisitionConfig:
     endpoint: str = ""
     baudrate: int = 115200
     slave_id: int = 1
+    read_profile: str = "channel_temperature"
+    timeout: float = 0.5
+    channel_settings: dict[str, Any] | None = None
     # Multiple physical interfaces can be used in one acquisition.
     interfaces: list[dict[str, Any]] | None = None
     interface_channel_assignments: dict[str, list[str]] | None = None
@@ -1783,6 +1888,9 @@ class AcquisitionConfig:
     stop_sampling_timeout_seconds: float = 5.0
     stop_force_timeout_seconds: float = 2.0
     first_sample_timeout_seconds: float = 3.0
+    async_start: bool = False
+    start_request_id: str = ""
+    capture_generation: str = ""
     initial_compaction_force_N: float = 400.0
     placement_speed_mm_s: float = 80.0
     pid_angle_deg: float = 5.0
@@ -1926,7 +2034,11 @@ class AcquisitionConfig:
             self.interfaces = [{
                 "id": "interface_1", "enabled": True,
                 "driver": self.driver, "endpoint": self.endpoint,
-                "baudrate": self.baudrate, "role": "other",
+                "baudrate": self.baudrate,
+                "role": THERMOCOUPLE64_ROLE if self.driver == THERMOCOUPLE64_DRIVER else "other",
+                **({"read_profile": self.read_profile, "timeout": self.timeout,
+                    "slave_id": self.slave_id, "channel_settings": deepcopy(self.channel_settings or {})}
+                   if self.driver == THERMOCOUPLE64_DRIVER else {}),
                 "channel_map": {},
             }]
         normalized_interfaces: list[dict[str, Any]] = []
@@ -2268,6 +2380,7 @@ ACQUISITION_TRANSPORT_METADATA_FIELDS = frozenset(
         "simulation_source_id",
         "simulation_source_ready",
         "simulation_source_transfer",
+        "force_check",
     }
 )
 
@@ -3545,6 +3658,11 @@ def normalize_interface_readiness(
     else:
         channel_state = freshness_state = "not_reached"
 
+    if result.get("driver") == THERMOCOUPLE64_DRIVER and final_state not in {"disabled", "no_channels", "configuration_invalid"}:
+        protocol_state = "passed" if result.get("protocol_verified") else "failed"
+        channel_state = "passed" if result.get("temperature_valid") else "failed"
+        freshness_state = "passed" if result.get("temperature_valid") else "not_verified"
+
     result["stages"] = {
         "physical_binding": stage("physical_binding", physical_state),
         "device_identity": stage("device_identity", identity_state),
@@ -4217,23 +4335,37 @@ class M3232PressureDriver(SampleDriver):
 
 class MultiInterfaceDriver(SampleDriver):
     """Run physical interfaces independently and expose their latest samples."""
-    def __init__(self, configs: list[dict[str, Any]], selected_sensors: list[str], source_file: str = "", assignments: dict[str, list[str]] | None = None) -> None:
+    def __init__(self, configs: list[dict[str, Any]], selected_sensors: list[str], source_file: str = "", assignments: dict[str, list[str]] | None = None, usb_startup_profiles: dict | None = None) -> None:
         self.configs = [item for item in configs if item.get("enabled", True)]
         self.selected_sensors = selected_sensors
         self.source_file = source_file
         self.assignments = assignments or {}
+        self.usb_startup_profiles = dict(usb_startup_profiles or {})
         self.drivers: list[SampleDriver] = []
         self.cache = ChannelSampleCache(max_events=max(128, len(selected_sensors) * 64))
         self.workers: list[LocalDirectAdapter] = []
         self.final_worker_status: list[dict[str, Any]] = []
         self.interface_quality_metadata: dict[str, dict[str, Any]] = {}
+        self._opening_cancel = threading.Event()
+        self._workers_lock = threading.RLock()
+
+    def cancel_open(self) -> None:
+        self._opening_cancel.set()
+        for worker in self.workers:
+            worker.stop_event.set()
+            cancel = getattr(worker.driver, "cancel_open", None)
+            if callable(cancel):
+                cancel()
 
     def open(self) -> None:
         self.drivers = []
         self.final_worker_status = []
         self.interface_quality_metadata = {}
+        opening_started = time.monotonic()
         try:
             for item in self.configs:
+                if self._opening_cancel.is_set():
+                    raise RuntimeError("capture_start_cancelled")
                 driver_name = str(item.get("driver") or "serial_json")
                 role = str(item.get("role") or "other")
                 channel_map = item.get("channel_map") if isinstance(item.get("channel_map"), dict) else {}
@@ -4291,6 +4423,10 @@ class MultiInterfaceDriver(SampleDriver):
                         int(item.get("baudrate") or 115200),
                         int(item.get("slave_id", 1)),
                         float(item.get("timeout") or 0.5),
+                        read_profile=item.get("read_profile", "channel_temperature"),
+                        channel_settings=item.get("channel_settings"),
+                        device_identity=item.get("device_identity"),
+                        scan_timeout_seconds=item.get("scan_timeout_seconds"),
                     )
                 elif driver_name == USB_DRIVER:
                     recorder = None
@@ -4305,6 +4441,7 @@ class MultiInterfaceDriver(SampleDriver):
                         str(item.get("endpoint") or ""), data_mode=item.get("data_mode", "raw_adc"),
                         calibration=item.get("calibration_profile"), binding=item.get("device_identity"),
                         bridge=str(item.get("bridge") or ""), recorder=recorder,
+                        startup_policy=self.usb_startup_profiles.get(str(item.get("id") or ""), "fixed"),
                     )
                 elif driver_name == "modbus_rtu_esr1001":
                     driver = Esr1001StrainDriver(
@@ -4323,6 +4460,8 @@ class MultiInterfaceDriver(SampleDriver):
                 if allowed is None:
                     allowed = list(self.selected_sensors)
                 requested_poll = float(item.get("poll_interval_seconds") or 0.002)
+                if driver_name == USB_DRIVER:
+                    requested_poll = min(requested_poll, 0.002)
                 before_open = None
                 if driver_name in {"modbus_tcp", "abb_robot"}:
                     network_interface = deepcopy(item)
@@ -4343,25 +4482,32 @@ class MultiInterfaceDriver(SampleDriver):
                         item.get("max_reconnect_backoff_seconds") or 1.0
                     ),
                     max_reconnect_attempts=int(item.get("max_reconnect_attempts") or 5),
+                    reconnect_window_seconds=item.get("reconnect_window_seconds"),
                     before_open=before_open,
                 )
-                self.workers.append(worker)
-                worker.start()
+                if driver_name == THERMOCOUPLE64_DRIVER:
+                    driver.poll_interval_seconds = worker.actual_poll_interval_seconds
+                with self._workers_lock:
+                    if self._opening_cancel.is_set():
+                        recorder = getattr(driver, "recorder", None)
+                        if recorder is not None:
+                            recorder.close(driver.quality_metadata)
+                        raise RuntimeError("capture_start_cancelled")
+                    self.workers.append(worker)
+                    worker.start()
+            open_timeout = max((max(float(getattr(worker.driver, "open_timeout_seconds", 2.5)),
+                                    10.0 if worker.before_open is not None and sys.platform.startswith("win") else 0.0)
+                                for worker in self.workers), default=2.5)
+            open_deadline = opening_started + open_timeout
             for worker in self.workers:
-                open_timeout = float(
-                    getattr(worker.driver, "open_timeout_seconds", 2.5)
-                )
-                if worker.before_open is not None and sys.platform.startswith("win"):
-                    # The dependency-free Windows adapter lookup starts a
-                    # bounded PowerShell query before the protocol opens.
-                    open_timeout = max(open_timeout, 10.0)
-                open_deadline = time.monotonic() + open_timeout
                 while (
                     not worker.opened.is_set()
                     and worker.thread is not None
                     and worker.thread.is_alive()
                     and time.monotonic() < open_deadline
                 ):
+                    if self._opening_cancel.is_set():
+                        raise RuntimeError("capture_start_cancelled")
                     worker.opened.wait(0.02)
                 if not worker.opened.is_set():
                     if worker.last_error:
@@ -4390,21 +4536,27 @@ class MultiInterfaceDriver(SampleDriver):
     def worker_status(self) -> list[dict[str, Any]]:
         return [worker.status() for worker in self.workers]
 
-    def close(self) -> None:
+    def close(self, timeout_seconds: float = 0.5) -> None:
         pending: list[LocalDirectAdapter] = []
-        if not self.workers:
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        self._opening_cancel.set()
+        with self._workers_lock:
+            workers = list(self.workers)
+        if not workers:
             return
-        for worker in self.workers:
-            if not worker.stop(timeout_seconds=0.5):
+        for worker in workers:
+            worker.stop(timeout_seconds=0)
+        for worker in workers:
+            if not worker.stop(timeout_seconds=max(0.0, deadline-time.monotonic())):
                 pending.append(worker)
-        self.final_worker_status = [worker.status() for worker in self.workers]
+        self.final_worker_status = [worker.status() for worker in workers]
         self.interface_quality_metadata = {
             worker.interface_id: dict(metadata)
-            for worker in self.workers
+            for worker in workers
             for metadata in [getattr(worker.driver, "quality_metadata", {})]
             if isinstance(metadata, dict)
         }
-        for worker in self.workers:
+        for worker in workers:
             recorder = getattr(worker.driver, "recorder", None)
             if recorder is not None and worker not in pending:
                 recorder.close(worker.driver.quality_metadata)
@@ -4442,6 +4594,7 @@ def build_driver(config: AcquisitionConfig) -> SampleDriver:
             list(config.selected_sensors or []),
             config.source_file,
             config.interface_channel_assignments,
+            usb_startup_profiles=getattr(config, "_session_usb_profiles", {}),
         )
     if config.driver == "simulator":
         path = (
@@ -4476,6 +4629,9 @@ def build_driver(config: AcquisitionConfig) -> SampleDriver:
             config.endpoint,
             config.baudrate or 115200,
             config.slave_id,
+            getattr(config, "timeout", 0.5),
+            read_profile=getattr(config, "read_profile", "channel_temperature"),
+            channel_settings=getattr(config, "channel_settings", None),
         )
     if config.driver == "modbus_rtu_esr1001":
         return Esr1001StrainDriver(
@@ -4670,7 +4826,10 @@ def read_real_process_parameters(
     return _process_parameter_payload(parameters)
 
 
-class AcquisitionManager:
+from acquisition_start import AcquisitionStartMixin
+
+
+class AcquisitionManager(AcquisitionStartMixin):
     def __init__(
         self,
         capture_root: Path = DEFAULT_CAPTURE_ROOT,
@@ -4689,6 +4848,7 @@ class AcquisitionManager:
         self.rows: deque[dict[str, Any]] = deque(maxlen=200000)
         self.timestamps: deque[float] = deque(maxlen=200000)
         self.frame_quality: deque[dict[str, str]] = deque(maxlen=200000)
+        self.frame_sources: deque[dict[str, Any]] = deque(maxlen=2400)
         self.frame_envelopes: deque[dict[str, Any]] = deque(maxlen=200000)
         self.frame_catalog: dict[str, Any] | None = None
         self.quality_metrics: AcquisitionQualityMetrics | None = None
@@ -4741,6 +4901,17 @@ class AcquisitionManager:
             "sensors": [],
         }
         self._readiness_snapshot: ReadinessSnapshot | None = None
+        self._init_start_lifecycle()
+        self._last_start_preflight: dict[str, Any] = {
+            "clock_domain": "server_monotonic",
+            "readiness_session_id": self.readiness_session_id,
+            "readiness_session_reused": False,
+            "complete": False,
+            "elapsed_ms": 0.0,
+            "events": [],
+        }
+        self._hardware_check_runs_lock = threading.Lock()
+        self._hardware_check_runs: dict[tuple[str, float], dict[str, Any]] = {}
         if recovery_scan is None:
             recovery_scan = Path(capture_root).resolve() != DEFAULT_CAPTURE_ROOT.resolve()
         self.recovery_state = (
@@ -5019,7 +5190,7 @@ class AcquisitionManager:
                     "location": str(getattr(item, "location", "") or ""),
                     "detected": True,
                     "identity_confirmed": False,
-                    "compatible_roles": ["pressure", "esr1001_strain", "custom"],
+                    "compatible_roles": ["thermocouple64", "pressure", "esr1001_strain", "custom"],
                 })
         except Exception as exc:
             error = str(exc)
@@ -5057,7 +5228,7 @@ class AcquisitionManager:
                                 "description": str(value_name or "Windows serial interface"),
                                 "manufacturer": "", "vid": None, "pid": None,
                                 "detected": True, "identity_confirmed": False,
-                                "compatible_roles": ["pressure", "esr1001_strain", "custom"],
+                                "compatible_roles": ["thermocouple64", "pressure", "esr1001_strain", "custom"],
                             })
                             index += 1
                 except Exception as registry_exc:
@@ -5244,7 +5415,7 @@ class AcquisitionManager:
                 "endpoint": "COM8", "label": "串口（待识别，启动后检查）",
                 "detected": False, "auto_assignable": True,
                 "identity_confirmed": False,
-                "compatible_roles": ["pressure", "esr1001_strain", "custom"],
+                "compatible_roles": ["thermocouple64", "pressure", "esr1001_strain", "custom"],
             })
         rtsp_reachable = False
         try:
@@ -5278,7 +5449,10 @@ class AcquisitionManager:
                 for item in camera_devices
             ],
             "rtsp_reachable": rtsp_reachable,
-            "thermocouple_reachable": bool(smrf_devices),
+            "thermocouple_reachable": False,
+            "thermocouple_discovered": any(p.get("kind") == "serial" and p.get("detected") for p in physical_interfaces),
+            "thermocouple_protocol_state": "not_verified",
+            "thermocouple_temperature_state": "not_verified",
         }
 
     @staticmethod
@@ -5294,9 +5468,47 @@ class AcquisitionManager:
         ]
 
     def test_connection(
+        self, config: AcquisitionConfig, timeout_seconds: float = 2.5, *, force: bool = False
+    ) -> dict:
+        """Run one real probe per fingerprint and serialize physical access."""
+        if getattr(config, "acquisition_mode", "real") != "real":
+            return self._test_connection_once(config, timeout_seconds)
+        key = (readiness_config_fingerprint(config), float(timeout_seconds), bool(force))
+        with self._hardware_check_runs_lock:
+            run = self._hardware_check_runs.get(key)
+            owner = run is None
+            if owner:
+                run = {"event": threading.Event(), "result": None, "error": None}
+                self._hardware_check_runs[key] = run
+        if not owner:
+            run["event"].wait()
+            if run["error"] is not None:
+                raise run["error"]
+            return deepcopy(run["result"])
+        try:
+            with self.lifecycle_lock:
+                from acquisition_readiness import check_interfaces
+                if self.thread is not None and self.thread.is_alive() and self.config.acquisition_mode == "real":
+                    raise RuntimeError("port_busy: 已有真实采集会话，不能启动临时探针")
+                if force:
+                    self.invalidate_readiness()
+                result = check_interfaces(self, config, timeout_seconds)
+            run["result"] = deepcopy(result)
+            return result
+        except BaseException as error:
+            run["error"] = error
+            raise
+        finally:
+            run["event"].set()
+            with self._hardware_check_runs_lock:
+                if self._hardware_check_runs.get(key) is run:
+                    self._hardware_check_runs.pop(key, None)
+
+    def _test_connection_once(
         self, config: AcquisitionConfig, timeout_seconds: float = 2.5
     ) -> dict:
         """Check source readiness and report the exact missing endpoint/channel."""
+        config._session_usb_profiles = {}
         with self.lock:
             if self.thread is not None and self.thread.is_alive() and self.config and self.config.acquisition_mode == "real":
                 raise RuntimeError("port_busy: 已有真实采集会话，不能启动临时探针")
@@ -5546,6 +5758,7 @@ class AcquisitionManager:
             invalid: dict[str, int] = {}
             channel_observations: dict[str, dict[str, Any]] = {}
             probe_errors: list[str] = []
+            probe_diagnostics: dict[str, Any] = {}
             interface_driver = None
             try:
                 interface_driver = MultiInterfaceDriver(
@@ -5577,13 +5790,17 @@ class AcquisitionManager:
                                     "source_timestamp": sample_timestamp,
                                     "quality": "measured_new",
                                 }
-                    if expected and all(detected.get(name, 0) > 0 for name in expected):
+                    if expected and all(detected.get(name, 0) > 0 or invalid.get(name, 0) > 0 for name in expected):
                         break
                     time.sleep(0.01)
             except Exception as exc:
                 probe_errors.append(str(exc))
             finally:
                 if interface_driver is not None:
+                    for source_driver in getattr(interface_driver, "drivers", []):
+                        metadata = getattr(source_driver, "quality_metadata", {})
+                        if isinstance(metadata, dict):
+                            probe_diagnostics = deepcopy(metadata)
                     try:
                         interface_driver.close()
                     except Exception:
@@ -5631,6 +5848,7 @@ class AcquisitionManager:
             if state not in {"ok", "data_ready"}:
                 errors.append(f"{endpoint}：{message}")
             channel_results = {}
+            driver_diagnostics = probe_diagnostics or (deepcopy(getattr(interface_driver, "interface_quality_metadata", {}).get(interface_id, {})) if interface_driver else {})
             for name in expected:
                 observation = dict(channel_observations.get(name) or {})
                 channel_results[name] = {
@@ -5688,6 +5906,10 @@ class AcquisitionManager:
                 "network_path": deepcopy(network_path),
                 "stages": stages,
                 "channel_results": channel_results,
+                "read_profile": item.get("read_profile"),
+                "driver_diagnostics": driver_diagnostics,
+                "protocol_verified": bool(driver_diagnostics.get("protocol_verified", bool(detected or invalid))),
+                "temperature_valid": bool(detected),
             })
         configuration_issues = list(getattr(config, "configuration_issues", []) or [])
         issues_by_interface: dict[str, list[dict[str, Any]]] = {}
@@ -5754,6 +5976,11 @@ class AcquisitionManager:
                     config, result, capabilities=config.helper_capabilities
                 )
                 result["readiness_snapshot"] = self._readiness_snapshot.to_dict()
+                self._session_readiness_fingerprint = readiness_config_fingerprint(config) if result["ok"] else ""
+                self.readiness_version += 1
+                self.readiness_invalid_reason = "" if result["ok"] else "hardware_check_failed"
+                result["readiness_session_id"] = self.readiness_session_id
+                result["readiness_version"] = self.readiness_version
             self._latest_check_result = deepcopy(result)
         return result
 
@@ -5761,6 +5988,7 @@ class AcquisitionManager:
         snapshot = ReadinessSnapshot.from_dict(payload)
         with self.lock:
             self._readiness_snapshot = snapshot
+            self._session_readiness_fingerprint = ""
 
     def latest_check_result(self) -> dict[str, Any]:
         """Return the last completed interface check without probing hardware."""
@@ -5940,6 +6168,16 @@ class AcquisitionManager:
         # finalized.  Until then, the previous specimen remains authoritative.
         self.pending_session_metadata = metadata
         return capture_uuid
+
+    def _capture_uuid_for_start(self, config: AcquisitionConfig) -> str:
+        token = _parameter_token(config)
+        if config.layer > 0 and config.save_root:
+            previous = self._read_json(Path(config.save_root) / token / "采集记录" / "当前试样会话.json")
+            signature = {"dataset_schema": config.dataset_schema, "condition_id": str(config.condition_id),
+                         "replicate": int(config.replicate), "parameter_token": token}
+            if previous.get("identity") == signature and previous.get("capture_uuid"):
+                return str(previous["capture_uuid"])
+        return str(config.capture_uuid or uuid.uuid4().hex)
 
     def _archive_orphan_partial(self, path: Path | None) -> None:
         if path is None or not path.exists():
@@ -6124,7 +6362,32 @@ class AcquisitionManager:
                 key: dict(value) for key, value in self.driver.interface_quality_metadata.items()
                 if value.get("driver") == USB_DRIVER
             }
+            summary["thermocouple64"] = {
+                key: dict(value) for key, value in self.driver.interface_quality_metadata.items()
+                if value.get("driver") == THERMOCOUPLE64_DRIVER
+            }
         return summary
+
+    def _record_start_preflight(
+        self, audit: dict[str, Any], stage: str, **details: Any
+    ) -> dict[str, Any]:
+        event = {
+            "stage": str(stage),
+            "server_monotonic": time.monotonic(),
+            **details,
+        }
+        audit["events"].append(event)
+        started = float(audit["events"][0]["server_monotonic"])
+        audit["elapsed_ms"] = max(
+            0.0, (float(event["server_monotonic"]) - started) * 1000.0
+        )
+        audit["complete"] = stage in {
+            "start_preflight_end",
+            "start_preflight_failed",
+        }
+        with self.lock:
+            self._last_start_preflight = deepcopy(audit)
+        return event
 
     def start(self, config: AcquisitionConfig) -> dict:
         """Start one capture while safely replacing an active simulation.
@@ -6134,46 +6397,153 @@ class AcquisitionManager:
         cannot permanently block local, LAN, or public operation.  A real
         hardware capture is never taken over implicitly.
         """
-        assert_config_contract(config, RELEASE_CONTRACT)
-        if config.acquisition_mode == "real":
-            requires_readiness = False
-            for item in config.interfaces or []:
-                if not item.get("enabled", True):
-                    continue
-                role = str(item.get("role") or "")
-                if item.get("driver") == USB_DRIVER:
-                    requires_readiness = True
-                if role in SHARED_DEVICE_PROFILES:
-                    requires_readiness = True
-                    profile_status = device_profile_readiness(item)
-                    if not profile_status["ready"]:
-                        raise RuntimeError(
-                            "device_profile_incomplete: "
-                            + str(item.get("id") or role)
-                            + ": "
-                            + ", ".join(profile_status["missing_device_facts"])
-                        )
-                if role in {"plc", "robot"}:
-                    item["network_path"] = require_network_path(item)
-                if item.get("physical_port_id") and not item.get("physical_interface_id"):
-                    raise RuntimeError(
-                        f"接口“{item.get('id', item.get('role', 'unknown'))}”："
-                        "端口存在，未检测到兼容设备；连接设备后重新识别接口"
-                    )
-                if not item.get("physical_verified", False):
-                    raise RuntimeError(
-                        f"接口“{item.get('id', item.get('role', 'unknown'))}”尚未通过物理设备验证，"
-                        "请先执行接口检查"
-                    )
-            if requires_readiness:
+        if self._start_thread is not None and self._start_thread.is_alive() and threading.current_thread() is not self._start_thread:
+            raise RuntimeError("capture_start_in_progress")
+        preflight: dict[str, Any] = {
+            "clock_domain": "server_monotonic",
+            "start_request_id": str(getattr(config, "start_request_id", "") or ""),
+            "capture_generation": str(
+                getattr(config, "capture_generation", "") or ""
+            ),
+            "readiness_session_id": self.readiness_session_id,
+            "readiness_session_reused": False,
+            "complete": False,
+            "elapsed_ms": 0.0,
+            "events": [],
+        }
+        self._record_start_preflight(preflight, "start_preflight_begin")
+        reused_network_paths = 0
+        probed_network_paths = 0
+        try:
+            assert_config_contract(config, RELEASE_CONTRACT)
+            if config.acquisition_mode == "real":
+                requires_readiness = False
                 with self.lock:
                     snapshot = self._readiness_snapshot
-                if snapshot is None:
-                    raise RuntimeError("readiness_required: 请先执行当前配置的接口检查")
-                try:
-                    snapshot.validate(config)
-                except ValueError as exc:
-                    raise RuntimeError(f"readiness_required: {exc}") from exc
+                same_readiness_session = bool(
+                    snapshot is not None and self.session_readiness_matches(config)
+                )
+                readiness_session_reused = False
+                if same_readiness_session:
+                    try:
+                        snapshot.validate(config, allow_expired=True)
+                    except ValueError:
+                        readiness_session_reused = False
+                    else:
+                        readiness_session_reused = True
+                preflight["readiness_session_reused"] = readiness_session_reused
+                self._record_start_preflight(
+                    preflight,
+                    "readiness_session_evaluated",
+                    snapshot_present=snapshot is not None,
+                    same_session=same_readiness_session,
+                    valid_for_reuse=readiness_session_reused,
+                )
+                for item in config.interfaces or []:
+                    if not item.get("enabled", True):
+                        continue
+                    role = str(item.get("role") or "")
+                    interface_id = str(item.get("id") or role or "unknown")
+                    if item.get("driver") == USB_DRIVER:
+                        requires_readiness = True
+                    if role in SHARED_DEVICE_PROFILES:
+                        requires_readiness = True
+                        profile_status = device_profile_readiness(item)
+                        if not profile_status["ready"]:
+                            raise RuntimeError(
+                                "device_profile_incomplete: "
+                                + interface_id
+                                + ": "
+                                + ", ".join(profile_status["missing_device_facts"])
+                            )
+                    if role in {"plc", "robot"}:
+                        network_path = (
+                            reusable_network_path(item, snapshot.interfaces)
+                            if readiness_session_reused and snapshot is not None
+                            else None
+                        )
+                        if network_path is not None:
+                            item["network_path"] = network_path
+                            reused_network_paths += 1
+                            self._record_start_preflight(
+                                preflight,
+                                "network_path_reused",
+                                interface_id=interface_id,
+                                physical_interface_id=str(
+                                    item.get("physical_interface_id") or ""
+                                ),
+                                target_address=str(
+                                    network_path.get("target_address") or ""
+                                ),
+                                target_port=int(
+                                    network_path.get("target_port") or 0
+                                ),
+                                source_address=str(
+                                    network_path.get("actual_source_address") or ""
+                                ),
+                            )
+                        else:
+                            probe_begin = self._record_start_preflight(
+                                preflight,
+                                "network_path_probe_begin",
+                                interface_id=interface_id,
+                            )
+                            probed_network_paths += 1
+                            item["network_path"] = require_network_path(item)
+                            self._record_start_preflight(
+                                preflight,
+                                "network_path_probe_end",
+                                interface_id=interface_id,
+                                elapsed_ms=max(
+                                    0.0,
+                                    (
+                                        time.monotonic()
+                                        - float(probe_begin["server_monotonic"])
+                                    )
+                                    * 1000.0,
+                                ),
+                                source_address=str(
+                                    item["network_path"].get(
+                                        "actual_source_address"
+                                    )
+                                    or ""
+                                ),
+                            )
+                    if item.get("physical_port_id") and not item.get("physical_interface_id"):
+                        raise RuntimeError(
+                            f"接口“{item.get('id', item.get('role', 'unknown'))}”："
+                            "端口存在，未检测到兼容设备；连接设备后重新识别接口"
+                        )
+                    if not item.get("physical_verified", False):
+                        raise RuntimeError(
+                            f"接口“{item.get('id', item.get('role', 'unknown'))}”尚未通过物理设备验证，"
+                            "请先执行接口检查"
+                        )
+                if requires_readiness:
+                    if snapshot is None:
+                        raise RuntimeError("readiness_required: 请先执行当前配置的接口检查")
+                    try:
+                        snapshot.validate(
+                            config, allow_expired=same_readiness_session
+                        )
+                    except ValueError as exc:
+                        raise RuntimeError(f"readiness_required: {exc}") from exc
+        except Exception as exc:
+            self._record_start_preflight(
+                preflight,
+                "start_preflight_failed",
+                error_type=type(exc).__name__,
+                error_code=str(exc).partition(":")[0][:120],
+                network_paths_reused=reused_network_paths,
+                network_paths_probed=probed_network_paths,
+            )
+            raise
+        self._record_start_preflight(
+            preflight,
+            "start_preflight_end",
+            network_paths_reused=reused_network_paths,
+            network_paths_probed=probed_network_paths,
+        )
         with self.lifecycle_lock:
             with self.lock:
                 if self.capture_phase == "stop_timed_out" and not self.finalization_complete:
@@ -6192,15 +6562,28 @@ class AcquisitionManager:
                 stopped = self.stop()
                 if stopped.get("running"):
                     raise RuntimeError("上一模拟采集未能停止，请稍后重试")
-            result = self._start_new(config)
+            self._assert_start_not_cancelled()
+            try:
+                result = self._start_new(
+                    config, preflight_events=tuple(preflight["events"])
+                )
+            except Exception:
+                if not self._start_cancel.is_set():
+                    self.invalidate_readiness()
+                raise
             if config.acquisition_mode == "real":
                 with self.lock:
-                    self._readiness_snapshot = None
+                    self._session_readiness_fingerprint = readiness_config_fingerprint(config)
             if replaced_simulation:
                 result["replaced_active_simulation"] = True
             return result
 
-    def _start_new(self, config: AcquisitionConfig) -> dict:
+    def _start_new(
+        self,
+        config: AcquisitionConfig,
+        *,
+        preflight_events: tuple[dict[str, Any], ...] = (),
+    ) -> dict:
         with self.lock:
             if self.thread is not None and self.thread.is_alive():
                 raise RuntimeError("采集已经在运行")
@@ -6220,6 +6603,10 @@ class AcquisitionManager:
                 # A hardware driver may stop itself after a read error.  Commit
                 # any rows already received before a new session resets state.
                 self.stop()
+            self._begin_capture_timeline(config)
+            if preflight_events:
+                with self._start_job_lock:
+                    self._start_events[0:0] = deepcopy(list(preflight_events))
             self.config = config
             self.mysql_status = {
                 "enabled": bool(config.mysql_enabled or config.mysql_local_enabled),
@@ -6234,6 +6621,7 @@ class AcquisitionManager:
             self.rows.clear()
             self.timestamps.clear()
             self.frame_quality.clear()
+            self.frame_sources.clear()
             self.frame_envelopes.clear()
             self.frame_catalog = None
             self.quality_metrics = AcquisitionQualityMetrics(
@@ -6267,211 +6655,234 @@ class AcquisitionManager:
             self.persistence_failed = False
             self.persistence_queue_depth = 0
             self.persistence_queue_high_water_rows = 0
-            self.save_status = check_capture_save_root(config.save_root)
-            mysql_preflight: dict[str, Any] = {}
-            preflight_destinations = (
-                self._mysql_destinations(config)
-                if config.acquisition_mode == "real"
-                else []
-            )
-            for destination_name, settings in preflight_destinations:
-                result = MySQLCaptureStore(settings).preflight(write_test=True)
-                mysql_preflight[destination_name] = result
-                if not result.get("ok"):
-                    self.last_error = (
-                        f"mysql_preflight_failed: {destination_name}: "
-                        f"{result.get('error') or result.get('stage') or 'unknown error'}"
-                    )
-                    self.mysql_status = {
-                        "enabled": True,
-                        "ok": False,
-                        "state": "preflight_failed",
-                        "preflight": mysql_preflight,
-                        "error": self.last_error,
-                        "saved_rows": 0,
-                    }
-                    self.finalization_complete = True
-                    raise RuntimeError(self.last_error)
-            if mysql_preflight:
-                self.mysql_status["preflight"] = mysql_preflight
-            if preflight_destinations and not self.save_status["ok"]:
-                # A database can disappear after preflight.  Real MySQL-only
-                # captures therefore stream to the manager's local durable
-                # root so the complete layer remains retryable instead of
-                # depending on the bounded live deque.
-                requested_save_status = dict(self.save_status)
-                retry_spool = check_capture_save_root(self.capture_root)
-                if not retry_spool.get("ok"):
-                    self.last_error = (
-                        "persistence_retry_spool_unavailable: "
-                        + str(retry_spool.get("message") or "unknown error")
-                    )
-                    self.finalization_complete = True
-                    raise RuntimeError(self.last_error)
-                self.save_status = {
-                    **retry_spool,
-                    "retry_spool": True,
-                    "requested_save_status": requested_save_status,
-                    "message": "MySQL正式采集使用本机耐久重试暂存目录",
-                }
-            durable_destination = bool(
-                self.save_status["ok"]
-                or config.mysql_enabled
-                or config.mysql_local_enabled
-            )
-            if (
-                config.acquisition_mode == "real"
-                and config.persistence_policy == "required"
-                and not durable_destination
-            ):
+        self.save_status = check_capture_save_root(config.save_root)
+        self.record_start_event("save_root_checked", ok=self.save_status["ok"])
+        mysql_preflight: dict[str, Any] = {}
+        preflight_destinations = (
+            self._mysql_destinations(config)
+            if config.acquisition_mode == "real"
+            else []
+        )
+        for destination_name, settings in preflight_destinations:
+            result = MySQLCaptureStore(settings).preflight(write_test=True)
+            mysql_preflight[destination_name] = result
+            if not result.get("ok"):
                 self.last_error = (
-                    "persistence_required: real capture requires a writable save root "
-                    "or an enabled durable MySQL destination"
+                    f"mysql_preflight_failed: {destination_name}: "
+                    f"{result.get('error') or result.get('stage') or 'unknown error'}"
+                )
+                self.mysql_status = {
+                    "enabled": True,
+                    "ok": False,
+                    "state": "preflight_failed",
+                    "preflight": mysql_preflight,
+                    "error": self.last_error,
+                    "saved_rows": 0,
+                }
+                self.finalization_complete = True
+                raise RuntimeError(self.last_error)
+        if mysql_preflight:
+            self.mysql_status["preflight"] = mysql_preflight
+        if preflight_destinations and not self.save_status["ok"]:
+            # A database can disappear after preflight.  Real MySQL-only
+            # captures therefore stream to the manager's local durable
+            # root so the complete layer remains retryable instead of
+            # depending on the bounded live deque.
+            requested_save_status = dict(self.save_status)
+            retry_spool = check_capture_save_root(self.capture_root)
+            if not retry_spool.get("ok"):
+                self.last_error = (
+                    "persistence_retry_spool_unavailable: "
+                    + str(retry_spool.get("message") or "unknown error")
                 )
                 self.finalization_complete = True
                 raise RuntimeError(self.last_error)
-            self.finalization_complete = False
-            self.full_specimen_path = None
-            self.completed_layers = []
-            self.last_data_quality = None
-            self.last_file_integrity = None
-            self.capture_uuid = ""
-            self.operator_specimen_id = ""
-            self.session_metadata_path = None
-            self.session_dir = None
-            self.capture_record_dir = None
-            self.timestamp_path = None
-            self.raw_work_path = None
-            self.timestamp_work_path = None
-            self.started_at = time.time()
-            self.stopped_at = None
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.session_stamp = stamp
-            parameter_token = _parameter_token(config)
-            # Storage names intentionally exclude specimen/run identifiers.
-            specimen_folder_name = parameter_token
-            self.specimen_folder_name = specimen_folder_name
-            manifest_path: Path | None = None
-            if self.save_status["ok"]:
-                self.save_enabled = True
-                selected_root = Path(str(self.save_status["path"])).resolve()
-                self.session_dir = selected_root / specimen_folder_name
-                self.capture_record_dir = self.session_dir / "采集记录"
-                self.capture_record_dir.mkdir(parents=True, exist_ok=True)
-                probe_path = self.capture_record_dir / f".{stamp}.write-probe"
-                try:
-                    with probe_path.open("xb") as probe:
-                        probe.write(b"afp-persistence-probe")
-                        probe.flush()
-                        os.fsync(probe.fileno())
-                finally:
-                    probe_path.unlink(missing_ok=True)
-                self.timestamp_path = self.capture_record_dir / (
-                    f"{specimen_folder_name}_第{config.layer + 1}层_"
-                    f"{stamp}_时间戳.csv"
-                )
-                manifest_path = self.capture_record_dir / (
-                    f"{specimen_folder_name}_第{config.layer + 1}层_"
-                    f"{stamp}_采集清单.json"
-                )
-                # Use stable Unicode layer names for new captures.  The fallback
-                # pattern in _rebuild_whole_specimen still accepts files created
-                # by earlier builds that used replacement characters.
-                self.raw_path = self.session_dir / (
-                    f"{specimen_folder_name}_\u7b2c{config.layer + 1}\u5c42.CSV"
-                )
-                if max(len(str(self.raw_path)), len(str(self.timestamp_path))) > 235:
-                    raise ValueError(
-                        "保存路径过长。请改选更短的保存根目录，或缩短试样名。"
-                    )
-            else:
-                # Keep the acquisition stream and predictions usable while
-                # routing all file output to memory for this run.
-                self.raw_path = None
-                self.capture_uuid = str(config.capture_uuid or "").strip() or (
-                    f"AFP-{datetime.now().strftime('%Y%m%dT%H%M%S')}-"
-                    f"{uuid.uuid4().hex[:8]}"
-                )
-                config.capture_uuid = self.capture_uuid
-            for item in config.interfaces or []:
-                if item.get("enabled", True) and item.get("driver") == USB_DRIVER:
-                    if self.capture_record_dir is None:
-                        raise RuntimeError("原生USB采集需要可写原始证据目录")
-                    item["_raw_capture_root"] = str(self.capture_record_dir)
-            self.driver = build_driver(config)
+            self.save_status = {
+                **retry_spool,
+                "retry_spool": True,
+                "requested_save_status": requested_save_status,
+                "message": "MySQL正式采集使用本机耐久重试暂存目录",
+            }
+        durable_destination = bool(
+            self.save_status["ok"]
+            or config.mysql_enabled
+            or config.mysql_local_enabled
+        )
+        if (
+            config.acquisition_mode == "real"
+            and config.persistence_policy == "required"
+            and not durable_destination
+        ):
+            self.last_error = (
+                "persistence_required: real capture requires a writable save root "
+                "or an enabled durable MySQL destination"
+            )
+            self.finalization_complete = True
+            raise RuntimeError(self.last_error)
+        self.finalization_complete = False
+        self.full_specimen_path = None
+        self.completed_layers = []
+        self.last_data_quality = None
+        self.last_file_integrity = None
+        self.capture_uuid = ""
+        self.operator_specimen_id = ""
+        self.session_metadata_path = None
+        self.session_dir = None
+        self.capture_record_dir = None
+        self.timestamp_path = None
+        self.raw_work_path = None
+        self.timestamp_work_path = None
+        self.started_at = time.time()
+        self.stopped_at = None
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.session_stamp = stamp
+        self.record_start_event("storage_paths_begin")
+        parameter_token = _parameter_token(config)
+        # Storage names intentionally exclude specimen/run identifiers.
+        specimen_folder_name = parameter_token
+        self.specimen_folder_name = specimen_folder_name
+        manifest_path: Path | None = None
+        if self.save_status["ok"]:
+            self.save_enabled = True
+            selected_root = Path(str(self.save_status["path"])).resolve()
+            self.session_dir = selected_root / specimen_folder_name
+            self.capture_record_dir = self.session_dir / "采集记录"
+            self.capture_record_dir.mkdir(parents=True, exist_ok=True)
+            probe_path = self.capture_record_dir / f".{stamp}.write-probe"
             try:
-                self.driver.open()
-                if self.save_enabled:
-                    self._prepare_capture_identity(config, specimen_folder_name)
-                    self.raw_work_path = self.raw_path.with_name(
-                        f"{self.raw_path.name}.partial"
-                    )
-                    self.timestamp_work_path = self.timestamp_path.with_name(
-                        f"{self.timestamp_path.name}.partial"
-                    )
-                    self._archive_orphan_partial(self.raw_work_path)
-                    self._archive_orphan_timestamp_partials(specimen_folder_name)
-                    self._archive_orphan_partial(self.timestamp_work_path)
-                    _atomic_write_json(
-                        manifest_path,
-                        {
-                            **self._public_config(config),
-                            "capture_uuid": self.capture_uuid,
-                            "operator_specimen_id": self.operator_specimen_id,
-                            "started_at": datetime.now().isoformat(timespec="milliseconds"),
-                            "raw_encoding": "gb18030",
-                            "raw_columns": config.raw_columns,
-                            "selected_save_root": str(selected_root),
-                            "specimen_folder": str(self.session_dir),
-                            "layer_file": str(self.raw_path),
-                            "working_layer_file": str(self.raw_work_path),
-                            "timestamp_file": str(self.timestamp_path),
-                            "working_timestamp_file": str(self.timestamp_work_path),
-                            "archived_previous_session": self.archived_previous_session,
-                            "whole_specimen_rule": (
-                                f"{specimen_folder_name}_完整试样.CSV（每层结束后原子覆盖更新）"
-                            ),
-                        },
-                    )
-            except Exception as exc:
-                self.last_error = str(exc)
-                try:
+                with probe_path.open("xb") as probe:
+                    probe.write(b"afp-persistence-probe")
+                    probe.flush()
+                    os.fsync(probe.fileno())
+            finally:
+                probe_path.unlink(missing_ok=True)
+            self.timestamp_path = self.capture_record_dir / (
+                f"{specimen_folder_name}_第{config.layer + 1}层_"
+                f"{stamp}_时间戳.csv"
+            )
+            manifest_path = self.capture_record_dir / (
+                f"{specimen_folder_name}_第{config.layer + 1}层_"
+                f"{stamp}_采集清单.json"
+            )
+            # Use stable Unicode layer names for new captures.  The fallback
+            # pattern in _rebuild_whole_specimen still accepts files created
+            # by earlier builds that used replacement characters.
+            self.raw_path = self.session_dir / (
+                f"{specimen_folder_name}_\u7b2c{config.layer + 1}\u5c42.CSV"
+            )
+            if max(len(str(self.raw_path)), len(str(self.timestamp_path))) > 235:
+                raise ValueError(
+                    "保存路径过长。请改选更短的保存根目录，或缩短试样名。"
+                )
+        else:
+            # Keep the acquisition stream and predictions usable while
+            # routing all file output to memory for this run.
+            self.raw_path = None
+            self.capture_uuid = str(config.capture_uuid or "").strip() or (
+                f"AFP-{datetime.now().strftime('%Y%m%dT%H%M%S')}-"
+                f"{uuid.uuid4().hex[:8]}"
+            )
+            config.capture_uuid = self.capture_uuid
+        for item in config.interfaces or []:
+            if item.get("enabled", True) and item.get("driver") == USB_DRIVER:
+                if self.capture_record_dir is None:
+                    raise RuntimeError("原生USB采集需要可写原始证据目录")
+                item["_raw_capture_root"] = str(self.capture_record_dir)
+        config._session_usb_profiles = self.usb_startup_profiles(config)
+        self.driver = build_driver(config)
+        self.record_start_event("storage_paths_end")
+        try:
+            self._assert_start_not_cancelled()
+            self.record_start_event("devices_open_begin")
+            self.driver.open()
+            self.record_start_event("devices_open_end")
+            self._assert_start_not_cancelled()
+            if self.save_enabled:
+                self.record_start_event("capture_identity_begin")
+                self._prepare_capture_identity(config, specimen_folder_name)
+                self.record_start_event("capture_identity_end")
+                self.raw_work_path = self.raw_path.with_name(
+                    f"{self.raw_path.name}.partial"
+                )
+                self.timestamp_work_path = self.timestamp_path.with_name(
+                    f"{self.timestamp_path.name}.partial"
+                )
+                self._archive_orphan_partial(self.raw_work_path)
+                self._archive_orphan_timestamp_partials(specimen_folder_name)
+                self._archive_orphan_partial(self.timestamp_work_path)
+                _atomic_write_json(
+                    manifest_path,
+                    {
+                        **self._public_config(config),
+                        "capture_uuid": self.capture_uuid,
+                        "operator_specimen_id": self.operator_specimen_id,
+                        "started_at": datetime.now().isoformat(timespec="milliseconds"),
+                        "raw_encoding": "gb18030",
+                        "raw_columns": config.raw_columns,
+                        "selected_save_root": str(selected_root),
+                        "specimen_folder": str(self.session_dir),
+                        "layer_file": str(self.raw_path),
+                        "working_layer_file": str(self.raw_work_path),
+                        "timestamp_file": str(self.timestamp_path),
+                        "working_timestamp_file": str(self.timestamp_work_path),
+                        "archived_previous_session": self.archived_previous_session,
+                        "whole_specimen_rule": (
+                            f"{specimen_folder_name}_完整试样.CSV（每层结束后原子覆盖更新）"
+                        ),
+                    },
+                )
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.capture_phase = "start_failed"
+            try:
+                if self._start_cancel.is_set() and isinstance(self.driver, MultiInterfaceDriver):
+                    usb_opening = any(isinstance(worker.driver, Esr1001UsbDriver) for worker in self.driver.workers)
+                    cancel_budget = config.stop_sampling_timeout_seconds if usb_opening else config.stop_force_timeout_seconds
+                    self.driver.close(timeout_seconds=cancel_budget)
+                else:
                     self.driver.close()
-                finally:
+            finally:
+                self.thread = None
+                if getattr(self.driver, "workers", []):
+                    self.finalization_complete = False
+                    self.capture_phase = "stop_timed_out"
+                else:
                     self.driver = None
-                    self.thread = None
                     self.finalization_complete = True
-                raise
-            self.stop_event.clear()
-            self.thread = threading.Thread(
-                target=self._run,
-                name="AFP-Acquisition",
-                daemon=True,
-            )
-            self.thread.start()
-            self.capture_phase = (
-                "waiting_first_sample"
-                if config.acquisition_mode == "real"
-                else "running"
-            )
+            raise
+        self._assert_start_not_cancelled()
+        self.stop_event.clear()
+        self.thread = threading.Thread(
+            target=self._run,
+            name="AFP-Acquisition",
+            daemon=True,
+        )
+        self.thread.start()
+        self.capture_phase = (
+            "waiting_first_sample"
+            if config.acquisition_mode == "real"
+            else "running"
+        )
         if config.acquisition_mode == "real":
             required_channels = set(config.selected_sensors or [])
             observed: set[str] = set()
             deadline = time.monotonic() + config.first_sample_timeout_seconds
             while time.monotonic() < deadline:
+                self._assert_start_not_cancelled()
                 with self.lock:
+                    self._record_start_frame()
                     observed = {
                         name for name in required_channels
-                        if self.channel_observed.get(name, 0) > 0
+                        if len(self._source_observations.get(name, [])) >= 2
                     }
                     alive = self.thread is not None and self.thread.is_alive()
-                if observed == required_channels:
+                if observed == required_channels and self._curve_start_saved:
                     self.capture_phase = "running"
                     break
                 if not alive:
                     break
-                self.wait_for_stream_activity(min(0.05, max(0.0, deadline - time.monotonic())))
-            if required_channels and observed != required_channels:
+                self.wait_for_stream_activity(min(0.01, max(0.0, deadline - time.monotonic())))
+            if required_channels and (observed != required_channels or not self._curve_start_saved):
                 missing = sorted(required_channels - observed)
                 self.last_error = "first_sample_timeout: " + ", ".join(missing)
                 self.capture_phase = "start_failed"
@@ -6880,9 +7291,23 @@ class AcquisitionManager:
                             )
                         with self.lock:
                             self.total_sample_count += 1
+                            self._record_start_frame(frame)
                             self.rows.append(row)
                             self.timestamps.append(now)
                             self.frame_quality.append(quality)
+                            self.frame_sources.append({name: {
+                                "capture_generation": config.capture_generation,
+                                "start_request_id": config.start_request_id,
+                                "source_sequence": sample.source_sequence,
+                                "received_monotonic": sample.received_monotonic,
+                                "interface_id": sample.interface_id,
+                                "protocol_ok": sample.protocol_ok,
+                                "after_start": self._capture_start_monotonic is not None and sample.received_monotonic >= self._capture_start_monotonic,
+                                "quality": sample.quality.value,
+                                "stable": sample.metadata.get("current_stream_stable", True),
+                            } for name, sample in frame.channels.items()})
+                            envelope["capture_generation"] = config.capture_generation
+                            envelope["start_request_id"] = config.start_request_id
                             self.frame_envelopes.append(envelope)
                             for name in selected:
                                 if _finite(row.get(name)) is not None:
@@ -7186,10 +7611,19 @@ class AcquisitionManager:
         return destinations
 
     def stop(self) -> dict:
+        if threading.current_thread() is not self._start_thread:
+            pending = self.cancel_start()
+            if pending is not None:
+                return pending
         with self.lifecycle_lock:
             return self._stop_active()
 
     def _stop_active(self) -> dict:
+        states = getattr(self.driver, "worker_status", lambda: [])()
+        failed_interfaces = [str(row.get("interface_id") or "") for row in states
+                             if row.get("state") == "failed" or int(row.get("reconnect_attempts") or 0) > 0]
+        if failed_interfaces:
+            self.invalidate_readiness(failed_interfaces)
         if (
             not self.finalization_complete
             and self.capture_phase in {"database_pending_retry", "finalization_failed"}
@@ -7220,7 +7654,9 @@ class AcquisitionManager:
                 self.capture_phase = "stop_timed_out"
                 return self.status()
         if isinstance(self.driver, MultiInterfaceDriver):
-            self.driver.close()
+            usb_stop = any(isinstance(worker.driver, Esr1001UsbDriver) for worker in self.driver.workers)
+            close_budget = (self.config.stop_force_timeout_seconds if self.config else 2.0) if usb_stop else 0.5
+            self.driver.close(timeout_seconds=close_budget)
             pending_workers = self.driver.worker_status()
             if pending_workers:
                 self.last_error = "stop_timeout: " + ", ".join(
@@ -7686,8 +8122,10 @@ class AcquisitionManager:
                     }
                 except Exception:
                     worker_by_interface = {}
-            if any(int(item.get("reconnect_attempts") or 0) > 0 for item in worker_by_interface.values()):
-                self._readiness_snapshot = None
+            interrupted = [key for key, value in worker_by_interface.items()
+                           if int(value.get("reconnect_attempts") or 0) > 0 or value.get("state") == "failed"]
+            if interrupted:
+                self.invalidate_readiness(interrupted, reason="interface_reconnect_or_failure")
             if self.config is not None and self.config.acquisition_mode == "real":
                 for item in self.config.interfaces or []:
                     interface_id = str(item.get("id") or "")
@@ -7766,6 +8204,7 @@ class AcquisitionManager:
                         "reconnect_attempts": int(adapter_status.get("reconnect_attempts") or 0),
                         "last_error": str(adapter_status.get("last_error") or ""),
                         "poll_interval_seconds": adapter_status.get("actual_poll_interval_seconds"),
+                        "start_events": adapter_status.get("start_events", []),
                         "usb_evidence": usb_evidence if item.get("driver") == USB_DRIVER else None,
                         "raw_file": adapter_status.get("raw_file") or usb_evidence.get("raw_file"),
                     })
@@ -7782,6 +8221,16 @@ class AcquisitionManager:
             )
             return {
                 "running": running,
+                "status_monotonic": time.monotonic(),
+                "start_operation": self.start_operation_status(),
+                "capture_generation": self._start_job.get("capture_generation") or getattr(self.config, "capture_generation", ""),
+                "start_request_id": self._start_job.get("start_request_id") or getattr(self.config, "start_request_id", ""),
+                "capture_timeline": self.capture_timeline(),
+                "start_preflight": deepcopy(self._last_start_preflight),
+                "readiness_session_id": self.readiness_session_id,
+                "readiness_version": self.readiness_version,
+                "readiness_invalid_reason": self.readiness_invalid_reason,
+                "readiness_session_valid": bool(self._readiness_snapshot is not None and self._session_readiness_fingerprint),
                 "sample_count": int(self.total_sample_count),
                 "online_buffer_rows": len(self.rows),
                 "capture_uuid": self.capture_uuid or None,
@@ -7899,23 +8348,40 @@ class AcquisitionManager:
 
     def reset_check_state(self) -> dict:
         """Reset interface/channel observations without deleting saved files."""
-        with self.lock:
-            if self.thread is not None and self.thread.is_alive():
-                raise RuntimeError("采集运行中不能重置检查，请先停止并保存")
-            if self.driver is not None:
-                try:
-                    self.driver.close()
-                except Exception:
-                    pass
-                self.driver = None
-            self.channel_observed = {name: 0 for name in ALL_SENSOR_COLUMNS}
-            self.channel_last_observed = {name: None for name in ALL_SENSOR_COLUMNS}
-            self.last_error = ""
-            return self.status()
+        with self.lifecycle_lock:
+            with self.lock:
+                if self.thread is not None and self.thread.is_alive():
+                    raise RuntimeError("采集运行中不能重置检查，请先停止并保存")
+                if self.driver is not None:
+                    try:
+                        self.driver.close()
+                    except Exception:
+                        pass
+                    self.driver = None
+                self.channel_observed = {name: 0 for name in ALL_SENSOR_COLUMNS}
+                self.channel_last_observed = {name: None for name in ALL_SENSOR_COLUMNS}
+                self.last_error = ""
+                self.invalidate_readiness()
+                return self.status()
 
     def numeric_matrix(self) -> tuple[list[dict[str, Any]], list[float]]:
         with self.lock:
             return list(self.rows), list(self.timestamps)
+
+    def live_curve_snapshot(self, limit: int) -> tuple:
+        """Copy one generation's bounded display data under the capture lock."""
+        limit = max(48, min(int(limit), 2400))
+        with self.lock:
+            tail = lambda values: list(islice(reversed(values), limit))[::-1]
+            return (self.status(), tail(self.rows), tail(self.timestamps), tail(self.frame_quality), tail(self.frame_sources),
+                    deepcopy(self._curve_start_observations) if self._curve_start_saved else {})
+
+    def _write_start_observations(self):
+        if self.capture_record_dir is not None:
+            path = self.capture_record_dir / f"{self.session_stamp}_{self.config.capture_generation}_start_observations.json"
+            _atomic_write_json(path, {"capture_uuid": self.capture_uuid, "capture_generation": self.config.capture_generation,
+                                     "start_request_id": self.config.start_request_id, "clock_domain": "server_monotonic",
+                                     "channels": self._curve_start_observations})
 
     def stream_counts(self) -> dict[str, int]:
         """Return O(1) counters for helper transport without copying samples."""

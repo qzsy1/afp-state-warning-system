@@ -1,22 +1,51 @@
-"""Native desktop entry point using the original AFP web workbench in an embedded window.
+"""Native desktop entry point using the AFP web workbench in an embedded window.
 
-The HTML/CSS/JS frontend is rendered inside pywebview, so the user does not need
-to open a browser or type a localhost address.  The local server is bound to an
-ephemeral loopback port only for the embedded window and is stopped on exit.
+The window reuses the matching fixed local AFP service when available.  If no
+matching service exists, it starts one on the fixed loopback port and falls back
+to an ephemeral loopback port only when that port belongs to another service.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
 from pathlib import Path
+from urllib.request import Request, urlopen
 
 import numpy as np
 
-from app import create_server
+from app import create_server, health_payload
+
+
+SHARED_UI_PORT = 8771
+SHARED_UI_URL = os.environ.get(
+    "AFP_LOCAL_UI_URL", f"http://127.0.0.1:{SHARED_UI_PORT}/"
+).rstrip("/") + "/"
+
+
+def discover_shared_ui_url(
+    base_url: str = SHARED_UI_URL,
+    *,
+    expected_health: dict | None = None,
+    opener=urlopen,
+) -> str | None:
+    """Return the fixed local AFP backend only when its release identity matches."""
+    normalized = str(base_url or "").rstrip("/") + "/"
+    expected = dict(expected_health or health_payload())
+    try:
+        request = Request(normalized + "api/health", headers={"Accept": "application/json"})
+        with opener(request, timeout=0.75) as response:
+            payload = json.loads(response.read(4097).decode("utf-8"))
+    except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+        return None
+    identity_fields = ("status", "version", "build_id", "runtime_revision")
+    if all(str(payload.get(key, "")) == str(expected.get(key, "")) for key in identity_fields):
+        return normalized
+    return None
 
 
 def _run_legacy_check(arguments: list[str]) -> None:
@@ -103,13 +132,28 @@ def main() -> None:
             "桌面界面组件未安装。请安装 pywebview，或使用已打包的 EXE。"
         ) from exc
 
-    server = create_server("127.0.0.1", 0)
-    thread = threading.Thread(target=server.serve_forever, name="AFP-local-ui", daemon=True)
-    thread.start()
-    deadline = time.time() + 10.0
-    while not thread.is_alive() and time.time() < deadline:
-        time.sleep(0.02)
-    url = f"http://127.0.0.1:{server.server_port}/"
+    server = None
+    thread = None
+    url = discover_shared_ui_url()
+    if url is None:
+        try:
+            server = create_server("127.0.0.1", SHARED_UI_PORT)
+        except OSError:
+            # Another matching launcher may have won the fixed-port race.
+            deadline = time.time() + 1.0
+            while url is None and time.time() < deadline:
+                url = discover_shared_ui_url()
+                if url is None:
+                    time.sleep(0.05)
+            if url is None:
+                server = create_server("127.0.0.1", 0)
+        if server is not None:
+            thread = threading.Thread(target=server.serve_forever, name="AFP-local-ui", daemon=True)
+            thread.start()
+            deadline = time.time() + 10.0
+            while not thread.is_alive() and time.time() < deadline:
+                time.sleep(0.02)
+            url = f"http://127.0.0.1:{server.server_port}/"
     try:
         webview.create_window(
             "AFP 实时预测与状态预警系统",
@@ -121,8 +165,9 @@ def main() -> None:
         )
         webview.start(debug=False)
     finally:
-        server.shutdown()
-        server.server_close()
+        if server is not None:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":

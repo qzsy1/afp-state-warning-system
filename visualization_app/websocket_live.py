@@ -19,6 +19,8 @@ from json_safety import json_safe_value
 
 
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+LIVE_PAYLOAD_VERSION_POLL_SECONDS = 0.01
+LIVE_PAYLOAD_ERROR_RETRY_SECONDS = 0.05
 
 
 class VersionedPayloadCache:

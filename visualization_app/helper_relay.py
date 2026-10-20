@@ -669,15 +669,17 @@ class HelperRegistry:
             record.terminal_error = ""
             self._active_captures.pop(f"unconfirmed-{record.request_id}", None)
             capture_uuid = str(result.get("capture_uuid") or "").strip()
+            start_state = str((result.get("start_operation") or {}).get("state") or "")
+            starting = start_state in {"starting", "cancelling"}
             if record.command == "status" and isinstance(result.get("running"), bool):
                 self._active_captures = {
                     capture_id: owner
                     for capture_id, owner in self._active_captures.items()
                     if owner != session_id
                 }
-            if record.command in {"start_capture", "status"} and result.get("running") is True and capture_uuid:
+            if record.command in {"start_capture", "status"} and (result.get("running") is True or starting) and capture_uuid:
                 self._active_captures[capture_uuid] = session_id
-            if result.get("running") is False and capture_uuid:
+            if result.get("running") is False and not starting and capture_uuid:
                 self._active_captures.pop(capture_uuid, None)
             self._persist_helpers_locked()
         return {"ok": True, "request_id": str(request_id)}

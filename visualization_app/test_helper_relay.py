@@ -247,6 +247,20 @@ class HelperRelayTests(unittest.TestCase):
         self.assertEqual(readiness["generation"], 1)
         self.assertEqual(readiness["active_capture_uuids"], ["capture-1"])
 
+    def test_async_start_and_cancellation_keep_cutover_reserved(self):
+        for state in ("starting", "cancelling"):
+            with self.subTest(state=state):
+                registry = self.generation_registry(MutableIngressLoader())
+                paired = self.pair(registry)
+                with patch("helper_relay.helper_capability_mismatches", return_value=()):
+                    request = registry.command("session-a", "start_capture", {})
+                registry.accept_result("device-a", paired["pairing_token"], request["request_id"],
+                    {"accepted": True, "running": False, "capture_uuid": "capture-1",
+                     "start_operation": {"id": "operation-1", "state": state}}, ingress_generation=1)
+                readiness = registry.cutover_readiness()
+                self.assertFalse(readiness["allowed"])
+                self.assertEqual(readiness["active_capture_uuids"], ["capture-1"])
+
     def test_cutover_reservation_blocks_new_capture_until_released(self):
         loader = MutableIngressLoader()
         registry = self.generation_registry(loader)

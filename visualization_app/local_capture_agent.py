@@ -45,7 +45,7 @@ from interface_transport_catalog import (
 
 
 _ROLE_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("thermocouple64", "serial", ("huipu_tc64_modbus_rtu",)),
+    ("thermocouple64", "serial", ("serial",)),
     ("plc_process", "ethernet", ("ethernet",)),
     ("uvc_temperature", "usb_uvc", ("uvc",)),
     ("abb_motion", "ethernet", ("ethernet",)),
@@ -133,6 +133,11 @@ class LocalCaptureAgent:
             candidate = self._choose_candidate(
                 physical, kind, protocols, used=used, allow_used=allow_used
             )
+            role_candidates = [p for p in physical if p.get("kind") == kind
+                               and p.get("protocol") in protocols
+                               and (not p.get("compatible_roles") or role in p["compatible_roles"])]
+            if role == "thermocouple64":
+                candidate = None
             physical_id = str(candidate.get("id") or "") if candidate else ""
             if candidate and not allow_used:
                 used.add(str(candidate.get("parent_port_id") or physical_id))
@@ -141,6 +146,8 @@ class LocalCaptureAgent:
             bindings.append(
                 {
                     "role": role,
+                    "candidates": role_candidates,
+                    "identity_confirmed": False,
                     "physical_interface_id": physical_id or None,
                     "physical_port_id": (candidate or {}).get("parent_port_id") or None,
                     "physical_kind": kind,
@@ -410,12 +417,16 @@ class LocalCaptureAgent:
                 snapshot.validate(
                     config,
                     required_capabilities=(required_contract,),
+                    allow_expired=bool(getattr(self.manager, "session_readiness_matches", lambda _: False)(config)),
                 )
             except ValueError as exc:
                 raise RuntimeError(f"remote_readiness_required: {exc}") from exc
         if not str(getattr(config, "capture_uuid", "") or "").strip():
             config.capture_uuid = uuid.uuid4().hex
-        result = self.manager.start(config)
+        if getattr(config, "async_start", False) and config.acquisition_mode == "real":
+            result = self.manager.start_async(config)
+        else:
+            result = self.manager.start(config)
         with self._stream_lock:
             self._capture_uuid = str(
                 (result or {}).get("capture_uuid")
@@ -446,6 +457,20 @@ class LocalCaptureAgent:
             if self._pending_batch is not None:
                 return dict(self._pending_batch)
             if not self._capture_uuid:
+                return None
+            operation = getattr(self.manager, "start_operation_status", lambda: {})()
+            if not isinstance(operation, dict):
+                operation = {}
+            if operation.get("state") in {"starting", "cancelling"}:
+                return None
+            manager_capture_uuid = str(
+                getattr(self.manager, "capture_uuid", "") or ""
+            )
+            if (
+                operation
+                and manager_capture_uuid
+                and manager_capture_uuid != self._capture_uuid
+            ):
                 return None
             incremental = None
             reader = getattr(self.manager, "stream_rows_since", None)
@@ -613,6 +638,7 @@ class LocalCaptureAgent:
         )
         self._readiness_snapshot = snapshot
         response["readiness_snapshot"] = snapshot.to_dict()
+        response["readiness_session_id"] = getattr(self.manager, "readiness_session_id", "")
         return response
 
     def import_readiness_snapshot(self, payload: dict[str, Any]) -> None:
@@ -626,6 +652,8 @@ class LocalCaptureAgent:
 
     def stop_capture(self) -> dict[str, Any]:
         result = self.manager.stop()
+        if isinstance(result, dict) and result.get("capture_phase") == "cancelling_start":
+            return {**result, "execution_host": "helper_local"}
         stopped_at = time.time()
         response = dict(result) if isinstance(result, dict) else {"result": result}
         with self._stream_lock:
@@ -671,6 +699,10 @@ class LocalCaptureAgent:
 
     def status(self) -> dict[str, Any]:
         value = dict(self.manager.status())
+        if value.get("start_operation", {}).get("state") in {"starting", "cancelling"}:
+            value["capture_uuid"] = self._capture_uuid
+            value["sample_count"] = 0
+            value["running"] = False
         value["execution_host"] = "helper_local"
         value["source_transfer"] = dict(self._source_transfer_status)
         value["transport"] = self.stream_metrics(status=value)

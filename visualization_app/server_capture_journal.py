@@ -154,7 +154,8 @@ class ServerCaptureJournal:
         with self._lock:
             pending = self._pending_starts.pop((session_id, request_id), None)
             capture_uuid = str((result or {}).get("capture_uuid") or "").strip()
-            if pending is None or not capture_uuid or not bool((result or {}).get("running")):
+            starting = str((result.get("start_operation") or {}).get("state") or "") in {"starting", "cancelling"}
+            if pending is None or not capture_uuid or not (bool((result or {}).get("running")) or starting):
                 return False
             self._armed[session_id] = (*pending, capture_uuid)
             return True

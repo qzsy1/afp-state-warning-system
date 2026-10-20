@@ -44,6 +44,13 @@
           "endpoint_ref": {"type": "string", "pattern": "^AFP_[A-Z0-9_]+$"},
           "baudrate": {"type": "integer", "minimum": 1200},
           "slave_id": {"type": "integer", "minimum": 1, "maximum": 247},
+          "read_profile": {"enum": ["channel_temperature", "full_record_block"]},
+          "timeout": {"type": "number", "minimum": 0.01, "maximum": 2},
+          "scan_timeout_seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 600},
+          "freshness_seconds": {"type": "number", "exclusiveMinimum": 0},
+          "poll_interval_seconds": {"type": "number", "minimum": 0},
+          "reconnect_window_seconds": {"type": "number", "minimum": 0, "maximum": 300},
+          "channel_settings": {"type": "object"},
           "hardware_facts": {"type": "object"}
           ,"data_mode": {"enum": ["raw_adc", "microstrain"]}
           ,"calibration_profile": {"type": ["string", "object", "null"]}

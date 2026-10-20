@@ -54,6 +54,103 @@ def run_logical_interface_script(assertions: str) -> dict:
 
 
 class UsbInterfaceCandidateTests(unittest.TestCase):
+    def test_saved_serial_endpoint_can_recover_an_unlocated_candidate(self):
+        result = run_candidate_script(r'''
+state.usbTopology={usb_ports:[{id:"usb:9",state:"occupied",user_connectable:true}],devices:[]};
+state.physicalInterfaces=[{id:"serial:COM5",kind:"serial",endpoint:"COM5",vid:6790,pid:29987,detected:true}];
+const candidates=physicalCandidatesForRole("esr1001_strain");
+console.log(JSON.stringify({exact:savedSerialCandidate(candidates,"esr1001_strain","COM5"),
+  offline:savedSerialCandidate(candidates,"esr1001_strain","COM7"),
+  empty:candidates.find(c=>c.id==="usb:9")}));
+''')
+        self.assertEqual(result["exact"]["physical_interface_id"], "serial:COM5")
+        self.assertTrue(result["exact"]["detected"])
+        self.assertIsNone(result["offline"])
+        self.assertFalse(result["empty"]["compatible"])
+
+    def test_tc64_check_budget_covers_driver_deadline_and_explicit_block_mode(self):
+        source = APP_JS.read_text(encoding="utf-8")
+        start = source.index("function hardwareCheckTimeoutMs")
+        end = source.index("async function checkSimulationSourceReadiness", start)
+        script = source[start:end] + r'''
+const tc={enabled:true,driver:"huipu_tc64_modbus_rtu",baudrate:115200,timeout:.5};
+console.log(JSON.stringify({normal:hardwareCheckTimeoutMs({interfaces:[tc]}),
+  block:hardwareCheckTimeoutMs({interfaces:[{...tc,read_profile:"full_record_block"}]}),
+  slow:hardwareCheckTimeoutMs({interfaces:[{...tc,baudrate:2400,timeout:2}]}),
+  disabled:hardwareCheckTimeoutMs({interfaces:[{...tc,enabled:false}]}),
+  other:hardwareCheckTimeoutMs({interfaces:[{driver:"modbus_tcp"}]})}));
+'''
+        result = subprocess.run(["node","-e",script],check=True,capture_output=True,text=True)
+        budgets = json.loads(result.stdout)
+        self.assertGreater(budgets["normal"], 104000)
+        self.assertGreater(budgets["normal"], budgets["block"])
+        self.assertGreater(budgets["slow"], 400000)
+        self.assertEqual(budgets["disabled"], 20000)
+        self.assertEqual(budgets["other"], 20000)
+
+    def test_browser_plan_save_keeps_tc64_settings_without_ready_flags(self):
+        source = APP_JS.read_text(encoding="utf-8")
+        start = source.index("function saveDatasetInterfacePreferences")
+        end = source.index("function queueSharedDatasetInterfacePreferences", start)
+        script = r'''
+const controls = {acquisitionMode:{value:"real"},processingMode:{value:"capture_only"}};
+const state = {activeInterfaceSchema:"new_collection_v13_0"};
+const original = {id:"tc",enabled:false,role:"thermocouple64",endpoint:"COM7",read_profile:"full_record_block",timeout:.28,
+ channel_settings:{confirmed:true,channels:{"温度64":{unit:0,input_type:0,switch:0}}},device_identity:{serial_number:"TC64"},freshness_seconds:5,reconnect_window_seconds:60,
+ physical_verified:true,protocol_verified:true,selection_origin:"manual"};
+function interfaceConfigs(){return {interfaces:[original]};}
+let stored;
+function queueSharedDatasetInterfacePreferences(value){stored=value;}
+function datasetInterfacePreferenceKey(){return "test";}
+const localStorage={setItem(key,value){}};
+''' + source[start:end] + '\nsaveDatasetInterfacePreferences(); console.log(JSON.stringify(stored));'
+        completed = subprocess.run(["node", "-e", script],check=True,capture_output=True,text=True,encoding="utf-8")
+        item = json.loads(completed.stdout)["plans"]["new_collection_v13_0"]["interfaces"][0]
+        self.assertEqual(item["read_profile"], "full_record_block")
+        self.assertEqual(item["timeout"], .28)
+        self.assertEqual(item["device_identity"], {"serial_number": "TC64"})
+        self.assertTrue(item["channel_settings"]["confirmed"])
+        self.assertFalse(item["enabled"])
+        self.assertNotIn("physical_verified", item)
+        self.assertNotIn("protocol_verified", item)
+
+    def test_tc64_never_guesses_and_preserves_manual_disabled_bindings(self):
+        result = run_candidate_script(r'''
+const ports = [6,7].map(n => ({id:`serial:COM${n}`,kind:"serial",protocol:"serial",endpoint:`COM${n}`,detected:true,vid:6790,pid:29987,device_identity:{vid:6790,pid:29987,serial_number:""}}));
+state.physicalInterfaces = ports;
+const unknown = {id:"tc",role:"thermocouple64",endpoint:"",enabled:false};
+autoAssignPhysicalInterfaces([unknown]);
+state.physicalInterfaces.reverse();
+autoAssignPhysicalInterfaces([unknown]);
+const offline = {id:"tc",role:"thermocouple64",endpoint:"COM2",physical_interface_id:"serial:COM2",selection_origin:"manual",enabled:false};
+autoAssignPhysicalInterfaces([offline]);
+const manual = {id:"tc",role:"thermocouple64",endpoint:"COM7",physical_interface_id:"serial:COM7",selection_origin:"manual",enabled:false};
+autoAssignPhysicalInterfaces([manual]);
+const occupied = {...manual};
+autoAssignPhysicalInterfaces([occupied,{id:"strain",role:"esr1001_strain",physical_interface_id:"serial:COM7",endpoint:"COM7"}]);
+console.log(JSON.stringify({unknown,offline,manual,occupied}));
+''')
+        self.assertEqual(result["unknown"]["endpoint"], "")
+        self.assertFalse(result["unknown"]["enabled"])
+        self.assertEqual(result["offline"]["endpoint"], "COM2")
+        self.assertFalse(result["offline"]["physical_verified"])
+        self.assertEqual(result["manual"]["endpoint"], "COM7")
+        self.assertFalse(result["manual"]["enabled"])
+        self.assertFalse(result["occupied"]["physical_verified"])
+
+    def test_tc64_stable_identity_restores_endpoint_and_revokes_evidence(self):
+        result = run_candidate_script(r'''
+const identity = {vid:1027,pid:24577,serial_number:"TC64",location:"old"};
+state.physicalInterfaces = [{id:"serial:COM9",kind:"serial",endpoint:"COM9",detected:true,vid:1027,pid:24577,device_identity:{...identity,location:"new"}}];
+const tc = {role:"thermocouple64",endpoint:"COM6",physical_interface_id:"serial:COM6",enabled:false,device_identity:identity,protocol_verified:true,channel_settings:{confirmed:true}};
+autoAssignPhysicalInterfaces([tc]);
+console.log(JSON.stringify(tc));
+''')
+        self.assertEqual(result["endpoint"], "COM9")
+        self.assertFalse(result["protocol_verified"])
+        self.assertFalse(result["enabled"])
+        self.assertEqual(result["channel_settings"], {})
+
     def test_tc64_lists_usb_serial_and_native_serial_without_hid(self) -> None:
         result = run_candidate_script(r'''
 state.physicalInterfaces = [

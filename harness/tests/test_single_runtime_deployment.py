@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import functools
+import http.server
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -39,6 +43,20 @@ def _run_ps(script: str) -> subprocess.CompletedProcess[str]:
 
 
 class SingleRuntimeDeploymentTests(unittest.TestCase):
+    def test_switchover_requires_explicit_local_only_or_public_url(self) -> None:
+        for extra, expected in (
+            ("", "Switchover requires PublicUrl or explicit LocalOnly"),
+            ("-LocalOnly -PublicUrl 'https://example.test'", "LocalOnly cannot be combined with PublicUrl"),
+        ):
+            with self.subTest(arguments=extra):
+                result = _run_ps(
+                    f"& {_ps_quote(CLI)} -Mode Switchover "
+                    "-StagingPath 'D:\\AFP_Runtime\\.afp-staging\\tc64-tests\\stage' "
+                    f"-ApprovedInventoryDigest 'approved' {extra}"
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected, result.stderr)
+
     def test_legacy_reservation_is_persisted_without_plaintext_token(self) -> None:
         with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
             runtime = Path(temporary) / "runtime-root"
@@ -84,6 +102,119 @@ class SingleRuntimeDeploymentTests(unittest.TestCase):
                 encoding="utf-8"
             )
             self.assertNotIn(payload["reservation_id"], persisted)
+
+    def test_local_only_legacy_reservation_does_not_require_ingress_state(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            runtime = Path(temporary) / "runtime-root"
+            state_root = runtime / "runtime"
+            state_root.mkdir(parents=True)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(LEGACY_RESERVATION),
+                    "--runtime-root",
+                    str(runtime),
+                    "--candidate-id",
+                    "candidate-old",
+                    "--ttl-seconds",
+                    "60",
+                    "--local-only",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["allowed"])
+            self.assertTrue(payload["reservation_id"])
+            persisted = (state_root / "public-ingress-cutover.json").read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn(payload["reservation_id"], persisted)
+
+    def test_local_only_legacy_reservation_blocks_active_capture_and_journal(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            runtime = Path(temporary) / "runtime-root"
+            state_root = runtime / "runtime"
+            state_root.mkdir(parents=True)
+            (state_root / "helper_registry.json").write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "ingress_generation": 0,
+                        "helpers": {},
+                        "commands": {},
+                        "active_captures": {"capture-a": "session-a"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            connection = sqlite3.connect(
+                state_root / "server_target_capture_journal.sqlite3"
+            )
+            try:
+                connection.execute(
+                    "CREATE TABLE captures (final_status TEXT, save_state TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO captures (final_status, save_state) VALUES (NULL, 'receiving')"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(LEGACY_RESERVATION),
+                    "--runtime-root",
+                    str(runtime),
+                    "--candidate-id",
+                    "candidate-old",
+                    "--local-only",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2, msg=result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertFalse(payload["allowed"])
+            self.assertEqual(payload["active_capture_uuids"], ["capture-a"])
+            self.assertIn(
+                "unfinished_capture_count:1", payload["blocking_request_ids"]
+            )
+            self.assertFalse((state_root / "public-ingress-cutover.json").exists())
+
+    def test_local_only_promotion_skips_public_ingress_and_helper_gates(self) -> None:
+        script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(MODULE)} -Force
+$events = [Collections.Generic.List[string]]::new()
+$inventory = [pscustomobject]@{{ digest = 'approved'; processes = @() }}
+$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'D:\AFP_Runtime\.afp-staging\tc64-tests\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='D:\AFP_Runtime\.afp-staging\tc64-tests\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory -LocalOnly `
+    -CutoverReadinessRunner {{ [pscustomobject]@{{ allowed=$true; reservation_id='lease' }} }} `
+    -CutoverReleaseRunner {{ param($ReservationId) $events.Add('release'); [pscustomobject]@{{ released=$true }} }} `
+    -StopRunner {{ $events.Add('stop') }} `
+    -PromotionRunner {{ $events.Add('promote'); [pscustomobject]@{{ status='switched' }} }} `
+    -StartRunner {{ $events.Add('start') }} `
+    -ServiceProbeRunner {{ $events.Add('services'); [pscustomobject]@{{ status='passed' }} }} `
+    -IngressPublisher {{ throw 'public ingress must not run in local-only mode' }} `
+    -HelperReadinessRunner {{ throw 'helper readiness must not run in local-only mode' }} `
+    -IngressCommitter {{ throw 'ingress commit must not run in local-only mode' }} `
+    -CompletionRunner {{ $events.Add('complete') }} `
+    -RestoreRunner {{ $events.Add('restore'); [pscustomobject]@{{ status='passed' }} }}
+if ($result.status -ne 'completed' -or [string]$result.mode -ne 'local_only') {{ throw ($result | ConvertTo-Json -Depth 8) }}
+if (($events -join ',') -ne 'stop,promote,start,services,release,complete') {{ throw ($events -join ',') }}
+"""
+        result = _run_ps(script)
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
 
     def test_service_gate_rejects_split_dns_success_without_forced_edge(self) -> None:
         script = rf"""
@@ -545,6 +676,66 @@ if ($bad.status -ne 'failed' -or $bad.issues -notcontains 'service probe failed:
 """
         result = _run_ps(script)
         self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+    def test_service_gate_local_only_omits_unconfigured_network_probes(self) -> None:
+        script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(MODULE)} -Force
+$probe = {{
+    param($Name, $Target)
+    [pscustomobject]@{{
+        passed = -not [string]::IsNullOrWhiteSpace([string]$Target)
+        detail = if ($Target) {{ 'ok' }} else {{ 'empty target' }}
+    }}
+}}
+$result = Test-AfpRuntimeServices -RuntimeRoot 'D:\AFP_Runtime\.afp-staging\tc64-tests\runtime' -ExpectedCandidateId 'candidate' -FunnelOrigin 'http://127.0.0.1:8770' -ProbeRunner $probe
+$names = @($result.checks | ForEach-Object {{ [string]$_.name }})
+        $expected = @('listener_8770', 'local_admin_8771', 'localhost_http', 'funnel_origin', 'static_identity')
+if ($result.status -ne 'passed' -or ($names -join ',') -ne ($expected -join ',')) {{
+    throw ($result | ConvertTo-Json -Depth 8)
+}}
+"""
+        result = _run_ps(script)
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+
+    def test_localhost_static_identity_matches_runtime_manifest_and_bytes(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            runtime = Path(temporary) / "runtime"
+            static_root = runtime / "app" / "ui"
+            static_root.mkdir(parents=True)
+            (static_root / "app.js").write_bytes(b"current-local-static-identity")
+            (runtime / "RELEASE-MANIFEST.json").write_text(
+                json.dumps({"candidate": {"candidate_id": "candidate-local"}}),
+                encoding="utf-8",
+            )
+            handler = functools.partial(
+                http.server.SimpleHTTPRequestHandler,
+                directory=str(static_root),
+            )
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(MODULE)} -Force
+$result = Test-AfpPublicStaticIdentity -RuntimeRoot {_ps_quote(runtime)} -PublicUrl 'http://127.0.0.1:{server.server_port}/' -ExpectedCandidateId 'candidate-local'
+if (-not $result.passed) {{ throw ($result | ConvertTo-Json -Depth 8) }}
+"""
+                result = _run_ps(script)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
 
     def test_service_gate_waits_for_delayed_startup_and_reports_attempts(self) -> None:
         script = rf"""

@@ -993,6 +993,7 @@ async function postJson(url, payload = {}, {timeoutMs = 30000, controller = null
       headers: {
         "Content-Type": "application/json",
         "X-AFP-CSRF": state.csrf || readCookie("afp_csrf"),
+        ...(payload.start_request_id ? {"X-AFP-Request-ID": payload.start_request_id} : {}),
       },
       body: JSON.stringify(payload),
       credentials: "same-origin",
@@ -1048,6 +1049,11 @@ async function requestLocalHelper(command, payload = {}, {timeoutMs = 30000} = {
 }
 
 function acquisitionDisplayPhase(status) {
+  const startState = status?.start_operation?.state;
+  if (startState === "starting") return {key: "starting", label: "正在启动，等待各接口数据"};
+  if (startState === "cancelling") return {key: "cancelling_start", label: "正在取消启动并释放接口"};
+  if (startState === "cancelled") return {key: "start_cancelled", label: "启动已取消"};
+  if (startState === "failed") return {key: "start_failed", label: "启动失败"};
   const flushState = String(status?.flush_state || status?.transport?.flush_state || "");
   const localStopped = status?.local_stopped_at !== null
     && status?.local_stopped_at !== undefined;
@@ -1095,7 +1101,21 @@ function formatTransportMetrics(status, runtimeMetrics = {}) {
 }
 
 function renderAcquisitionStatus(status) {
+  if (controls.acquisitionMode?.value === "real" && window.afpCurveTrace
+      && !window.afpCurveTrace.accepts(status)) return;
+  if (state.acquisitionStatus?.readiness_session_id === status.readiness_session_id
+      && Number.isFinite(status.status_monotonic) && Number.isFinite(state.acquisitionStatus?.status_monotonic)
+      && status.status_monotonic < state.acquisitionStatus.status_monotonic) return;
   state.acquisitionStatus = status;
+  const evidence = state.hardwareCheck;
+  const sameReadinessSession = status.readiness_session_id === evidence?.readiness_session_id;
+  const outdatedReadiness = sameReadinessSession && Number.isFinite(status.readiness_version)
+    && Number.isFinite(evidence?.readiness_version) && status.readiness_version < evidence.readiness_version;
+  if (status.readiness_session_valid === false && evidence?.readiness_session_id && !outdatedReadiness) {
+    window.afpCurveTrace?.event("readiness_invalidated", {reason: status.readiness_invalid_reason || "backend_session_invalid"});
+    state.hardwareCheck = null;
+    state.hardwareCheckFingerprint = "";
+  }
   if (status?.save_status) renderSaveRootStatus(status.save_status);
   const node = $("acquisitionStatus");
   const selected = (status.sensors || []).filter((item) => item.selected);
@@ -1150,7 +1170,7 @@ function renderAcquisitionStatus(status) {
       ? "预测与预警输入已就绪"
       : `等待全部${expectedInputCount}个模型输入通道，预测至少24点、首次预警至少48点`;
   const predictionCount = selectedPredictionSensors().length;
-  const locked = Boolean(status.running);
+  const locked = Boolean(status.running || ["starting", "cancelling"].includes(status.start_operation?.state));
   // The data scheme belongs to the current acquisition session.  Lock it only
   // while the stream is actually running; after stop() has completed, both
   // real and simulated acquisitions must be able to choose a new scheme even
@@ -1197,6 +1217,7 @@ function renderAcquisitionStatus(status) {
     : sourceTransfer.state && sourceTransfer.state !== "not_required"
       ? ` · 模拟源交付：${sourceTransfer.state}` : "";
   const phase = acquisitionDisplayPhase(status);
+  const startTiming = status.start_operation?.all_channels_seconds;
   const transportText = executionHost === "helper_local"
     ? formatTransportMetrics(status, {
       payloadRateHz: state.browserPayloadRateHz,
@@ -1210,7 +1231,7 @@ function renderAcquisitionStatus(status) {
       : `模型输入 ${expectedInputCount}通道 · 模型输出 ${predictionCount}通道`} · ${readiness}` +
     `${captureUuid ? ` · 试样会话：${captureUuid}` : ""}` +
     executionText + sourceTransferText + transportText +
-    qualityText +
+    qualityText + (Number.isFinite(startTiming) ? ` · 全部通道启动耗时 ${startTiming.toFixed(2)} 秒` : "") +
     `${status.archived_previous_session ? " · 已自动归档上一试样，避免混层" : ""}` +
     `${status.layer_file ? ` · 分层文件：${status.layer_file}` : ""}` +
     `${status.full_specimen_file ? ` · 完整试样：${status.full_specimen_file}` : ""}` +
@@ -2076,6 +2097,7 @@ function buildAgentEvents(hardwareResult) {
         invalid_channels: (interfaceItem.invalid_channels || []).map(String),
         sample_counts: interfaceItem.sample_counts || {},
         invalid_sample_counts: interfaceItem.invalid_sample_counts || {},
+        driver_diagnostics: interfaceItem.driver_diagnostics || {},
         received_samples: sensor.received_samples,
         invalid_samples: sensor.invalid_samples,
         last_sample_age_seconds: sensor.last_sample_age_seconds,
@@ -2480,11 +2502,20 @@ function stopPublicDemo() {
 }
 
 async function startAcquisition() {
+  const event = arguments[0];
+  const handlerEntered = performance.now();
   if (state.acquisitionStartBusy || state.acquisitionStatus?.running) return;
   state.acquisitionStartBusy = true;
   synchronizeAcquisitionButtons();
   try {
     const simulation = controls.acquisitionMode?.value === "simulation";
+    const frozenConfig = !simulation ? JSON.parse(JSON.stringify(acquisitionConfig({allowUnverifiedPhysical: true}))) : null;
+    const frozenFingerprint = frozenConfig ? hardwareConfigFingerprint(frozenConfig) : "";
+    window.afpCurveTrace = null;
+    if (!simulation && !usesLocalCaptureHelper() && window.AFP_CURVE_READINESS) {
+      window.afpCurveTrace = new window.AFP_CURVE_READINESS.CurveTrace(event, frozenConfig, {handlerEntered});
+      window.afpCurveTrace.event("configuration_frozen", {fingerprint: frozenFingerprint});
+    }
     const simulationSelection = simulation
       ? simulationExecutionSelection(
         state.accessRole,
@@ -2517,6 +2548,11 @@ async function startAcquisition() {
     }
     if (controls.autoProcessParameters?.checked) {
       await readProcessParameters({automatic: true});
+      if (frozenConfig) {
+        const processConfig = acquisitionConfig({allowUnverifiedPhysical: true});
+        ["initial_compaction_force_N", "placement_speed_mm_s", "pid_angle_deg", "temperature_setpoint_C", "p", "v", "pr"]
+          .forEach(key => { frozenConfig[key] = processConfig[key]; });
+      }
     }
     if (state.accessRole === "guest") {
       // Load the selected/default dataset once, then replay it locally in the
@@ -2559,6 +2595,9 @@ async function startAcquisition() {
         throw new Error("本地采集辅助程序版本不兼容，请重新下载并运行最新版后再开始真实采集");
       }
       await acquireRealControl();
+      if (hardwareConfigFingerprint() !== frozenFingerprint) {
+        throw new Error("启动期间采集配置已变化，请按当前配置重新点击开始");
+      }
       if (state.hardwareCheckInProgress) {
         throw new Error("接口与传感器通道检查正在进行，请等待检查完成");
       }
@@ -2570,6 +2609,12 @@ async function startAcquisition() {
         }
       }
       requireUnchangedHardwareCheck();
+      const checkedInterfaces = new Map((state.hardwareCheck?.interfaces || []).map(item => [item.id, item]));
+      frozenConfig.interfaces.forEach(item => {
+        const proof = checkedInterfaces.get(item.id);
+        if (item.enabled !== false && item.physical_interface_id && proof?.ok
+            && proof.physical_interface_id === item.physical_interface_id) item.physical_verified = true;
+      });
     }
     const nextScope = liveEvidenceScopeKey();
     if (state.liveScopeKey !== null && nextScope !== state.liveScopeKey) {
@@ -2583,17 +2628,33 @@ async function startAcquisition() {
       ? (simulationSelection?.execution_host || "server")
       : (helperBackedCapture ? "helper_local" : "server");
     const captureConfig = () => ({
-      ...acquisitionConfig(),
+      ...(frozenConfig || acquisitionConfig()),
+      ...(!simulation && window.afpCurveTrace ? {start_request_id: window.afpCurveTrace.id} : {}),
+      ...(!simulation && (!helperBackedCapture || state.helperStatus?.capabilities?.async_capture_start_v1)
+        ? {async_start: true} : {}),
       execution_host: executionHost,
       ...(simulationSelection?.explicit_fallback
         ? {simulation_execution_choice: "server_explicit"}
         : {}),
     });
-    const sendStart = () => helperBackedCapture
-      ? requestLocalHelper("start_capture", captureConfig(), {
-        timeoutMs: helperBackedSimulation ? 10000 : 30000,
+    const helperStartTimeout = helperBackedSimulation ? 10000 : 30000;
+    if (!simulation && !helperBackedCapture) {
+      controls.dataMode.value = "live";
+      configureDataMode();
+      window.afpCurveTrace?.event("live_connection_prepared");
+    }
+    const sendStart = async () => {
+      window.afpCurveTrace?.event("C1");
+      const started = helperBackedCapture
+      ? await requestLocalHelper("start_capture", captureConfig(), {
+        timeoutMs: simulation ? helperStartTimeout : Math.max(helperStartTimeout, hardwareCheckTimeoutMs(captureConfig()) + 30000),
       })
-      : postJson("/api/acquisition/start", captureConfig());
+      : await postJson("/api/acquisition/start", captureConfig());
+      window.afpCurveTrace?.event("request_accepted", {operation_id: started.start_operation?.id,
+        capture_uuid: started.capture_uuid, server_timing: started.request_timing});
+      if (!simulation) window.afpCurveTrace?.accepts(started);
+      return waitForCaptureStart(started, helperBackedCapture);
+    };
     let result;
     try {
       result = await sendStart();
@@ -2615,7 +2676,7 @@ async function startAcquisition() {
         throw new Error("接口检查结果在启动前失效，自动重检后仍无法启动，请重新检查接口后再试");
       }
     }
-    if (!simulation) {
+    if (!simulation && !state.hardwareCheck?.readiness_session_id) {
       state.hardwareCheck = null;
       state.hardwareCheckFingerprint = "";
     }
@@ -2635,14 +2696,63 @@ async function startAcquisition() {
   } catch (error) {
     const status = $("acquisitionStatus");
     if (status) {
-      status.classList.add("error");
+      const unconfirmed = controls.acquisitionMode?.value !== "simulation"
+        && /请求超时|Failed to fetch|NetworkError|Load failed/i.test(String(error.message));
+      status.classList.toggle("error", !unconfirmed && error.code !== "capture_start_cancelled");
       status.classList.remove("ok");
-      status.textContent = `采集启动失败：${error.message}`;
+      status.textContent = unconfirmed ? "启动结果尚未确认，后台可能仍在准备，请恢复连接后查看采集状态"
+        : error.code === "capture_start_cancelled" ? "启动已取消" : `采集启动失败：${error.message}`;
     }
     toast(error.message);
   } finally {
     state.acquisitionStartBusy = false;
     synchronizeAcquisitionButtons();
+  }
+}
+
+async function waitForCaptureStart(result, helperBacked) {
+  if (!result?.accepted || !result.start_operation?.id) return result;
+  const operationId = result.start_operation.id;
+  renderAcquisitionStatus(result);
+  synchronizeAcquisitionButtons();
+  const deadline = Date.now() + Math.max(120000, hardwareCheckTimeoutMs(acquisitionConfig()) + 30000);
+  let cancellationSent = false;
+  while (true) {
+    let current;
+    try {
+      if (helperBacked) {
+        current = await requestLocalHelper("status", {}, {timeoutMs: 5000});
+      } else {
+        const controller = new AbortController();
+        const timer = window.setTimeout(() => controller.abort(), 5000);
+        try {
+          const response = await fetch("/api/acquisition/status?acquisition_mode=real", {
+            cache: "no-store", credentials: "same-origin", signal: controller.signal,
+          });
+          current = await response.json();
+          if (!response.ok) throw new Error(current.error || "启动状态暂不可用");
+        } finally { window.clearTimeout(timer); }
+      }
+    } catch (_error) {
+      const node = $("acquisitionStatus");
+      if (node) node.textContent = "启动结果尚未确认，正在重新连接状态查询；可点击取消启动";
+    }
+    if (current?.start_operation?.id === operationId) {
+      renderAcquisitionStatus(current);
+      const phase = current.start_operation.state;
+      if (phase === "running") return current;
+      if (phase === "failed" || phase === "cancelled") {
+        const error = new Error(current.start_operation.error || (phase === "cancelled" ? "启动已取消" : "设备启动失败"));
+        if (phase === "cancelled") error.code = "capture_start_cancelled";
+        throw error;
+      }
+    }
+    if (Date.now() > deadline && !cancellationSent) {
+      cancellationSent = true;
+      if (helperBacked) await requestLocalHelper("stop_capture", {}, {timeoutMs: 10000});
+      else await postJson("/api/acquisition/stop", {acquisition_mode: "real"}, {timeoutMs: 10000});
+    }
+    await new Promise(resolve => window.setTimeout(resolve, 200));
   }
 }
 
@@ -2750,6 +2860,22 @@ async function stopAcquisition() {
     return;
   }
   if (state.stopBusy) return;
+  if (["starting", "cancelling"].includes(state.acquisitionStatus?.start_operation?.state)) {
+    state.stopBusy = true;
+    synchronizeAcquisitionButtons();
+    try {
+      const result = usesLocalCaptureHelper()
+        ? await requestLocalHelper("stop_capture", {}, {timeoutMs: 10000})
+        : await postJson("/api/acquisition/stop", {acquisition_mode: "real"}, {timeoutMs: 10000});
+      renderAcquisitionStatus(result);
+    } catch (error) {
+      toast(`取消结果尚未确认：${error.message}，请恢复连接后查看状态`);
+    } finally {
+      state.stopBusy = false;
+      synchronizeAcquisitionButtons();
+    }
+    return;
+  }
   state.stopBusy = true;
   const stopButton = $("stopAcquisitionButton");
   if (stopButton) {
@@ -3019,7 +3145,8 @@ function saveDatasetInterfacePreferences() {
   if (!state.activeInterfaceSchema || controls.acquisitionMode?.value === "simulation") return;
   const fields = ["id", "enabled", "role", "driver", "endpoint", "baudrate", "slave_id",
     "data_mode", "calibration_profile", "bridge", "channel_count", "channel_map", "channels",
-    "physical_interface_id", "physical_port_id", "physical_interface_kind", "physical_transport_family", "selection_origin"];
+    "physical_interface_id", "physical_port_id", "physical_interface_kind", "physical_transport_family", "selection_origin",
+    "read_profile", "timeout", "channel_settings", "device_identity", "scan_timeout_seconds", "freshness_seconds", "poll_interval_seconds", "reconnect_window_seconds"];
   const interfaces = interfaceConfigs().interfaces.map(item => Object.fromEntries(
     fields.filter(key => item[key] !== undefined).map(key => [key, item[key]])
   ));
@@ -3299,6 +3426,12 @@ function applyRealtimePayload(payload, renderOptions = {}) {
   if (!payload || payload.type === "error") {
     throw new Error(payload?.error || "实时数据服务异常");
   }
+  if (controls.acquisitionMode?.value === "real" && window.afpCurveTrace
+      && !window.afpCurveTrace.received(payload)) return;
+  const captureStatus = payload.acquisition;
+  if (captureStatus?.readiness_session_id === state.acquisitionStatus?.readiness_session_id
+      && Number.isFinite(captureStatus?.status_monotonic) && Number.isFinite(state.acquisitionStatus?.status_monotonic)
+      && captureStatus.status_monotonic < state.acquisitionStatus.status_monotonic) return;
   const processingStarted = typeof performance !== "undefined" && performance.now
     ? performance.now() : Date.now();
   state.payload = payload;
@@ -3523,6 +3656,32 @@ function stopLocalSimulationReplay() {
   state.simulationLocalReplayTimer = null;
 }
 
+function startupCurvePayloadHasAllChannels(payload, trace) {
+  if (payload?.mode !== "capture_only" || !trace
+      || !trace.id || !trace.generation || !trace.channels?.length) return false;
+  const channels = new Map((payload.channels || []).map(channel => [
+    channel.source_channel_name || channel.name, channel,
+  ]));
+  return trace.channels.every((name) => {
+    const channel = channels.get(name);
+    const startup = channel?.startup_curve?.source_observations;
+    const observations = Array.isArray(startup) && startup.length
+      ? startup : channel?.source_observations;
+    if (!Array.isArray(observations)) return false;
+    const fresh = new Set();
+    observations.forEach((source) => {
+      if (source?.quality !== "measured_new" || source.after_start !== true
+          || source.protocol_ok === false || source.stable === false
+          || source.capture_generation !== trace.generation
+          || source.start_request_id !== trace.id || source.source_sequence == null
+          || !Number.isFinite(source.received_monotonic)
+          || (Object.hasOwn(source, "value") && !Number.isFinite(source.value))) return;
+      fresh.add(`${source.interface_id}:${source.source_sequence}:${source.received_monotonic}`);
+    });
+    return fresh.size >= 2;
+  });
+}
+
 function openLiveWebSocket() {
   if (isPublicPrecomputedSimulationMode()) return;
   if (!supportsLiveWebSocket() || controls.dataMode.value !== "live") return;
@@ -3549,11 +3708,31 @@ function openLiveWebSocket() {
     $("connectionStatus").textContent = "实时数据推送已连接";
     document.querySelector(".status-dot").classList.add("connected");
   };
+  let pendingPayload = null, renderScheduled = false;
   socket.onmessage = (event) => {
+    if (state.liveSocket !== socket) return;
     try {
       const payload = JSON.parse(event.data);
       if (payload?.type === "heartbeat") return;
-      applyRealtimePayload(payload);
+      if (window.afpCurveTrace && controls.acquisitionMode?.value === "real"
+          && !window.afpCurveTrace.accepts(payload?.acquisition)) return;
+      const trace = controls.acquisitionMode?.value === "real" ? window.afpCurveTrace : null;
+      const completeStartupPayload = startupCurvePayloadHasAllChannels(payload, trace);
+      const needsPaintBoundary = Boolean(trace && !trace.complete) || completeStartupPayload;
+      if (!needsPaintBoundary) {
+        applyRealtimePayload(payload);
+        return;
+      }
+      if (pendingPayload) state.browserCoalescedPayloads = (state.browserCoalescedPayloads || 0) + 1;
+      pendingPayload = payload;
+      if (!renderScheduled) {
+        renderScheduled = true;
+        window.requestAnimationFrame(() => {
+          renderScheduled = false;
+          const latest = pendingPayload;pendingPayload = null;
+          if (latest && state.liveSocket === socket) applyRealtimePayload(latest);
+        });
+      }
     } catch (error) {
       $("connectionStatus").textContent = `实时数据服务异常：${error.message}`;
     }
@@ -3620,7 +3799,12 @@ async function loadRealtime() {
     const response = await fetch(`${endpoint}?${queryString()}`, { cache: "no-store" });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || "实时数据请求失败");
-    applyRealtimePayload(payload);
+    const trace = controls.acquisitionMode?.value === "real" ? window.afpCurveTrace : null;
+    if (trace && !trace.complete) {
+      window.requestAnimationFrame(() => applyRealtimePayload(payload));
+    } else {
+      applyRealtimePayload(payload);
+    }
   } catch (error) {
     stopPlayback();
     const detail = `页面数据请求 ${endpoint} 失败：${error.message}`;
@@ -3954,19 +4138,76 @@ function render(payload, {stablePublicDemo = false, previousPayload = null} = {}
 function setupCanvas(canvas, height) {
   const dpr = window.devicePixelRatio || 1;
   const width = canvas.clientWidth;
-  canvas.width = Math.max(1, Math.round(width * dpr));
-  canvas.height = Math.round(height * dpr);
+  const pixelWidth = Math.max(1, Math.round(width * dpr));
+  const pixelHeight = Math.round(height * dpr);
+  if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
+  if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
   const ctx = canvas.getContext("2d");
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   return { ctx, width, height };
+}
+
+function originalCurveCanvasVisible(canvas) {
+  if (document.visibilityState !== "visible" || !canvas?.isConnected
+      || canvas.clientWidth <= 0 || canvas.clientHeight <= 0 || canvas.closest(".hidden")) return false;
+  return typeof canvas.checkVisibility !== "function"
+    || canvas.checkVisibility({checkOpacity: true, checkVisibilityCSS: true});
+}
+
+function confirmOriginalCurveFrame(canvas, channels, surface) {
+  const trace = window.afpCurveTrace;
+  if (!trace || controls.acquisitionMode?.value !== "real" || !originalCurveCanvasVisible(canvas)) return;
+  const names = channels.filter(channel => trace.drawnChannel(channel, canvas, true))
+    .map(channel => channel.source_channel_name || channel.name);
+  if (!names.length) return;
+  const token = String((Number(canvas.dataset.curveFrameToken) || 0) + 1);
+  const generation = trace.generation;
+  const presentation = {
+    surface,
+    channels: channels.map(channel => channel.source_channel_name || channel.name),
+    canvas_width: canvas.width,
+    canvas_height: canvas.height,
+    client_width: canvas.clientWidth,
+    client_height: canvas.clientHeight,
+  };
+  canvas.dataset.channels = presentation.channels.join(",");
+  canvas.dataset.curveFrameToken = token;
+  window.requestAnimationFrame(() => {
+    if (window.afpCurveTrace !== trace || trace.generation !== generation
+        || canvas.dataset.curveFrameToken !== token) return;
+    trace.confirmDisplayed(names, originalCurveCanvasVisible(canvas), presentation);
+  });
 }
 
 function renderSeriesChart(channel) {
   drawChannelChart($("seriesChart"), channel, 220, false);
 }
 
+function originalCanvasSourceChannel(channel) {
+  const trace = controls.acquisitionMode?.value === "real" ? window.afpCurveTrace : null;
+  const name = channel.source_channel_name || channel.name;
+  if (!trace || trace.complete || trace.drawn.has(name)) return channel;
+  const validPoints = (data) => {
+    const identities = new Set();
+    (data?.source_observations || []).forEach((source, index) => {
+      if (source?.quality !== "measured_new" || source.after_start !== true
+          || source.protocol_ok === false || source.stable === false
+          || source.start_request_id !== trace.id || source.capture_generation !== trace.generation
+          || source.source_sequence == null || !Number.isFinite(source.received_monotonic)
+          || !Number.isFinite(data.actual?.[index]) || !Number.isFinite(data.x_observed?.[index])) return;
+      identities.add(`${source.interface_id}:${source.source_sequence}:${source.received_monotonic}`);
+    });
+    return identities.size;
+  };
+  const startup = channel.startup_curve;
+  if (validPoints(channel) >= 2 || startup?.x_domain !== "seconds_before_payload"
+      || validPoints(startup) < 2) return channel;
+  return {...channel, ...startup, actual_current: startup.actual.at(-1),
+    prediction_observed: [], prediction_future: [], x_future: []};
+}
+
 function drawChannelChart(canvas, channel, height, compact) {
-  if (!canvas?.isConnected) return;
+  if (!canvas?.isConnected) return false;
   const setup = setupCanvas(canvas, height);
   const ctx = setup.ctx, width = setup.width;
   const pad = compact
@@ -3994,7 +4235,7 @@ function drawChannelChart(canvas, channel, height, compact) {
   }
   const allValues = lines.flatMap((line) => line.values).filter(Number.isFinite);
   const allX = lines.flatMap((line) => line.x).filter(Number.isFinite);
-  if (!allValues.length || !allX.length) return;
+  if (!allValues.length || !allX.length) return false;
   const fixedRange = channel.display_range;
   let ymin;
   let ymax;
@@ -4064,6 +4305,7 @@ function drawChannelChart(canvas, channel, height, compact) {
     ctx.stroke();
   }
   ctx.setLineDash([]);
+  return true;
 }
 
 function renderTimeline(data) {
@@ -4147,10 +4389,10 @@ function thermocouple64DownsampleIndices(matrix, maxPoints = 600) {
 }
 
 function drawThermocouple64GroupDetail(canvas, matrix, visible, fixedRange = null) {
-  if (!canvas?.isConnected || canvas.closest('.hidden')) return;
+  if (!canvas?.isConnected || canvas.closest('.hidden')) return false;
   const preview = canvas.classList.contains('thermocouple64-preview');
   const {ctx, width, height} = setupCanvas(canvas, preview ? 104 : 170);
-  if (width <= 0) return;
+  if (width <= 0) return false;
   const active = matrix.filter((_, index) => visible[index] !== false);
   const all = active.flat().filter(Number.isFinite);
   canvas.dataset.seriesCount = String(matrix.length);
@@ -4160,7 +4402,7 @@ function drawThermocouple64GroupDetail(canvas, matrix, visible, fixedRange = nul
   ctx.font = '11px Segoe UI';
   if (!all.length) {
     ctx.fillText(active.length ? '暂无有效值' : '曲线已隐藏', 3, 24);
-    return;
+    return false;
   }
   let ymin = fixedRange?.min, ymax = fixedRange?.max;
   if (!Number.isFinite(ymin) || !Number.isFinite(ymax) || ymin >= ymax) {
@@ -4202,6 +4444,7 @@ function drawThermocouple64GroupDetail(canvas, matrix, visible, fixedRange = nul
     ctx.strokeStyle = THERMOCOUPLE64_COLORS[channelIndex % 8];
     ctx.lineWidth = preview ? 1.2 : 1.7; ctx.stroke();
   });
+  return true;
 }
 
 function thermocouple64UniformRange(cache) {
@@ -4223,23 +4466,37 @@ function thermocouple64GroupVisibility(groupIndex) {
   });
 }
 
+function drawThermocouple64Now() {
+  const cache = state.thermocouple64Cache;
+  if (!cache || document.hidden) return;
+  const raw = state.thermocouple64View === 'raw', range = thermocouple64UniformRange(cache);
+  const target = raw ? $('thermocouple64RawGroups') : $('thermocouple64AverageGroups');
+  const rawChannels = raw ? new Map((state.payload?.channels || []).map(channel => [
+    channel.source_channel_name || channel.name, channel,
+  ])) : null;
+  target?.querySelectorAll('.thermocouple64-preview').forEach((canvas, group) => {
+    const visibility = raw ? thermocouple64GroupVisibility(group) : [state.thermocouple64MeanVisible.has(group)];
+    const drawn = drawThermocouple64GroupDetail(
+      canvas, raw ? cache.rawSeries[group] : [cache.derivedSeries[group]], visibility, range,
+    );
+    if (raw && drawn) {
+      const channels = visibility.map((shown, offset) => shown
+        ? rawChannels.get(`温度${group * 8 + offset + 1}`) : null).filter(Boolean);
+      confirmOriginalCurveFrame(canvas, channels, "thermocouple64_group");
+    }
+  });
+  if (state.thermocouple64DetailActive && $('sensorSharedDetail')?.open) {
+    const group = state.thermocouple64SelectedGroup || 0;
+    drawThermocouple64GroupDetail($('thermocouple64GroupCanvas'), raw ? cache.rawSeries[group] : [cache.derivedSeries[group]],
+      raw ? thermocouple64GroupVisibility(group) : [state.thermocouple64MeanVisible.has(group)], range);
+  }
+}
+
 function scheduleThermocouple64Draw() {
   if (state.thermocouple64Raf || document.hidden) return;
   state.thermocouple64Raf = window.requestAnimationFrame(() => {
     state.thermocouple64Raf = 0;
-    const cache = state.thermocouple64Cache;
-    if (!cache) return;
-    const raw = state.thermocouple64View === 'raw', range = thermocouple64UniformRange(cache);
-    const target = raw ? $('thermocouple64RawGroups') : $('thermocouple64AverageGroups');
-    target?.querySelectorAll('.thermocouple64-preview').forEach((canvas, group) => {
-      drawThermocouple64GroupDetail(canvas, raw ? cache.rawSeries[group] : [cache.derivedSeries[group]],
-        raw ? thermocouple64GroupVisibility(group) : [state.thermocouple64MeanVisible.has(group)], range);
-    });
-    if (state.thermocouple64DetailActive && $('sensorSharedDetail')?.open) {
-      const group = state.thermocouple64SelectedGroup || 0;
-      drawThermocouple64GroupDetail($('thermocouple64GroupCanvas'), raw ? cache.rawSeries[group] : [cache.derivedSeries[group]],
-        raw ? thermocouple64GroupVisibility(group) : [state.thermocouple64MeanVisible.has(group)], range);
-    }
+    drawThermocouple64Now();
   });
 }
 
@@ -4332,7 +4589,7 @@ function showSensorSharedDetail(group = false) {
   if ($('sensorSharedDetail')) $('sensorSharedDetail').open = true;
 }
 
-function selectThermocouple64Group(groupIndex, {focusRow = false, openDetail = false} = {}) {
+function selectThermocouple64Group(groupIndex, {focusRow = false, openDetail = false, scheduleDraw = true} = {}) {
   const normalized = Math.max(0, Math.min(7, Number(groupIndex) || 0));
   state.thermocouple64SelectedGroup = normalized;
   const label = thermocouple64GroupLabel(normalized);
@@ -4348,7 +4605,8 @@ function selectThermocouple64Group(groupIndex, {focusRow = false, openDetail = f
   if (state.thermocouple64DetailActive) $('seriesTitle').textContent = `${label} · 共用放大详情`;
   renderThermocouple64GroupLegend();
   if (focusRow) document.querySelector(`.thermocouple64-row[data-group-index="${normalized}"]`)?.scrollIntoView({block: 'nearest'});
-  updateThermocouple64ScrollHint(); scheduleThermocouple64Draw();
+  updateThermocouple64ScrollHint();
+  if (scheduleDraw) scheduleThermocouple64Draw();
 }
 
 function selectThermocouple64Raw(name) {
@@ -4428,7 +4686,12 @@ function renderThermocouple64(payload) {
     card.dataset.validCount = String(valid);
   });
   refreshThermocouple64Legends(); updateThermocouple64DisplayedCount();
-  selectThermocouple64Group(state.thermocouple64SelectedGroup);
+  selectThermocouple64Group(state.thermocouple64SelectedGroup, {scheduleDraw: false});
+  if (state.thermocouple64Raf) {
+    window.cancelAnimationFrame?.(state.thermocouple64Raf);
+    state.thermocouple64Raf = 0;
+  }
+  drawThermocouple64Now();
   window.requestAnimationFrame(updateThermocouple64ScrollHint);
 }
 
@@ -4437,6 +4700,13 @@ document.addEventListener("visibilitychange", () => {
 });
 
 function renderSensorCardsInto(target, channels, selectedId, {reuse = false} = {}) {
+  const drawCard = (card, channel) => {
+    const canvas = card.querySelector("canvas");
+    const sourceChannel = originalCanvasSourceChannel(channel);
+    if (drawChannelChart(canvas, sourceChannel, 150, true)) {
+      confirmOriginalCurveFrame(canvas, [sourceChannel], "sensor_card");
+    }
+  };
   const updateCard = (card, channel) => {
     const predictionEnabled = channel.prediction_enabled !== false;
     card.className =
@@ -4451,15 +4721,13 @@ function renderSensorCardsInto(target, channels, selectedId, {reuse = false} = {
     if (predicted) predicted.textContent = fmt(channel.prediction_current, 2);
     if (rmse) rmse.textContent = fmt(channel.rmse, 3);
     if (quality) quality.textContent = channel.quality || channel.status || (Number.isFinite(channel.actual_current) ? "有效" : "不可用");
-    window.requestAnimationFrame(() =>
-      drawChannelChart(card.querySelector("canvas"), channel, 150, true)
-    );
   };
   const existing = target ? [...target.querySelectorAll(":scope > .full-sensor-card")] : [];
   const canReuse = existing.length === channels.length
     && existing.every((card, index) => card.dataset.channelId === String(channels[index]?.id));
   if (canReuse) {
     existing.forEach((card, index) => updateCard(card, channels[index]));
+    existing.forEach((card, index) => drawCard(card, channels[index]));
     return;
   }
   const cards = channels.map((channel) => {
@@ -4500,7 +4768,10 @@ function renderSensorCardsInto(target, channels, selectedId, {reuse = false} = {
     updateCard(card, channel);
     return card;
   });
-  if (target) target.replaceChildren(...cards);
+  if (target) {
+    target.replaceChildren(...cards);
+    cards.forEach((card, index) => drawCard(card, channels[index]));
+  }
 }
 
 function renderSensorCards(channels, selectedId, options = {}) {
@@ -5584,6 +5855,13 @@ function interfaceConfigs() {
       endpoint: row.querySelector(".interface-endpoint")?.value?.trim() || "",
       baudrate: Number(row.querySelector(".interface-baudrate")?.value) || 115200,
       slave_id: Number(row.querySelector(".interface-slave-id")?.value ?? row.dataset.slaveId ?? 1),
+      read_profile: row.querySelector(".interface-read-profile")?.value || catalogItem.read_profile || "channel_temperature",
+      timeout: Number(row.querySelector(".interface-timeout")?.value || catalogItem.timeout || 0.5),
+      channel_settings: parseDatasetObject(row.querySelector(".interface-channel-settings")?.value || JSON.stringify(catalogItem.channel_settings || {})),
+      freshness_seconds: Number(row.querySelector(".interface-freshness")?.value || catalogItem.freshness_seconds || 1),
+      poll_interval_seconds: catalogItem.poll_interval_seconds,
+      scan_timeout_seconds: catalogItem.scan_timeout_seconds,
+      reconnect_window_seconds: Number(row.querySelector(".interface-reconnect-window")?.value ?? catalogItem.reconnect_window_seconds ?? 60),
       data_mode: row.querySelector(".interface-data-mode")?.value || "raw_adc",
       calibration_profile: (()=>{const text=row.querySelector(".interface-calibration")?.value?.trim() || ""; return text.startsWith("{") ? JSON.parse(text) : text || null;})(),
       calibration_digest: (state.hardwareCheck?.interfaces || []).find(item=>item.id===row.dataset.interfaceId)?.usb_evidence?.calibration_digest || "",
@@ -5861,7 +6139,8 @@ function physicalSelectionProvidesProtocolEndpoint(role, item) {
 }
 
 function autoAssignPhysicalInterfaces(configs, {allowSerialFallback = true} = {}) {
-  const used = new Set();
+  const used = new Set((configs || []).filter(item => item.role !== "thermocouple64")
+    .map(item => String(item.physical_port_id || item.physical_interface_id || "")).filter(Boolean));
   const assigned = {};
   const normalizedKind = (item) => item.kind || item.interface_kind || item.type || "";
   const resourceId = (item) => String(item.physical_port_id || item.parent_port_id || item.id || "");
@@ -5900,6 +6179,34 @@ function autoAssignPhysicalInterfaces(configs, {allowSerialFallback = true} = {}
     const role = item.role || "custom";
     const candidates = physicalCandidatesForRole(role);
     const desired = String(item.physical_port_id || item.physical_interface_id || "");
+    if (role === "thermocouple64") {
+      const identity = item.device_identity || {};
+      const matches = identity.serial_number ? candidates.filter(c => {
+        const current = c.device_identity || {};
+        return current.serial_number === identity.serial_number && current.vid === identity.vid && current.pid === identity.pid;
+      }) : [];
+      const selected = matches.length === 1 ? matches[0] : candidates.find(c =>
+        String(c.physical_interface_id || c.id || "") === String(item.physical_interface_id || "")
+        && String(c.endpoint || "") === String(item.endpoint || ""));
+      if (!desired || !selected || used.has(resourceId(selected))) {
+        item.physical_verified = false;
+        return;
+      }
+      const currentIdentity = selected.device_identity || {};
+      const identityChanged = JSON.stringify(identity) !== JSON.stringify(currentIdentity);
+      const changed = String(selected.endpoint || "") !== String(item.endpoint || "") || identityChanged;
+      if (changed) {
+        item.protocol_verified = false;
+        item.channel_settings = {};
+      }
+      item.physical_interface_id = String(selected.physical_interface_id || selected.id || "");
+      item.physical_port_id = String(selected.physical_port_id || selected.parent_port_id || "");
+      item.endpoint = selected.endpoint || item.endpoint;
+      item.device_identity = currentIdentity;
+      item.physical_verified = selected.detected !== false && selected.compatible !== false;
+      used.add(resourceId(selected));
+      return;
+    }
     let selected = desired ? candidates.find((candidate) =>
       [candidate.id, candidate.physical_port_id, candidate.physical_interface_id].map(String).includes(desired),
     ) : null;
@@ -5943,6 +6250,13 @@ function autoAssignPhysicalInterfaces(configs, {allowSerialFallback = true} = {}
     if (!(role === "plc" || role === "robot")) used.add(resourceId(selected));
   });
   return configs;
+}
+
+function savedSerialCandidate(candidates, role, endpoint) {
+  if (!["thermocouple64", "esr1001_strain", "pressure"].includes(role) || !endpoint) return null;
+  const matches = candidates.filter(item => item.compatible !== false && item.detected !== false
+    && String(item.endpoint || "").toUpperCase() === String(endpoint).toUpperCase());
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function refreshPhysicalInterfaceOptions(row, preferredId = "") {
@@ -6022,9 +6336,13 @@ function refreshPhysicalInterfaceOptions(row, preferredId = "") {
     });
     groups.get(groupLabel).append(node);
   });
-  const currentCandidate = candidates.find((item) =>
+  let currentCandidate = candidates.find((item) =>
     [item.id, item.physical_port_id, item.physical_interface_id].map(String).includes(String(current)),
   );
+  if (current && currentCandidate?.compatible !== true && ["manual", "saved"].includes(row.dataset.selectionOrigin)) {
+    currentCandidate = savedSerialCandidate(candidates, role,
+      row.querySelector(".interface-endpoint")?.value || row.dataset.endpoint);
+  }
   if (currentCandidate) {
     select.value = currentCandidate.id;
   } else if (current) {
@@ -6076,6 +6394,7 @@ function defaultInterfaceCatalog() {
     {
       id: "thermocouple_64ch", enabled: true, role: "thermocouple64",
       driver: "huipu_tc64_modbus_rtu", endpoint: "", baudrate: 115200, slave_id: 1,
+      read_profile: "channel_temperature", timeout: 0.5, channel_settings: {}, reconnect_window_seconds: 60,
       channels: Array.from({length: 64}, (_, index) => `温度${index + 1}`), channel_map: {},
     },
     { id: "plc_process", enabled: true, role: "plc", driver: "modbus_tcp", endpoint: "192.168.125.5:502", channel_map: {} },
@@ -6167,6 +6486,34 @@ function renderInterfacePanel(configs) {
     endpoint.value = currentEndpoint;
     const baud = document.createElement("input"); baud.className = "interface-baudrate"; baud.type = "number"; baud.min = "1200"; baud.value = String(Number(item.baudrate || 115200));
     const slave = document.createElement("input"); slave.className = "interface-slave-id"; slave.type = "number"; slave.min = "1"; slave.max = "247"; slave.value = String(item.slave_id ?? 1);
+    const tcOptions = document.createElement("div"); tcOptions.className = "interface-tc64-options";
+    tcOptions.hidden = canonicalRole !== "thermocouple64";
+    const readProfile = document.createElement("select"); readProfile.className = "interface-read-profile";
+    readProfile.append(option("channel_temperature", "逐通道温度（默认兼容方式）"), option("full_record_block", "完整记录批量（已验证设备）"));
+    readProfile.value = item.read_profile || "channel_temperature";
+    const timeout = document.createElement("input"); timeout.type = "number"; timeout.className = "interface-timeout"; timeout.min = "0.01"; timeout.max = "2"; timeout.step = "0.01"; timeout.value = String(item.timeout || 0.5);
+    const freshness = document.createElement("input"); freshness.type = "number"; freshness.className = "interface-freshness"; freshness.min = "0.1"; freshness.step = "0.1"; freshness.value = String(item.freshness_seconds || 1);
+    const reconnect = document.createElement("input"); reconnect.type = "number"; reconnect.className = "interface-reconnect-window"; reconnect.min = "0"; reconnect.max = "300"; reconnect.value = String(item.reconnect_window_seconds ?? 60);
+    const settings = document.createElement("textarea"); settings.className = "interface-channel-settings";
+    settings.value = JSON.stringify(item.channel_settings || {});
+    settings.placeholder = '{"channels":{"温度1":{"unit":0,"input_type":0,"switch":0}}}';
+    const confirmSettings = document.createElement("button"); confirmSettings.type = "button"; confirmSettings.textContent = "已核对仪表当前通道设置";
+    confirmSettings.addEventListener("click", () => {
+      try {
+        const value = JSON.parse(settings.value || "{}");
+        if (!value.channels || Array.isArray(value.channels)) throw new Error("请填写channels通道设置对象");
+        const selected = row.querySelector(".interface-physical")?.selectedOptions?.[0];
+        value.confirmed = true;
+        value.binding = {endpoint: endpoint.value.trim().toUpperCase(), baudrate: Number(baud.value), slave_id: Number(slave.value), read_profile: readProfile.value,
+          device_identity: JSON.parse(selected?.dataset?.deviceIdentity || "{}")};
+        settings.value = JSON.stringify(value);
+        markHardwareCheckStale("通道设置已确认，请重新检查设备");
+      } catch (error) { toast(error.message); }
+    });
+    tcOptions.append(addLabel("读取方式", readProfile), addLabel("单请求超时（秒）", timeout), addLabel("新鲜度（秒，据扫描耗时设置）", freshness), addLabel("重连窗口（秒）", reconnect),
+      addLabel("仅在仪表明确拒绝设置查询时：逐通道设置JSON，unit 0摄氏/1开尔文/2华氏，input_type 0～10温度，switch 0开/1关；重新连接后需复核", settings), confirmSettings);
+    row.append(tcOptions);
+    [readProfile, timeout, freshness, reconnect, settings].forEach(control => control.addEventListener("change", () => markHardwareCheckStale("热电偶设置已变化")));
     slave.addEventListener("change", () => { row.dataset.slaveId = slave.value; markHardwareCheckStale("仪表地址已变化"); });
     const physical = document.createElement("select"); physical.className = "interface-physical";
     const map = document.createElement("input"); map.className = "interface-map"; map.type = "text"; map.value = typeof item.channel_map === "string" ? item.channel_map : JSON.stringify(item.channel_map || {}); map.placeholder = '{"force":"压力"}';
@@ -6186,6 +6533,7 @@ function renderInterfacePanel(configs) {
     });
     row.append(addLabel(`接口 ${index + 1} · 启用`, enabled), addLabel("传感器类型", role), addLabel("实际物理接口", physical, "interface-physical-label"), addLabel("自动驱动/协议", driver), addLabel("连接地址", endpoint), addLabel("波特率", baud), addLabel("仪表地址", slave, "interface-slave-label"), addLabel("通道映射（仅自定义JSON）", map, "interface-map-label"), profileDetail, summary, removeButton);
     role.addEventListener("change", () => {
+      tcOptions.hidden = role.value !== "thermocouple64";
       row.dataset.selectionOrigin = "auto";
       physical.value = "";
       applySensorTypeProfile(row, true);
@@ -6247,7 +6595,8 @@ function mergeRememberedInterfaceSelections(defaults) {
     "enabled", "driver", "data_mode", "calibration_profile", "bridge", "calibration_digest", "channel_count", "channel_map",
     "physical_interface_id", "physical_port_id", "physical_interface_kind",
     "physical_transport_family", "physical_verified", "physical_fallback",
-    "selection_origin", "endpoint", "baudrate", "slave_id",
+    "selection_origin", "endpoint", "baudrate", "slave_id", "device_identity",
+    "read_profile", "timeout", "channel_settings", "scan_timeout_seconds", "freshness_seconds", "poll_interval_seconds", "reconnect_window_seconds",
   ];
   return (defaults || []).map((item) => {
     const previous = byId.get(String(item.id || ""));
@@ -6636,19 +6985,20 @@ function synchronizeAcquisitionButtons() {
   const publicDemo = isPublicPrecomputedSimulationMode();
   const publicDemoRunning = Boolean(state.publicDemoPlayback?.snapshot()?.running);
   const acquisitionRunning = Boolean(state.acquisitionStatus?.running);
+  const starting = ["starting", "cancelling"].includes(state.acquisitionStatus?.start_operation?.state);
   const startButton = $("startAcquisitionButton");
   const stopButton = $("stopAcquisitionButton");
   if (startButton) {
     startButton.textContent = publicDemo ? "开始演示" : "开始采集";
     startButton.disabled = publicDemo
       ? (!state.publicDemoReady || publicDemoRunning)
-      : (state.acquisitionStartBusy || acquisitionRunning);
+      : (state.acquisitionStartBusy || acquisitionRunning || starting);
   }
   if (stopButton) {
-    stopButton.textContent = publicDemo ? "停止演示" : "停止并保存";
+    stopButton.textContent = publicDemo ? "停止演示" : starting ? "取消启动" : "停止并保存";
     stopButton.disabled = publicDemo
       ? !publicDemoRunning
-      : (state.stopBusy || !acquisitionRunning);
+      : (state.stopBusy || (!acquisitionRunning && !starting));
   }
 }
 
@@ -7520,6 +7870,13 @@ function readinessInterfaceFingerprint(item) {
     endpoint: item?.endpoint,
     baudrate: item?.baudrate,
     slave_id: item?.slave_id,
+    read_profile: item?.read_profile,
+    timeout: item?.timeout,
+    channel_settings: item?.channel_settings,
+    scan_timeout_seconds: item?.scan_timeout_seconds,
+    freshness_seconds: item?.freshness_seconds,
+    poll_interval_seconds: item?.poll_interval_seconds,
+    reconnect_window_seconds: item?.reconnect_window_seconds,
     data_mode: item?.data_mode,
     channel_count: item?.channel_count,
     calibration_profile: item?.calibration_profile,
@@ -7542,7 +7899,7 @@ function readinessInterfaceFingerprint(item) {
 
 function hardwareConfigFingerprint() {
   try {
-    const config = acquisitionConfig({allowUnverifiedPhysical: true});
+    const config = arguments[0] || acquisitionConfig({allowUnverifiedPhysical: true});
     const packageId = String(state.simulationSourcePackageId || (
       state.simulationSourceId ? "" : (
         state.publicDemoBundle?.package_id || controls.simulationPackage?.value || ""
@@ -7556,7 +7913,7 @@ function hardwareConfigFingerprint() {
       selected_sensors: [...(config.selected_sensors || [])].sort(),
       runtime_revision: {
         application_version: state.bootstrap?.application?.version || "",
-        release_revision: state.bootstrap?.application?.build_id || "",
+        release_revision: state.bootstrap?.application?.runtime_revision || state.bootstrap?.application?.build_id || "",
       },
       interfaces: (config.interfaces || []).map(readinessInterfaceFingerprint),
       assignments: config.interface_channel_assignments || {},
@@ -7586,8 +7943,8 @@ function hardwareCheckIsCurrent(fingerprint) {
   const check = state.hardwareCheck;
   return Boolean(check?.ok
     && state.hardwareCheckFingerprint === fingerprint
-    && Number.isFinite(check.readinessDeadline)
-    && performance.now() < check.readinessDeadline);
+    && (Boolean(check.readiness_session_id) || (Number.isFinite(check.readinessDeadline)
+    && performance.now() < check.readinessDeadline)));
 }
 
 function rememberHardwareCheck(result, fingerprint, requestStartedAt) {
@@ -7722,6 +8079,14 @@ function renderHardwareCheckResult(result, {automatic = false, live = false} = {
     (item) => String(item?.message || item),
   );
   appendDetails("接口绑定警告", fallbackInterfaces, (item) => `${item.id || "接口"}：${item.physical_warning}`);
+  appendDetails("热电偶通信", interfaces.filter(item => item.driver === "huipu_tc64_modbus_rtu"), item => {
+    if (item.enabled === false) return "TCP64未参与采集";
+    const d = item.driver_diagnostics || {};
+    const tx = d.last_transaction || {};
+    const sources = new Set(Object.values(d.channel_settings || {}).map(s => s.source));
+    const sourceLabels = {device_readback:"仪表读回",operator_confirmed:"操作者确认",unconfirmed:"未确认"};
+    return `${d.endpoint || item.endpoint} · ${d.baudrate || "?"} 8N1 · 地址${d.slave_id ?? "?"} · ${d.read_profile || item.read_profile || "channel_temperature"} · 协议${d.protocol_verified ? "有效" : "未验证"} · 有效温度${d.valid_temperature_count ?? 0}/64 · 扫描${Number(d.scan_duration_seconds || 0).toFixed(2)}秒 · 设置${[...sources].map(s=>sourceLabels[s] || s).join("/") || "未确认"} · TX/RX ${d.tx_bytes || 0}/${d.rx_bytes || 0}字节 · CH${tx.channel || "?"}寄存器${tx.start_register ?? "?"}+${tx.register_count || 0} · ${d.error_code || "无通信错误"} · 请求 ${tx.request_hex || "无"} · 响应 ${tx.response_hex || "无"}`;
+  });
   appendDetails("异常通道", badSensors, (item) => `${item.name}（${item.message || hardwareStateLabel(item.state)}）`);
   appendDetails(
     "未采集通道（不阻止启动）",
@@ -7764,6 +8129,7 @@ function renderHardwareCheckResult(result, {automatic = false, live = false} = {
 }
 
 function markHardwareCheckStale(reason = "配置已变化") {
+  window.afpCurveTrace?.event("readiness_invalidated", {reason});
   state.agentRequestId += 1;
   state.agentController?.abort();
   state.agentController = null;
@@ -7786,6 +8152,7 @@ function scheduleAutomaticHardwareCheck(delay = 700) {
   if (isPublicPrecomputedSimulationMode()) return;
   if (!controls.autoHardwareCheck?.checked || state.hardwareCheckInProgress) return;
   if (state.acquisitionStatus?.running) return;
+  if (hardwareCheckIsCurrent(hardwareConfigFingerprint())) return;
   if (state.hardwareCheckTimer) window.clearTimeout(state.hardwareCheckTimer);
   state.hardwareCheckTimer = window.setTimeout(() => {
     state.hardwareCheckTimer = null;
@@ -7871,6 +8238,20 @@ function normalizeHardwareCheckResult(result, {executionHost = "helper_local"} =
     errors,
     hardware_check_timed_out: timedOut,
   };
+}
+
+function hardwareCheckTimeoutMs(config) {
+  const interfaces = (config?.interfaces || []).filter(item => item.enabled !== false);
+  let budget = 20000;
+  interfaces.filter(item => item.driver === "huipu_tc64_modbus_rtu").forEach(item => {
+    const count = item.read_profile === "full_record_block" ? 11 : 192;
+    const baudrate = Number(item.baudrate) || 115200;
+    const timeout = Math.max(0.01, Math.min(Number(item.timeout) || 0.5, 2));
+    const bytes = count === 11 ? 2703 : 3136;
+    const scan = Number(item.scan_timeout_seconds) || count * (timeout + Math.max(0.003, 35 / baudrate) + 0.025) + bytes * 10 / baudrate + 1;
+    budget += (scan + 2) * 1000;
+  });
+  return Math.ceil(budget);
 }
 
 async function checkSimulationSourceReadiness({automatic = false} = {}) {
@@ -7966,10 +8347,11 @@ async function testSensorConnection({automatic = false} = {}) {
       // drivers to time out one by one.  The helper keeps its heartbeat on a
       // separate thread, so allow the command enough time to finish instead
       // of reporting a client-side timeout while the check is still running.
+      const checkConfig = acquisitionConfig({allowUnverifiedPhysical: true, diagnosticValidation: true});
       const result = normalizeHardwareCheckResult(
         await requestLocalHelper("check_capture",
-          acquisitionConfig({allowUnverifiedPhysical: true, diagnosticValidation: true}),
-          {timeoutMs: 120000},
+          checkConfig,
+          {timeoutMs: Math.max(120000, hardwareCheckTimeoutMs(checkConfig))},
         ),
       );
       rememberHardwareCheck(result, checkedFingerprint, checkStartedAt);
@@ -8005,13 +8387,14 @@ async function testSensorConnection({automatic = false} = {}) {
   if (resetButton) resetButton.disabled = false;
   if (node) {
     node.className = "hardware-check-status checking";
-    node.textContent = `${automatic ? "正在自动检查" : "正在检查"}，将逐一读取每个接口的全部已选通道…`;
+    node.textContent = `${automatic ? "正在自动检查" : "正在检查"}，正在检查各独立接口的已选通道…`;
   }
   try {
+    const checkConfig = acquisitionConfig({allowUnverifiedPhysical: true, diagnosticValidation: true});
     const result = await postJson(
       state.accessRole === "guest" ? "/api/simulation/start" : "/api/acquisition/test",
-      acquisitionConfig({allowUnverifiedPhysical: true, diagnosticValidation: true}),
-      {timeoutMs: 20000, controller},
+      {...checkConfig, force_check: !automatic},
+      {timeoutMs: hardwareCheckTimeoutMs(checkConfig), controller},
     );
     if (state.accessRole === "guest") {
       state.guestSimulationStarted = true;

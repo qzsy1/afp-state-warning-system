@@ -580,6 +580,7 @@ def helper_capabilities(server_url: str = "") -> dict[str, Any]:
         "readiness_schema_version": RELEASE_CONTRACT.readiness_schema_version,
         "device_readiness_contract": DEVICE_READINESS_CONTRACT,
         "unified_device_readiness_v1": True,
+        "async_capture_start_v1": True,
         "command_lifecycle": "isolated_hardware_check",
         "hardware_check_timeout_seconds": HARDWARE_CHECK_TIMEOUT_SECONDS,
         "hardware_discovery": True,

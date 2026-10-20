@@ -12,6 +12,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import acquisition  # noqa: E402
+from real_acquisition import ReadinessSnapshot, readiness_config_fingerprint  # noqa: E402
 
 
 class InterfaceBindingModelTests(unittest.TestCase):
@@ -376,6 +377,139 @@ class NetworkPathGateTests(unittest.TestCase):
 
         gate.assert_called_once_with(config.interfaces[0])
         start_new.assert_not_called()
+
+    def test_passed_session_reuses_matching_network_path_until_driver_open_gate(self) -> None:
+        checked = {
+            **self.interface,
+            "ok": True,
+            "state": "data_ready",
+            "network_path": {
+                "ok": True,
+                "status": "network_path_ready",
+                "target_address": "192.168.125.5",
+                "target_port": 502,
+                "selected_interface_id": "ethernet:以太网",
+                "actual_interface_id": "ethernet:以太网",
+                "actual_source_address": "192.168.125.209",
+            },
+        }
+        reused = acquisition.reusable_network_path(self.interface, [checked])
+        self.assertEqual(reused, checked["network_path"])
+        changed = {**self.interface, "endpoint": "192.168.125.6:502"}
+        self.assertIsNone(acquisition.reusable_network_path(changed, [checked]))
+        changed = {**self.interface, "physical_interface_id": "ethernet:other"}
+        self.assertIsNone(acquisition.reusable_network_path(changed, [checked]))
+        changed = {**self.interface, "source_address": "192.168.125.210"}
+        self.assertIsNone(acquisition.reusable_network_path(changed, [checked]))
+        matching = {**self.interface, "source_address": "192.168.125.209"}
+        self.assertEqual(
+            acquisition.reusable_network_path(matching, [checked]),
+            checked["network_path"],
+        )
+
+    def test_formal_start_does_not_repeat_passed_session_network_probe(self) -> None:
+        config = acquisition.AcquisitionConfig(
+            acquisition_mode="real",
+            real_acquisition_mode="local_direct",
+            dataset_schema="new_collection_v11_3",
+            selected_sensors=["温度", "压力", "张力"],
+            interfaces=[dict(self.interface)],
+            interface_channel_assignments={
+                "plc_process": ["温度", "压力", "张力"]
+            },
+        )
+        checked = {
+            **self.interface,
+            "ok": True,
+            "state": "data_ready",
+            "network_path": {
+                "ok": True,
+                "status": "network_path_ready",
+                "target_address": "192.168.125.5",
+                "target_port": 502,
+                "selected_interface_id": "ethernet:以太网",
+                "actual_interface_id": "ethernet:以太网",
+                "actual_source_address": "192.168.125.209",
+            },
+        }
+        result = {
+            "ok": True,
+            "interfaces": [checked],
+            "sensors": [
+                {"name": name, "ok": True, "state": "ok"}
+                for name in config.selected_sensors
+            ],
+        }
+        manager = acquisition.AcquisitionManager()
+        manager._readiness_snapshot = ReadinessSnapshot.create(config, result)
+        manager._session_readiness_fingerprint = readiness_config_fingerprint(config)
+        manager._latest_check_result = result
+        with patch(
+            "acquisition.require_network_path",
+            side_effect=AssertionError("passed session repeated the network probe"),
+        ), patch.object(manager, "_start_new", return_value={"ok": True}) as start_new:
+            manager.start(config)
+        start_new.assert_called_once()
+        self.assertEqual(config.interfaces[0]["network_path"], checked["network_path"])
+        preflight = manager.status()["start_preflight"]
+        self.assertTrue(preflight["readiness_session_reused"])
+        reuse = next(
+            item for item in preflight["events"]
+            if item["stage"] == "network_path_reused"
+        )
+        self.assertEqual(reuse["interface_id"], "plc_process")
+        self.assertEqual(reuse["source_address"], "192.168.125.209")
+
+    def test_formal_start_probes_when_snapshot_is_not_current_session(self) -> None:
+        config = acquisition.AcquisitionConfig(
+            acquisition_mode="real",
+            real_acquisition_mode="local_direct",
+            dataset_schema="new_collection_v11_3",
+            selected_sensors=["温度", "压力", "张力"],
+            interfaces=[dict(self.interface)],
+            interface_channel_assignments={
+                "plc_process": ["温度", "压力", "张力"]
+            },
+        )
+        checked = {
+            **self.interface,
+            "ok": True,
+            "state": "data_ready",
+            "network_path": {
+                "ok": True,
+                "status": "network_path_ready",
+                "target_address": "192.168.125.5",
+                "target_port": 502,
+                "selected_interface_id": "ethernet:以太网",
+                "actual_interface_id": "ethernet:以太网",
+                "actual_source_address": "192.168.125.209",
+            },
+        }
+        result = {
+            "ok": True,
+            "interfaces": [checked],
+            "sensors": [
+                {"name": name, "ok": True, "state": "ok"}
+                for name in config.selected_sensors
+            ],
+        }
+        manager = acquisition.AcquisitionManager()
+        manager._readiness_snapshot = ReadinessSnapshot.create(config, result)
+        manager._session_readiness_fingerprint = ""
+        probed = dict(checked["network_path"])
+        with patch(
+            "acquisition.require_network_path", return_value=probed
+        ) as gate, patch.object(
+            manager, "_start_new", return_value={"ok": True}
+        ) as start_new:
+            manager.start(config)
+        gate.assert_called_once_with(config.interfaces[0])
+        start_new.assert_called_once()
+        preflight = manager.status()["start_preflight"]
+        self.assertFalse(preflight["readiness_session_reused"])
+        stages = [item["stage"] for item in preflight["events"]]
+        self.assertIn("network_path_probe_begin", stages)
+        self.assertIn("network_path_probe_end", stages)
 
 
 class DeviceProfileContractTests(unittest.TestCase):

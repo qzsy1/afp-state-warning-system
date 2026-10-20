@@ -185,6 +185,26 @@ class RegressionMatrixContractTests(unittest.TestCase):
             check.change_patterns,
         )
 
+    def test_esr1001_native_usb_check_covers_current_recovery_and_singleflight(self) -> None:
+        checks = {item.id: item for item in self.matrix.checks}
+        check = checks["esr1001-native-usb-contracts"]
+        field = checks["field-real-hardware"]
+        self.assertTrue(check.blocking)
+        self.assertEqual(check.evidence_tier, "protocol_simulation")
+        self.assertEqual(check.profiles, ("quick", "full", "release"))
+        self.assertIn("visualization_app.test_esr1001_usb", check.command)
+        self.assertIn("当前就绪恢复", check.title)
+        self.assertTrue(
+            {"ESR1001-USB-001", "PHYSICAL_READINESS-001", "REAL_PREP_RECOVERY-001"}
+            .issubset(check.requirements)
+        )
+        runtime = checks["modular-runtime-contracts"]
+        self.assertIn("单后端", runtime.title)
+        self.assertIn("ESR1001-USB-001", runtime.requirements)
+        self.assertIn("modular_runtime/tests", " ".join(runtime.command))
+        self.assertIn("modular_runtime/**", runtime.change_patterns)
+        self.assertIn("ESR1001-USB-001", field.requirements)
+
     def test_thermocouple64_checks_cover_protocol_layers_and_frontend(self) -> None:
         expectations = {
             "thermocouple64-protocol-contracts": "THERMOCOUPLE64-PROTOCOL-001",
@@ -198,6 +218,17 @@ class RegressionMatrixContractTests(unittest.TestCase):
                 self.assertEqual(check.profiles, ("quick", "full", "release"))
                 self.assertIn(requirement_id, check.requirements)
                 self.assertIn("visualization_app.test_thermocouple64", " ".join(check.command))
+        protocol = next(
+            item for item in self.matrix.checks
+            if item.id == "thermocouple64-protocol-contracts"
+        )
+        field = next(item for item in self.matrix.checks if item.id == "field-real-hardware")
+        self.assertIn("扫描时延", protocol.title)
+        self.assertIn(
+            "openspec/changes/fix-tc64-native-usb-acquisition/**",
+            protocol.change_patterns,
+        )
+        self.assertIn("THERMOCOUPLE64-PROTOCOL-001", field.requirements)
 
     def test_lan_and_public_access_are_explicit_blocking_checks(self) -> None:
         runtime = next(

@@ -108,6 +108,8 @@ from web_auth import AuthenticationError, SecurityStore
 from control_lease import RealControlLease
 from json_safety import json_safe_value
 from websocket_live import (
+    LIVE_PAYLOAD_ERROR_RETRY_SECONDS,
+    LIVE_PAYLOAD_VERSION_POLL_SECONDS,
     VersionedPayloadCache,
     encode_json_frame,
     encode_server_frame,
@@ -1313,7 +1315,8 @@ class DashboardData:
                     }
                 )
         return {
-            "application": {"version": APP_VERSION, "build_id": BUILD_ID},
+            "application": {"version": APP_VERSION, "build_id": BUILD_ID,
+                            "runtime_revision": str(os.environ.get("AFP_RUNTIME_REVISION") or "")},
             "manifest": self.manifest,
             "state_labels": STATE_LABELS,
             "sensors": self.sensors,
@@ -2866,11 +2869,31 @@ class DashboardData:
         step: int,
         prediction_horizon: int,
         quality_rows: list[dict[str, str]] | None = None,
+        source_rows: list[dict] | None = None,
+        startup_observations: dict | None = None,
     ) -> dict:
         config = status.get("config") or {}
+        source_time_origin = time.monotonic()
         sample_rate = _finite(config.get("sample_rate_hz"), 10.0)
+        total_count = int(status.get("sample_count") or len(rows))
         observed_start = max(0, len(rows) - history)
         indices = np.arange(observed_start, len(rows), step, dtype=int)
+        if step > 1 and config.get("acquisition_mode") == "real" and source_rows:
+            retained = set(int(index) for index in indices)
+            for name in sensor_columns:
+                sequences = set()
+                for index in range(len(rows) - 1, observed_start - 1, -1):
+                    source = (source_rows[index] or {}).get(name) if index < len(source_rows) else None
+                    if (not source or source.get("quality") != "measured_new" or not source.get("after_start")
+                            or source.get("source_sequence") is None):
+                        continue
+                    sequence = (source.get("interface_id"), source["source_sequence"])
+                    if sequence not in sequences:
+                        retained.add(index)
+                        sequences.add(sequence)
+                        if len(sequences) == 2:
+                            break
+            indices = np.asarray(sorted(retained), dtype=int)
         observed_time = (
             (indices - max(len(rows), 1)) / sample_rate
             if len(indices)
@@ -2894,6 +2917,7 @@ class DashboardData:
             channels.append(
                 {
                     **sensor,
+                    "source_channel_name": name,
                     "prediction_source_name": name,
                     "prediction_enabled": False,
                     "x_observed": observed_time.tolist(),
@@ -2904,6 +2928,18 @@ class DashboardData:
                         else "quality_unavailable"
                         for row_index in indices
                     ],
+                    "source_observations": [
+                        (source_rows[int(row_index)] or {}).get(name)
+                        if source_rows and int(row_index) < len(source_rows) else None
+                        for row_index in indices
+                    ],
+                    "startup_curve": {
+                        "actual": [point["value"] for point in (startup_observations or {}).get(name, [])],
+                        "x_observed": [point["received_monotonic"] - source_time_origin
+                                       for point in (startup_observations or {}).get(name, [])],
+                        "x_domain": "seconds_before_payload",
+                        "source_observations": (startup_observations or {}).get(name, []),
+                    },
                     "prediction_observed": [],
                     "x_future": [],
                     "prediction_future": [],
@@ -2939,10 +2975,12 @@ class DashboardData:
         )
         return {
             "mode": "capture_only",
+            "curve_transport": {"clock_domain": "server_monotonic", "assembled": time.monotonic(),
+                                "capture_generation": status.get("capture_generation")},
             "selection": {
                 "specimen": str(config.get("specimen_id", "LIVE_SPECIMEN")),
                 "sensor": sensor_id,
-                "cursor": len(rows),
+                "cursor": total_count,
                 "history": history,
                 "step": step,
                 "threshold": 0.5,
@@ -2979,14 +3017,14 @@ class DashboardData:
                 "display_consistency": "not_applicable",
             },
             "progress": {
-                "cursor": len(rows),
-                "total_points": max(len(rows) + 1, 1),
+                "cursor": total_count,
+                "total_points": max(total_count + 1, 1),
                 "percent": 0.0,
                 "current_layer_index": current_layer,
                 "current_layer": current_layer + 1,
                 "current_layer_id": f"LIVE_L{current_layer}",
-                "layer_point": len(rows),
-                "layer_total_points": max(len(rows) + 1, 1),
+                "layer_point": total_count,
+                "layer_total_points": max(total_count + 1, 1),
                 "current_window": 1,
                 "total_windows_in_layer": 1,
                 "sample_in_window": ((max(len(rows), 1) - 1) % 24) + 1,
@@ -3064,7 +3102,14 @@ class DashboardData:
         """Real acquisition -> live model -> live HI features -> warning."""
         active_acquisition = acquisition or self.acquisition
         status = active_acquisition.status()
-        rows, timestamps = active_acquisition.numeric_matrix()
+        quality_rows, source_rows, startup_observations = None, None, None
+        effective_processing = processing_mode or (status.get("config") or {}).get("processing_mode")
+        if effective_processing == "capture_only" and callable(getattr(active_acquisition, "live_curve_snapshot", None)):
+            status, rows, timestamps, quality_rows, source_rows, startup_observations = active_acquisition.live_curve_snapshot(history)
+        else:
+            rows, timestamps = active_acquisition.numeric_matrix()
+            quality_rows = list(getattr(active_acquisition, "frame_quality", []) or [])
+            source_rows = list(getattr(active_acquisition, "frame_sources", []) or [])
         config = status.get("config") or {}
         requested_schema = (
             dataset_schema
@@ -3105,7 +3150,9 @@ class DashboardData:
                 history=history,
                 step=step,
                 prediction_horizon=prediction_horizon,
-                quality_rows=list(getattr(active_acquisition, "frame_quality", []) or []),
+                quality_rows=quality_rows,
+                source_rows=source_rows,
+                startup_observations=startup_observations,
             )
         new_schema = config.get("dataset_schema") in {"new_collection_v11_3", "new_collection_v12_0", THERMOCOUPLE64_MODE_ID}
         abnormal_states = (
@@ -4779,7 +4826,8 @@ class AppHandler(BaseHTTPRequestHandler):
         request_id = str(self.headers.get("X-AFP-Request-ID", "")).strip()
         if not request_id or len(request_id) > 128:
             return ""
-        return f"{path}:{request_id}"
+        suffix = f":{getattr(self, '_request_body_digest', '')}" if path == "/api/acquisition/start" else ""
+        return f"{path}:{request_id}{suffix}"
 
     def _replay_get(self, key: str) -> tuple[int, dict] | None:
         if not key:
@@ -4841,6 +4889,10 @@ class AppHandler(BaseHTTPRequestHandler):
             return {"installed": False, "running": False, "service_name": "cloudflared", "error_code": "inspection_unavailable"}
 
     def _send_json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
+        if isinstance(payload.get("curve_transport"), dict):
+            payload = {**payload, "curve_transport": {
+                **payload["curve_transport"], "send_started": time.monotonic(), "transport": "http",
+            }}
         raw, compressed = encode_json_response(
             payload, self.headers.get("Accept-Encoding", "")
         )
@@ -5020,7 +5072,10 @@ class AppHandler(BaseHTTPRequestHandler):
             payload_cache = VersionedPayloadCache()
             while True:
                 now = time.monotonic()
-                wait_for = max(0.0, min(0.05, next_push - now))
+                wait_for = max(
+                    0.0,
+                    min(LIVE_PAYLOAD_VERSION_POLL_SECONDS, next_push - now),
+                )
                 readable, _, _ = select.select([self.request], [], [], wait_for)
                 if readable:
                     try:
@@ -5038,6 +5093,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     continue
                 if time.monotonic() < next_push:
                     continue
+                payload_error = False
                 try:
                     payload = payload_cache.payload_for(
                         acquisition,
@@ -5045,18 +5101,33 @@ class AppHandler(BaseHTTPRequestHandler):
                     )
                     if payload is None:
                         if time.monotonic() < next_heartbeat:
-                            next_push = time.monotonic() + 0.05
+                            next_push = (
+                                time.monotonic()
+                                + LIVE_PAYLOAD_VERSION_POLL_SECONDS
+                            )
                             continue
                         payload = {
                             "type": "heartbeat",
                             "stream_version": payload_cache.version,
                         }
                         next_heartbeat = time.monotonic() + 5.0
+                    if isinstance(payload.get("curve_transport"), dict):
+                        payload = {**payload, "curve_transport": {
+                            **payload["curve_transport"], "send_started": time.monotonic(), "transport": "websocket",
+                        }}
                     frame = encode_json_frame(payload)
                 except Exception as exc:
+                    payload_error = True
                     frame = encode_json_frame({"type": "error", "error": str(exc)})
                 self.request.sendall(frame)
-                next_push = time.monotonic() + 0.05
+                next_push = (
+                    time.monotonic()
+                    + (
+                        LIVE_PAYLOAD_ERROR_RETRY_SECONDS
+                        if payload_error
+                        else LIVE_PAYLOAD_VERSION_POLL_SECONDS
+                    )
+                )
         except (BrokenPipeError, ConnectionResetError, OSError, TimeoutError):
             return
 
@@ -5573,6 +5644,7 @@ class AppHandler(BaseHTTPRequestHandler):
         self._send_file(target)
 
     def do_POST(self) -> None:  # noqa: N802
+        request_received_monotonic = time.monotonic()
         parsed = urlparse(self.path)
         if self._reject_unsafe_request():
             return
@@ -5589,6 +5661,7 @@ class AppHandler(BaseHTTPRequestHandler):
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 body = self.rfile.read(length) if length else b"{}"
+                self._request_body_digest = hashlib.sha256(body).hexdigest()
                 payload = json.loads(body.decode("utf-8"))
                 if not isinstance(payload, dict):
                     raise ValueError("request body must be an object")
@@ -5640,11 +5713,12 @@ class AppHandler(BaseHTTPRequestHandler):
             )
             return
         operation_name = None
-        if parsed.path in {
-            "/api/acquisition/test",
-            "/api/acquisition/reset-check",
-        }:
+        if parsed.path == "/api/acquisition/reset-check":
             operation_name = "acquisition-check"
+        elif parsed.path == "/api/acquisition/test":
+            # AcquisitionManager coordinates checks by configuration fingerprint
+            # and serializes physical probes for the full bounded probe lifetime.
+            operation_name = None
         elif parsed.path == "/api/agent/diagnose":
             # Model diagnosis may legitimately take longer than a hardware
             # probe.  Keep its mutex independent so a timed-out/slow model
@@ -5662,6 +5736,7 @@ class AppHandler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length) if length else b"{}"
+            self._request_body_digest = hashlib.sha256(body).hexdigest()
             payload = json.loads(body.decode("utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("请求体必须是JSON对象")
@@ -6213,7 +6288,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 model_validation = self.dashboard.validate_prediction_setup(
                     config, load_model=False
                 )
-                result = self.dashboard.acquisition.test_connection(config)
+                result = (self.dashboard.acquisition.test_connection(config, force=True)
+                          if payload.get("force_check") else self.dashboard.acquisition.test_connection(config))
                 result["prediction_model"] = model_validation
                 self._send_json(result)
                 return
@@ -6697,13 +6773,11 @@ class AppHandler(BaseHTTPRequestHandler):
                     self._replay_put(replay_key, HTTPStatus.OK, result)
                     self._send_json(result)
                     return
-                demo = (
-                    (self.dashboard.bootstrap(include_discovery=False).get("acquisition") or {})
-                    .get("new_collection_demo") or {}
-                )
-                payload = resolve_default_simulation_source(
-                    payload, str(demo.get("source_file") or "")
-                )
+                requested_real = str(payload.get("acquisition_mode") or "").lower() == "real"
+                if not requested_real:
+                    payload = resolve_default_simulation_source(
+                        payload, str(NEW_DEMO_SOURCE.resolve()) if NEW_DEMO_SOURCE.exists() else ""
+                    )
                 if str(payload.get("simulation_source_type", "")).lower() == "mysql":
                     payload["simulation_mysql_query"] = validate_read_only_mysql_query(
                         str(payload.get("simulation_mysql_query", ""))
@@ -6721,11 +6795,24 @@ class AppHandler(BaseHTTPRequestHandler):
                         HTTPStatus.CONFLICT,
                     )
                     return
-                try:
-                    result = self.dashboard.acquisition.start(config)
-                finally:
-                    self.dashboard.helper_registry.end_capture_start()
+                if config.acquisition_mode == "real" and config.async_start:
+                    try:
+                        result = self.dashboard.acquisition.start_async(
+                            config, on_finished=self.dashboard.helper_registry.end_capture_start
+                        )
+                    except Exception:
+                        self.dashboard.helper_registry.end_capture_start()
+                        raise
+                else:
+                    try:
+                        result = self.dashboard.acquisition.start(config)
+                    finally:
+                        self.dashboard.helper_registry.end_capture_start()
                 result["prediction_model"] = model_validation
+                result["request_timing"] = {
+                    "clock_domain": "server_monotonic", "received": request_received_monotonic,
+                    "accepted": time.monotonic(), "start_request_id": config.start_request_id,
+                }
                 self._replay_put(replay_key, HTTPStatus.OK, result)
                 self._send_json(result)
                 return

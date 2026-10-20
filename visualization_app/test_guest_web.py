@@ -73,9 +73,20 @@ class PublicDeviceStatusTests(unittest.TestCase):
 
         self.assertEqual(
             [item["role"] for item in payload["interfaces"]],
-            ["thermocouple", "plc", "thermal_uvc", "robot", "pressure", "esr1001_strain"],
+            ["thermocouple64", "plc", "thermal_uvc", "robot", "pressure", "esr1001_strain"],
         )
         self.assertTrue(all(item["state"] == "unchecked" for item in payload["interfaces"]))
+
+    def test_public_tc64_state_uses_the_actual_serial_check(self):
+        payload = self._module().build_public_device_status({}, {"interfaces":[{
+            "role":"thermocouple64", "state":"ok", "ok":True,
+            "driver":"huipu_tc64_modbus_rtu", "endpoint":"COM-secret",
+        }]}, {"running":False})
+        tc = payload["interfaces"][0]
+        self.assertEqual(tc["role"], "thermocouple64")
+        self.assertTrue(tc["ok"])
+        self.assertEqual(tc["driver"], "huipu_tc64_modbus_rtu")
+        self.assertNotIn("COM-secret",json.dumps(payload))
 
     def test_public_status_projects_the_checked_esr_driver_and_protocol(self):
         module = self._module()

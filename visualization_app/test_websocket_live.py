@@ -7,6 +7,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 class WebSocketLiveProtocolTests(unittest.TestCase):
+    def test_version_poll_interval_is_bounded_for_first_curve_delivery(self):
+        from websocket_live import (
+            LIVE_PAYLOAD_ERROR_RETRY_SECONDS,
+            LIVE_PAYLOAD_VERSION_POLL_SECONDS,
+        )
+
+        self.assertGreater(LIVE_PAYLOAD_VERSION_POLL_SECONDS, 0)
+        self.assertLessEqual(LIVE_PAYLOAD_VERSION_POLL_SECONDS, 0.01)
+        self.assertGreaterEqual(LIVE_PAYLOAD_ERROR_RETRY_SECONDS, 0.05)
+
     def test_versioned_payload_cache_reuses_payload_until_stream_changes(self):
         from websocket_live import VersionedPayloadCache
 
@@ -29,6 +39,24 @@ class WebSocketLiveProtocolTests(unittest.TestCase):
         self.assertIsNone(unchanged)
         self.assertEqual(changed, {"value": 3})
         self.assertEqual(builds, [0, 2])
+
+    def test_failed_payload_build_does_not_consume_the_stream_version(self):
+        from websocket_live import VersionedPayloadCache
+
+        class Acquisition:
+            def stream_version(self):
+                return 7
+
+        cache = VersionedPayloadCache()
+        with self.assertRaisesRegex(RuntimeError, "temporary build failure"):
+            cache.payload_for(
+                Acquisition(),
+                lambda: (_ for _ in ()).throw(RuntimeError("temporary build failure")),
+            )
+        self.assertEqual(
+            cache.payload_for(Acquisition(), lambda: {"recovered": True}),
+            {"recovered": True},
+        )
 
     def test_rfc6455_accept_value_matches_reference(self):
         from websocket_live import websocket_accept_value

@@ -220,13 +220,14 @@ class ReadinessSnapshot:
         *,
         now: float | None = None,
         required_capabilities: Iterable[str] = (),
+        allow_expired: bool = False,
     ) -> None:
         current = float(time.time() if now is None else now)
         if self.schema_version != 1:
             raise ValueError(f"unsupported readiness snapshot schema: {self.schema_version}")
         if not self.ok:
             raise ValueError("readiness snapshot is not ready")
-        if current > self.expires_at:
+        if current > self.expires_at and not allow_expired:
             raise ValueError("readiness snapshot expired")
         if self.config_fingerprint != readiness_config_fingerprint(config):
             raise ValueError("readiness snapshot fingerprint mismatch")
@@ -338,6 +339,8 @@ def readiness_config_fingerprint(config: Any) -> str:
                 "profile_id", "profile_version", "protocol_verified",
                 "channel_types", "channel_types_confirmed", "roi", "dll_path",
                 "data_mode", "channel_count", "calibration_digest", "calibration_profile", "bridge",
+                "read_profile", "timeout", "channel_settings", "scan_timeout_seconds",
+                "freshness_seconds", "poll_interval_seconds", "reconnect_window_seconds",
             )
         }
         interface_facts.update({
@@ -1162,6 +1165,10 @@ class FrameAssembler:
                 continue
             age = max(0.0, deadline - source.received_monotonic)
             freshness = self.freshness_by_channel.get(channel, self.period_seconds * 2.5)
+            if source.metadata.get("driver") == "huipu_tc64_modbus_rtu":
+                duration = _finite(source.metadata.get("scan_duration_seconds")) or 0.0
+                interval = _finite(source.metadata.get("poll_interval_seconds")) or 0.1
+                freshness = max(freshness, duration * 2.5 + interval)
             previous_sequence = self.last_source_sequence.get(channel)
             is_new = source.source_sequence != previous_sequence
             if source.value is None or source.quality == ChannelQuality.INVALID:

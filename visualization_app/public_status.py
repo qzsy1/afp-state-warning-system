@@ -7,10 +7,10 @@ from typing import Any
 
 PUBLIC_INTERFACE_DEFINITIONS = (
     {
-        "role": "thermocouple",
-        "label": "SMRF八通道热电偶",
-        "driver": "smrf_hid",
-        "protocol": "USB HID",
+        "role": "thermocouple64",
+        "label": "慧谱TCP64热电偶（64路）",
+        "driver": "huipu_tc64_modbus_rtu",
+        "protocol": "Modbus RTU",
     },
     {
         "role": "plc",

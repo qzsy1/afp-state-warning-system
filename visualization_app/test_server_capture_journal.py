@@ -56,6 +56,15 @@ def unified_frame(sequence, value, *, timestamp=None):
 
 
 class ServerCaptureJournalTests(unittest.TestCase):
+    def test_async_start_binds_target_before_first_sample(self):
+        self.journal.disarm("session-a")
+        self.journal.arm_start("session-a", "request-1", "selection-a", config={"selected_sensors": ["温度"]})
+        self.assertTrue(self.journal.bind_start_result("session-a", "request-1", {
+            "accepted": True, "running": False, "capture_uuid": "capture-1",
+            "start_operation": {"id": "operation-1", "state": "starting"},
+        }))
+        self.assertTrue(self.journal.manages("session-a", "capture-1"))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.journal = ServerCaptureJournal(Path(self.temp.name) / "journal.sqlite3", max_capture_bytes=300000)

@@ -21,13 +21,32 @@ START = bytes.fromhex("23 A1 01 00 00 FF")
 STOP = bytes.fromhex("23 A1 00 00 00 FF")
 PORT_SETTLE_SECONDS = 1.0
 START_SETTLE_SECONDS = 1.0
+PORT_READY_GUARD_SECONDS = 0.5
+QUERY_START_SPACING_SECONDS = 1.3
+BOUNDED_START_PARAMETER_HEX = "26016306040001086800000000ff"
 RATE_CODES = {0xB0, 0xA1, 0x92, 0x82, 0x72, 0x63, 0x53, 0x43, 0x33, 0x23, 0x13, 0xF1, 0xF2}
+FRESHNESS_LIMIT_SECONDS = 0.25
+FRESHNESS_RECOVERY_INTERVALS = 3
 
 
 class UsbProtocolError(RuntimeError):
     def __init__(self, code, message):
         self.code = code
         super().__init__(f"{code}: {message}")
+
+
+def current_stream_is_stable(driver, latest_host_monotonic, *, now=None):
+    """Return current readiness after a recovered gap while preserving gap evidence."""
+    current = time.monotonic() if now is None else float(now)
+    intervals = tuple(getattr(driver, "recent_intervals", ()))
+    parser = driver.parser
+    return (
+        0 <= current - float(latest_host_monotonic) <= FRESHNESS_LIMIT_SECONDS
+        and len(intervals) >= FRESHNESS_RECOVERY_INTERVALS
+        and all(0 <= value <= FRESHNESS_LIMIT_SECONDS for value in intervals)
+        and not parser.discarded_bytes
+        and not parser.overflows
+    )
 
 
 def parse_parameters(frame):
@@ -233,7 +252,7 @@ def require_helper_capabilities(config):
 class Esr1001UsbDriver:
     open_timeout_seconds = 7.0
 
-    def __init__(self, endpoint, *, data_mode="raw_adc", calibration=None, binding=None, bridge="", command_timeout=2.0, serial_factory=None, inventory=None, recorder=None):
+    def __init__(self, endpoint, *, data_mode="raw_adc", calibration=None, binding=None, bridge="", command_timeout=2.0, serial_factory=None, inventory=None, recorder=None, startup_policy="fixed"):
         self.endpoint = str(endpoint).strip()
         self.data_mode = data_mode
         if data_mode not in {"raw_adc", "microstrain"}:
@@ -245,18 +264,26 @@ class Esr1001UsbDriver:
         self.serial_factory = serial_factory
         self.inventory = inventory
         self.recorder = recorder
+        if startup_policy not in {"fixed", "bounded_response"}:
+            raise ValueError("unsupported USB startup policy")
+        self.startup_policy = startup_policy
+        self._effective_startup_policy = startup_policy
+        self._cancel_open = threading.Event()
         self.serial = None
         self.parser = UsbStreamParser()
         self.parameters = {}
         self.protocol_verified = False
         self.open_stages = set()
+        self.start_events = []
         self.started = False
         self.sequence = 0
         self.connection_generation = 0
+        self.open_attempts = 0
         self.latest_record = None
         self.last_observation = None
         self.first_observation = None
         self.max_interval = 0.0
+        self.recent_intervals = deque(maxlen=FRESHNESS_RECOVERY_INTERVALS)
         self.gaps = []
         self.calibration = None
         self.calibration_digest = ""
@@ -280,8 +307,8 @@ class Esr1001UsbDriver:
         metrics.update({key: metrics[key] + value for key, value in self._previous_metrics.items()})
         duration = (self.last_observation - self.first_observation) if self.first_observation is not None and self.last_observation is not None else 0
         metrics["actual_source_rate_hz"] = (self.sequence - 1) / duration if duration > 0 else None
-        metrics.update(received_bytes=self.received_bytes, received_tail_hex=self.received_tail.hex(), commands=list(self.command_evidence))
-        return {"driver": USB_DRIVER, "data_mode": self.data_mode, "unit": "adc_counts" if self.data_mode == "raw_adc" else "με", "calibration_state": "confirmed" if self.calibration else "标定未确认", "calibration_digest": self.calibration_digest, "parameters": dict(self.parameters), "source_frames": self.sequence, "connection_generation": self.connection_generation, "max_interval_seconds": self.max_interval, "stop_error": self.stop_error, "stop_failures": list(self.stop_failures), "latest_record": dict(self.latest_record or {}), "gaps": list(self.gaps[-128:]), **metrics}
+        metrics.update(received_bytes=self.received_bytes, received_tail_hex=self.received_tail.hex(), commands=list(self.command_evidence), start_events=list(self.start_events), startup_policy=self._effective_startup_policy, current_stream_stable=bool(self.last_observation is not None and current_stream_is_stable(self, self.last_observation)))
+        return {"driver": USB_DRIVER, "data_mode": self.data_mode, "unit": "adc_counts" if self.data_mode == "raw_adc" else "με", "calibration_state": "confirmed" if self.calibration else "标定未确认", "calibration_digest": self.calibration_digest, "parameters": dict(self.parameters), "source_frames": self.sequence, "connection_generation": self.connection_generation, "max_interval_seconds": self.max_interval, "recent_intervals_seconds": list(self.recent_intervals), "freshness_recovery_intervals": FRESHNESS_RECOVERY_INTERVALS, "stop_error": self.stop_error, "stop_failures": list(self.stop_failures), "latest_record": dict(self.latest_record or {}), "gaps": list(self.gaps[-128:]), **metrics}
 
     def _read(self):
         pending = int(getattr(self.serial, "in_waiting", 0))
@@ -299,12 +326,15 @@ class Esr1001UsbDriver:
                 values = decode_adc(raw, self.parser.channels)
                 mono, wall = time.monotonic(), time.time()
                 self.sequence += 1
+                if self.sequence <= FRESHNESS_RECOVERY_INTERVALS + 1:
+                    self.start_events.append({"stage": "source_frame", "sequence": self.sequence, "server_monotonic": mono})
                 if self.first_observation is None:
                     self.first_observation = mono
                 if self.last_observation is not None:
                     interval = mono - self.last_observation
                     self.max_interval = max(self.max_interval, interval)
-                    if interval > 0.25:
+                    self.recent_intervals.append(interval)
+                    if interval > FRESHNESS_LIMIT_SECONDS:
                         self.gaps.append({"after_sequence": self.sequence - 1, "interval_seconds": interval})
                         self.gaps = self.gaps[-128:]
                 self.last_observation = mono
@@ -317,6 +347,11 @@ class Esr1001UsbDriver:
                 self._pending.append(record)
 
     def _command(self, command):
+        if self._effective_startup_policy == "bounded_response" and command != STOP:
+            if int(getattr(self.serial, "in_waiting", 0)):
+                self._read()
+            if self.parser.buffer:
+                raise UsbProtocolError("usb_stale_response", "命令发送前仍有不完整旧帧，必须重新检查")
         self._controls.clear()
         self._parameter_frames.clear()
         self.serial.write(command)
@@ -324,6 +359,8 @@ class Esr1001UsbDriver:
         self.command_evidence.append(command_record)
         deadline = time.monotonic() + self.command_timeout
         while time.monotonic() < deadline:
+            if command != STOP and self._cancel_open.is_set():
+                raise UsbProtocolError("capture_start_cancelled", "设备启动已取消")
             self._read()
             if command == QUERY and self._parameter_frames:
                 command_record["matched_response_hex"] = self._parameter_frames[0].hex()
@@ -336,9 +373,24 @@ class Esr1001UsbDriver:
         stage = "parameters" if command == QUERY else "start" if command == START else "stop"
         raise UsbProtocolError(f"usb_{stage}_timeout", "未收到匹配应答")
 
+    def reset_open_cancellation(self):
+        self._cancel_open.clear()
+
+    def cancel_open(self):
+        self._cancel_open.set()
+
+    def _wait_open_until(self, deadline):
+        if self._cancel_open.wait(max(0.0, deadline-time.monotonic())):
+            raise UsbProtocolError("capture_start_cancelled", "设备启动已取消")
+
     def open(self):
         with self._io_lock:
+            if self._cancel_open.is_set():
+                raise UsbProtocolError("capture_start_cancelled", "设备启动已取消")
             self.open_stages.clear()
+            self._effective_startup_policy = "fixed" if self.open_attempts else self.startup_policy
+            self.open_attempts += 1
+            self.start_events = [{"stage": "open_begin", "server_monotonic": time.monotonic()}]
             self.protocol_verified = False
             if not self.endpoint:
                 raise ValueError("必须显式选择USB串口")
@@ -353,6 +405,7 @@ class Esr1001UsbDriver:
                 from serial.tools import list_ports
                 inventory = self.inventory or list_ports.comports
                 ports = [p for p in inventory() if p.device.casefold() == key]
+                self.start_events.append({"stage": "enumeration_end", "server_monotonic": time.monotonic()})
                 if not ports:
                     raise UsbProtocolError("port_not_present", "所选端口当前不存在，请重新识别")
                 self.open_stages.add("port_present")
@@ -372,12 +425,24 @@ class Esr1001UsbDriver:
                         raise UsbProtocolError("port_access_denied", "串口访问被拒绝；请关闭其他占用程序或检查访问权限") from exc
                     raise
                 self.open_stages.add("driver_open")
-                time.sleep(PORT_SETTLE_SECONDS)
+                self.start_events.append({"stage": "port_settle_begin", "server_monotonic": time.monotonic()})
+                port_guard = PORT_READY_GUARD_SECONDS if self._effective_startup_policy == "bounded_response" else PORT_SETTLE_SECONDS
+                self._wait_open_until(time.monotonic() + port_guard)
+                self.start_events.append({"stage": "port_settle_end", "server_monotonic": time.monotonic()})
                 for key in self._previous_metrics:
                     self._previous_metrics[key] += self.parser.metrics()[key]
                 self.parser = UsbStreamParser()
                 self._pending.clear()
+                if self._effective_startup_policy == "bounded_response":
+                    reset_input = getattr(self.serial, "reset_input_buffer", None)
+                    if callable(reset_input):
+                        reset_input()
+                    else:
+                        pending = int(getattr(self.serial, "in_waiting", 0))
+                        if pending:
+                            self.serial.read(pending)
                 parameters = self._command(QUERY)
+                self.start_events.append({"stage": "query_matched", "server_monotonic": time.monotonic()})
                 self.protocol_verified = True
                 self.open_stages.add("protocol_identified")
                 if parameters["mode"] != 1:
@@ -394,10 +459,15 @@ class Esr1001UsbDriver:
                     self.calibration, self.calibration_digest = calibration, digest
                 self.connection_generation += 1
                 self.stop_error = ""
-                time.sleep(START_SETTLE_SECONDS)
+                self.start_events.append({"stage": "start_settle_begin", "server_monotonic": time.monotonic()})
+                start_deadline = (self.command_evidence[-1]["host_monotonic"] + QUERY_START_SPACING_SECONDS
+                                  if self._effective_startup_policy == "bounded_response" else time.monotonic() + START_SETTLE_SECONDS)
+                self._wait_open_until(start_deadline)
+                self.start_events.append({"stage": "start_settle_end", "server_monotonic": time.monotonic()})
                 self.started = True
                 self.started_monotonic = time.monotonic()
                 self._command(START)
+                self.start_events.append({"stage": "start_matched", "server_monotonic": time.monotonic()})
             except Exception:
                 self.close()
                 raise
@@ -429,6 +499,7 @@ class Esr1001UsbDriver:
         return samples[-1][0] if samples else None
 
     def close(self):
+        self.cancel_open()
         with self._io_lock:
             try:
                 if self.serial is not None and self.started:
@@ -477,9 +548,7 @@ def probe_usb(interface, *, driver_factory=Esr1001UsbDriver, data_window=3.0):
             time.sleep(0.001)
         if samples:
             stage_states["channels_complete"] = stage_states["values_valid"] = "passed"
-            age = time.monotonic() - samples[-1][1]["host_monotonic"]
-            stable = age <= 0.25 and driver.max_interval <= 0.25
-            stable = stable and not driver.parser.discarded_bytes and not driver.parser.overflows
+            stable = current_stream_is_stable(driver, samples[-1][1]["host_monotonic"])
             stage_states["freshness_stable"] = "passed" if stable else "failed"
             if stable:
                 stage_states["ready"] = "passed"

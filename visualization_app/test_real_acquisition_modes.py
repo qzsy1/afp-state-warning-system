@@ -662,6 +662,19 @@ class LocalDirectNoHardwareIntegrationTests(unittest.TestCase):
 
 
 class SharedAcquisitionCoreTests(unittest.TestCase):
+    @staticmethod
+    def fresh_temperature_driver(value=20.0):
+        driver = MultiInterfaceDriver([], ["温度"])
+        def publish_current_samples():
+            for sequence in (1, 2):
+                driver.cache.publish(ChannelSample(
+                    interface_id="temperature-device", channel_name="温度",
+                    value=value, source_sequence=sequence,
+                    received_monotonic=time.monotonic(),
+                ))
+        driver.open = publish_current_samples
+        return driver
+
     class FragmentedSocket:
         def __init__(self, payload: bytes, fragment: int = 2):
             self.payload = bytearray(payload)
@@ -767,15 +780,7 @@ class SharedAcquisitionCoreTests(unittest.TestCase):
                     mysql_database="afp_state_warning",
                 )
             )
-            driver = MultiInterfaceDriver([], ["温度"])
-            driver.cache.publish(
-                ChannelSample(
-                    interface_id="temperature-device",
-                    channel_name="温度",
-                    value=20.0,
-                    source_sequence=1,
-                )
-            )
+            driver = self.fresh_temperature_driver(20.0)
             store = Mock()
             store.preflight.return_value = {"ok": True}
             store.save_layer.return_value = {
@@ -809,15 +814,7 @@ class SharedAcquisitionCoreTests(unittest.TestCase):
             self.assertEqual(manager.status()["capture_phase"], "completed")
             self.assertTrue(manager.status()["mysql"]["ok"])
 
-            next_driver = MultiInterfaceDriver([], ["温度"])
-            next_driver.cache.publish(
-                ChannelSample(
-                    interface_id="temperature-device",
-                    channel_name="温度",
-                    value=21.0,
-                    source_sequence=1,
-                )
-            )
+            next_driver = self.fresh_temperature_driver(21.0)
             next_config = AcquisitionConfig(
                 **real_payload(
                     save_root="",
@@ -851,15 +848,7 @@ class SharedAcquisitionCoreTests(unittest.TestCase):
         config = AcquisitionConfig(
             **real_payload(save_root="", persistence_policy="engineering_preview")
         )
-        driver = MultiInterfaceDriver([], ["温度"])
-        driver.cache.publish(
-            ChannelSample(
-                interface_id="temperature-device",
-                channel_name="温度",
-                value=20.0,
-                source_sequence=1,
-            )
-        )
+        driver = self.fresh_temperature_driver(20.0)
 
         with (
             patch("acquisition.build_driver", return_value=driver),

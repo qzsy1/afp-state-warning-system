@@ -12,6 +12,24 @@ from acquisition import AcquisitionManager  # noqa: E402
 
 
 class AcquisitionTransportCatalogTests(unittest.TestCase):
+    def test_serial_candidates_include_tc64_without_identity_or_hid_reachability(self):
+        serial_ports = [SimpleNamespace(device=f"COM{i+3}", description=label, manufacturer="fixture",
+            vid=vid, pid=pid, serial_number="", hwid=hwid, location="")
+            for i, (label, vid, pid, hwid) in enumerate([
+                ("CH340",0x1A86,0x7523,"USB VID:PID=1A86:7523"),
+                ("FTDI",0x0403,0x6001,"USB VID:PID=0403:6001"),
+                ("Bluetooth",None,None,"BTHENUM"),
+            ])]
+        with patch("serial.tools.list_ports.comports",return_value=serial_ports), patch("acquisition.discover_windows_usb_topology",return_value={}), patch("acquisition.enumerate_smrf_hid_devices",return_value=[]), patch("acquisition.socket.create_connection",side_effect=OSError("offline")), patch("acquisition._network_adapter_snapshot",return_value=[]):
+            result = AcquisitionManager.discover_interfaces()
+        serial = [p for p in result["physical_interfaces"] if p["kind"] == "serial"]
+        self.assertEqual(len(serial), 3)
+        self.assertTrue(all("thermocouple64" in p["compatible_roles"] for p in serial))
+        self.assertTrue(all(p["identity_confirmed"] is False for p in serial))
+        self.assertFalse(result["thermocouple_reachable"])
+        self.assertTrue(result["thermocouple_discovered"])
+        self.assertTrue(all(p.get("transport_family") == "usb" for p in serial[:2]))
+
     @patch("acquisition.socket.create_connection", side_effect=OSError("offline"))
     @patch("acquisition.enumerate_smrf_hid_devices", return_value=[])
     @patch("serial.tools.list_ports.comports")

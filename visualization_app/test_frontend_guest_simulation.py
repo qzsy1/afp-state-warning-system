@@ -194,7 +194,7 @@ const fetch = async () => { requests += 1; return {ok: true, json: async () => (
     def test_failed_server_target_mysql_has_a_session_bound_retry_control(self):
         html = (Path(__file__).with_name("static") / "index.html").read_text(encoding="utf-8")
         self.assertIn('id="retryTargetMysqlButton"', html)
-        self.assertRegex(html, r'/app\.js\?v=\d{8}-thermocouple64-v\d+')
+        self.assertRegex(html, r'/app\.js\?v=\d{8}-[a-z0-9]+(?:-[a-z0-9]+)*-\d+')
         text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
         start = text.index("async function retryServerTargetMysql()")
         end = text.index("async function stopAcquisition()", start)
