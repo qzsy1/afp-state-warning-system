@@ -46,6 +46,8 @@ from m3232_serial import (M3232PressureDriver, MatrixRecorder, normalize_config 
     matrix_csv_path,
     BAUDRATE as M3232_BAUDRATE, RAW_CHANNEL as M3232_RAW_CHANNEL)
 from simulation_replay import MonotonicReplayScheduler
+from uvc_temperature import validate_roi
+from uvc_windows import probe_windows_uvc
 from real_acquisition import (
     AcquisitionQualityMetrics,
     ChannelQuality,
@@ -508,9 +510,10 @@ def _windows_camera_pnp_facts() -> list[dict[str, Any]]:
         "$version=($props|Where-Object KeyName -eq 'DEVPKEY_Device_DriverVersion').Data;"
         "$locations=($props|Where-Object KeyName -eq 'DEVPKEY_Device_LocationPaths').Data;"
         "$container=($props|Where-Object KeyName -eq 'DEVPKEY_Device_ContainerId').Data;"
+        "$parent=($props|Where-Object KeyName -eq 'DEVPKEY_Device_Parent').Data;"
         "[pscustomobject]@{InstanceId=$id;FriendlyName=$_.FriendlyName;"
         "Status=$_.Status;Service=$service;DriverProvider=$provider;"
-        "DriverVersion=$version;LocationPaths=@($locations);ContainerId=\"$container\"}"
+        "DriverVersion=$version;LocationPaths=@($locations);ContainerId=\"$container\";ParentInstanceId=$parent}"
         "});$items | ConvertTo-Json -Depth 4 -Compress"
     )
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -549,6 +552,7 @@ def _windows_camera_pnp_facts() -> list[dict[str, Any]]:
             "driver_version": str(row.get("DriverVersion") or ""),
             "location_paths": [str(item) for item in locations if str(item)],
             "container_id": str(row.get("ContainerId") or ""),
+            "parent_instance_id": str(row.get("ParentInstanceId") or ""),
             "vid": vid,
             "pid": pid,
         })
@@ -575,6 +579,16 @@ def _merge_camera_pnp_with_usb_topology(
             if item.get("vid") == camera.get("vid")
             and item.get("pid") == camera.get("pid")
         ]
+        container = str(camera.get("container_id") or "").strip('{}').casefold()
+        parent = str(camera.get("parent_instance_id") or "").casefold()
+        precise_matches = [item for item in matches if (
+            (container and str(item.get("container_id") or "").strip('{}').casefold() == container)
+            or (parent and str(item.get("instance_id") or "").casefold() == parent)
+        )]
+        if precise_matches:
+            matches = precise_matches
+        elif len([c for c in camera_devices if (c.get("vid"), c.get("pid")) == (camera.get("vid"), camera.get("pid"))]) != 1:
+            continue
         if len(matches) != 1:
             continue
         device = matches[0]
@@ -3979,7 +3993,7 @@ class UvcDriverError(RuntimeError):
 
 
 class UvcThermalDriver(SampleDriver):
-    """BSV UVC native DLL reader; produces a calibrated ROI temperature."""
+    """BSV 温度矩阵读取；适用格式和量值精度由设备档及独立验收约束。"""
 
     def __init__(
         self,
@@ -3989,7 +4003,7 @@ class UvcThermalDriver(SampleDriver):
         call_timeout_seconds: float = 1.0,
     ) -> None:
         self.dll_path = str(dll_path or "").strip()
-        self.roi = _parse_roi(roi)
+        self.roi = validate_roi(roi, BSV_UVC_WIDTH, BSV_UVC_HEIGHT)
         self.poll_retries = max(1, int(poll_retries))
         self.call_timeout_seconds = max(0.01, float(call_timeout_seconds))
         self.dll = None
@@ -4108,18 +4122,6 @@ class UvcThermalDriver(SampleDriver):
             self.dll = None
             raise UvcDriverError("driver_incompatible", "load") from None
         try:
-            range_result = int(self._native_call(
-                "set_range",
-                self.dll.BsvSetTempRangeCode,
-                BSV_UVC_TEMP_RANGE_CODE,
-            ))
-            if range_result < 0:
-                raise UvcDriverError(
-                    "driver_incompatible",
-                    "set_range",
-                    return_code=range_result,
-                    last_error=self._safe_last_error(),
-                )
             result = int(self._native_call("open", self.dll.BsvOpen))
             if result < 0:
                 raise UvcDriverError(
@@ -4150,10 +4152,6 @@ class UvcThermalDriver(SampleDriver):
 
     def _roi_average_temperature(self) -> float:
         x1, y1, x2, y2 = self.roi or (0, 0, BSV_UVC_WIDTH, BSV_UVC_HEIGHT)
-        x1 = max(0, min(int(x1), BSV_UVC_WIDTH - 1))
-        x2 = max(x1 + 1, min(int(x2), BSV_UVC_WIDTH))
-        y1 = max(0, min(int(y1), BSV_UVC_HEIGHT - 1))
-        y2 = max(y1 + 1, min(int(y2), BSV_UVC_HEIGHT))
         total = 0.0
         count = 0
         for row in range(y1, y2):
@@ -4161,7 +4159,7 @@ class UvcThermalDriver(SampleDriver):
             for column in range(x1, x2):
                 total += self.temp_buffer[base + column] / BSV_UVC_TEMP_FORMULA_SCALE + BSV_UVC_TEMP_FORMULA_OFFSET
                 count += 1
-        return round(total / count, 2) if count else 0.0
+        return total / count
 
     def read_sample(self) -> dict[str, float] | None:
         if self.dll is None:
@@ -4202,6 +4200,12 @@ class UvcThermalDriver(SampleDriver):
                 if frame_counter_after != frame_counter_before:
                     counter_copy_retries += 1
                     continue
+                if not any(self.temp_buffer):
+                    raise UvcDriverError("uninitialized_zero_matrix", "validate_frame")
+                if self._last_frame_counter is not None and (
+                    (frame_counter_after - self._last_frame_counter) & 0xFFFFFFFF
+                ) >= 0x80000000:
+                    raise UvcDriverError("source_sequence_reset_or_out_of_order", "validate_frame")
                 temperature = self._roi_average_temperature()
                 if not math.isfinite(temperature):
                     raise UvcDriverError(
@@ -5274,6 +5278,7 @@ class AcquisitionManager(AcquisitionStartMixin):
                 Path.cwd() / BSV_UVC_DLL_NAME,
             )
         )
+        uvc_windows_found = (RELEASE_CONTRACT.source_path.parent / "native_dll" / "AFP_UvcWindowsProbe.exe").is_file()
         camera_devices = _windows_camera_pnp_facts()
         _merge_camera_pnp_with_usb_topology(usb_topology, camera_devices)
         bsv_pnp = next(
@@ -5299,7 +5304,8 @@ class AcquisitionManager(AcquisitionStartMixin):
             }]
         for device in bsv_devices:
             parent_port_id = str(device.get("parent_port_id") or "")
-            pnp = bsv_pnp if bsv_pnp else device
+            pnp_matches = [c for c in camera_devices if c.get("usb_device_id") == device.get("id")]
+            pnp = pnp_matches[0] if len(pnp_matches) == 1 else device
             physical_interfaces.append({
                 "id": f"uvc:bsv:{str(device.get('id') or parent_port_id or 'device')}",
                 "kind": "usb_uvc", "protocol": "uvc",
@@ -5308,7 +5314,7 @@ class AcquisitionManager(AcquisitionStartMixin):
                 "detected": True,
                 "device_detected": True,
                 "topology_bound": bool(parent_port_id),
-                "driver_available": uvc_dll_found,
+                "driver_available": uvc_dll_found or (uvc_windows_found and pnp.get("service") == "usbvideo"),
                 "auto_assignable": True,
                 "vid": BSV_UVC_VENDOR_ID,
                 "pid": BSV_UVC_PRODUCT_ID,
@@ -5711,6 +5717,15 @@ class AcquisitionManager(AcquisitionStartMixin):
                     continue
             device_profile_status = device_profile_readiness(item)
             if role in SHARED_DEVICE_PROFILES and not device_profile_status["ready"]:
+                uvc_diagnostics = {}
+                if role == "thermal_uvc" and physical_verified:
+                    identity = item.get("device_identity") or {}
+                    binding_service = (item.get("driver_state") or {}).get("service") or identity.get("service")
+                    if identity and str(binding_service or "").casefold() == "usbvideo":
+                        uvc_diagnostics = probe_windows_uvc(
+                            identity,
+                            executable=RELEASE_CONTRACT.source_path.parent / "native_dll" / "AFP_UvcWindowsProbe.exe",
+                        )
                 missing_device_facts = list(
                     device_profile_status["missing_device_facts"]
                 )
@@ -5718,6 +5733,8 @@ class AcquisitionManager(AcquisitionStartMixin):
                     "设备档缺少已批准的必需事实："
                     + "、".join(missing_device_facts)
                 )
+                if uvc_diagnostics:
+                    message += "；Windows XU诊断：" + str(uvc_diagnostics.get("status") or "failed")
                 errors.append(f"{endpoint}：{message}")
                 interface_results.append({
                     "id": interface_id,
@@ -5743,6 +5760,7 @@ class AcquisitionManager(AcquisitionStartMixin):
                     "message": message,
                     "ok": False,
                     **device_profile_status,
+                    **({"driver_diagnostics": uvc_diagnostics} if uvc_diagnostics else {}),
                 })
                 continue
             detected: dict[str, int] = {}

@@ -47,6 +47,12 @@ class FakeBsvDll:
         self.BsvStart = NativeFunction(start_result)
         self.BsvHasFrame = NativeFunction(has_frame)
         self.BsvGetFrame = NativeFunction(get_frame)
+        if get_frame > 0:
+            def fill_frame(_yuv, _yuv_size, temperature, pixels):
+                for index in range(pixels):
+                    temperature[index] = 6400
+                return get_frame
+            self.BsvGetFrame.callback = fill_frame
         self.BsvGetFrameCounter = NativeFunction(frame_counter)
         self.BsvGetLastError = NativeFunction(last_error)
         self.BsvStop = NativeFunction(None)
@@ -162,7 +168,8 @@ class UvcDllContractTests(unittest.TestCase):
         driver.close()
 
         self.assertEqual(sample, {"ROI平均温度": 50.0})
-        self.assertEqual(len(dll.BsvSetTempRangeCode.calls), 1)
+
+        self.assertEqual(len(dll.BsvSetTempRangeCode.calls), 0)
         self.assertEqual(len(dll.BsvOpen.calls), 1)
         self.assertEqual(len(dll.BsvStart.calls), 1)
         self.assertEqual(len(dll.BsvGetFrame.calls), 1)
@@ -177,7 +184,7 @@ class UvcDllContractTests(unittest.TestCase):
         first = driver.read_sample()
         repeated = driver.read_sample()
 
-        self.assertEqual(first, {"ROI平均温度": -50.0})
+        self.assertEqual(first, {"ROI平均温度": 50.0})
         self.assertIsNone(repeated)
         self.assertEqual(driver.quality_metadata["source_frame_counter"], 7)
         self.assertEqual(len(dll.BsvGetFrame.calls), 1)
@@ -191,10 +198,31 @@ class UvcDllContractTests(unittest.TestCase):
 
         sample = driver.read_sample()
 
-        self.assertEqual(sample, {"ROI平均温度": -50.0})
+        self.assertEqual(sample, {"ROI平均温度": 50.0})
         self.assertEqual(driver.quality_metadata["source_frame_counter"], 9)
         self.assertEqual(driver.quality_metadata["counter_copy_retries"], 1)
         self.assertEqual(len(dll.BsvGetFrame.calls), 2)
+
+    def test_zero_matrix_and_invalid_roi_are_rejected(self) -> None:
+        dll = FakeBsvDll()
+        dll.BsvGetFrame.callback = None
+        driver = self._driver(dll)
+        driver.open()
+        with self.assertRaisesRegex(Exception, "uninitialized_zero_matrix"):
+            driver.read_sample()
+        for roi in [(0,0,257,192),(-1,0,2,2),(0,0,0,1)]:
+            with self.assertRaisesRegex(ValueError,"invalid_roi"):
+                UvcThermalDriver(roi=roi)
+
+    def test_roi_precision_is_not_rounded_for_storage(self) -> None:
+        dll = FakeBsvDll()
+        def fill(_yuv, _yuv_size, temperature, _pixels):
+            temperature[0] = 6401
+            return 1
+        dll.BsvGetFrame.callback = fill
+        driver = self._driver(dll, roi=(0,0,1,1))
+        driver.open()
+        self.assertEqual(driver.read_sample()["ROI平均温度"],50.015625)
 
     def test_blocking_open_and_stop_return_within_declared_timeout(self) -> None:
         never = threading.Event()

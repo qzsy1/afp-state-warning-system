@@ -4,7 +4,7 @@
     "application_version": "2.0.5-rc.3",
     "helper_version": "2.0.5-rc.3",
     "launcher_version": "2.0.5-rc.3",
-    "release_revision": "esr1001-focused-display-v1"
+    "release_revision": "uvc-windows-transport-evidence-v1"
   },
   "contracts": {
     "helper_protocol_version": 2,
@@ -53,6 +53,10 @@
       {
         "id": "local_capture_helper",
         "path": "local_helper/AFP_Local_Capture_Helper.exe"
+      },
+      {
+        "id": "uvc_windows_probe",
+        "path": "native_dll/AFP_UvcWindowsProbe.exe"
       }
     ],
     "native_components": [

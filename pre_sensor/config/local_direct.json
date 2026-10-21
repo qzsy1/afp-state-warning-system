@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "release_revision": "esr1001-focused-display-v1",
+    "release_revision": "uvc-windows-transport-evidence-v1",
   "dataset_schema": "new_collection_v13_0",
   "mode": "local_direct",
   "channels": [

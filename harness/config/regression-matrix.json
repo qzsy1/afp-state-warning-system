@@ -221,7 +221,7 @@
       "id": "plc-abb-uvc-readiness-contracts",
       "title": "PLC、ABB与BSV UVC端点、协议、驱动和统一Readiness合同",
       "kind": "command",
-      "command": ["{python}", "-m", "unittest", "visualization_app.test_plc_abb_uvc_readiness", "visualization_app.test_plc_abb_uvc_frontend", "visualization_app.test_plc_modbus_contract", "visualization_app.test_abb_digest_contract", "visualization_app.test_uvc_dll_contract", "visualization_app.test_unified_device_readiness", "visualization_app.test_readiness_fingerprint", "visualization_app.test_plc_abb_uvc_fault_isolation", "visualization_app.test_plc_abb_uvc_documentation", "visualization_app.test_industrial_acquisition_probe", "-v"],
+      "command": ["{python}", "-m", "unittest", "visualization_app.test_plc_abb_uvc_readiness", "visualization_app.test_plc_abb_uvc_frontend", "visualization_app.test_plc_modbus_contract", "visualization_app.test_abb_digest_contract", "visualization_app.test_uvc_dll_contract", "visualization_app.test_uvc_temperature", "visualization_app.test_uvc_windows", "visualization_app.test_unified_device_readiness", "visualization_app.test_readiness_fingerprint", "visualization_app.test_plc_abb_uvc_fault_isolation", "visualization_app.test_plc_abb_uvc_documentation", "visualization_app.test_industrial_acquisition_probe", "-v"],
       "cwd": ".",
       "timeout_seconds": 300,
       "profiles": ["quick", "full", "release"],
@@ -229,7 +229,7 @@
       "blocking": true,
       "evidence_tier": "automated",
       "requirements": ["PLC_ABB_UVC-001", "REAL_ACQUISITION-001", "PHYSICAL_READINESS-001", "REAL_PREP_PROTOCOL-001"],
-      "change_patterns": ["visualization_app/acquisition.py", "visualization_app/real_acquisition.py", "visualization_app/local_capture_agent.py", "visualization_app/release_contract.py", "visualization_app/static/app.js", "visualization_app/test_plc_abb_uvc*.py", "visualization_app/test_plc_modbus_contract.py", "visualization_app/test_abb_digest_contract.py", "visualization_app/test_uvc_dll_contract.py", "visualization_app/test_unified_device_readiness.py", "visualization_app/test_readiness_fingerprint.py", "visualization_app/industrial_acquisition_probe.py", "visualization_app/test_industrial_acquisition_probe.py", "pre_sensor/FIELD-OPERATIONS.md", "openspec/changes/fix-plc-abb-uvc-real-acquisition/**"]
+      "change_patterns": ["visualization_app/acquisition.py", "visualization_app/real_acquisition.py", "visualization_app/local_capture_agent.py", "visualization_app/release_contract.py", "visualization_app/static/app.js", "visualization_app/test_plc_abb_uvc*.py", "visualization_app/test_plc_modbus_contract.py", "visualization_app/test_abb_digest_contract.py", "visualization_app/test_uvc_dll_contract.py", "visualization_app/test_uvc_temperature.py", "visualization_app/test_uvc_windows.py", "visualization_app/uvc_temperature.py", "visualization_app/uvc_windows.py", "visualization_app/uvc_windows_probe.cs", "openspec/changes/fix-uvc-temperature-acquisition-preserve-channels/**", "visualization_app/test_unified_device_readiness.py", "visualization_app/test_readiness_fingerprint.py", "visualization_app/industrial_acquisition_probe.py", "visualization_app/test_industrial_acquisition_probe.py", "pre_sensor/FIELD-OPERATIONS.md", "openspec/changes/fix-plc-abb-uvc-real-acquisition/**"]
     },
     {
       "id": "real-acquisition-remote-helper-contracts",

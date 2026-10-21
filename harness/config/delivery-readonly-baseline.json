@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
-  "captured_from_commit": "b03b8147ed8d+working-tree.8cf3c743e30f",
+  "captured_from_commit": "3b485b2376ec+working-tree.50360c18b693",
   "delivery_path": "D:\\AFP_Runtime\\AFP_Integrated_System_Modular",
-  "managed_file_count": 6255,
-  "tree_sha256": "6e3adc11dd3667978a7bab54126e94a8b24fd95008d48a576cb8b9dd7bab748b",
+  "managed_file_count": 6258,
+  "tree_sha256": "8443ed37f60471164583e136087ec0b6e346d3e1a665af8ebfe00d3f8452ffdf",
   "per_file_manifest": "SHA256SUMS.txt",
-  "per_file_manifest_entries": 6254,
-  "per_file_manifest_sha256": "71326e016beb66540609014214683c5e6b3e6b5b7127482b4106bcd416362444"
+  "per_file_manifest_entries": 6257,
+  "per_file_manifest_sha256": "ed6947ae0ea3cf3ebe7a751cd31f7879db5e65a4ea5f7a6c39a949d349c6ace3"
 }

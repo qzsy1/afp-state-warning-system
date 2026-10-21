@@ -224,7 +224,7 @@ $legacyFiles = @(
     "training_data.py", "training_center.py", "training_center_cli.py",
     "native_integrated_app.py", "fit_new_collection_health.py", "websocket_live.py",
     "helper_relay.py", "edge_capture.py", "local_capture_agent.py", "local_capture_helper_entry.py", "release_contract.py", "public_ingress_state.py", "pre_sensor_config.py", "pre_sensor_preflight.py", "pre_sensor_drill.py", "pre_sensor_endurance.py", "pre_sensor_evidence.py", "windows_usb_topology.py", "interface_transport_catalog.py",
-    "simulation_replay.py", "simulation_source_transfer.py",
+    "simulation_replay.py", "simulation_source_transfer.py", "uvc_temperature.py", "uvc_windows.py",
     "public_demo_bundles.py",
     "remote_mysql_setup.py", "server_target_mysql.py", "server_capture_journal.py", "generate_pressure_simulation.py",
     "web_auth.py", "web_access.py", "public_status.py", "guest_simulation.py", "control_lease.py", "json_safety.py",
@@ -292,6 +292,23 @@ if ($HelperExecutable) {
 }
 Get-ChildItem -LiteralPath (Join-Path $LegacySource "hardware_dlls") -File | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination $nativeTarget -Force
+}
+$probeSource = Join-Path $LegacySource "uvc_windows_probe.cs"
+$compiler = Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
+    throw "Windows UVC diagnostics require the .NET Framework 4 x64 compiler."
+}
+$probeTarget = Join-Path $nativeTarget "AFP_UvcWindowsProbe.exe"
+$previousTemp = $env:TEMP
+$previousTmp = $env:TMP
+try {
+    $env:TEMP = $TargetDir
+    $env:TMP = $TargetDir
+    & $compiler /nologo /target:exe /platform:x64 /r:System.Web.Extensions.dll "/out:$probeTarget" $probeSource
+    if ($LASTEXITCODE -ne 0) { throw "Windows UVC probe compilation failed: $LASTEXITCODE" }
+} finally {
+    $env:TEMP = $previousTemp
+    $env:TMP = $previousTmp
 }
 
 foreach ($directory in @("logs", "runtime", "rollback", "updates", "verification")) {
