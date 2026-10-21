@@ -425,11 +425,27 @@ class LaunchTests(unittest.TestCase):
             fake = types.SimpleNamespace(create_window=MagicMock(), start=MagicMock())
             with patch.dict(sys.modules, {"webview": fake}):
                 bootstrap._show_desktop_window(context, "http://127.0.0.1:8771/")
+                bootstrap._show_desktop_window(context, "http://127.0.0.1:8771/")
             cache = context.paths.runtime_dir / "webview"
             self.assertTrue(cache.is_dir())
-            fake.start.assert_called_once_with(
-                debug=False, private_mode=True, storage_path=str(cache)
+            sessions = [Path(call.kwargs["storage_path"]) for call in fake.start.call_args_list]
+            self.assertEqual(len(sessions), 2)
+            self.assertNotEqual(sessions[0], sessions[1])
+            for call, session in zip(fake.start.call_args_list, sessions):
+                self.assertEqual(session.parent, cache)
+                self.assertFalse(session.exists())
+                self.assertFalse(call.kwargs["debug"])
+                self.assertTrue(call.kwargs["private_mode"])
+
+    def test_desktop_session_is_removed_after_start_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            context = RuntimeContext(Path(temporary), {})
+            fake = types.SimpleNamespace(
+                create_window=MagicMock(), start=MagicMock(side_effect=RuntimeError("WebView2"))
             )
+            with patch.dict(sys.modules, {"webview": fake}), self.assertRaises(RuntimeError):
+                bootstrap._show_desktop_window(context, "http://127.0.0.1:8771/")
+            self.assertFalse(Path(fake.start.call_args.kwargs["storage_path"]).exists())
 
     def test_existing_afp_server_probe_requires_healthy_json(self) -> None:
         response = MagicMock()

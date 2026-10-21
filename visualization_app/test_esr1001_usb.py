@@ -187,6 +187,41 @@ class UsbProtocolTests(unittest.TestCase):
                 driver.open()
             self.assertNotIn(START, invalid.writes)
 
+    def test_guarded_start_preserves_parameter_wait_and_reconnect_uses_fixed_timing(self):
+        from esr1001_usb import GUARDED_START_PARAMETER_HEX
+        class GuardedSerial(SerialStub):
+            def write(self, data):
+                super().write(data)
+                if data == QUERY:
+                    self.buffer[:] = bytes.fromhex(GUARDED_START_PARAMETER_HEX)
+        driver, _ = self.driver(GuardedSerial(), startup_policy="guarded_response")
+        waits = []
+        with patch.object(driver, "_wait_open_until", side_effect=lambda deadline: waits.append(deadline - time.monotonic())):
+            driver.open()
+            try:
+                self.assertEqual(driver.quality_metadata["startup_policy"], "guarded_response")
+                self.assertTrue(driver.read_samples())
+            finally:
+                driver.close()
+            driver.serial_factory = lambda *args, **kwargs: GuardedSerial()
+            driver.reset_open_cancellation()
+            driver.open()
+            try:
+                self.assertEqual(driver.quality_metadata["startup_policy"], "fixed")
+            finally:
+                driver.close()
+        self.assertEqual(len(waits), 4)
+        for actual, expected in zip(waits, (.5, 1.0, 1.0, 1.0)):
+            self.assertAlmostEqual(actual, expected, delta=.05)
+
+    def test_guarded_start_rejects_changed_parameters_before_start_command(self):
+        driver, stub = self.driver(startup_policy="guarded_response")
+        with patch.object(driver, "_wait_open_until"):
+            with self.assertRaisesRegex(UsbProtocolError, "binding_unconfirmed"):
+                driver.open()
+        self.assertNotIn(START, stub.writes)
+        self.assertFalse(stub.is_open)
+
     def test_bounded_spacing_uses_command_clock_with_a_slow_matching_reply(self):
         clock = [100.0]
         class Event:
@@ -976,7 +1011,8 @@ console.log(JSON.stringify(Object.fromEntries(codes.map(code => [code, hardwareS
         self.assertIn("115200-8-N-1", readme)
         self.assertIn("没有 CRC", readme)
         self.assertIn("adc_counts", readme)
-        self.assertIn("不进入规范应变列和模型", readme)
+        self.assertIn("主CSV按页面显示保存", readme)
+        self.assertIn("候选换算不代表标定确认，不改变模型和MySQL的准入条件", readme)
 
     def test_multiple_candidates_are_not_automatically_claimed(self):
         from visualization_app.test_usb_interface_candidates import run_candidate_script
@@ -1234,7 +1270,7 @@ console.log(JSON.stringify(config));
                 rows = list(csv.DictReader(f))
             self.assertEqual(len(rows), len(saved[0]["rows"]))
             for row in rows:
-                self.assertAlmostEqual(float(row["应变1"]), USB_EXPECTED_ADC[0] * 0.01 - 2)
+                self.assertEqual(row["应变1"], "685.9")
                 self.assertNotIn("CH1_ADC_signed", row)
             evidence = saved[0]["summary"]["data_quality"]["esr1001_usb"]["esr"]
             self.assertTrue(evidence["calibration_digest"])

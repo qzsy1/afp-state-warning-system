@@ -42,6 +42,7 @@ from esr1001_usb import (
     USB_DRIVER, RAW_CHANNELS, Esr1001UsbDriver, RawCaptureWriter,
     load_calibration, UsbProtocolError, probe_usb, read_vendor_candidate, confirm_vendor_candidate, replay_source_capture,
     normalize_vendor_candidate,
+    vendor_display,
 )
 from m3232_serial import (M3232PressureDriver, MatrixRecorder, normalize_config as normalize_m3232,
     matrix_csv_path,
@@ -2421,6 +2422,50 @@ class AcquisitionConfig:
         if missing:
             raise ValueError("selected_channels_missing_from_csv: " + ", ".join(sorted(missing)))
         return columns
+
+    @property
+    def saved_channel_names(self) -> dict[str, str]:
+        """主CSV的USB应变列与页面应变显示使用相同通道。"""
+        names = {}
+        if self.acquisition_mode != "real":
+            return names
+        for item in self.interfaces or []:
+            if not item.get("enabled", True) or item.get("driver") != USB_DRIVER:
+                continue
+            candidate = (item.get("channel_settings") or {}).get("esr_vendor_candidate")
+            if item.get("data_mode", "raw_adc") == "raw_adc" and not candidate:
+                continue
+            source_names = RAW_CHANNELS if item.get("data_mode", "raw_adc") == "raw_adc" else STRAIN_SENSOR_COLUMNS
+            names.update({name: f"应变{i}" for i, name in enumerate(source_names, 1)
+                          if name in self.selected_sensors})
+        return names
+
+    @property
+    def saved_columns(self) -> list[str]:
+        names = self.saved_channel_names
+        return [names.get(name, name) for name in self.raw_columns]
+
+    def saved_row(self, row: dict, frame: UnifiedFrame | None) -> dict:
+        """按该行源帧的系数及零点保存显示值，缺测不补值。"""
+        saved = dict(row)
+        for source, target in self.saved_channel_names.items():
+            saved.pop(source, None)
+            saved[target] = ""
+            channel = frame.channels.get(source) if frame else None
+            if (channel is None or channel.value is None or channel.quality not in
+                    {ChannelQuality.MEASURED_NEW, ChannelQuality.HELD_WITHIN_FRESHNESS}):
+                continue
+            metadata = channel.metadata
+            record = metadata.get("latest_record") or metadata.get("adc_source") or {}
+            candidate = bool(metadata.get("vendor_candidate_snapshot") or record.get("vendor_candidate_digest"))
+            relative = bool(record.get("zero_id"))
+            key = ("vendor_candidate_relative_values" if relative else "vendor_candidate_values") if candidate else (
+                "relative_values" if relative else "calibrated_values")
+            index = STRAIN_SENSOR_COLUMNS.index(target) + 1
+            value = _finite((record.get(key) or {}).get(f"相对应变{index}" if relative else target))
+            if value is not None:
+                saved[target] = vendor_display(value)
+        return saved
 
     @property
     def process_columns(self) -> list[str]:
@@ -6916,7 +6961,10 @@ class AcquisitionManager(AcquisitionStartMixin):
                         "operator_specimen_id": self.operator_specimen_id,
                         "started_at": datetime.now().isoformat(timespec="milliseconds"),
                         "raw_encoding": "gb18030",
-                        "raw_columns": config.raw_columns,
+                        "raw_columns": config.saved_columns,
+                        "saved_strain_channels": config.saved_channel_names,
+                        "saved_strain_unit": "με" if config.saved_channel_names else None,
+                        "saved_strain_basis": "source_frame_display_with_zero" if config.saved_channel_names else None,
                         "selected_save_root": str(selected_root),
                         "specimen_folder": str(self.session_dir),
                         "layer_file": str(self.raw_path),
@@ -7110,6 +7158,7 @@ class AcquisitionManager(AcquisitionStartMixin):
                 layer_payloads,
                 sensor_columns=sensor_union,
                 scope="completed_specimen",
+                include_row_metadata=False,
             )
             derived_path = combined_path.with_name(
                 f"{specimen_folder_name}_完整试样_派生.CSV"
@@ -7175,7 +7224,7 @@ class AcquisitionManager(AcquisitionStartMixin):
             )
             with raw_context as raw_file, timestamp_context as time_file:
                 writer = csv.DictWriter(
-                    raw_file, fieldnames=config.raw_columns
+                    raw_file, fieldnames=config.saved_columns
                 )
                 timestamp_writer = csv.DictWriter(
                     time_file,
@@ -7372,7 +7421,7 @@ class AcquisitionManager(AcquisitionStartMixin):
                             "channel_interface_json": json.dumps({name: ch.interface_id for name, ch in frame.channels.items()} if frame else {}, ensure_ascii=False),
                             "channel_source_record_json": json.dumps({name: (dict(ch.metadata["latest_record"], calibration_snapshot=ch.metadata.get("calibration_snapshot"), vendor_candidate_snapshot=ch.metadata.get("vendor_candidate_snapshot")) if ch.metadata.get("driver") == USB_DRIVER else {key: ch.metadata["latest_record"].get(key) for key in ("connection_generation", "receive_sequence", "sha256", "byte_offset")}) for name, ch in frame.channels.items() if ch.metadata.get("latest_record")} if frame else {}, ensure_ascii=False),
                         }
-                        capture_writer.submit(row, timestamp_row)
+                        capture_writer.submit(config.saved_row(row, frame), timestamp_row)
                         self.persistence_queue_depth = capture_writer.pending_rows
                         self.persistence_queue_high_water_rows = max(
                             self.persistence_queue_high_water_rows,

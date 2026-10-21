@@ -104,7 +104,7 @@ class AcquisitionStartMixin:
                     self._session_readiness_fingerprint == readiness_config_fingerprint(config))
 
     def usb_startup_profiles(self, config):
-        from esr1001_usb import USB_DRIVER, BOUNDED_START_PARAMETER_HEX, QUERY, START
+        from esr1001_usb import USB_DRIVER, BOUNDED_START_PARAMETER_HEX, GUARDED_START_PARAMETER_HEX, QUERY, START, STOP
         if not self.session_readiness_matches(config):
             return {}
         enabled = {str(item.get("id")) for item in config.interfaces or []
@@ -112,18 +112,22 @@ class AcquisitionStartMixin:
         profiles = {}
         for row in self._latest_check_result.get("interfaces", []):
             evidence = row.get("usb_evidence") or {}
+            parameters_hex = (evidence.get("parameters") or {}).get("raw_hex")
             if (str(row.get("id")) not in enabled or not row.get("ok")
                     or row.get("driver") != USB_DRIVER or row.get("state") != "data_ready"
-                    or (evidence.get("parameters") or {}).get("raw_hex") != BOUNDED_START_PARAMETER_HEX
+                    or parameters_hex not in {BOUNDED_START_PARAMETER_HEX, GUARDED_START_PARAMETER_HEX}
                     or evidence.get("current_stream_stable") is not True
                     or evidence.get("stop_error") or evidence.get("stop_failures")):
                 continue
             matched = {command.get("command_hex"): command.get("matched_response_hex")
                        for command in evidence.get("commands", [])}
             start_response = (b"\x25" + START[1:5] + bytes(8) + b"\xff").hex()
-            if (matched.get(QUERY.hex()) == BOUNDED_START_PARAMETER_HEX
+            if (matched.get(QUERY.hex()) == parameters_hex
                     and matched.get(START.hex()) == start_response):
-                profiles[str(row["id"])] = "bounded_response"
+                if parameters_hex == BOUNDED_START_PARAMETER_HEX:
+                    profiles[str(row["id"])] = "bounded_response"
+                elif matched.get(STOP.hex()) == (b"\x25" + STOP[1:5] + bytes(8) + b"\xff").hex():
+                    profiles[str(row["id"])] = "guarded_response"
         return profiles
 
     def invalidate_readiness(self, interface_ids=None, reason="device_evidence_invalid"):

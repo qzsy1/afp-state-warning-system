@@ -54,6 +54,19 @@ class HealthPayloadTests(unittest.TestCase):
 
 
 class SourceCurvePayloadTests(unittest.TestCase):
+    def test_live_downsampling_always_keeps_latest_measurement(self):
+        for step in (1, 2, 4, 6, 12, 24):
+            with self.subTest(step=step):
+                rows = [{"CH1_ADC_signed": float(index)} for index in range(48)]
+                payload = DashboardData._capture_only_live(
+                    SimpleNamespace(sensors=[]), status={"config": {"acquisition_mode": "real"}},
+                    rows=rows, sensor_columns=["CH1_ADC_signed"], sensor_id=0,
+                    history=48, step=step, prediction_horizon=24)
+                channel = payload["channels"][0]
+                self.assertEqual(channel["actual_current"], 47.0)
+                self.assertEqual(channel["actual"][-1], 47.0)
+                self.assertEqual(len(channel["actual"]), len(channel["source_observations"]))
+
     def test_capture_only_startup_points_use_real_observation_times_in_seconds(self):
         points = [{"value": 12.0, "source_sequence": 4, "received_monotonic": 99.8},
                   {"value": 13.0, "source_sequence": 5, "received_monotonic": 99.9}]
@@ -94,8 +107,8 @@ class DashboardTests(unittest.TestCase):
         channel = payload["channels"][0]
         self.assertEqual(channel["name"], "压实力")
         self.assertEqual(channel["source_channel_name"], "压力")
-        self.assertEqual(channel["actual"], [42.0, 42.0])
-        self.assertEqual([row["source_sequence"] for row in channel["source_observations"]], [1, 2])
+        self.assertEqual(channel["actual"], [42.0, 42.0, 42.0])
+        self.assertEqual([row["source_sequence"] for row in channel["source_observations"]], [1, 2, 2])
         self.assertEqual(payload["progress"]["cursor"], 240)
 
     @classmethod

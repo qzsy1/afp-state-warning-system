@@ -27,6 +27,7 @@ START_SETTLE_SECONDS = 1.0
 PORT_READY_GUARD_SECONDS = 0.5
 QUERY_START_SPACING_SECONDS = 1.3
 BOUNDED_START_PARAMETER_HEX = "26016306040001086800000000ff"
+GUARDED_START_PARAMETER_HEX = "26016306040001080000000000ff"
 RATE_CODES = {0xB0, 0xA1, 0x92, 0x82, 0x72, 0x63, 0x53, 0x43, 0x33, 0x23, 0x13, 0xF1, 0xF2}
 FRESHNESS_LIMIT_SECONDS = 0.25
 FRESHNESS_RECOVERY_INTERVALS = 3
@@ -522,7 +523,7 @@ class Esr1001UsbDriver:
         self.serial_factory = serial_factory
         self.inventory = inventory
         self.recorder = recorder
-        if startup_policy not in {"fixed", "bounded_response"}:
+        if startup_policy not in {"fixed", "bounded_response", "guarded_response"}:
             raise ValueError("unsupported USB startup policy")
         self.startup_policy = startup_policy
         self._effective_startup_policy = startup_policy
@@ -658,7 +659,7 @@ class Esr1001UsbDriver:
                 self._pending.append(record)
 
     def _command(self, command):
-        if self._effective_startup_policy == "bounded_response" and command != STOP:
+        if self._effective_startup_policy != "fixed" and command != STOP:
             if int(getattr(self.serial, "in_waiting", 0)):
                 self._read()
             if self.parser.buffer:
@@ -737,14 +738,14 @@ class Esr1001UsbDriver:
                     raise
                 self.open_stages.add("driver_open")
                 self.start_events.append({"stage": "port_settle_begin", "server_monotonic": time.monotonic()})
-                port_guard = PORT_READY_GUARD_SECONDS if self._effective_startup_policy == "bounded_response" else PORT_SETTLE_SECONDS
+                port_guard = PORT_READY_GUARD_SECONDS if self._effective_startup_policy != "fixed" else PORT_SETTLE_SECONDS
                 self._wait_open_until(time.monotonic() + port_guard)
                 self.start_events.append({"stage": "port_settle_end", "server_monotonic": time.monotonic()})
                 for key in self._previous_metrics:
                     self._previous_metrics[key] += self.parser.metrics()[key]
                 self.parser = UsbStreamParser()
                 self._pending.clear()
-                if self._effective_startup_policy == "bounded_response":
+                if self._effective_startup_policy != "fixed":
                     reset_input = getattr(self.serial, "reset_input_buffer", None)
                     if callable(reset_input):
                         reset_input()
@@ -754,6 +755,9 @@ class Esr1001UsbDriver:
                             self.serial.read(pending)
                 parameters = self._command(QUERY)
                 self.start_events.append({"stage": "query_matched", "server_monotonic": time.monotonic()})
+                if (self._effective_startup_policy == "guarded_response"
+                        and parameters["raw_hex"] != GUARDED_START_PARAMETER_HEX):
+                    raise UsbProtocolError("binding_unconfirmed", "设备参数与已检查的启动配置不同，请重新检查接口")
                 self.protocol_verified = True
                 self.open_stages.add("protocol_identified")
                 if parameters["mode"] != 1:

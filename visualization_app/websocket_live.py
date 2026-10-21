@@ -23,6 +23,71 @@ LIVE_PAYLOAD_VERSION_POLL_SECONDS = 0.01
 LIVE_PAYLOAD_ERROR_RETRY_SECONDS = 0.05
 
 
+def compact_live_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Intern repeated provenance without removing any dashboard evidence."""
+    channels = payload.get("channels")
+    if not isinstance(channels, list):
+        return payload
+    observations: list[Any] = []
+    observation_indices: dict[Any, int] = {}
+    shared_arrays: list[list[Any]] = []
+    array_indices: dict[Any, int] = {}
+
+    def reference(source):
+        if source is None:
+            return None
+        try:
+            key = tuple(sorted(source.items()))
+            hash(key)
+        except (AttributeError, TypeError):
+            key = json.dumps(source, sort_keys=True, ensure_ascii=False)
+        index = observation_indices.get(key)
+        if index is None:
+            index = len(observations)
+            observation_indices[key] = index
+            observations.append(source)
+        return index
+
+    packed = []
+    for channel in channels:
+        item = dict(channel)
+        if isinstance(item.get("source_observations"), list):
+            item["source_observations"] = [reference(source) for source in item["source_observations"]]
+        for field in ("x_observed", "x_future", "actual", "quality_history", "source_observations",
+                      "prediction_observed", "prediction_future"):
+            values = item.get(field)
+            if not isinstance(values, list) or len(values) < 8:
+                continue
+            key = (field, tuple(values))
+            try:
+                index = array_indices.get(key)
+            except TypeError:
+                continue
+            if index is None:
+                index = len(shared_arrays)
+                array_indices[key] = index
+                shared_arrays.append(values)
+            item[field] = {"live_array_index": index}
+        packed.append(item)
+    indices = {id(channel): index for index, channel in enumerate(channels)}
+    result = {**payload, "channels": packed,
+              "live_encoding": {"version": 1, "source_observations": observations,
+                                "shared_arrays": shared_arrays}}
+    selected = payload.get("selected_channel")
+    if id(selected) in indices:
+        result["selected_channel"] = {"live_channel_index": indices[id(selected)]}
+    thermocouples = payload.get("thermocouple64")
+    if isinstance(thermocouples, dict):
+        result["thermocouple64"] = {
+            **thermocouples,
+            "other_channels": [
+                {"live_channel_index": indices[id(channel)]} if id(channel) in indices else channel
+                for channel in thermocouples.get("other_channels", [])
+            ],
+        }
+    return result
+
+
 class VersionedPayloadCache:
     """Build a live payload only when a version-aware source advances."""
 

@@ -6,6 +6,7 @@ import importlib
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -232,7 +233,12 @@ def _show_desktop_window(context: Any, url: str) -> None:
     )
     storage = context.paths.runtime_dir / "webview"
     storage.mkdir(parents=True, exist_ok=True)
-    webview.start(debug=False, private_mode=True, storage_path=str(storage))
+    # Separate browser environments prevent concurrent windows with different
+    # WebView2 options from conflicting over the same user data folder.
+    with tempfile.TemporaryDirectory(
+        prefix="session-", dir=storage, ignore_cleanup_errors=True
+    ) as session_storage:
+        webview.start(debug=False, private_mode=True, storage_path=session_storage)
 
 
 def self_test(context: Any, manager: Any) -> dict[str, Any]:

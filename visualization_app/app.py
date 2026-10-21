@@ -2878,6 +2878,8 @@ class DashboardData:
         total_count = int(status.get("sample_count") or len(rows))
         observed_start = max(0, len(rows) - history)
         indices = np.arange(observed_start, len(rows), step, dtype=int)
+        if len(rows) and (not len(indices) or indices[-1] != len(rows) - 1):
+            indices = np.append(indices, len(rows) - 1)
         if step > 1 and config.get("acquisition_mode") == "real" and source_rows:
             retained = set(int(index) for index in indices)
             for name in sensor_columns:
@@ -3856,6 +3858,8 @@ class DashboardData:
 
         observed_start = max(0, len(rows) - history)
         observed_indices = np.arange(observed_start, len(rows), step, dtype=int)
+        if len(rows) and (not len(observed_indices) or observed_indices[-1] != len(rows) - 1):
+            observed_indices = np.append(observed_indices, len(rows) - 1)
         sampling_hz = (
             _finite(status.get("config", {}).get("sample_rate_hz"), 10.0)
             if status.get("config")
@@ -5031,6 +5035,9 @@ class AppHandler(BaseHTTPRequestHandler):
             payload["acquisition"] = self.guest_manager.public_status(
                 self._identity().guest_id, payload["acquisition"]
             )
+        if self._one(query, "live_encoding", "") == "1":
+            from websocket_live import compact_live_payload
+            payload = compact_live_payload(payload)
         return payload
 
     def _serve_live_websocket(self, query: dict[str, list[str]]) -> None:

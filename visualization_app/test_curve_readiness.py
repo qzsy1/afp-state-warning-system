@@ -115,6 +115,28 @@ status.capture_generation='current';evidence.latest_matrix.matrix[0]=[NaN];rende
             manager.invalidate_readiness(["one"])
             self.assertEqual(manager.usb_startup_profiles(cfg), {})
 
+    def test_guarded_usb_profile_requires_verified_stop_and_exact_current_parameters(self):
+        from real_acquisition import ReadinessSnapshot, readiness_config_fingerprint
+        from esr1001_usb import USB_DRIVER, GUARDED_START_PARAMETER_HEX
+        with tempfile.TemporaryDirectory() as root:
+            manager = AcquisitionManager(Path(root), recovery_scan=False)
+            cfg = config(root)
+            cfg.interfaces[0]["driver"] = USB_DRIVER
+            evidence = {"parameters": {"raw_hex": GUARDED_START_PARAMETER_HEX},
+                        "current_stream_stable": True, "commands": [
+                            {"command_hex": "23a8000000ff", "matched_response_hex": GUARDED_START_PARAMETER_HEX},
+                            {"command_hex": "23a1010000ff", "matched_response_hex": "25a10100000000000000000000ff"}]}
+            result = {"ok": True, "interfaces": [{"id": "one", "driver": USB_DRIVER,
+                      "ok": True, "state": "data_ready", "usb_evidence": evidence}]}
+            manager._latest_check_result = result
+            manager._readiness_snapshot = ReadinessSnapshot.create(cfg, result)
+            manager._session_readiness_fingerprint = readiness_config_fingerprint(cfg)
+            self.assertEqual(manager.usb_startup_profiles(cfg), {})
+            evidence["commands"].append({"command_hex": "23a1000000ff", "matched_response_hex": "25a10000000000000000000000ff"})
+            self.assertEqual(manager.usb_startup_profiles(cfg), {"one": "guarded_response"})
+            evidence["commands"][0]["matched_response_hex"] = "different"
+            self.assertEqual(manager.usb_startup_profiles(cfg), {})
+
     def test_two_fresh_source_observations_survive_unified_frame_holding(self):
         with tempfile.TemporaryDirectory() as root:
             manager = AcquisitionManager(Path(root), recovery_scan=False)
@@ -504,6 +526,18 @@ frames.shift()();
 assert.deepEqual(applied,[3,4]);
 socket.onmessage({data:JSON.stringify({...payload(5),acquisition:{start_request_id:'other',capture_generation:'generation'}})});
 assert.deepEqual(applied,[3,4]);
+trace.complete=true;
+socket.onmessage({data:JSON.stringify(payload(6))});
+socket.onmessage({data:JSON.stringify(payload(7))});
+socket.onmessage({data:JSON.stringify(payload(8))});
+assert.deepEqual(applied,[3,4]);
+assert.equal(frames.length,1);
+frames.shift()();
+assert.deepEqual(applied,[3,4,8]);
+socket.onmessage({data:JSON.stringify(payload(9))});
+state.liveSocket=null;
+frames.shift()();
+assert.deepEqual(applied,[3,4,8]);
 '''
         result = subprocess.run(["node", "-"], input=script, text=True, capture_output=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)

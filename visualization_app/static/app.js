@@ -3739,7 +3739,32 @@ function closeLiveWebSocket() {
   }
 }
 
+function expandLivePayload(payload) {
+  if (payload?.live_encoding?.version !== 1) return payload;
+  const observations = payload.live_encoding.source_observations;
+  for (const channel of payload.channels || []) {
+    for (const field of ["x_observed", "x_future", "actual", "quality_history", "source_observations",
+                         "prediction_observed", "prediction_future"]) {
+      if (Number.isInteger(channel[field]?.live_array_index)) {
+        channel[field] = payload.live_encoding.shared_arrays[channel[field].live_array_index].slice();
+      }
+    }
+    if (Array.isArray(channel.source_observations)) {
+      channel.source_observations = channel.source_observations.map(index => index === null ? null : observations[index]);
+    }
+  }
+  const resolve = channel => Number.isInteger(channel?.live_channel_index)
+    ? payload.channels[channel.live_channel_index] : channel;
+  payload.selected_channel = resolve(payload.selected_channel);
+  if (payload.thermocouple64) {
+    payload.thermocouple64.other_channels = payload.thermocouple64.other_channels.map(resolve);
+  }
+  delete payload.live_encoding;
+  return payload;
+}
+
 function applyRealtimePayload(payload, renderOptions = {}) {
+  payload = expandLivePayload(payload);
   if (!payload || payload.type === "error") {
     throw new Error(payload?.error || "实时数据服务异常");
   }
@@ -4033,13 +4058,6 @@ function openLiveWebSocket() {
       if (payload?.type === "heartbeat") return;
       if (window.afpCurveTrace && controls.acquisitionMode?.value === "real"
           && !window.afpCurveTrace.accepts(payload?.acquisition)) return;
-      const trace = controls.acquisitionMode?.value === "real" ? window.afpCurveTrace : null;
-      const completeStartupPayload = startupCurvePayloadHasAllChannels(payload, trace);
-      const needsPaintBoundary = Boolean(trace && !trace.complete) || completeStartupPayload;
-      if (!needsPaintBoundary) {
-        applyRealtimePayload(payload);
-        return;
-      }
       if (pendingPayload) state.browserCoalescedPayloads = (state.browserCoalescedPayloads || 0) + 1;
       pendingPayload = payload;
       if (!renderScheduled) {
@@ -4047,7 +4065,10 @@ function openLiveWebSocket() {
         window.requestAnimationFrame(() => {
           renderScheduled = false;
           const latest = pendingPayload;pendingPayload = null;
-          if (latest && state.liveSocket === socket) applyRealtimePayload(latest);
+          if (latest && state.liveSocket === socket) {
+            try { applyRealtimePayload(latest); }
+            catch (error) { $("connectionStatus").textContent = `实时数据服务异常：${error.message}`; }
+          }
         });
       }
     } catch (error) {
@@ -4073,6 +4094,7 @@ function openLiveWebSocket() {
 function queryString() {
   const predictionSensors = selectedPredictionSensors();
   return new URLSearchParams({
+    live_encoding: "1",
     specimen: controls.specimen.value,
     sensor: controls.sensor.value,
     cursor: controls.cursor.value,
@@ -4985,8 +5007,9 @@ function renderThermocouple64(payload) {
     panel.classList.add('hidden'); split?.classList.add('thermocouple-unavailable');
     state.thermocouple64Cache = null; return;
   }
+  const panelBecameVisible = panel.classList.contains('hidden');
   panel.classList.remove('hidden'); split?.classList.remove('thermocouple-unavailable');
-  window.requestAnimationFrame(() => split?.reapplySensorPanelRatio?.());
+  if (panelBecameVisible) window.requestAnimationFrame(() => split?.reapplySensorPanelRatio?.());
   const rawNames = payload.raw_directory.channels.map(item => item.name);
   const rawRows = (payload.raw_history || []).slice(-THERMOCOUPLE64_HISTORY_LIMIT);
   const derivedRows = (payload.derived_history || []).slice(-THERMOCOUPLE64_HISTORY_LIMIT);
@@ -5979,13 +6002,15 @@ function initializeSensorPanelResizer() {
     const total = availableHeight();
     const limits = ratioLimits(total);
     const safe = Math.max(limits.minimum, Math.min(limits.maximum, requested));
-    split.style.setProperty("--thermocouple-pane-size", `${Math.round(total * safe)}px`);
+    const size = `${Math.round(total * safe)}px`;
+    const sizeChanged = split.style.getPropertyValue("--thermocouple-pane-size") !== size;
+    if (sizeChanged) split.style.setProperty("--thermocouple-pane-size", size);
     handle.setAttribute("aria-valuemin", String(Math.round(limits.minimum * 100)));
     handle.setAttribute("aria-valuemax", String(Math.round(limits.maximum * 100)));
     handle.setAttribute("aria-valuenow", String(Math.round(safe * 100)));
     handle.setAttribute("aria-valuetext", `热电偶面板 ${Math.round(safe * 100)}%，其他传感器面板 ${Math.round((1 - safe) * 100)}%`);
     if (persist) persistRatio();
-    redrawChartsAfterColumnResize();
+    if (sizeChanged) redrawChartsAfterColumnResize();
   }
 
   function resetRatio() {

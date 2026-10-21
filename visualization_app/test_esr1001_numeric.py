@@ -43,6 +43,75 @@ def source_record(sequence=1):
 
 
 class NumericTests(unittest.TestCase):
+    def test_main_csv_saves_display_strain_and_keeps_adc_source_evidence(self):
+        from acquisition import AcquisitionConfig, AcquisitionManager
+        from test_esr1001_usb import StreamingSerial, UsbIntegrationTests
+        candidate = fixture_vendor_candidate()
+        interface = dict(UsbIntegrationTests.config().interfaces[0],
+                         channel_settings={"esr_vendor_candidate": candidate})
+        with tempfile.TemporaryDirectory() as root, \
+                patch("serial.Serial", side_effect=StreamingSerial), \
+                patch("serial.tools.list_ports.comports", return_value=[SimpleNamespace(device="COM91", location="test")]):
+            config = AcquisitionConfig(acquisition_mode="real", dataset_schema="new_collection_v13_0",
+                interfaces=[interface], processing_mode="capture_only", save_root=root)
+            manager = AcquisitionManager(Path(root), recovery_scan=False)
+            self.assertTrue(manager.test_connection(config)["ok"])
+            manager.start(config)
+            try:
+                deadline = time.monotonic() + 2
+                while manager.total_sample_count < 3 and time.monotonic() < deadline:
+                    time.sleep(.01)
+            finally:
+                result = manager.stop()
+            self.assertTrue(result["finalization_complete"], result)
+            with manager.raw_path.open(encoding="gb18030", newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertGreaterEqual(len(rows), 3)
+            expected = {f"应变{i}": vendor_display(adc * .007456 + 420.95)
+                        for i, adc in enumerate(USB_EXPECTED_ADC, 1)}
+            for row in rows:
+                self.assertFalse(set(RAW_CHANNELS).intersection(row))
+                self.assertEqual({key: row[key] for key in expected}, expected)
+            with manager.full_specimen_path.open(encoding="gb18030", newline="") as stream:
+                self.assertEqual(list(csv.DictReader(stream)), rows)
+            for row in manager.rows:
+                self.assertEqual(tuple(row[name] for name in RAW_CHANNELS), USB_EXPECTED_ADC)
+            evidence = manager.driver.interface_quality_metadata["esr"]
+            self.assertEqual(evidence["data_mode"], "raw_adc")
+            replayed = list(replay_source_capture(evidence["raw_file"]))
+            self.assertGreaterEqual(len(replayed), len(rows))
+            self.assertEqual(tuple(replayed[0][name] for name in RAW_CHANNELS), USB_EXPECTED_ADC)
+
+    def test_saved_strain_uses_each_frames_zero_and_preserves_missing_rows(self):
+        from acquisition import AcquisitionConfig
+        from real_acquisition import ChannelSample, ChannelQuality, UnifiedFrame
+        from test_esr1001_usb import UsbIntegrationTests
+        candidate = fixture_vendor_candidate()
+        config = AcquisitionConfig(acquisition_mode="real", dataset_schema="new_collection_v13_0",
+            interfaces=[dict(UsbIntegrationTests.config().interfaces[0],
+                channel_settings={"esr_vendor_candidate": candidate})], processing_mode="capture_only")
+        record = source_record(2)
+        record["vendor_candidate_digest"] = content_digest(candidate)
+        baseline = dict(zip(RAW_CHANNELS, (value - 10 for value in USB_EXPECTED_ADC)))
+        zero = {"id": "zero", "adc_values": baseline,
+                "vendor_candidate_values": calibrated_values(baseline, candidate)}
+        record.update(measurement_record(record, None, zero=zero, vendor_candidate=candidate))
+        row = dict(zip(RAW_CHANNELS, USB_EXPECTED_ADC))
+        unchanged = copy.deepcopy(row)
+        for quality, expected in ((ChannelQuality.MEASURED_NEW, "0.1"),
+                                  (ChannelQuality.HELD_WITHIN_FRESHNESS, "0.1"),
+                                  (ChannelQuality.MISSING, ""), (ChannelQuality.STALE, ""),
+                                  (ChannelQuality.INVALID, "")):
+            for remote in (False, True):
+                with self.subTest(quality=quality, remote=remote):
+                    metadata = {"adc_source": record} if remote else {
+                        "latest_record": record, "vendor_candidate_snapshot": candidate}
+                    frame = UnifiedFrame(capture_sequence=0, target_monotonic=1, target_wall_time=1,
+                        channels={name: ChannelSample(interface_id="esr", channel_name=name,
+                            value=value, quality=quality, metadata=metadata) for name, value in row.items()})
+                    saved = config.saved_row(row, frame)
+                    self.assertEqual(saved, {f"应变{i}": expected for i in range(1, 5)})
+                    self.assertEqual(row, unchanged)
     @unittest.skipUnless(shutil.which("node"), "需要Node验证应变通道显示投影")
     def test_vendor_display_replaces_original_strain_slots_without_mutating_adc(self):
         script = r'''
