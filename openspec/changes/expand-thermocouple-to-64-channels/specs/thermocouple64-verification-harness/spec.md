@@ -132,8 +132,8 @@ Harness SHALL 提供确定性的 64 路容量场景，分别测量采集/保存�
 - **WHEN** 测试把显示消费速度限制到低于采集速度
 - **THEN** 采集和保存仍完成全部预期帧，显示只减少绘制次数或合并增量，不增加保存缺口
 
-### Requirement: F 盘单一主运行交付
-系统 SHALL 只把 `F:\new_AFP_exam\AFP_Integrated_System_Modular` 作为受支持的完整主运行目录。源码 SHALL 位于 `F:\new_AFP_exam\AFP-Readiness-Repo`，构建中间产物 SHALL 仅位于 `F:\new_AFP_exam\.afp-staging`，默认采集目录 SHALL 为 `F:\AFP_Capture`。C 盘 MUST NOT 保存完整交付包、候选运行目录、构建缓存或采集数据。未经用户明确许可，系统 MUST NOT 保留第二个完整可运行副本或大体积运行归档。
+### Requirement: D 盘单一主运行交付
+系统 SHALL 只把 `D:\AFP_Runtime\AFP_Integrated_System_Modular` 作为受支持的完整主运行目录。源码 SHALL 位于 `D:\AFP_Integrated_Modular_v2`，构建中间产物 SHALL 仅位于 `D:\AFP_Runtime\.afp-staging`，默认采集目录 SHALL 为 `D:\AFP_Capture`。C 盘 MUST NOT 保存完整交付包、候选运行目录、构建缓存或采集数据。未经用户明确许可，系统 MUST NOT 保留第二个完整可运行副本或大体积运行归档。
 
 #### Scenario: 提升已验证候选
 - **WHEN** 已验证候选被提升为当前运行版本
@@ -141,11 +141,11 @@ Harness SHALL 提供确定性的 64 路容量场景，分别测量采集/保存�
 
 #### Scenario: 构建或验证失败
 - **WHEN** 候选构建、完整性检查或启动验证失败
-- **THEN** 失败内容只在 F 盘 staging 中处理并完成清理，不得回退到 C 盘保留大体积副本
+- **THEN** 失败内容只在 D 盘 staging 中处理并完成清理，不得回退到 C 盘保留大体积副本
 
 #### Scenario: 检查保存位置
 - **WHEN** Harness 检查交付目录、staging 根和默认采集目录
-- **THEN** 所有路径均位于 F 盘，且没有未经许可的第二个完整运行程序
+- **THEN** 所有路径均位于 D 盘，且没有未经许可的第二个完整运行程序
 
 ### Requirement: 旧模式和模型隔离回归
 Harness SHALL 在同一矩阵中验证旧 8 路数据文件仍可回放和导出，但旧 8 路实物采集入口已移除；现有模型不得被错误地解释为 8 组均值模型。

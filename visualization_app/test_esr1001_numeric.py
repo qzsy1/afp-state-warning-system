@@ -15,7 +15,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from esr1001_usb import (RAW_CHANNELS, Esr1001UsbDriver, RawCaptureWriter, UsbProtocolError,
     calibrated_values, content_digest, measurement_record, read_vendor_candidate,
-    confirm_vendor_candidate, load_calibration, replay_source_capture, vendor_display, verify_source_evidence)
+    confirm_vendor_candidate, load_calibration, normalize_vendor_candidate, replay_source_capture,
+    vendor_display, verify_source_evidence)
 from esr1001_fixtures import USB_DATA, USB_EXPECTED_ADC
 
 
@@ -25,6 +26,16 @@ def fixture_profile():
         "channels": [{"K": .007456, "B": 420.95}] * 4}
 
 
+def fixture_vendor_candidate():
+    return {"kind": "esr1001_vendor_candidate_v1", "confirmed": False,
+        "source": r"C:\Program Files (x86)\ESR1001四通道应变仪采集软件\Config.xml",
+        "source_sha256": "d82372383067befd70f00e6823e824826817009ba3798f4a9e78527a4aef2822",
+        "unit": "με", "display_format": "0.0",
+        "channels": [{"K": .007456, "B": 420.95}] * 4,
+        "vendor_settings": {"PGA": "6", "Speed": "6", "SendNum": "1", "FilterNum": "0"},
+        "applicability": "待逐路确认设备、接线、桥路、增益和标定依据；示例系数不能证明适用"}
+
+
 def source_record(sequence=1):
     return dict(zip(RAW_CHANNELS, USB_EXPECTED_ADC), receive_sequence=sequence,
         host_wall_time=time.time(), host_monotonic=time.monotonic(), raw_hex=USB_DATA.hex(),
@@ -32,6 +43,130 @@ def source_record(sequence=1):
 
 
 class NumericTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("node"), "需要Node验证应变通道显示投影")
+    def test_vendor_display_replaces_original_strain_slots_without_mutating_adc(self):
+        script = r'''
+const fs=require('fs'),assert=require('assert');
+const source=fs.readFileSync('visualization_app/static/app.js','utf8');
+eval(source.slice(source.indexOf('function esrChannelContext('),source.indexOf('const esrRelativeHistory')));
+eval(source.slice(source.indexOf('function esrDisplayBasis('),source.indexOf('function renderEsrNumeric(')));
+const evidence={capture_generation:'driver',connection_generation:1,data_mode:'raw_adc',vendor_candidate_digest:'candidate',
+ vendor_candidate_snapshot:{channels:Array.from({length:4},()=>({K:.007456,B:420.95}))},zero:null,
+ latest_record:{receive_sequence:2,host_monotonic:2,CH1_ADC_signed:5008,vendor_candidate_values:{应变1:458.289648},display_vendor_candidate_values:{应变1:'458.3'}}};
+const status={capture_generation:'capture',running:false,interfaces:[{id:'esr1001_strain',usb_evidence:evidence}]};
+const raw={id:65,name:'CH1_ADC_signed',unit:'adc_counts',actual:[5000,5008],actual_current:5008,x_observed:[-1,0],
+ source_observations:[1,2].map((n)=>({capture_generation:'capture',interface_id:'esr1001_strain',source_sequence:n,received_monotonic:n,quality:'measured_new'}))};
+const unchanged=structuredClone(raw);
+const pressure={id:4,name:'压力',unit:'N',actual:[1,2]};
+const channels=esrSensorDisplayChannels([pressure,{id:5,name:'应变1',unit:'με'},raw],status);
+assert.equal(channels.length,2);assert.strictEqual(channels[0],pressure);
+const projected=channels[1];
+assert.equal(projected.id,65);assert.equal(projected.name,'CH1_ADC_signed');assert.equal(projected.display_name,'应变1 · CH1');
+assert.equal(projected.unit,'με');assert.equal(projected.actual_current,458.289648);
+assert.equal(projected.esr_display.text,'458.3');assert.equal(projected.esr_display.historical,true);
+assert.deepStrictEqual(projected.actual,raw.actual.map(v=>v*.007456+420.95));
+assert.equal(projected.prediction_enabled,false);assert.equal(projected.startup_curve,undefined);
+assert.deepStrictEqual(raw,unchanged);
+assert.deepStrictEqual(esrSensorDisplayChannels(channels,status),channels);
+const one=esrSensorDisplayChannels([{...raw,actual:[5008],source_observations:[raw.source_observations[1]]}],status)[0];
+assert.equal(one.esr_display.curve_ready,false);
+assert.equal(projected.esr_display.curve_ready,true);
+const startup=esrSensorDisplayChannels([{...raw,actual:[5008],source_observations:[raw.source_observations[1]],
+ startup_curve:{actual:raw.actual,x_observed:raw.x_observed,source_observations:raw.source_observations}}],status)[0];
+assert.equal(startup.esr_display.curve_ready,true);
+assert.deepStrictEqual(startup.actual,projected.actual);
+const gap=esrSensorDisplayChannels([{...raw,source_observations:[raw.source_observations[0],{...raw.source_observations[1],quality:'stale'}]}],status)[0];
+assert.equal(gap.actual[1],null);assert.equal(gap.esr_display.curve_ready,false);
+const foreign=esrSensorDisplayChannels([{...raw,source_observations:raw.source_observations.map(s=>({...s,capture_generation:'old'}))}],status);
+assert.equal(foreign[0].unit,'adc_counts');
+evidence.zero={id:'zero',receive_sequence:1,vendor_candidate_values:{应变1:458.23}};
+evidence.latest_record={...evidence.latest_record,zero_id:'zero',vendor_candidate_relative_values:{相对应变1:.059648},display_vendor_candidate_relative_values:{相对应变1:'0.1'}};
+const relative=esrSensorDisplayChannels([raw],status)[0];
+assert.equal(relative.actual[0],null);assert.equal(relative.esr_display.text,'0.1');
+assert(Math.abs(relative.actual[1]-(5008*.007456+420.95-458.23))<1e-10);
+'''
+        subprocess.run([shutil.which("node"), "-e", script], cwd=Path(__file__).resolve().parents[1], check=True, timeout=20)
+
+    def test_shared_plan_rejects_stale_page_that_removes_vendor_snapshot(self):
+        from pre_sensor_config import InterfacePlanStore
+        with tempfile.TemporaryDirectory() as root:
+            store = InterfacePlanStore(Path(root) / "plans.json")
+            payload = {"active": "esr1001_raw_adc", "plans": {"esr1001_raw_adc": {
+                "interfaces": [{"id": "esr", "channel_settings": {}}]}}}
+            store.save(payload)
+            stale, revision = store.load_with_revision()
+            current = copy.deepcopy(stale)
+            current["plans"]["esr1001_raw_adc"]["interfaces"][0]["channel_settings"] = {
+                "esr_vendor_candidate": fixture_vendor_candidate()}
+            updated_revision = store.save(current, expected_revision=revision, require_revision=True)
+            self.assertNotEqual(revision, updated_revision)
+            with self.assertRaisesRegex(ValueError, "interface_plan_conflict"):
+                store.save(stale, expected_revision=revision, require_revision=True)
+            with self.assertRaisesRegex(ValueError, "interface_plan_conflict"):
+                store.save(stale, require_revision=True)
+            self.assertEqual(store.load(), current)
+
+    def test_replay_rejects_foreign_zero_generation_and_raw_unit_or_digest(self):
+        with tempfile.TemporaryDirectory() as root:
+            driver = self.driver()
+            writer = RawCaptureWriter(root, {"calibration_snapshot": driver.calibration,
+                "calibration_digest": driver.calibration_digest, "capture_generation": driver.capture_generation})
+            writer.submit(dict(driver.latest_record, **measurement_record(driver.latest_record, driver.calibration)))
+            zero = self.set_zero(driver)
+            second = source_record(2)
+            writer.submit(dict(second, **measurement_record(second, driver.calibration, zero)))
+            writer.close({})
+            original = writer.path.read_text(encoding="utf-8")
+            self.assertEqual(len(list(replay_source_capture(writer.path))), 2)
+            for field in ("zero_generation", "unit"):
+                rows = list(csv.DictReader(original.splitlines()))
+                if field == "zero_generation":
+                    foreign = json.loads(rows[1]["zero_snapshot_json"])
+                    foreign["capture_generation"] = "another-capture"
+                    rows[1]["zero_snapshot_json"] = json.dumps(foreign)
+                else:
+                    rows[1]["unit"] = "με"
+                with writer.path.open("w", encoding="utf-8", newline="") as stream:
+                    output = csv.DictWriter(stream, fieldnames=rows[0].keys())
+                    output.writeheader(); output.writerows(rows)
+                with self.subTest(field=field), self.assertRaises(ValueError):
+                    list(replay_source_capture(writer.path))
+            writer.path.write_text(original, encoding="utf-8")
+            metadata = json.loads(writer.metadata_path.read_text(encoding="utf-8"))
+            metadata["calibration_snapshot"] = None
+            writer.metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                list(replay_source_capture(writer.path))
+            raw = source_record()
+            raw["calibration_digest"] = "orphaned-digest"
+            raw_writer = RawCaptureWriter(root, {"calibration_snapshot": None, "calibration_digest": "orphaned-digest"})
+            raw_writer.submit(dict(raw, **measurement_record(raw, None)))
+            raw_writer.close({})
+            with self.assertRaises(ValueError):
+                list(replay_source_capture(raw_writer.path))
+            with self.assertRaises(ValueError):
+                verify_source_evidence({"record": dict(raw, unit="με"), "calibration_snapshot": None})
+
+    @unittest.skipUnless(shutil.which("node"), "需要Node验证比较口径提示")
+    def test_numeric_comparison_basis_distinguishes_units_and_zero(self):
+        script = r'''
+const fs=require('fs'), assert=require('assert');
+const source=fs.readFileSync('visualization_app/static/app.js','utf8');
+eval(source.slice(source.indexOf('function esrComparisonBasis('),source.indexOf('function renderEsrNumeric(')));
+const raw=esrComparisonBasis({data_mode:'raw_adc',zero:null});
+assert(raw.includes('adc_counts'));assert(raw.includes('不能直接比较'));assert(raw.includes('K/B'));
+assert(esrComparisonBasis({data_mode:'raw_adc',zero:{id:'z'}}).includes('相对ADC'));
+const candidate=esrComparisonBasis({data_mode:'raw_adc',vendor_candidate_snapshot:{unit:'με'},zero:null});
+assert(candidate.includes('厂商候选微应变'));assert(candidate.includes('不进入模型'));
+assert(esrComparisonBasis({data_mode:'microstrain',calibration_snapshot:{},zero:null}).includes('标定绝对值'));
+assert(esrComparisonBasis({data_mode:'microstrain',calibration_snapshot:{},zero:{id:'z'}}).includes('单帧零点'));
+assert(source.includes('esrComparisonBasis(evidence)'));
+assert(source.includes('display_vendor_candidate_values'));
+assert(source.includes('厂商候选显示 (με，未确认)'));
+'''
+        subprocess.run([shutil.which("node"), "-e", script], cwd=Path(__file__).resolve().parents[1], check=True, timeout=20)
+
+
     def test_reported_context_is_preserved_without_enabling_calibration(self):
         from acquisition import AcquisitionConfig
         from pre_sensor_config import InterfacePlanStore
@@ -92,10 +227,35 @@ assert(esrChannelContext(context,1).includes('接线损坏'));
 assert(esrChannelContext(context,3).includes('未接传感器'));
 assert(esrChannelContext({},2).includes('未核验'));
 const html=fs.readFileSync('visualization_app/static/index.html','utf8');
-assert(html.indexOf('id="esrNumericPanel"')>html.indexOf('<main class="main-content">'));
+assert(html.indexOf('id="esrNumericPanel"')>html.indexOf('<template id="esrDiagnosticsTemplate">'));
+assert(!html.slice(html.indexOf('<main class="main-content">')).includes('id="esrNumericPanel"'));
+assert(!html.includes('id="esrRelativeTrends"'));
+assert(source.includes('usbOptions.append(document.getElementById("esrDiagnosticsTemplate").content.cloneNode(true))'));
 assert.strictEqual(html.match(/id="esrNumericPanel"/g).length,1);
 '''
         subprocess.run([shutil.which("node"), "-e", script], cwd=Path(__file__).resolve().parents[1], check=True, timeout=20)
+    @unittest.skipUnless(shutil.which("node"), "需要Node验证ADC饱和提示")
+    def test_sensor_cards_distinguish_adc_rails_from_valid_measurements(self):
+        script = r'''
+const fs=require('fs'),assert=require('assert');
+const source=fs.readFileSync('visualization_app/static/app.js','utf8');
+eval(source.slice(source.indexOf('function sensorCardMeasurementState('),source.indexOf('function renderSensorCardsInto(')));
+for(const value of [8388607,-8388608]) {
+ const channel={name:'CH2_ADC_signed',unit:'adc_counts',actual_current:value,quality:'有效',actual:[value,value]};
+ const before=JSON.stringify(channel), result=sensorCardMeasurementState(channel);
+ assert(result.warning);assert(result.label.includes('饱和'));assert(result.label.includes('量值不可用'));
+ assert(result.detail.includes('清零不能恢复量程'));assert.strictEqual(JSON.stringify(channel),before);
+}
+for(const value of [0,8388606,-8388607]) {
+ const result=sensorCardMeasurementState({name:'CH2_ADC_signed',unit:'adc_counts',actual_current:value});
+ assert(!result.warning);assert(result.label.includes('未标定'));
+}
+assert.strictEqual(sensorCardMeasurementState({name:'温度1',unit:'℃',actual_current:8388607}).label,'有效');
+assert.strictEqual(sensorCardMeasurementState({name:'CH2_ADC_signed',unit:'adc_counts',actual_current:null,quality:'过期'}).label,'过期');
+assert(source.includes('card.classList.toggle("adc-saturated", measurement.warning)'));
+'''
+        subprocess.run([shutil.which("node"), "-e", script], cwd=Path(__file__).resolve().parents[1], check=True, timeout=20)
+
     def test_readonly_import_confirm_and_mismatch(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "Config.xml"
@@ -123,6 +283,73 @@ assert.strictEqual(html.match(/id="esrNumericPanel"/g).length,1);
             path.write_text(xml.replace("420.95", "420.96"), encoding="utf-8")
             with self.assertRaises(ValueError):
                 confirm_vendor_candidate(candidate, conditions)
+
+    def test_vendor_candidate_display_is_separate_from_calibration_and_model(self):
+        candidate, digest = normalize_vendor_candidate(fixture_vendor_candidate())
+        record = source_record()
+        record["calibration_digest"] = ""
+        record["vendor_candidate_digest"] = digest
+        computed = measurement_record(record, None, vendor_candidate=candidate)
+        expected = calibrated_values(record, candidate)
+        self.assertEqual(computed["calibrated_values"], {})
+        self.assertEqual(computed["relative_values"], {})
+        self.assertEqual(computed["vendor_candidate_values"], expected)
+        self.assertEqual(computed["display_vendor_candidate_values"]["应变2"], vendor_display(expected["应变2"]))
+        self.assertEqual(computed["range_assessment"], ["range_unverified"] * 4)
+        driver = Esr1001UsbDriver("fixture", vendor_candidate=candidate)
+        self.assertIsNone(driver.calibration)
+        self.assertEqual(driver.calibration_digest, "")
+        self.assertEqual(driver.quality_metadata["vendor_candidate_state"], "available_unconfirmed")
+        self.assertEqual(driver.quality_metadata["vendor_candidate_digest"], digest)
+        from acquisition import AcquisitionConfig
+        config = AcquisitionConfig(dataset_schema="esr1001_raw_adc", processing_mode="capture_only",
+            interfaces=[{"id": "esr", "role": "esr1001_strain", "driver": "esr1001_usb_ttl",
+                "endpoint": "COM91", "data_mode": "raw_adc",
+                "channel_settings": {"esr_vendor_candidate": candidate}}])
+        interface = config.interfaces[0]
+        self.assertEqual(interface["channel_settings"]["esr_vendor_candidate"], candidate)
+        self.assertEqual(interface["vendor_candidate_digest"], digest)
+        self.assertIsNone(interface.get("calibration_profile"))
+
+    def test_vendor_candidate_zero_save_replay_and_tamper_rejection(self):
+        candidate, digest = normalize_vendor_candidate(fixture_vendor_candidate())
+        with tempfile.TemporaryDirectory() as root:
+            driver = Esr1001UsbDriver("fixture", vendor_candidate=candidate)
+            driver.started = True
+            driver.connection_generation = 1
+            driver.latest_record = source_record()
+            driver.latest_record["calibration_digest"] = ""
+            driver.latest_record["vendor_candidate_digest"] = digest
+            writer = RawCaptureWriter(root, {"calibration_snapshot": None, "calibration_digest": "",
+                "vendor_candidate_snapshot": candidate, "vendor_candidate_digest": digest,
+                "capture_generation": driver.capture_generation})
+            writer.submit(dict(driver.latest_record, **measurement_record(
+                driver.latest_record, None, vendor_candidate=candidate)))
+            zero = self.set_zero(driver)
+            self.assertEqual(zero["calibrated_values"], {})
+            self.assertEqual(zero["vendor_candidate_values"], calibrated_values(driver.latest_record, candidate))
+            second = source_record(2)
+            second["calibration_digest"] = ""
+            second["vendor_candidate_digest"] = digest
+            second[RAW_CHANNELS[1]] += 10
+            raw = bytearray(USB_DATA)
+            raw[7:10] = (second[RAW_CHANNELS[1]] & 0xffffff).to_bytes(3, "big")
+            second["raw_hex"] = raw.hex()
+            second.update(measurement_record(second, None, zero, candidate))
+            self.assertEqual(second["relative_values"]["CH2_ADC_relative"], 10)
+            self.assertAlmostEqual(second["vendor_candidate_relative_values"]["相对应变2"], .07456)
+            self.assertEqual(second["calibrated_values"], {})
+            writer.submit(second)
+            writer.close(driver.quality_metadata)
+            rows = list(replay_source_capture(writer.path))
+            self.assertAlmostEqual(rows[1]["vendor_candidate_relative_values"]["相对应变2"], .07456)
+            verify_source_evidence({"record": rows[1], "calibration_snapshot": None,
+                "vendor_candidate_snapshot": candidate, "capture_generation": driver.capture_generation})
+            metadata = json.loads(writer.metadata_path.read_text(encoding="utf-8"))
+            metadata["vendor_candidate_snapshot"]["channels"][0]["K"] = 1
+            writer.metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                list(replay_source_capture(writer.path))
 
     def driver(self):
         driver = Esr1001UsbDriver("fixture", data_mode="microstrain")
@@ -210,7 +437,7 @@ assert.strictEqual(html.match(/id="esrNumericPanel"/g).length,1);
         script = r'''
 const fs = require('fs'), assert = require('assert');
 const source = fs.readFileSync('visualization_app/static/app.js', 'utf8');
-eval(source.slice(source.indexOf('function updateEsrRelativeHistory('), source.indexOf('function renderEsrNumeric(')));
+eval(source.slice(source.indexOf('function esrDisplayBasis('), source.indexOf('function renderEsrNumeric(')));
 const history = {key: '', points: []};
 const e = {capture_generation:'capture', connection_generation:1, calibration_digest:'', zero:{id:'zero'},
   latest_record:{receive_sequence:2, host_monotonic:1, zero_id:'zero', relative_values:{CH2_ADC_relative:0}}};
@@ -232,6 +459,48 @@ assert.strictEqual(history.points.length,0);
 e.connection_generation=2;
 updateEsrRelativeHistory(history,e,false);
 assert.strictEqual(history.points.length,0);
+'''
+        subprocess.run([shutil.which("node"), "-e", script], cwd=Path(__file__).resolve().parents[1], check=True, timeout=20)
+
+    @unittest.skipUnless(shutil.which("node"), "需要Node验证厂商候选主显示")
+    def test_vendor_candidate_is_primary_four_channel_display_and_drift_is_observation_only(self):
+        script = r'''
+const fs = require('fs'), assert = require('assert');
+const source = fs.readFileSync('visualization_app/static/app.js', 'utf8');
+eval(source.slice(source.indexOf('function esrDisplayBasis('), source.indexOf('function renderEsrNumeric(')));
+const history = {key: '', points: []};
+const evidence = {capture_generation:'capture', connection_generation:1, calibration_digest:'',
+  vendor_candidate_digest:'candidate', vendor_candidate_snapshot:{unit:'με'}, zero:null,
+  latest_record:{receive_sequence:1, host_monotonic:1,
+    vendor_candidate_values:{应变1:10.04,应变2:-18640.14,应变3:-90.46,应变4:59.44},
+    display_vendor_candidate_values:{应变1:'10.0',应变2:'-18640.1',应变3:'-90.5',应变4:'59.4'}}};
+let basis = esrDisplayBasis(evidence);
+assert.strictEqual(basis.unit, 'με');
+assert.strictEqual(basis.title, '厂商候选应变');
+assert.strictEqual(basis.display(2), '-18640.1');
+updateEsrRelativeHistory(history,evidence,true);
+assert.strictEqual(esrObservedRange(history.points,basis.key(2)).ready,false);
+evidence.latest_record={...evidence.latest_record,receive_sequence:2,host_monotonic:2,
+  vendor_candidate_values:{应变1:10.14,应变2:-18639.94,应变3:-90.36,应变4:59.54}};
+updateEsrRelativeHistory(history,evidence,true);
+assert.deepStrictEqual(history.points.map(p => p.values['应变2']).filter(Number.isFinite),[-18640.14,-18639.94]);
+assert.strictEqual(history.points.at(-1).values['CH2_ADC_relative'], undefined);
+const range=esrObservedRange(history.points,basis.key(2));
+assert.strictEqual(range.ready,true);
+assert.strictEqual(range.count,2);
+assert.strictEqual(range.minimum,-18640.14);
+assert.strictEqual(range.maximum,-18639.94);
+evidence.zero={id:'zero'};
+evidence.latest_record={...evidence.latest_record,receive_sequence:3,host_monotonic:3,zero_id:'zero',
+  vendor_candidate_relative_values:{相对应变1:.1,相对应变2:.2,相对应变3:.1,相对应变4:.1},
+  display_vendor_candidate_relative_values:{相对应变1:'0.1',相对应变2:'0.2',相对应变3:'0.1',相对应变4:'0.1'}};
+basis=esrDisplayBasis(evidence);
+assert.strictEqual(basis.title, '厂商候选相对应变');
+assert.strictEqual(basis.display(2), '0.2');
+updateEsrRelativeHistory(history,evidence,true);
+assert.deepStrictEqual(history.points.map(p => p.values['相对应变2']),[.2]);
+assert.deepStrictEqual(evidence.latest_record.vendor_candidate_values,
+  {应变1:10.14,应变2:-18639.94,应变3:-90.36,应变4:59.54});
 '''
         subprocess.run([shutil.which("node"), "-e", script], cwd=Path(__file__).resolve().parents[1], check=True, timeout=20)
 
@@ -323,8 +592,12 @@ $rows=@(-8388608,-7149977,-9254,-1,0,1,68794,8388607) | ForEach-Object {
         from mysql_storage import MySQLCaptureStore, MySQLSettings
         from test_mysql_identity import _FakeConnection
         record = source_record()
-        record.update(measurement_record(record, fixture_profile()))
-        evidence = {"interface_id": "esr", "record": record, "calibration_snapshot": fixture_profile(), "capture_generation": "fixture", "measurement_context": {"source": "operator", "channels": {"CH2": {"switch_verified": False}}}}
+        candidate, candidate_digest = normalize_vendor_candidate(fixture_vendor_candidate())
+        record["vendor_candidate_digest"] = candidate_digest
+        record.update(measurement_record(record, fixture_profile(), vendor_candidate=candidate))
+        evidence = {"interface_id": "esr", "record": record, "calibration_snapshot": fixture_profile(),
+            "vendor_candidate_snapshot": candidate, "capture_generation": "fixture",
+            "measurement_context": {"source": "operator", "channels": {"CH2": {"switch_verified": False}}}}
         config = AcquisitionConfig(specimen_id="fixture", selected_sensors=["温度1"])
         for target in ("local_target", "server_target"):
             store = MySQLCaptureStore(MySQLSettings(enabled=True, database=target))
@@ -337,6 +610,8 @@ $rows=@(-8388608,-7149977,-9254,-1,0,1,68794,8388607) | ForEach-Object {
             inserted = [values for sql, values in connection.cursor_instance.executed if sql.startswith("INSERT INTO afp_source_evidence")]
             saved = json.loads(inserted[0][0][-1])
             self.assertEqual(saved["record"]["calibrated_values"], record["calibrated_values"])
+            self.assertEqual(saved["record"]["vendor_candidate_values"], record["vendor_candidate_values"])
+            self.assertEqual(saved["vendor_candidate_snapshot"], candidate)
             self.assertEqual(saved["calibration_snapshot"], fixture_profile())
             self.assertEqual(saved["measurement_context"], evidence["measurement_context"])
         store = MySQLCaptureStore(MySQLSettings(enabled=True))
@@ -349,16 +624,21 @@ $rows=@(-8388608,-7149977,-9254,-1,0,1,68794,8388607) | ForEach-Object {
         from acquisition import AcquisitionManager, AcquisitionConfig
         from local_capture_agent import LocalCaptureAgent
         with tempfile.TemporaryDirectory() as root:
-            writer = RawCaptureWriter(root, {})
+            candidate, candidate_digest = normalize_vendor_candidate(fixture_vendor_candidate())
+            writer = RawCaptureWriter(root, {"vendor_candidate_snapshot": candidate,
+                "vendor_candidate_digest": candidate_digest, "capture_generation": "helper-fixture"})
             for sequence in range(1, 202):
                 record = source_record(sequence); record["calibration_digest"] = ""
-                record.update(measurement_record(record, None)); writer.submit(record)
+                record["vendor_candidate_digest"] = candidate_digest
+                record.update(measurement_record(record, None, vendor_candidate=candidate)); writer.submit(record)
             writer.close({})
             manager = AcquisitionManager(Path(root), recovery_scan=False)
             manager.config = AcquisitionConfig(dataset_schema="esr1001_raw_adc", acquisition_mode="real",
                 interfaces=[{"id": "esr", "role": "esr1001_strain", "driver": "esr1001_usb_ttl", "endpoint": "COM91", "physical_interface_id": "serial:COM91", "physical_interface_kind": "serial", "data_mode": "raw_adc"}], processing_mode="capture_only")
             manager.driver = SimpleNamespace(workers=[], interface_quality_metadata={"esr": {"driver": "esr1001_usb_ttl",
                 "raw_file": str(writer.path), "saved_source_rows": 201, "calibration_snapshot": None,
+                "vendor_candidate_snapshot": candidate, "vendor_candidate_digest": candidate_digest,
+                "capture_generation": "helper-fixture",
                 "measurement_context": {"source": "operator", "channels": {"CH2": {"switch_verified": False}}}}})
             manager.finalization_complete = True
             agent = LocalCaptureAgent(manager=manager, simulation_cache_root=Path(root))
@@ -367,6 +647,8 @@ $rows=@(-8388608,-7149977,-9254,-1,0,1,68794,8388607) | ForEach-Object {
             first = agent.next_sample_batch()
             self.assertEqual(len(first["esr_source_records"]), 200)
             self.assertFalse(first["esr_source_records"][0]["measurement_context"]["channels"]["CH2"]["switch_verified"])
+            self.assertEqual(first["esr_source_records"][0]["vendor_candidate_snapshot"], candidate)
+            self.assertTrue(first["esr_source_records"][0]["record"]["vendor_candidate_values_json"])
             self.assertEqual(first, agent.next_sample_batch())
             self.assertFalse(first["status"]["finalization_complete"])
             self.assertTrue(agent.ack_sample_batch("fixture", first["sequence"]))

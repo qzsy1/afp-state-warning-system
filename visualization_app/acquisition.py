@@ -41,6 +41,7 @@ from hp_thermocouple64 import HpThermocouple64Driver, normalize_read_profile
 from esr1001_usb import (
     USB_DRIVER, RAW_CHANNELS, Esr1001UsbDriver, RawCaptureWriter,
     load_calibration, UsbProtocolError, probe_usb, read_vendor_candidate, confirm_vendor_candidate, replay_source_capture,
+    normalize_vendor_candidate,
 )
 from m3232_serial import (M3232PressureDriver, MatrixRecorder, normalize_config as normalize_m3232,
     matrix_csv_path,
@@ -1495,6 +1496,13 @@ def _apply_sensor_interface_profile(interface: dict[str, Any]) -> dict[str, Any]
             interface["calibration_digest"] = hashlib.sha256(json.dumps(profile_data, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
         else:
             interface["calibration_digest"] = ""
+        vendor_candidate, vendor_candidate_digest = normalize_vendor_candidate(
+            interface["channel_settings"].get("esr_vendor_candidate"))
+        if vendor_candidate:
+            interface["channel_settings"]["esr_vendor_candidate"] = vendor_candidate
+        else:
+            interface["channel_settings"].pop("esr_vendor_candidate", None)
+        interface["vendor_candidate_digest"] = vendor_candidate_digest
     elif not profile.get("editable_driver"):
         interface["driver"] = str(profile["driver"])
     else:
@@ -4422,6 +4430,8 @@ class MultiInterfaceDriver(SampleDriver):
                             "device_binding": item.get("device_identity") or {},
                             "data_mode": item.get("data_mode"), "bridge": item.get("bridge"),
                             "calibration_digest": item.get("calibration_digest"),
+                            "vendor_candidate_snapshot": deepcopy((item.get("channel_settings") or {}).get("esr_vendor_candidate")),
+                            "vendor_candidate_digest": item.get("vendor_candidate_digest"),
                             "measurement_context": deepcopy((item.get("channel_settings") or {}).get("esr_context", {})),
                         })
                     driver = Esr1001UsbDriver(
@@ -4429,6 +4439,7 @@ class MultiInterfaceDriver(SampleDriver):
                         calibration=item.get("calibration_profile"), binding=item.get("device_identity"),
                         bridge=str(item.get("bridge") or ""), recorder=recorder,
                         measurement_context=(item.get("channel_settings") or {}).get("esr_context"),
+                        vendor_candidate=(item.get("channel_settings") or {}).get("esr_vendor_candidate"),
                         startup_policy=self.usb_startup_profiles.get(str(item.get("id") or ""), "fixed"),
                     )
                 elif driver_name == "modbus_rtu_esr1001":
@@ -7359,7 +7370,7 @@ class AcquisitionManager(AcquisitionStartMixin):
                             ),
                             "channel_source_sequence_json": json.dumps({name: ch.source_sequence for name, ch in frame.channels.items()} if frame else {}, ensure_ascii=False),
                             "channel_interface_json": json.dumps({name: ch.interface_id for name, ch in frame.channels.items()} if frame else {}, ensure_ascii=False),
-                            "channel_source_record_json": json.dumps({name: (dict(ch.metadata["latest_record"], calibration_snapshot=ch.metadata.get("calibration_snapshot")) if ch.metadata.get("driver") == USB_DRIVER else {key: ch.metadata["latest_record"].get(key) for key in ("connection_generation", "receive_sequence", "sha256", "byte_offset")}) for name, ch in frame.channels.items() if ch.metadata.get("latest_record")} if frame else {}, ensure_ascii=False),
+                            "channel_source_record_json": json.dumps({name: (dict(ch.metadata["latest_record"], calibration_snapshot=ch.metadata.get("calibration_snapshot"), vendor_candidate_snapshot=ch.metadata.get("vendor_candidate_snapshot")) if ch.metadata.get("driver") == USB_DRIVER else {key: ch.metadata["latest_record"].get(key) for key in ("connection_generation", "receive_sequence", "sha256", "byte_offset")}) for name, ch in frame.channels.items() if ch.metadata.get("latest_record")} if frame else {}, ensure_ascii=False),
                         }
                         capture_writer.submit(row, timestamp_row)
                         self.persistence_queue_depth = capture_writer.pending_rows
@@ -8220,6 +8231,7 @@ class AcquisitionManager(AcquisitionStartMixin):
                     output.append({"interface_id": identity, "record": row,
                                    "measurement_context": deepcopy(evidence.get("measurement_context") or {}),
                                    "calibration_snapshot": evidence.get("calibration_snapshot"),
+                                    "vendor_candidate_snapshot": evidence.get("vendor_candidate_snapshot"),
                                    "capture_generation": evidence.get("capture_generation")})
                     updated[identity] = index + 1
             remaining += max(0, count - int(updated.get(identity, 0)))

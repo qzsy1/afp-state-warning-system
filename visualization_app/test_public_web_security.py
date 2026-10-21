@@ -417,6 +417,22 @@ class PublicWebHttpTests(unittest.TestCase):
             self.assertEqual(status, 200, result)
             status, result, _ = self.request_json("GET", route)
             self.assertEqual(status, 200, result)
+            revision = result["revision"]
+            candidate_plan = json.loads(json.dumps(plan))
+            candidate_plan["expected_revision"] = revision
+            candidate_plan["plans"]["new_collection_v13_0"]["interfaces"][0]["channel_settings"] = {
+                "esr_vendor_candidate": {"source_sha256": "fixture", "channels": [1, 2, 3, 4]}}
+            status, saved, _ = self.request_json("POST", route, candidate_plan)
+            self.assertEqual(status, 200, saved)
+            self.assertNotEqual(saved["revision"], revision)
+            status, rejected, _ = self.request_json("POST", route, plan)
+            self.assertEqual(status, 409, rejected)
+            self.assertIn("interface_plan_conflict", rejected["error"])
+            candidate_plan["expected_revision"] = revision
+            status, rejected, _ = self.request_json("POST", route, candidate_plan)
+            self.assertEqual(status, 409, rejected)
+            status, result, _ = self.request_json("GET", route)
+            self.assertEqual(status, 200, result)
         from pre_sensor_config import InterfacePlanStore
         stored = InterfacePlanStore(self.server.security_store.path.parent / "interface-plans.json").load()
         self.assertEqual(result["preferences"], stored)

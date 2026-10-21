@@ -13,6 +13,66 @@ from interface_transport_catalog import (  # noqa: E402
 
 
 class InterfaceTransportCatalogTests(unittest.TestCase):
+    def serial_fixture(self, path: str = "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(9)#USB(3)") -> tuple[dict, list[dict]]:
+        from test_windows_usb_topology import _genesys_fixture
+        from windows_usb_topology import normalize_usb_topology
+
+        hubs = _genesys_fixture()
+        hubs[0]["ports"][2].update(state="occupied", device={
+            "instance_id": r"USB\VID_1A86&PID_7523\fixture-esr",
+            "class": "ports", "vid": 0x1A86, "pid": 0x7523,
+            "location_paths": [path],
+        })
+        current = normalize_usb_topology(hubs)
+        interfaces = [{"id": "serial:COM91", "kind": "serial", "endpoint": "COM91",
+                       "vid": 0x1A86, "pid": 0x7523, "location": "1-9.3", "detected": True}]
+        return current, interfaces
+
+    def test_windows_route_associates_serial_without_claiming_protocol(self) -> None:
+        current, interfaces = self.serial_fixture()
+        catalog = enrich_interface_transports(current, interfaces)
+        parent = interfaces[0]["parent_port_id"]
+        port = next(p for p in catalog["usb_ports"] if p["id"] == parent)
+        self.assertEqual([e["endpoint"] for e in port["endpoints"]], ["COM91"])
+        self.assertEqual(catalog["unlocated_usb_interface_ids"], [])
+        self.assertFalse(interfaces[0].get("identity_confirmed", False))
+        self.assertFalse(interfaces[0].get("physical_verified", False))
+
+    def test_windows_host_route_and_composite_interface(self) -> None:
+        from test_windows_usb_topology import _port
+        from windows_usb_topology import normalize_usb_topology
+        for path, location in [("PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(8)", "1-8"),
+                               ("PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(8)#USBMI(2)", "1-8:x.2")]:
+            with self.subTest(path=path):
+                current = normalize_usb_topology([{
+                    "id": "root", "is_root": True, "instance_id": r"USB\ROOT_HUB30\fixture",
+                    "location_paths": ["PCIROOT(0)#PCI(1400)#USBROOT(0)"],
+                    "ports": [_port(8, state="occupied", device={
+                        "instance_id": r"USB\VID_1A86&PID_7523\fixture-tc64",
+                        "vid": 0x1A86, "pid": 0x7523, "location_paths": [path]})],
+                }])
+                interfaces = [{"id": "serial:COM92", "kind": "serial", "vid": 0x1A86,
+                               "pid": 0x7523, "location": location}]
+                enrich_interface_transports(current, interfaces)
+                self.assertTrue(interfaces[0].get("parent_port_id"))
+
+    def test_route_ambiguity_movement_and_chip_mismatch_do_not_rebind(self) -> None:
+        from copy import deepcopy
+        for case in ("ambiguous", "moved", "different_chip"):
+            with self.subTest(case=case):
+                current, interfaces = self.serial_fixture()
+                if case == "ambiguous":
+                    duplicate = deepcopy(next(d for d in current["devices"] if d.get("vid") == 0x1A86))
+                    duplicate.update(id="other-controller-device", parent_port_id="other-controller-port")
+                    current["devices"].append(duplicate)
+                elif case == "moved":
+                    interfaces[0]["location"] = "1-9.2"
+                else:
+                    interfaces[0]["pid"] = 0x5523
+                catalog = enrich_interface_transports(current, interfaces)
+                self.assertNotIn("parent_port_id", interfaces[0])
+                self.assertEqual(catalog["unlocated_usb_interface_ids"], ["serial:COM91"])
+
     def test_usb_serial_is_nested_under_port_and_native_serial_stays_separate(self) -> None:
         topology = {
             "schema_version": 2,

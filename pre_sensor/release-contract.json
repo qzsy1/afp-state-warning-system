@@ -4,7 +4,7 @@
     "application_version": "2.0.5-rc.3",
     "helper_version": "2.0.5-rc.3",
     "launcher_version": "2.0.5-rc.3",
-    "release_revision": "uvc-windows-transport-evidence-v1"
+    "release_revision": "esr1001-usb-route-v1"
   },
   "contracts": {
     "helper_protocol_version": 2,

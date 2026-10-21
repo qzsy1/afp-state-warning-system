@@ -835,8 +835,9 @@ const window={clearTimeout:()=>{},setTimeout:f=>{queued=f;return 1}};
 function usesLocalCaptureHelper(){return false}
 function toast(message){throw Error(message)}
 function interfaceConfigs(){return {interfaces:expected.plans[normal].interfaces}}
-async function fetch(path){assert.equal(path,"/api/admin/acquisition/interface-plans");return {ok:true,json:async()=>({preferences:expected})}}
-async function postJson(path,body){assert.equal(path,"/api/admin/acquisition/interface-plans");posted=structuredClone(body);return {ok:true}}
+async function fetch(path){assert.equal(path,"/api/admin/acquisition/interface-plans");return {ok:true,json:async()=>({preferences:expected,revision:'first'})}}
+let nextRevision='first', conflict=false;
+async function postJson(path,body){assert.equal(path,"/api/admin/acquisition/interface-plans");assert.equal(body.expected_revision,nextRevision);if(conflict)throw Error('interface_plan_conflict');posted=structuredClone(body);nextRevision+='-next';return {ok:true,revision:nextRevision}}
 (async()=>{
  await loadSharedDatasetInterfacePreferences();
  loadDatasetInterfacePreferences();
@@ -848,6 +849,20 @@ async function postJson(path,body){assert.equal(path,"/api/admin/acquisition/int
  await queued();
  assert.equal(posted.plans[normal].interfaces[0].driver,"esr1001_usb_ttl");
  assert.deepEqual(posted.plans[normal].interfaces[0].channels,["CH1_ADC_signed"]);
+ assert.equal(state.interfacePlanRevision,'first-next');
+ saveDatasetInterfacePreferences();
+ await queued();
+ assert.equal(state.interfacePlanRevision,'first-next-next');
+ conflict=true;
+ const messages=[];
+ toast=message=>messages.push(message);
+ saveDatasetInterfacePreferences();
+ await queued();
+ assert.equal(state.interfacePlanConflict,true);
+ assert.equal(messages.length,1);
+ queued=null;
+ queueSharedDatasetInterfacePreferences(expected);
+ assert.equal(queued,null);
  state.accessRole="authorized";queued=null;
  queueSharedDatasetInterfacePreferences(expected);
  assert.equal(queued,null);

@@ -25,6 +25,23 @@ from typing import Any, Iterable, Mapping, Sequence
 SCHEMA_VERSION = 2
 PROVIDER_NAME = "windows_usb_hub_ioctl"
 
+
+def _device_location_keys(paths: Sequence[str]) -> list[str]:
+    """Include pyserial's USB route alongside full Windows location paths."""
+    keys: list[str] = []
+    for path in paths:
+        if not path:
+            continue
+        keys.append(_stable_id("location", path))
+        route = re.search(r"(?:^|#)USBROOT\((\d+)\)((?:#USB\(\d+\))+)(?:#USBMI\((\d+)\))?$", path, re.I)
+        if route:
+            ports = re.findall(r"#USB\((\d+)\)", route[2], re.I)
+            location = f"{int(route[1]) + 1}-" + ".".join(ports)
+            if route[3] is not None:
+                location += f":x.{int(route[3])}"
+            keys.append(_stable_id("location", location))
+    return list(dict.fromkeys(keys))
+
 _FILE_DEVICE_UNKNOWN = 0x22
 _METHOD_BUFFERED = 0
 _FILE_ANY_ACCESS = 0
@@ -725,11 +742,7 @@ def normalize_usb_topology(
                     ),
                     "removal_policy": _removal_policy_name(device.get("removal_policy")),
                     "device_category": next(iter(sorted(_category_tokens(device.get("device_category")))), "usb"),
-                    "location_keys": [
-                        _stable_id("location", path)
-                        for path in device.get("location_paths", [])
-                        if path
-                    ],
+                    "location_keys": _device_location_keys(device.get("location_paths", [])),
                 })
 
         port_numbers = [int(port["number"]) for _, port in members]
@@ -921,11 +934,7 @@ def normalize_usb_topology(
                     ),
                     "removal_policy": _removal_policy_name(device.get("removal_policy")),
                     "device_category": next(iter(sorted(_category_tokens(device.get("device_category")))), "usb"),
-                    "location_keys": [
-                        _stable_id("location", path)
-                        for path in device.get("location_paths", [])
-                        if path
-                    ],
+                    "location_keys": _device_location_keys(device.get("location_paths", [])),
                 })
         numbers = [int(port["number"]) for _, port in members]
         ports.append({

@@ -157,12 +157,16 @@ def _match_topology_device(
     location = str(interface.get("location_path") or interface.get("location") or "")
     if location:
         location_key = _stable_key("location", location)
+        vid, pid = interface.get("vid"), interface.get("pid")
+        serial = str(interface.get("serial") or "").strip().casefold()
         matches = [
             item for item in devices
             if location_key in {str(value) for value in item.get("location_keys", []) or []}
+            and (vid is None or item.get("vid") == int(vid))
+            and (pid is None or item.get("pid") == int(pid))
+            and (not serial or str(item.get("serial") or "").strip().casefold() == serial)
         ]
-        if len(matches) == 1:
-            return matches[0]
+        return matches[0] if len(matches) == 1 else None
 
     network_name = str(interface.get("name") or interface.get("network_name") or "").strip().casefold()
     if network_name:

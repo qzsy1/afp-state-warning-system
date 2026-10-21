@@ -3,13 +3,16 @@ from __future__ import annotations
 import sys
 import subprocess
 import unittest
+from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 
 APP_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(APP_DIR))
 
-from app import build_thermocouple64_live_payload  # noqa: E402
+from app import DashboardData, build_thermocouple64_live_payload  # noqa: E402
+from acquisition import SENSOR_COLUMNS  # noqa: E402
 from thermocouple64 import (  # noqa: E402
     THERMOCOUPLE64_AGGREGATION_VERSION,
     THERMOCOUPLE64_DERIVED_CHANNELS,
@@ -86,6 +89,66 @@ class Thermocouple64FrontendContractsTests(unittest.TestCase):
             )
         )
 
+    def test_empty_capture_uses_requested_view_without_changing_recovery_status(self) -> None:
+        status = {
+            "running": False,
+            "config": None,
+            "capture_phase": "finalization_failed",
+            "finalization_complete": False,
+            "persistence_recovery": {"blocked": True, "incomplete_files": 3},
+        }
+        original = deepcopy(status)
+        dashboard = DashboardData.__new__(DashboardData)
+        dashboard.sensors = [{"name": name, "unit": ""} for name in SENSOR_COLUMNS]
+        dashboard.acquisition = SimpleNamespace(
+            status=lambda: status,
+            live_curve_snapshot=lambda history: (status, [], [], [], [], {}),
+        )
+        for schema, count in (("new_collection_v13_0", 77), ("new_collection_v12_0", 21)):
+            with self.subTest(schema=schema):
+                payload = dashboard.live(
+                    sensor_id=0, history=240, step=1, threshold=.5, rho=.5,
+                    indicator="TC-HI", model_kind="random_forest", prediction_horizon=24,
+                    processing_mode="capture_only", dataset_schema=schema,
+                )
+                self.assertEqual(len(payload["channels"]), count)
+                self.assertIs(payload["acquisition"], status)
+                self.assertEqual(status, original)
+                if schema == "new_collection_v13_0":
+                    panel = payload["thermocouple64"]
+                    self.assertIsNotNone(panel)
+                    self.assertEqual(len(panel["raw_directory"]["channels"]), 64)
+                    self.assertEqual(len(panel["other_channels"]), 13)
+                    self.assertEqual(panel["raw_history"], [])
+                    self.assertEqual(panel["derived_history"], [])
+                    self.assertTrue(all(item["value"] is None for item in panel["derived_latest"].values()))
+                    self.assertEqual(
+                        {item["unit"] for item in payload["channels"]
+                         if item["name"].startswith("温度") and item["name"] != "温度"},
+                        {"°C"},
+                    )
+                else:
+                    self.assertIsNone(payload["thermocouple64"])
+        status["config"] = {"dataset_schema": "new_collection_v13_0"}
+        with self.assertRaisesRegex(ValueError, "界面数据方案与当前采集会话不一致"):
+            dashboard.live(
+                sensor_id=0, history=240, step=1, threshold=.5, rho=.5,
+                indicator="TC-HI", model_kind="random_forest", prediction_horizon=24,
+                processing_mode="capture_only", dataset_schema="new_collection_v12_0",
+            )
+
+    def test_v13_without_selected_temperatures_retains_empty_group_directory(self) -> None:
+        channels = [self._channels()[-1]]
+        original = deepcopy(channels)
+        payload = build_thermocouple64_live_payload(channels, dataset_schema="new_collection_v13_0")
+        self.assertIsNotNone(payload)
+        self.assertEqual(len(payload["raw_directory"]["channels"]), 64)
+        self.assertEqual(len(payload["derived_directory"]["channels"]), 8)
+        self.assertEqual(payload["other_channels"], channels)
+        self.assertEqual(payload["time_axis"], [])
+        self.assertEqual(payload["raw_history"], [])
+        self.assertEqual(channels, original)
+
     def test_page_defines_eight_group_plots_four_normal_cards_and_shared_detail(self) -> None:
         html = (APP_DIR / "static" / "index.html").read_text(encoding="utf-8")
         script = (APP_DIR / "static" / "app.js").read_text(encoding="utf-8")
@@ -116,8 +179,8 @@ class Thermocouple64FrontendContractsTests(unittest.TestCase):
         self.assertIn("SENSOR_PANEL_SPLIT_STORAGE_KEY", script)
         self.assertIn("const defaultRatio = 0.42", script)
         self.assertIn('handle.addEventListener("dblclick", resetRatio)', script)
-        self.assertIn("/app.js?v=20261020-click-to-curve-5", html)
-        self.assertIn("20261017-thermocouple64-v6", html)
+        self.assertIn("/app.js?v=20261021-thermocouple-layout-1", html)
+        self.assertIn("/styles.css?v=20261021-strain-cards-1", html)
 
     def test_group_drawing_has_eight_raw_lines_one_mean_and_preserves_gaps(self) -> None:
         script = (APP_DIR / "static" / "app.js").read_text(encoding="utf-8")

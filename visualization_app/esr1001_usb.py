@@ -60,6 +60,34 @@ def read_vendor_candidate(path):
             "applicability": "待逐路确认设备、接线、桥路、增益和标定依据；示例系数不能证明适用"}
 
 
+def normalize_vendor_candidate(candidate):
+    """Validate and snapshot an unconfirmed vendor-display candidate."""
+    if candidate is None:
+        return None, ""
+    try:
+        snapshot = copy.deepcopy(dict(candidate))
+        channels = snapshot["channels"]
+        valid = (
+            snapshot.get("kind") == "esr1001_vendor_candidate_v1"
+            and snapshot.get("confirmed") is False
+            and snapshot.get("unit") == "με"
+            and snapshot.get("display_format") == "0.0"
+            and bool(str(snapshot.get("source") or "").strip())
+            and len(str(snapshot.get("source_sha256") or "")) == 64
+            and all(c in "0123456789abcdefABCDEF" for c in snapshot["source_sha256"])
+            and isinstance(channels, list) and len(channels) == 4
+            and all(math.isfinite(float(c["K"])) and float(c["K"]) != 0
+                    and math.isfinite(float(c["B"])) for c in channels)
+        )
+    except (KeyError, TypeError, ValueError):
+        valid = False
+    if not valid:
+        raise ValueError("厂商候选必须包含未确认状态、微应变单位、来源摘要及四路有限K/B")
+    snapshot["source_sha256"] = snapshot["source_sha256"].lower()
+    snapshot["channels"] = [{"K": float(c["K"]), "B": float(c["B"])} for c in channels]
+    return snapshot, content_digest(snapshot)
+
+
 def confirm_vendor_candidate(candidate, confirmation):
     current = read_vendor_candidate(candidate["source"])
     if current != candidate:
@@ -106,13 +134,18 @@ def vendor_display(value):
     return format(Decimal(str(float(value))).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP), ".1f")
 
 
-def measurement_record(record, profile, zero=None):
+def measurement_record(record, profile, zero=None, vendor_candidate=None):
     absolute = calibrated_values(record, profile) if profile else {}
     relative = {f"相对应变{i + 1}": absolute[f"应变{i + 1}"] - zero["calibrated_values"][f"应变{i + 1}"]
                 for i in range(4)} if zero and absolute else {}
     if zero and not profile:
         relative = {f"CH{i + 1}_ADC_relative": record[name] - zero["adc_values"][name]
                     for i, name in enumerate(RAW_CHANNELS)}
+    candidate_absolute = calibrated_values(record, vendor_candidate) if vendor_candidate else {}
+    candidate_zero = (zero or {}).get("vendor_candidate_values") or {}
+    candidate_relative = ({f"相对应变{i + 1}": candidate_absolute[f"应变{i + 1}"] - candidate_zero[f"应变{i + 1}"]
+                           for i in range(4)}
+                          if candidate_absolute and len(candidate_zero) == 4 else {})
     ranges = []
     for i, condition in enumerate((profile or {}).get("channel_conditions", [])):
         limits = condition.get("range_microstrain") if profile.get("version") == 2 and condition.get("range_basis") and condition.get("reference_input") else None
@@ -121,6 +154,10 @@ def measurement_record(record, profile, zero=None):
     return {"calibrated_values": absolute, "relative_values": relative,
             "display_values": {k: vendor_display(v) for k, v in absolute.items()},
             "display_relative_values": {k: vendor_display(v) if profile else str(v) for k, v in relative.items()},
+            "vendor_candidate_values": candidate_absolute,
+            "vendor_candidate_relative_values": candidate_relative,
+            "display_vendor_candidate_values": {k: vendor_display(v) for k, v in candidate_absolute.items()},
+            "display_vendor_candidate_relative_values": {k: vendor_display(v) for k, v in candidate_relative.items()},
             "relative_unit": "με" if profile else "adc_counts",
             "zero_id": zero["id"] if zero else "", "zero_snapshot": copy.deepcopy(zero),
             "range_assessment": ranges or ["range_unverified"] * 4,
@@ -129,12 +166,17 @@ def measurement_record(record, profile, zero=None):
 
 def verify_source_evidence(evidence):
     row = evidence["record"]
+    if row.get("unit", "adc_counts") != "adc_counts":
+        raise ValueError("原始源帧单位必须为adc_counts")
     adc = {name: int(row[name]) for name in RAW_CHANNELS}
     if tuple(adc.values()) != decode_adc(bytes.fromhex(row["raw_hex"])):
         raise ValueError("源帧ADC与原始字节不一致")
     profile = evidence.get("calibration_snapshot")
     if (content_digest(profile) if profile else "") != row.get("calibration_digest", ""):
         raise ValueError("源帧标定快照摘要不一致")
+    candidate, candidate_digest = normalize_vendor_candidate(evidence.get("vendor_candidate_snapshot"))
+    if candidate_digest != row.get("vendor_candidate_digest", ""):
+        raise ValueError("源帧厂商候选快照摘要不一致")
     zero = row.get("zero_snapshot") or json.loads(row.get("zero_snapshot_json") or "null")
     if zero and (zero["calibration_digest"] != row["calibration_digest"] or
                  zero["capture_generation"] != evidence.get("capture_generation") or
@@ -142,8 +184,11 @@ def verify_source_evidence(evidence):
                  zero["receive_sequence"] >= int(row["receive_sequence"]) or
                  (calibrated_values(zero["adc_values"], profile) if profile else {}) != zero["calibrated_values"]):
         raise ValueError("源帧零点条件不一致")
-    computed = measurement_record(adc, profile, zero)
-    for key in ("calibrated_values", "relative_values"):
+    if zero and candidate and (zero.get("vendor_candidate_digest") != candidate_digest or
+            calibrated_values(zero["adc_values"], candidate) != zero.get("vendor_candidate_values")):
+        raise ValueError("源帧厂商候选零点条件不一致")
+    computed = measurement_record(adc, profile, zero, candidate)
+    for key in ("calibrated_values", "relative_values", "vendor_candidate_values", "vendor_candidate_relative_values"):
         saved = row.get(key)
         if saved is None and row.get(key + "_json"):
             saved = json.loads(row[key + "_json"])
@@ -158,30 +203,42 @@ def replay_source_capture(path):
     metadata = json.loads(source.with_suffix(".json").read_text(encoding="utf-8"))
     profile = metadata.get("calibration_snapshot")
     digest = metadata.get("calibration_digest") or ""
-    if profile and content_digest(profile) != digest:
+    if (content_digest(profile) if profile else "") != digest:
         raise ValueError("历史标定快照摘要不匹配")
+    candidate, candidate_digest = normalize_vendor_candidate(metadata.get("vendor_candidate_snapshot"))
+    if candidate_digest != (metadata.get("vendor_candidate_digest") or ""):
+        raise ValueError("历史厂商候选快照摘要不匹配")
     with source.open(encoding="utf-8-sig", newline="") as stream:
         previous = 0
         previous_adc = None
         active_zero = None
         for row in csv.DictReader(stream):
+            if row.get("unit", "adc_counts") != "adc_counts":
+                raise ValueError("历史原始源帧单位必须为adc_counts")
             record = {name: int(row[name]) for name in RAW_CHANNELS}
             sequence = int(row["receive_sequence"])
             if sequence != previous + 1 or tuple(record.values()) != decode_adc(bytes.fromhex(row["raw_hex"])):
                 raise ValueError("历史源帧序号或ADC与原始字节不一致")
             if row.get("calibration_digest", "") != digest:
                 raise ValueError("历史源帧标定摘要不一致")
+            if row.get("vendor_candidate_digest", "") != candidate_digest:
+                raise ValueError("历史源帧厂商候选摘要不一致")
             previous = sequence
             zero = json.loads(row.get("zero_snapshot_json") or "null")
-            if zero and (zero["calibration_digest"] != digest or zero["connection_generation"] != int(row["connection_generation"]) or
+            if zero and (zero["calibration_digest"] != digest or
+                         (metadata.get("capture_generation") and zero["capture_generation"] != metadata["capture_generation"]) or
+                         zero["connection_generation"] != int(row["connection_generation"]) or
                          zero["receive_sequence"] >= sequence or
                          (calibrated_values(zero["adc_values"], profile) if profile else {}) != zero["calibrated_values"]):
                 raise ValueError("历史零点与源帧条件不匹配")
+            if zero and candidate and (zero.get("vendor_candidate_digest") != candidate_digest or
+                    calibrated_values(zero["adc_values"], candidate) != zero.get("vendor_candidate_values")):
+                raise ValueError("历史厂商候选零点与源帧条件不匹配")
             if zero and zero["id"] != active_zero:
                 if zero["receive_sequence"] != sequence - 1 or zero["adc_values"] != previous_adc:
                     raise ValueError("零点基准不对应先前最新源帧")
-            computed = measurement_record(record, profile, zero)
-            for key in ("calibrated_values", "relative_values", "zero_id"):
+            computed = measurement_record(record, profile, zero, candidate)
+            for key in ("calibrated_values", "relative_values", "vendor_candidate_values", "vendor_candidate_relative_values", "zero_id"):
                 saved = json.loads(row[key + "_json"]) if row.get(key + "_json") else row.get(key)
                 if saved is not None and saved != computed[key]:
                     raise ValueError("保存的派生值与历史源帧复算不一致")
@@ -351,8 +408,10 @@ def load_calibration(source, *, binding, parameters, bridge):
 
 class RawCaptureWriter:
     """有界源帧队列；写入错误和过载阻止成功收尾。"""
-    fields = ("receive_sequence", "host_wall_time", "host_monotonic", *RAW_CHANNELS, "unit", "raw_hex", "connection_generation", "calibration_digest",
-              "calibrated_values_json", "relative_values_json", "zero_id", "zero_snapshot_json", "range_assessment_json", "adc_at_rail_json")
+    fields = ("receive_sequence", "host_wall_time", "host_monotonic", *RAW_CHANNELS, "unit", "raw_hex", "connection_generation", "calibration_digest", "vendor_candidate_digest",
+              "calibrated_values_json", "relative_values_json", "vendor_candidate_values_json", "vendor_candidate_relative_values_json",
+              "display_vendor_candidate_values_json", "display_vendor_candidate_relative_values_json",
+              "zero_id", "zero_snapshot_json", "range_assessment_json", "adc_at_rail_json")
 
     def __init__(self, root, metadata, capacity=4096):
         root = Path(root)
@@ -397,7 +456,9 @@ class RawCaptureWriter:
                 if record is None:
                     break
                 saved = dict(record)
-                for key in ("calibrated_values", "relative_values", "zero_snapshot", "range_assessment", "adc_at_rail"):
+                for key in ("calibrated_values", "relative_values", "vendor_candidate_values", "vendor_candidate_relative_values",
+                            "display_vendor_candidate_values", "display_vendor_candidate_relative_values",
+                            "zero_snapshot", "range_assessment", "adc_at_rail"):
                     saved[key + "_json"] = json.dumps(record.get(key), ensure_ascii=False, allow_nan=False)
                 self.writer.writerow(saved)
                 self.stream.flush()
@@ -445,7 +506,7 @@ def require_helper_capabilities(config):
 class Esr1001UsbDriver:
     open_timeout_seconds = 7.0
 
-    def __init__(self, endpoint, *, data_mode="raw_adc", calibration=None, binding=None, bridge="", command_timeout=2.0, serial_factory=None, inventory=None, recorder=None, startup_policy="fixed", measurement_context=None):
+    def __init__(self, endpoint, *, data_mode="raw_adc", calibration=None, binding=None, bridge="", command_timeout=2.0, serial_factory=None, inventory=None, recorder=None, startup_policy="fixed", measurement_context=None, vendor_candidate=None):
         self.endpoint = str(endpoint).strip()
         self.data_mode = data_mode
         if data_mode not in {"raw_adc", "microstrain"}:
@@ -456,6 +517,7 @@ class Esr1001UsbDriver:
         if measurement_context is not None and not isinstance(measurement_context, dict):
             raise ValueError("ESR现场信息必须为对象")
         self.measurement_context = copy.deepcopy(measurement_context or {})
+        self.vendor_candidate, self.vendor_candidate_digest = normalize_vendor_candidate(vendor_candidate)
         self.command_timeout = max(0.01, min(float(command_timeout), 2.0))
         self.serial_factory = serial_factory
         self.inventory = inventory
@@ -500,6 +562,11 @@ class Esr1001UsbDriver:
         self.received_tail = b""
         self.command_evidence = deque(maxlen=32)
         self._previous_metrics = {key: 0 for key in ("discarded_bytes", "overflows", "resynchronizations", "invalid_frames")}
+        if self.recorder:
+            self.recorder.metadata.update(
+                vendor_candidate_snapshot=copy.deepcopy(self.vendor_candidate),
+                vendor_candidate_digest=self.vendor_candidate_digest,
+            )
 
     @property
     def quality_metadata(self):
@@ -508,7 +575,7 @@ class Esr1001UsbDriver:
         duration = (self.last_observation - self.first_observation) if self.first_observation is not None and self.last_observation is not None else 0
         metrics["actual_source_rate_hz"] = (self.sequence - 1) / duration if duration > 0 else None
         metrics.update(received_bytes=self.received_bytes, received_tail_hex=self.received_tail.hex(), commands=list(self.command_evidence), start_events=list(self.start_events), startup_policy=self._effective_startup_policy, current_stream_stable=bool(self.last_observation is not None and current_stream_is_stable(self, self.last_observation)))
-        return {"driver": USB_DRIVER, "data_mode": self.data_mode, "unit": "adc_counts" if self.data_mode == "raw_adc" else "με", "measurement_context": copy.deepcopy(self.measurement_context), "calibration_state": "confirmed" if self.calibration else "标定未确认", "calibration_digest": self.calibration_digest, "calibration_snapshot": copy.deepcopy(self.calibration), "zero": copy.deepcopy(self.zero), "zero_events": copy.deepcopy(self.zero_events), "capture_generation": self.capture_generation, "parameters": dict(self.parameters), "source_frames": self.sequence, "connection_generation": self.connection_generation, "max_interval_seconds": self.max_interval, "recent_intervals_seconds": list(self.recent_intervals), "freshness_recovery_intervals": FRESHNESS_RECOVERY_INTERVALS, "stop_error": self.stop_error, "stop_failures": list(self.stop_failures), "latest_record": copy.deepcopy(self.latest_record or {}), "gaps": list(self.gaps[-128:]), **metrics}
+        return {"driver": USB_DRIVER, "data_mode": self.data_mode, "unit": "adc_counts" if self.data_mode == "raw_adc" else "με", "measurement_context": copy.deepcopy(self.measurement_context), "calibration_state": "confirmed" if self.calibration else "标定未确认", "calibration_digest": self.calibration_digest, "calibration_snapshot": copy.deepcopy(self.calibration), "vendor_candidate_state": "available_unconfirmed" if self.vendor_candidate else "unavailable", "vendor_candidate_digest": self.vendor_candidate_digest, "vendor_candidate_snapshot": copy.deepcopy(self.vendor_candidate), "zero": copy.deepcopy(self.zero), "zero_events": copy.deepcopy(self.zero_events), "capture_generation": self.capture_generation, "parameters": dict(self.parameters), "source_frames": self.sequence, "connection_generation": self.connection_generation, "max_interval_seconds": self.max_interval, "recent_intervals_seconds": list(self.recent_intervals), "freshness_recovery_intervals": FRESHNESS_RECOVERY_INTERVALS, "stop_error": self.stop_error, "stop_failures": list(self.stop_failures), "latest_record": copy.deepcopy(self.latest_record or {}), "gaps": list(self.gaps[-128:]), **metrics}
 
     def set_zero(self, *, expected_sequence, connection_generation, capture_generation, calibration_digest):
         with self._io_lock:
@@ -528,6 +595,8 @@ class Esr1001UsbDriver:
                          "source_host_monotonic": record["host_monotonic"], "receive_sequence": record["receive_sequence"],
                          "adc_values": {name: record[name] for name in RAW_CHANNELS},
                          "calibrated_values": calibrated_values(record, self.calibration) if self.calibration else {},
+                          "vendor_candidate_values": calibrated_values(record, self.vendor_candidate) if self.vendor_candidate else {},
+                          "vendor_candidate_digest": self.vendor_candidate_digest,
                          "relative_unit": "με" if self.calibration else "adc_counts", "calibration_digest": self.calibration_digest,
                          "connection_generation": self.connection_generation, "capture_generation": self.capture_generation}
             self.zero_events.append(dict(action="set", **copy.deepcopy(self.zero)))
@@ -579,8 +648,8 @@ class Esr1001UsbDriver:
                         self.gaps.append({"after_sequence": self.sequence - 1, "interval_seconds": interval})
                         self.gaps = self.gaps[-128:]
                 self.last_observation = mono
-                record = dict(zip(RAW_CHANNELS, values), receive_sequence=self.sequence, host_wall_time=wall, host_monotonic=mono, raw_hex=raw.hex(), unit="adc_counts", connection_generation=self.connection_generation, calibration_digest=self.calibration_digest)
-                record.update(measurement_record(record, self.calibration, self.zero))
+                record = dict(zip(RAW_CHANNELS, values), receive_sequence=self.sequence, host_wall_time=wall, host_monotonic=mono, raw_hex=raw.hex(), unit="adc_counts", connection_generation=self.connection_generation, calibration_digest=self.calibration_digest, vendor_candidate_digest=self.vendor_candidate_digest)
+                record.update(measurement_record(record, self.calibration, self.zero, self.vendor_candidate))
                 if self.recorder:
                     self.recorder.submit(record)
                 self.latest_record = record

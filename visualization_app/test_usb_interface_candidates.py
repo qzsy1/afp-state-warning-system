@@ -54,6 +54,40 @@ def run_logical_interface_script(assertions: str) -> dict:
 
 
 class UsbInterfaceCandidateTests(unittest.TestCase):
+    def test_esr_topology_enrichment_preserves_candidate_but_source_change_clears_it(self):
+        result = run_candidate_script(r'''
+state.usbTopology={usb_ports:[{id:'host:9',state:'occupied',user_connectable:true}],devices:[]};
+state.physicalInterfaces=[{id:'serial:COM5',kind:'serial',transport_family:'usb',parent_port_id:'host:9',endpoint:'COM5',detected:true,
+ device_identity:{vid:6790,pid:29987,serial_number:'',location:'1-9'}}];
+const settings={esr_vendor_candidate:{source_sha256:'fixture'},esr_context:{focus_channel:2}};
+const original={id:'esr',role:'esr1001_strain',driver:'esr1001_usb_ttl',endpoint:'COM5',physical_interface_id:'serial:COM5',
+ physical_port_id:'',selection_origin:'manual',protocol_verified:true,channel_settings:settings,
+ device_identity:{vid:6790,pid:29987,serial_number:'',location:'1-9'}};
+const enriched=autoAssignPhysicalInterfaces([structuredClone(original)])[0];
+state.physicalInterfaces[0].device_identity.location='1-8';
+const changed=autoAssignPhysicalInterfaces([structuredClone(original)])[0];
+console.log(JSON.stringify({enriched,changed}));
+''')
+        self.assertIn("esr_vendor_candidate", result["enriched"]["channel_settings"])
+        self.assertEqual(result["enriched"]["physical_port_id"], "host:9")
+        self.assertFalse(result["enriched"]["protocol_verified"])
+        self.assertEqual(result["changed"]["channel_settings"], {})
+
+    def test_esr_unlocated_serial_outweighs_incompatible_saved_port_placeholder(self):
+        result = run_candidate_script(r'''
+state.usbTopology={usb_ports:[{id:'host:9',state:'occupied',user_connectable:true}],devices:[]};
+state.physicalInterfaces=[{id:'serial:COM5',kind:'serial',transport_family:'usb',endpoint:'COM5',detected:true,
+ device_identity:{vid:6790,pid:29987,serial_number:'',location:'1-9'}}];
+const config={id:'esr',role:'esr1001_strain',driver:'esr1001_usb_ttl',endpoint:'COM5',physical_interface_id:'',
+ physical_port_id:'host:9',selection_origin:'manual',channel_settings:{esr_vendor_candidate:{source_sha256:'fixture'}},
+ device_identity:{vid:6790,pid:29987,serial_number:'',location:'1-9'}};
+console.log(JSON.stringify(autoAssignPhysicalInterfaces([config])[0]));
+''')
+        self.assertEqual(result["physical_interface_id"], "serial:COM5")
+        self.assertEqual(result["endpoint"], "COM5")
+        self.assertTrue(result["physical_verified"])
+        self.assertIn("esr_vendor_candidate", result["channel_settings"])
+
     def test_saved_serial_endpoint_can_recover_an_unlocated_candidate(self):
         result = run_candidate_script(r'''
 state.usbTopology={usb_ports:[{id:"usb:9",state:"occupied",user_connectable:true}],devices:[]};

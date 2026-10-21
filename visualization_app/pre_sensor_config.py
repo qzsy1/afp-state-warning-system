@@ -11,6 +11,7 @@ from copy import deepcopy
 
 import re
 import json
+import hashlib
 import os
 import threading
 import sys
@@ -114,15 +115,30 @@ class InterfacePlanStore:
             except (OSError, ValueError, TypeError):
                 return None
 
-    def save(self, payload):
-        rendered = json.dumps(self.sanitize(payload), ensure_ascii=False, allow_nan=False)
+    @staticmethod
+    def revision(preferences):
+        rendered = json.dumps(preferences, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+    def load_with_revision(self):
+        with self._lock:
+            preferences = self.load()
+            return preferences, self.revision(preferences)
+
+    def save(self, payload, *, expected_revision=None, require_revision=False):
+        preferences = self.sanitize(payload)
+        rendered = json.dumps(preferences, ensure_ascii=False, allow_nan=False)
         if len(rendered.encode("utf-8")) > 262144:
             raise ValueError("接口方案过大")
         with self._lock:
+            current = self.load()
+            if (expected_revision is not None or (require_revision and current is not None)) and expected_revision != self.revision(current):
+                raise ValueError("interface_plan_conflict: 方案已在其他页面更新，请刷新后重新修改")
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.path.with_suffix(".tmp")
             temporary.write_text(rendered, encoding="utf-8")
             os.replace(temporary, self.path)
+            return self.revision(preferences)
 
 
 def _object(payload: Mapping[str, Any], name: str) -> Mapping[str, Any]:

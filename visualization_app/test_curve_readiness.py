@@ -275,7 +275,7 @@ assert.equal(synthetic.complete,false);
             app_source.index("function renderTimeline")
         ]
         card_functions = app_source[
-            app_source.index("function renderSensorCardsInto"):
+            app_source.index("function sensorCardMeasurementState"):
             app_source.index("function renderSensorCards(")
         ]
         readiness = Path(__file__).parent / "static" / "curve_readiness.js"
@@ -293,8 +293,8 @@ const state={showResidual:false};
 const context=new Proxy({setTransform(){},setLineDash(){}},{get:(target,key)=>target[key]||(()=>{})});
 const canvas={isConnected:true,clientWidth:320,clientHeight:150,width:0,height:0,dataset:{},
   getContext:()=>context,closest:()=>null,checkVisibility:()=>true};
-const textNode=()=>({textContent:''});
-const card={dataset:{channelId:'7'},className:'',querySelector:(selector)=>selector==='canvas'?canvas:textNode()};
+const textNode=()=>({textContent:'',classList:{toggle(){}}});
+const card={dataset:{channelId:'7'},className:'',classList:{toggle(){}},setAttribute(){},querySelector:(selector)=>selector==='canvas'?canvas:textNode()};
 const target={querySelectorAll:()=>[card]};
 const source=(sequence)=>({source_sequence:sequence,interface_id:'plc',capture_generation:'generation',
   start_request_id:'click',received_monotonic:100+sequence,after_start:true,protocol_ok:true,stable:true,
@@ -335,7 +335,7 @@ assert.ok(snapshot.events.some(event=>event.stage==='C3_all'));
             app_source.index("function renderTimeline")
         ]
         card_functions = app_source[
-            app_source.index("function renderSensorCardsInto"):
+            app_source.index("function sensorCardMeasurementState"):
             app_source.index("function renderSensorCards(")
         ]
         readiness = Path(__file__).parent / "static" / "curve_readiness.js"
@@ -353,11 +353,11 @@ const context=new Proxy({setTransform(){},setLineDash(){}},{get:(target,key)=>ta
 const makeCanvas=()=>({isConnected:false,clientWidth:320,clientHeight:150,width:0,height:0,dataset:{},
   getContext:()=>context,closest:()=>null,checkVisibility:()=>true});
 class Card {
-  constructor(){this.dataset={};this.canvas=makeCanvas();this.nodes=new Map();}
+  constructor(){this.dataset={};this.canvas=makeCanvas();this.nodes=new Map();this.classList={toggle(){}};}
   set innerHTML(value){this.html=value;}
   querySelector(selector){
     if(selector==='canvas')return this.canvas;
-    if(!this.nodes.has(selector))this.nodes.set(selector,{textContent:''});
+    if(!this.nodes.has(selector))this.nodes.set(selector,{textContent:'',classList:{toggle(){}}});
     return this.nodes.get(selector);
   }
   addEventListener(){}

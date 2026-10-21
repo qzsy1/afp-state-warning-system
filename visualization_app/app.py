@@ -158,10 +158,8 @@ def build_thermocouple64_live_payload(
         return None
     by_name = {str(item.get("name") or ""): item for item in channels}
     raw_channels = [by_name[name] for name in THERMOCOUPLE64_CHANNELS if name in by_name]
-    if not raw_channels:
-        return None
     history_length = max((len(item.get("actual") or []) for item in raw_channels), default=0)
-    time_axis = list(raw_channels[0].get("x_observed") or [])
+    time_axis = list(raw_channels[0].get("x_observed") or []) if raw_channels else []
     raw_history: list[list[float | None]] = []
     derived_history: list[list[float | None]] = []
     derived_latest: dict[str, dict] = {}
@@ -2869,11 +2867,12 @@ class DashboardData:
         history: int,
         step: int,
         prediction_horizon: int,
+        config: dict | None = None,
         quality_rows: list[dict[str, str]] | None = None,
         source_rows: list[dict] | None = None,
         startup_observations: dict | None = None,
     ) -> dict:
-        config = status.get("config") or {}
+        config = config if config is not None else status.get("config") or {}
         source_time_origin = time.monotonic()
         sample_rate = _finite(config.get("sample_rate_hz"), 10.0)
         total_count = int(status.get("sample_count") or len(rows))
@@ -2902,7 +2901,9 @@ class DashboardData:
         )
         channels: list[dict] = []
         for index, name in enumerate(sensor_columns):
-            if name in SENSOR_COLUMNS:
+            if config.get("dataset_schema") == THERMOCOUPLE64_MODE_ID and name in THERMOCOUPLE64_CHANNELS:
+                sensor = {"id": index, "name": name, "unit": "°C"}
+            elif name in SENSOR_COLUMNS:
                 legacy_index = SENSOR_COLUMNS.index(name)
                 sensor = {**self.sensors[legacy_index], "id": index}
             else:
@@ -3151,6 +3152,7 @@ class DashboardData:
                 history=history,
                 step=step,
                 prediction_horizon=prediction_horizon,
+                config=config,
                 quality_rows=quality_rows,
                 source_rows=source_rows,
                 startup_observations=startup_observations,
@@ -5336,7 +5338,8 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/admin/acquisition/interface-plans":
             store = InterfacePlanStore(self.security_store.path.parent / "interface-plans.json")
-            self._send_json({"preferences": store.load()})
+            preferences, revision = store.load_with_revision()
+            self._send_json({"preferences": preferences, "revision": revision})
             return
         if parsed.path == "/api/simulation/status":
             self._send_json(self.guest_manager.status(self._identity().guest_id))
@@ -5743,8 +5746,14 @@ class AppHandler(BaseHTTPRequestHandler):
                 raise ValueError("请求体必须是JSON对象")
             if parsed.path == "/api/admin/acquisition/interface-plans":
                 store = InterfacePlanStore(self.security_store.path.parent / "interface-plans.json")
-                store.save(payload)
-                self._send_json({"ok": True})
+                try:
+                    revision = store.save(payload, expected_revision=payload.get("expected_revision"), require_revision=True)
+                except ValueError as exc:
+                    if str(exc).startswith("interface_plan_conflict:"):
+                        self._send_json({"error": str(exc)}, HTTPStatus.CONFLICT)
+                        return
+                    raise
+                self._send_json({"ok": True, "revision": revision})
                 return
             if parsed.path == "/api/helper/pair/complete":
                 result = self.dashboard.helper_registry.complete_pairing(

@@ -1417,6 +1417,7 @@ class MySQLCaptureStore:
                             yield {"interface_id": identity, "record": record,
                                    "measurement_context": source_metadata.get("measurement_context") or {},
                                    "calibration_snapshot": evidence.get("calibration_snapshot"),
+                                    "vendor_candidate_snapshot": source_metadata.get("vendor_candidate_snapshot"),
                                    "capture_generation": evidence.get("capture_generation")}
                             count += 1
                         if count != evidence.get("saved_source_rows") or evidence.get("writer_error"):
