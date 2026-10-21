@@ -43,6 +43,7 @@ ALLOWED_HELPER_COMMANDS = frozenset(
         "prepare_simulation_source",
         "start_capture",
         "stop_capture",
+        "esr_numeric",
         "status",
     }
 )

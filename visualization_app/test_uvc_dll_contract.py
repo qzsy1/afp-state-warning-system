@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from acquisition import UvcThermalDriver  # noqa: E402
+from acquisition import UvcThermalDriver, uvc_source_observation_readiness  # noqa: E402
 
 
 class NativeFunction:
@@ -34,11 +34,12 @@ class FakeBsvDll:
     def __init__(
         self,
         *,
-        set_range=1,
-        open_result=1,
-        start_result=1,
+        set_range=0,
+        open_result=0,
+        start_result=0,
         has_frame=1,
         get_frame=1,
+        frame_counter=1,
         last_error=-9,
     ) -> None:
         self.BsvSetTempRangeCode = NativeFunction(set_range)
@@ -46,12 +47,33 @@ class FakeBsvDll:
         self.BsvStart = NativeFunction(start_result)
         self.BsvHasFrame = NativeFunction(has_frame)
         self.BsvGetFrame = NativeFunction(get_frame)
+        self.BsvGetFrameCounter = NativeFunction(frame_counter)
         self.BsvGetLastError = NativeFunction(last_error)
         self.BsvStop = NativeFunction(None)
         self.BsvClose = NativeFunction(None)
 
 
 class UvcDllContractTests(unittest.TestCase):
+    def test_uvc_readiness_requires_three_distinct_frames_spanning_one_second(self) -> None:
+        repeated = [
+            {"source_sequence": 1, "received_monotonic": 10.0},
+            {"source_sequence": 1, "received_monotonic": 10.5},
+            {"source_sequence": 2, "received_monotonic": 11.2},
+        ]
+        short = [
+            {"source_sequence": 1, "received_monotonic": 10.0},
+            {"source_sequence": 2, "received_monotonic": 10.4},
+            {"source_sequence": 3, "received_monotonic": 10.8},
+        ]
+        ready = short + [{"source_sequence": 4, "received_monotonic": 11.1}]
+
+        self.assertFalse(uvc_source_observation_readiness(repeated)["ready"])
+        self.assertFalse(uvc_source_observation_readiness(short)["ready"])
+        evidence = uvc_source_observation_readiness(ready)
+        self.assertTrue(evidence["ready"])
+        self.assertEqual(evidence["distinct_source_frames"], 4)
+        self.assertAlmostEqual(evidence["observation_span_seconds"], 1.1)
+
     def test_helper_finds_native_api_beside_release_manifest(self) -> None:
         release_root = Path("D:/AFP_Runtime/.afp-staging/helper-fixture")
         expected = release_root / "native_dll" / "BsvUvcNative.dll"
@@ -92,6 +114,18 @@ class UvcDllContractTests(unittest.TestCase):
                     rf"device_open_failed.*stage={stage}.*code={expected_code}",
                 ):
                     driver.open()
+
+    def test_zero_return_codes_open_and_start_successfully(self) -> None:
+        dll = FakeBsvDll(set_range=0, open_result=0, start_result=0)
+        driver = self._driver(dll)
+
+        driver.open()
+        driver.close()
+
+        self.assertEqual(len(dll.BsvOpen.calls), 1)
+        self.assertEqual(len(dll.BsvStart.calls), 1)
+        self.assertEqual(len(dll.BsvStop.calls), 1)
+        self.assertEqual(len(dll.BsvClose.calls), 1)
 
     def test_no_frame_and_get_frame_failure_are_no_valid_frame(self) -> None:
         for dll, expected in (
@@ -134,6 +168,33 @@ class UvcDllContractTests(unittest.TestCase):
         self.assertEqual(len(dll.BsvGetFrame.calls), 1)
         self.assertEqual(len(dll.BsvStop.calls), 1)
         self.assertEqual(len(dll.BsvClose.calls), 1)
+
+    def test_repeated_native_frame_counter_is_not_published_as_new_data(self) -> None:
+        dll = FakeBsvDll(frame_counter=7)
+        driver = self._driver(dll)
+        driver.open()
+
+        first = driver.read_sample()
+        repeated = driver.read_sample()
+
+        self.assertEqual(first, {"ROI平均温度": -50.0})
+        self.assertIsNone(repeated)
+        self.assertEqual(driver.quality_metadata["source_frame_counter"], 7)
+        self.assertEqual(len(dll.BsvGetFrame.calls), 1)
+
+    def test_counter_change_during_copy_retries_until_frame_is_consistent(self) -> None:
+        counters = iter((8, 9, 9, 9))
+        dll = FakeBsvDll()
+        dll.BsvGetFrameCounter.callback = lambda: next(counters)
+        driver = self._driver(dll, poll_retries=2)
+        driver.open()
+
+        sample = driver.read_sample()
+
+        self.assertEqual(sample, {"ROI平均温度": -50.0})
+        self.assertEqual(driver.quality_metadata["source_frame_counter"], 9)
+        self.assertEqual(driver.quality_metadata["counter_copy_retries"], 1)
+        self.assertEqual(len(dll.BsvGetFrame.calls), 2)
 
     def test_blocking_open_and_stop_return_within_declared_timeout(self) -> None:
         never = threading.Event()

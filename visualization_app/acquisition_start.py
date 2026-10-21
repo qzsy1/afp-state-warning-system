@@ -149,6 +149,9 @@ class AcquisitionStartMixin:
         if result:
             end = result.get("finished_monotonic") or time.monotonic()
             result["elapsed_seconds"] = max(0.0, end - result["started_monotonic"])
+            if result.get("state") == "running" and not (self.thread and self.thread.is_alive()):
+                result["startup_result"] = "running"
+                result["state"] = "completed" if self.finalization_complete else self.capture_phase
         return result
 
     def start_async(self, config, *, on_finished=None):

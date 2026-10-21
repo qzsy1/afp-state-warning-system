@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import time
@@ -67,6 +68,8 @@ def _result(
     stdout: bytes | str | None = None,
     stderr: bytes | str | None = None,
     error: str = "",
+    external_environment: bool = False,
+    remediation: str = "",
 ) -> CheckResult:
     return CheckResult(
         check_id=check.id,
@@ -84,7 +87,34 @@ def _result(
         blocking=check.blocking,
         evidence_tier=check.evidence_tier,
         requirements=check.requirements,
+        external_environment=external_environment,
+        remediation=remediation,
     )
+
+
+def _remote_environment_outcome(
+    check: CheckSpec,
+    exit_code: int,
+    stdout: bytes | str | None,
+) -> dict[str, object] | None:
+    if check.evidence_tier != "remote_integration":
+        return None
+    try:
+        payload = json.loads(_decode(stdout))
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    status = str(payload.get("status") or "")
+    expected_exit = {"passed": 0, "failed": 1, "blocked": 2}.get(status)
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("external_environment") is not True
+        or expected_exit is None
+        or exit_code != expected_exit
+    ):
+        return None
+    return payload
 
 
 def run_check(
@@ -176,6 +206,23 @@ def run_check(
             command=command,
             cwd=str(working_directory),
             error=f"command could not start: {exc}",
+        )
+    environment_outcome = _remote_environment_outcome(
+        check, completed.returncode, completed.stdout
+    )
+    if environment_outcome is not None:
+        return _result(
+            check,
+            status=str(environment_outcome["status"]),
+            started_at=started_at,
+            start_time=start_time,
+            command=command,
+            cwd=str(working_directory),
+            exit_code=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+            external_environment=True,
+            remediation=str(environment_outcome.get("remediation") or ""),
         )
     return _result(
         check,

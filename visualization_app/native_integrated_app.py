@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 
 APP_DIR = (
@@ -370,6 +370,7 @@ class AcquisitionPanel(ttk.Frame):
                 ttk.Combobox(interfaces, textvariable=values["data_mode"], values=("raw_adc", "microstrain"), state="readonly", width=12).grid(row=index, column=7)
                 ttk.Entry(interfaces, textvariable=values["calibration_profile"], width=20).grid(row=index, column=8)
                 ttk.Entry(interfaces, textvariable=values["bridge"], width=10).grid(row=index, column=9)
+                ttk.Button(interfaces, text="导入K/B候选", command=lambda v=values: self._import_esr_candidate(v)).grid(row=index, column=10)
                 def protocol_changed(_event, value=values, slave=slave_widget):
                     usb = value["driver"].get() == "esr1001_usb_ttl"
                     value["baudrate"].set(115200 if usb else 9600)
@@ -530,6 +531,8 @@ class AcquisitionPanel(ttk.Frame):
         self.sensor_combo = ttk.Combobox(select, textvariable=self.sensor_display, state="readonly", width=24)
         self.sensor_combo.pack(side="left", padx=6)
         self.sensor_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_chart())
+        ttk.Button(select, text="ESR相对清零（最新源帧）", command=lambda: self._esr_zero_action("zero")).pack(side="left", padx=3)
+        ttk.Button(select, text="关闭相对清零", command=lambda: self._esr_zero_action("clear_zero")).pack(side="left", padx=3)
         self.chart = LineChart(parent, height=410)
         self.chart.grid(row=2, column=0, sticky="nsew")
         table_frame = ttk.LabelFrame(parent, text="全部通道当前值", padding=5)
@@ -711,7 +714,8 @@ class AcquisitionPanel(ttk.Frame):
                     device_identity=json.loads(str(values["m3232_binding"].get())), physical_interface_id="serial:"+interface["endpoint"], physical_interface_kind="serial")
             if interface["driver"] == "esr1001_usb_ttl":
                 from serial.tools import list_ports
-                interface.update(data_mode=str(values["data_mode"].get()), calibration_profile=str(values["calibration_profile"].get()).strip() or None, bridge=str(values["bridge"].get()).strip(), baudrate=115200)
+                calibration = str(values["calibration_profile"].get()).strip()
+                interface.update(data_mode=str(values["data_mode"].get()), calibration_profile=json.loads(calibration) if calibration.startswith("{") else calibration or None, bridge=str(values["bridge"].get()).strip(), baudrate=115200)
                 ports = [p for p in list_ports.comports() if p.device.casefold() == interface["endpoint"].casefold()]
                 if ports:
                     port = ports[0]
@@ -1256,6 +1260,37 @@ class AcquisitionPanel(ttk.Frame):
             threading.Thread(target=work, daemon=True).start()
         self.after(250, self._poll)
 
+    def _import_esr_candidate(self, values):
+        try:
+            if self.dashboard.acquisition.status().get("running"):
+                raise ValueError("请先停止采集再更改标定")
+            path = filedialog.askopenfilename(parent=self, title="只读选择厂商Config.xml", filetypes=[("XML", "*.xml")])
+            if not path:
+                return
+            candidate = self.dashboard.acquisition.esr_numeric_action({"action": "candidate", "path": path})["candidate"]
+            text = simpledialog.askstring("厂商系数待确认", json.dumps(candidate, ensure_ascii=False, indent=2) +
+                "\n输入含gain_code、bridge、device_binding和四路channels适用条件的JSON；未接通道不能确认标定。", parent=self)
+            if not text:
+                return
+            confirmation = dict(json.loads(text), confirmed=True)
+            result = self.dashboard.acquisition.esr_numeric_action({"action": "confirm", "candidate": candidate, "confirmation": confirmation})
+            values["calibration_profile"].set(json.dumps(result["profile"], ensure_ascii=False))
+            values["bridge"].set(result["profile"]["bridge"])
+            self._hardware_check = None
+            self.monitor_status.set("已选择标定档案，设备参数未改动；请明确选择微应变并重新检查")
+        except Exception as exc:
+            messagebox.showerror("标定未确认", str(exc), parent=self)
+
+    def _esr_zero_action(self, action):
+        try:
+            item = next(x for x in self.dashboard.acquisition.status().get("interfaces", []) if x.get("usb_evidence"))
+            evidence = item["usb_evidence"]
+            self.dashboard.acquisition.esr_numeric_action({"action": action, "interface_id": item["id"],
+                **{k: evidence[k] for k in ("capture_generation", "connection_generation", "calibration_digest")}})
+            self.monitor_status.set("相对零点已设置；绝对值保留" if action == "zero" else "相对清零已关闭")
+        except Exception as exc:
+            messagebox.showerror("相对清零未执行", str(exc), parent=self)
+
     def _apply_live(self, payload: dict[str, Any]) -> None:
         self._last_live = payload
         acquisition = payload.get("acquisition", {})
@@ -1264,7 +1299,8 @@ class AcquisitionPanel(ttk.Frame):
         if usb:
             rate = usb.get("actual_source_rate_hz")
             rate_text = f"{rate:.2f} Hz" if rate is not None else "帧率待确认"
-            self.monitor_status.set(f"源帧 {usb.get('source_frames', 0)}｜{rate_text}｜{usb.get('unit')}｜{usb.get('calibration_state')}")
+            record = usb.get("latest_record") or {}
+            self.monitor_status.set(f"{'当前采集' if acquisition.get('running') else '已停止，历史证据'}｜源帧 {usb.get('source_frames', 0)}｜{rate_text}｜{usb.get('unit')}｜{usb.get('calibration_state')}｜标定 {record.get('display_values', {})}｜相对 {record.get('display_relative_values', {}) if usb.get('zero') else '关闭'}")
         names = [item.get("name") for item in payload.get("channels", [])]
         if tuple(self.sensor_combo["values"]) != tuple(names): self.sensor_combo["values"] = names
         if self.sensor_display.get() not in names and names: self.sensor_display.set(names[0])

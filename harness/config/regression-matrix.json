@@ -56,7 +56,7 @@
       "id": "esr1001-native-usb-contracts",
       "title": "ESR1001原生USB、当前就绪恢复、并发检查与原始ADC诊断合同",
       "kind": "command",
-      "command": ["{python}", "-m", "unittest", "visualization_app.test_esr1001_usb", "-v"],
+      "command": ["{python}", "-m", "unittest", "visualization_app.test_esr1001_usb", "visualization_app.test_esr1001_numeric", "-v"],
       "cwd": ".", "timeout_seconds": 180,
       "profiles": ["quick", "full", "release"], "environments": ["local", "ci"],
       "blocking": true, "evidence_tier": "protocol_simulation",

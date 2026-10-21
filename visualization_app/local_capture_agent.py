@@ -46,10 +46,10 @@ from interface_transport_catalog import (
 
 _ROLE_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("thermocouple64", "serial", ("serial",)),
-    ("plc_process", "ethernet", ("ethernet",)),
-    ("uvc_temperature", "usb_uvc", ("uvc",)),
-    ("abb_motion", "ethernet", ("ethernet",)),
-    ("m3232_pressure", "serial", ("serial",)),
+    ("plc", "ethernet", ("ethernet",)),
+    ("thermal_uvc", "usb_uvc", ("uvc",)),
+    ("robot", "ethernet", ("ethernet",)),
+    ("pressure", "serial", ("serial",)),
     ("esr1001_strain", "serial", ("serial",)),
 )
 RELEASE_CONTRACT = load_release_contract(start=__file__)
@@ -70,6 +70,7 @@ class LocalCaptureAgent:
             simulation_cache_root or default_cache_root
         )
         self._stream_lock = threading.RLock()
+        self._esr_source_cursors = {}
         self._capture_uuid = ""
         self._stream_cursor = 0
         self._stream_sequence = 0
@@ -129,14 +130,14 @@ class LocalCaptureAgent:
         used: set[str] = set()
         for role, kind, protocols in _ROLE_SPECS:
             # Only PLC and ABB are allowed to share an Ethernet adapter.
-            allow_used = role == "abb_motion"
+            allow_used = role == "robot"
             candidate = self._choose_candidate(
                 physical, kind, protocols, used=used, allow_used=allow_used
             )
             role_candidates = [p for p in physical if p.get("kind") == kind
                                and p.get("protocol") in protocols
                                and (not p.get("compatible_roles") or role in p["compatible_roles"])]
-            if role in {"thermocouple64", "m3232_pressure"}:
+            if role in {"thermocouple64", "pressure", "esr1001_strain"}:
                 candidate = None
             physical_id = str(candidate.get("id") or "") if candidate else ""
             if candidate and not allow_used:
@@ -219,6 +220,7 @@ class LocalCaptureAgent:
                 "m3232_uart_text_v1": True,
                 "m3232_matrix_csv_v1": True,
                 "esr1001_calibration_v1": True,
+                "esr1001_numeric_v1": True,
                 "huipu_tc64_modbus_rtu": True,
                 "interface_roles": [item[0] for item in _ROLE_SPECS],
                 "drivers": [
@@ -438,6 +440,7 @@ class LocalCaptureAgent:
                 else ""
             ).strip() or str(config.capture_uuid)
             self._stream_cursor = 0
+            self._esr_source_cursors = {}
             self._stream_sequence = 0
             self._pending_batch = None
             self._status_revision += 1
@@ -502,7 +505,11 @@ class LocalCaptureAgent:
                 frames = []
                 frame_catalog = None
                 total_count = len(all_rows)
-            if end_cursor <= self._stream_cursor and not self._status_dirty:
+            source_reader = getattr(self.manager, "esr_source_evidence_since", None)
+            source_evidence = source_reader(self._esr_source_cursors, 200) if callable(source_reader) else {}
+            if not isinstance(source_evidence, dict):
+                source_evidence = {}
+            if end_cursor <= self._stream_cursor and not self._status_dirty and not source_evidence.get("records"):
                 return None
             frame_contract = str(
                 (frames[0] if frames else {}).get("contract_version")
@@ -518,6 +525,9 @@ class LocalCaptureAgent:
                 "rows": [json_safe_value(dict(row)) for row in rows],
                 "timestamps": [float(value) for value in timestamps],
                 "frames": [json_safe_value(dict(frame)) for frame in frames],
+                "esr_source_records": json_safe_value(source_evidence.get("records", [])),
+                "esr_source_cursors": source_evidence.get("cursors", {}),
+                "esr_source_remaining": source_evidence.get("remaining", 0),
                 "status": json_safe_value(self.status()),
                 "transport": {
                     "helper_batch_created_at": time.time(),
@@ -551,6 +561,7 @@ class LocalCaptureAgent:
                 pending.get("cursor_end", self._stream_cursor + len(pending["rows"]))
             )
             self._stream_sequence += 1
+            self._esr_source_cursors = dict(pending.get("esr_source_cursors", self._esr_source_cursors))
             self._pending_batch = None
             pending_status_revision = self._pending_status_revision
             if self._local_stopped_at is not None and self._flush_state == "flushing":
@@ -565,7 +576,7 @@ class LocalCaptureAgent:
                     total_count = len(all_rows)
                 else:
                     total_count = int(counts.get("total_count", 0))
-                if total_count <= self._stream_cursor:
+                if total_count <= self._stream_cursor and not pending.get("esr_source_remaining", 0):
                     self._flush_state = "completed"
                     self._status_revision += 1
                     self._status_dirty = True
@@ -702,6 +713,12 @@ class LocalCaptureAgent:
             }
         )
         return response
+
+    def esr_numeric(self, payload):
+        result = self.manager.esr_numeric_action(payload)
+        self._status_dirty = True
+        self._status_revision += 1
+        return result
 
     def status(self) -> dict[str, Any]:
         value = dict(self.manager.status())

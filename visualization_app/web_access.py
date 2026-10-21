@@ -86,6 +86,7 @@ AUTHORIZED_POST = {
     "/api/real/control/release",
     "/api/auth/logout",
     "/api/acquisition/test",
+    "/api/acquisition/esr-numeric",
     "/api/acquisition/reset-check",
     "/api/acquisition/start",
     "/api/acquisition/render-evidence",

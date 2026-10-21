@@ -345,8 +345,8 @@ class LocalCaptureAgentTests(unittest.TestCase):
         self.assertEqual(
             [item["role"] for item in result["sensor_bindings"]],
             [
-                "thermocouple64", "plc_process", "uvc_temperature",
-                "abb_motion", "m3232_pressure", "esr1001_strain",
+                "thermocouple64", "plc", "thermal_uvc",
+                "robot", "pressure", "esr1001_strain",
             ],
         )
         self.assertNotIn("thermocouple_8ch", [item["role"] for item in result["sensor_bindings"]])
@@ -354,8 +354,12 @@ class LocalCaptureAgentTests(unittest.TestCase):
         self.assertEqual(result["sensor_bindings"][3]["physical_interface_id"], "ethernet:工控网卡")
         self.assertIsNone(result["sensor_bindings"][4]["physical_interface_id"])
         self.assertFalse(result["sensor_bindings"][4]["identity_confirmed"])
-        self.assertEqual(result["sensor_bindings"][5]["physical_interface_id"], "serial:COM3")
+        self.assertIsNone(result["sensor_bindings"][5]["physical_interface_id"])
         self.assertEqual(result["sensor_bindings"][5]["protocol"], "modbus_rtu")
+        self.assertEqual(
+            [item["id"] for item in result["sensor_bindings"][5]["candidates"]],
+            ["serial:COM3"],
+        )
 
     @patch("local_capture_agent.AcquisitionManager")
     def test_capture_methods_delegate_to_existing_manager(self, manager_cls):

@@ -1057,6 +1057,8 @@ def dispatch_command(agent: LocalCaptureAgent, raw: str | bytes) -> dict[str, An
             )
         elif name == "stop_capture":
             result = agent.stop_capture()
+        elif name == "esr_numeric":
+            result = agent.esr_numeric(payload)
         else:  # decode_command already guards this; retain a defensive branch.
             raise ValueError("helper命令不在允许列表")
     except Exception as exc:

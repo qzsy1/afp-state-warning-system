@@ -64,6 +64,11 @@ class JournalRows:
                     recovered.setdefault("timestamp_unix", float(timestamp))
                     yield recovered
 
+    def source_records(self):
+        with closing(sqlite3.connect(self.path)) as connection:
+            for (body,) in connection.execute("SELECT body FROM batches WHERE session_id=? AND capture_uuid=? ORDER BY sequence", (self.session_id, self.capture_uuid)):
+                yield from json.loads(body).get("esr_source_records", [])
+
 
 @dataclass(frozen=True)
 class CaptureRecord:
@@ -275,6 +280,17 @@ class ServerCaptureJournal:
             "rows": rows,
             "timestamps": timestamps,
         }
+        sources = batch.get("esr_source_records", [])
+        if not isinstance(sources, list) or len(sources) > 200 or _without_secrets(sources) != sources:
+            return {"ok": False, "error": "esr_source_evidence_invalid"}
+        try:
+            from esr1001_usb import verify_source_evidence, UsbProtocolError
+            for source in sources:
+                verify_source_evidence(source)
+        except (KeyError, TypeError, ValueError, UsbProtocolError) as exc:
+            return {"ok": False, "error": "esr_source_evidence_invalid", "detail": str(exc)}
+        if sources:
+            journal_payload["esr_source_records"] = sources
         if frames is not None:
             journal_payload["frames"] = frames
         frame_catalog = batch.get("frame_catalog")
@@ -489,6 +505,7 @@ class TargetMySQLSaveCoordinator:
                 "sample_count": record.row_count,
                 "source": "remote_helper_server_journal",
                 "completed_layers": [int(config.layer) + 1],
+                "data_quality": record.status.get("data_quality") or {},
             }
             result = self.store_factory(selection.settings).save_layer(
                 config,
@@ -498,6 +515,7 @@ class TargetMySQLSaveCoordinator:
                 timestamp_file=None,
                 folder_path=None,
                 summary=summary,
+                source_records=record.rows.source_records(),
             )
             result = _without_secrets(result if isinstance(result, dict) else {"ok": False})
         except Exception as exc:

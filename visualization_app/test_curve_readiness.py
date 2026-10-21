@@ -177,6 +177,7 @@ status.capture_generation='current';evidence.latest_matrix.matrix[0]=[NaN];rende
         script = r'''
 const assert=require('node:assert/strict');const window={};
 const controls={acquisitionMode:{value:'real'}};
+const renderEsrNumeric=()=>{};
 const state={hardwareCheck:{ok:true,readiness_session_id:'backend',readiness_version:3},hardwareCheckFingerprint:'same'};
 ''' + source[start:end] + "}\n" + r'''
 renderAcquisitionStatus({readiness_session_id:'backend',readiness_version:2,readiness_session_valid:false});

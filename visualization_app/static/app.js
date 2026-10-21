@@ -794,6 +794,7 @@ function applySensorTypeProfile(row, resetEndpoint = true) {
     driver.disabled = !profile.editable_driver && !strain;
   }
   const usb = strain && driver?.value === "esr1001_usb_ttl";
+  row.querySelector(".esr-import")?.classList.toggle("hidden", !usb);
   const film = role?.value === "pressure";
   const mode = row.querySelector(".interface-data-mode");
   if (mode) {
@@ -1173,6 +1174,112 @@ function renderM3232Matrix(status) {
   }));
 }
 
+async function esrNumericAction(payload) {
+  if (usesLocalCaptureHelper()) {
+    if (!state.helperStatus?.capabilities?.esr1001_numeric_v1) throw new Error("辅助程序缺少ESR数值语义能力，请更新辅助程序");
+    return await requestLocalHelper("esr_numeric", payload);
+  }
+  return await postJson("/api/acquisition/esr-numeric", payload);
+}
+
+function esrChannelContext(context, channel) {
+  const info = context?.channels?.[`CH${channel}`] || {};
+  const states = {connected: "已接传感器（现场申报）", disconnected: "未接传感器，仅作ADC诊断", wiring_fault: "已报告接线损坏，仅作ADC诊断"};
+  const parts = [states[info.connection_state] || "接线状态未核验"];
+  if (info.model) parts.push(`型号 ${info.model}`);
+  if (Number.isFinite(info.resistance_ohm) && info.resistance_ohm > 0) parts.push(`标称 ${info.resistance_ohm}Ω`);
+  if (Number.isFinite(info.gauge_factor)) parts.push(`片栅灵敏系数 ${info.gauge_factor}（不是ADC换算K）`);
+  if (info.expected_bridge) parts.push(`传感器桥路 ${info.expected_bridge}`);
+  parts.push(info.switch_verified === true ? "拨码已记录核验" : "实际拨码未核验");
+  if (info.mounting) parts.push(`安装 ${info.mounting}`);
+  if (info.load) parts.push(`加载 ${info.load}`);
+  return parts.join("；");
+}
+
+const esrRelativeHistory = {key: "", points: []};
+
+function updateEsrRelativeHistory(history, evidence, fresh) {
+  const record = evidence.latest_record || {};
+  const key = [evidence.capture_generation, evidence.connection_generation, evidence.calibration_digest, evidence.zero?.id].join("/");
+  if (key !== history.key) { history.key = key; history.points = []; }
+  const last = history.points.at(-1);
+  if (fresh && evidence.zero && record.zero_id === evidence.zero.id &&
+      (!last || record.receive_sequence > last.sequence)) {
+    if (last && record.host_monotonic - last.time > 0.25) {
+      history.points.push({time: record.host_monotonic, values: {}, sequence: last.sequence});
+    }
+    history.points.push({time: record.host_monotonic, sequence: record.receive_sequence, values: record.relative_values || {}});
+    history.points = history.points.filter(p => p.time >= record.host_monotonic - 60).slice(-600);
+  }
+  return history.points;
+}
+
+function renderEsrNumeric(status) {
+  const panel = document.getElementById("esrNumericPanel");
+  if (!panel) return;
+  const item = (status.interfaces || []).find(x => x.usb_evidence);
+  panel.classList.toggle("hidden", !item);
+  if (!item) return;
+  const evidence = item.usb_evidence;
+  const context = evidence.measurement_context || {};
+  const focus = document.getElementById("esrFocusChannel");
+  const captureKey = [item.id, evidence.capture_generation].join("/");
+  if (focus.dataset.captureKey !== captureKey) {
+    focus.dataset.captureKey = captureKey;
+    focus.value = [1,2,3,4].includes(context.focus_channel) ? String(context.focus_channel) : "all";
+  }
+  focus.onchange = () => renderEsrNumeric(state.acquisitionStatus);
+  const focused = [1,2,3,4].filter(i => focus.value === "all" || String(i) === focus.value);
+  document.getElementById("esrMeasurementContext").textContent = [
+    "现场信息用于诊断，不作为标定或正常范围依据。",
+    ...focused.map(i => `CH${i}：${esrChannelContext(context, i)}`),
+    context.external_power_reported === true ? "外接供电已由现场确认；电压与稳定性未测量。" : "外部供电条件未核验。",
+  ].join("\n");
+  const record = evidence.latest_record || {};
+  const fresh = status.running && item.adapter_state === "running" && item.state === "ok";
+  document.getElementById("esrNumericState").textContent = `${fresh ? "当前源观测" : status.running ? "当前数据不可用；下列为历史证据" : "已停止；下列为历史证据"}｜${evidence.calibration_state}｜相对零点${evidence.zero ? "已设置" : "关闭"}｜源序号 ${record.receive_sequence ?? "—"}`;
+  const calibrated = record.calibrated_values || {};
+  const relativeUnit = Object.keys(calibrated).length ? "με" : "adc_counts";
+  const relativeKey = i => relativeUnit === "με" ? `相对应变${i}` : `CH${i}_ADC_relative`;
+  const lines = [`通道 | 原始ADC (adc_counts) | 标定绝对值 (με) | 相对变化 (${relativeUnit}) | 量程核对`];
+  const labels = {within_reference_range: "在已记录参考范围内", outside_reference_range: "超出已记录参考范围", range_unverified: "缺少范围依据"};
+  for (let i = 1; i <= 4; i++) {
+    lines.push(`CH${i} | ${record[`CH${i}_ADC_signed`] ?? "—"} | ${record.display_values?.[`应变${i}`] ?? "未标定"} | ${evidence.zero ? record.display_relative_values?.[relativeKey(i)] ?? "等待清零后的新源帧" : "关闭"} | ${labels[record.range_assessment?.[i-1]] || "缺少范围依据"}${record.adc_at_rail?.[i-1] ? "；ADC已达补码边界，需检查量程/接线" : ""}`);
+  }
+  document.getElementById("esrNumericValues").textContent = lines.join("\n");
+  const zero = document.getElementById("esrZeroButton");
+  const clear = document.getElementById("esrClearZeroButton");
+  zero.disabled = !fresh;
+  clear.disabled = !status.running || !evidence.zero;
+  const request = action => ({action, interface_id: item.id, capture_generation: evidence.capture_generation,
+    connection_generation: evidence.connection_generation, calibration_digest: evidence.calibration_digest});
+  zero.onclick = async () => { try { await esrNumericAction(request("zero")); toast("相对零点已设置；请查看主工作区的相对变化，原始值保留"); } catch (error) { toast(error.message); } };
+  clear.onclick = async () => { try { await esrNumericAction(request("clear_zero")); toast("相对清零已关闭"); } catch (error) { toast(error.message); } };
+  const trends = document.getElementById("esrRelativeTrends");
+  const points = updateEsrRelativeHistory(esrRelativeHistory, evidence, fresh);
+  trends.classList.toggle("hidden", !Object.keys(record).length);
+  if (!trends.children.length) {
+    trends.innerHTML = [1,2,3,4].map(i => `<div class="esr-relative-channel"><strong>CH${i} 相对变化</strong><output></output><p class="esr-source-value"></p><p class="esr-channel-diagnostic"></p><small></small><canvas></canvas></div>`).join("");
+  }
+  [...trends.children].forEach((card, index) => {
+    card.classList.toggle("hidden", !focused.includes(index + 1));
+    const key = relativeKey(index + 1);
+    const values = points.map(p => p.values[key]);
+    const observed = values.filter(Number.isFinite);
+    card.querySelector("output").textContent = evidence.zero ? `${fresh ? "" : "历史："}${record.zero_id === evidence.zero.id ? record.display_relative_values?.[key] ?? "—" : "等待新源帧"} ${relativeUnit}` : "相对零点未设置";
+    card.querySelector(".esr-source-value").textContent = `${fresh ? "当前源帧" : "历史源帧"} #${record.receive_sequence ?? "—"}：原始ADC ${record[`CH${index+1}_ADC_signed`] ?? "—"} adc_counts`;
+    const diagnostic = card.querySelector(".esr-channel-diagnostic");
+    diagnostic.textContent = [esrChannelContext(context, index + 1), record.adc_at_rail?.[index] ? "ADC已达补码边界；相对值为零也不能判为正常" : "量值范围仍需标定与参考输入依据"].join("；");
+    diagnostic.classList.toggle("error", Boolean(record.adc_at_rail?.[index]));
+    card.querySelector("small").textContent = observed.length ? `页面近60秒新源观测：${observed.length}次；最小 ${Math.min(...observed)}，最大 ${Math.max(...observed)}，峰峰值 ${Math.max(...observed)-Math.min(...observed)} ${relativeUnit}` : evidence.zero ? "等待清零后的新源观测" : "需要明确点击设置相对零点后才显示相对趋势";
+    const canvas = card.querySelector("canvas");
+    const lastTime = points.at(-1)?.time || 0;
+    if (card.classList.contains("hidden")) return;
+    if (observed.length) drawChannelChart(canvas, {x_observed: points.map(p => p.time-lastTime), x_future: [], actual: values, prediction_observed: [], prediction_enabled: false}, 150, true);
+    else { const {ctx, width, height} = setupCanvas(canvas, 150); ctx.clearRect(0, 0, width, height); }
+  });
+}
+
 function renderAcquisitionStatus(status) {
   if (controls.acquisitionMode?.value === "real" && window.afpCurveTrace
       && !window.afpCurveTrace.accepts(status)) return;
@@ -1180,6 +1287,7 @@ function renderAcquisitionStatus(status) {
       && Number.isFinite(status.status_monotonic) && Number.isFinite(state.acquisitionStatus?.status_monotonic)
       && status.status_monotonic < state.acquisitionStatus.status_monotonic) return;
   state.acquisitionStatus = status;
+  renderEsrNumeric(status);
   if (typeof renderM3232Matrix === "function") renderM3232Matrix(status);
   const evidence = state.hardwareCheck;
   const sameReadinessSession = status.readiness_session_id === evidence?.readiness_session_id;
@@ -6225,6 +6333,18 @@ function physicalSelectionProvidesProtocolEndpoint(role, item) {
   return profile.physical_kind === "serial" && ["serial", "com"].includes(kind);
 }
 
+function stableUvcIdentityMatches(savedIdentity, liveIdentity) {
+  const saved = savedIdentity && typeof savedIdentity === "object" ? savedIdentity : {};
+  const live = liveIdentity && typeof liveIdentity === "object" ? liveIdentity : {};
+  const savedContainer = String(saved.container_id || saved.containerId || "").toLowerCase();
+  const liveContainer = String(live.container_id || live.containerId || "").toLowerCase();
+  if (!savedContainer || savedContainer !== liveContainer) return false;
+  const savedVid = Number(saved.vid);
+  const savedPid = Number(saved.pid);
+  return Number.isFinite(savedVid) && Number.isFinite(savedPid)
+    && savedVid === Number(live.vid) && savedPid === Number(live.pid);
+}
+
 function autoAssignPhysicalInterfaces(configs, {allowSerialFallback = true} = {}) {
   const used = new Set((configs || []).filter(item => item.role !== "thermocouple64")
     .map(item => String(item.physical_port_id || item.physical_interface_id || "")).filter(Boolean));
@@ -6301,6 +6421,13 @@ function autoAssignPhysicalInterfaces(configs, {allowSerialFallback = true} = {}
     let selected = desired ? candidates.find((candidate) =>
       [candidate.id, candidate.physical_port_id, candidate.physical_interface_id].map(String).includes(desired),
     ) : null;
+    if (!selected && role === "thermal_uvc") {
+      const identityMatches = candidates.filter((candidate) => (
+        candidate.compatible !== false
+        && stableUvcIdentityMatches(item.device_identity, candidate.device_identity)
+      ));
+      if (identityMatches.length === 1) selected = identityMatches[0];
+    }
     if (!selected && role === "esr1001_strain" && item.driver === "esr1001_usb_ttl") return;
     if (!selected && desired && ["manual", "saved"].includes(item.selection_origin)) {
       const keptResource = String(item.physical_port_id || item.physical_interface_id || "");
@@ -6321,9 +6448,23 @@ function autoAssignPhysicalInterfaces(configs, {allowSerialFallback = true} = {}
         .sort((left, right) => rank(left, role) - rank(right, role) || resourceId(left).localeCompare(resourceId(right)))[0];
     }
     if (!selected) return;
-    item.physical_port_id = String(selected.physical_port_id || selected.parent_port_id || "");
+    const previousEndpoint = String(item.endpoint || "");
+    const previousInterfaceId = String(item.physical_interface_id || "");
+    const previousPortId = String(item.physical_port_id || "");
+    const nextInterfaceId = selected.compatible === false
+      ? "" : String(selected.physical_interface_id || (!selected.physical_port_id ? selected.id : "") || "");
+    const nextPortId = String(selected.physical_port_id || selected.parent_port_id || "");
+    const nextEndpoint = (
+      selected.endpoint
+      && selected.compatible !== false
+      && physicalSelectionProvidesProtocolEndpoint(role, selected)
+    ) ? String(selected.endpoint) : previousEndpoint;
+    const bindingChanged = previousEndpoint !== nextEndpoint
+      || previousInterfaceId !== nextInterfaceId
+      || previousPortId !== nextPortId;
+    item.physical_port_id = nextPortId;
     item.physical_interface_id = selected.compatible === false
-      ? "" : String(selected.physical_interface_id || (!item.physical_port_id ? selected.id : "") || "");
+      ? "" : nextInterfaceId;
     item.physical_interface_kind = profile.physical_kind || normalizedKind(selected);
     item.physical_transport_family = interfaceTransportFamily(selected);
     item.physical_verified = Boolean(item.physical_interface_id && selected.detected !== false && selected.compatible !== false);
@@ -6334,7 +6475,12 @@ function autoAssignPhysicalInterfaces(configs, {allowSerialFallback = true} = {}
       && selected.compatible !== false
       && physicalSelectionProvidesProtocolEndpoint(role, selected)
     ) {
-      item.endpoint = selected.endpoint;
+      item.endpoint = nextEndpoint;
+    }
+    if (selected.device_identity) item.device_identity = {...selected.device_identity};
+    if (bindingChanged) {
+      item.protocol_verified = false;
+      item.channel_settings = {};
     }
     item.enabled = item.enabled !== false;
     if (interfaceTransportFamily(selected) === "ethernet") assigned.ethernet = selected;
@@ -6568,6 +6714,33 @@ function renderInterfacePanel(configs) {
     const bridge = document.createElement("input"); bridge.className = "interface-bridge";
     bridge.placeholder = "与标定档案一致的桥路"; bridge.value = item.bridge || "";
     usbOptions.append(dataMode, calibration, bridge);
+    const esrImport = document.createElement("details"); esrImport.className = "esr-import";
+    const importSummary = document.createElement("summary"); importSummary.textContent = "只读导入厂商K/B候选并确认适用条件";
+    const vendorPath = document.createElement("input"); vendorPath.placeholder = "设备所在主机的厂商Config.xml路径";
+    const candidateView = document.createElement("pre");
+    const conditions = document.createElement("textarea"); conditions.rows = 6;
+    conditions.placeholder = '逐路适用条件JSON：{"gain_code":实际读回值,"bridge":"桥路标识","channels":[四路{connected,bridge,resistance_ohm,calibration_basis}]}；范围需另含range_microstrain、range_basis、reference_input';
+    const read = document.createElement("button"); read.type = "button"; read.textContent = "读取候选（不改设备参数）";
+    const apply = document.createElement("button"); apply.type = "button"; apply.textContent = "确认适用条件并选择档案（须重新检查）"; apply.disabled = true;
+    let candidate = null;
+    read.addEventListener("click", async () => {
+      try {
+        candidate = (await esrNumericAction({action: "candidate", path: vendorPath.value.trim()})).candidate;
+        candidateView.textContent = JSON.stringify(candidate, null, 2); apply.disabled = false;
+      } catch (error) { candidate = null; apply.disabled = true; toast(error.message); }
+    });
+    apply.addEventListener("click", async () => {
+      try {
+        if (state.acquisitionStatus?.running) throw new Error("请先停止采集再更改标定");
+        const config = interfaceConfigs().find(x => x.id === row.dataset.interfaceId);
+        const confirmation = {...JSON.parse(conditions.value), device_binding: config?.device_identity, confirmed: true};
+        const result = await esrNumericAction({action: "confirm", candidate, confirmation});
+        calibration.value = JSON.stringify(result.profile); bridge.value = result.profile.bridge;
+        markHardwareCheckStale("标定档案已选择，请重新检查；设备参数未改动"); configureDatasetSchema(false);
+        toast("已选择确认档案；微应变仍需明确选择数据用途并通过接口检查");
+      } catch (error) { toast(error.message); }
+    });
+    esrImport.append(importSummary, vendorPath, read, candidateView, conditions, apply); usbOptions.append(esrImport);
     [dataMode, calibration, bridge].forEach((control) => control.addEventListener("change", () => {
       markHardwareCheckStale("USB数据用途或标定已变化"); configureDatasetSchema(false);
     }));

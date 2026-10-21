@@ -40,7 +40,7 @@ from smrf_hid import SmrfHidDriver, enumerate_smrf_hid_devices
 from hp_thermocouple64 import HpThermocouple64Driver, normalize_read_profile
 from esr1001_usb import (
     USB_DRIVER, RAW_CHANNELS, Esr1001UsbDriver, RawCaptureWriter,
-    load_calibration, UsbProtocolError, probe_usb,
+    load_calibration, UsbProtocolError, probe_usb, read_vendor_candidate, confirm_vendor_candidate, replay_source_capture,
 )
 from m3232_serial import (M3232PressureDriver, MatrixRecorder, normalize_config as normalize_m3232,
     matrix_csv_path,
@@ -1466,6 +1466,9 @@ def _apply_sensor_interface_profile(interface: dict[str, Any]) -> dict[str, Any]
     interface["role"] = sensor_type
     usb_strain = sensor_type == "esr1001_strain" and interface.get("driver") == USB_DRIVER
     if usb_strain:
+        interface["channel_settings"] = deepcopy(interface.get("channel_settings") or {})
+        if not isinstance(interface["channel_settings"], dict) or not isinstance(interface["channel_settings"].get("esr_context", {}), dict):
+            raise ValueError("ESR通道设置及现场信息必须为对象")
         interface["protocol"] = USB_DRIVER
         interface["baudrate"] = 115200
         interface["data_mode"] = str(interface.get("data_mode") or "raw_adc")
@@ -3161,6 +3164,17 @@ class SimulatorDriver(SampleDriver):
     def open(self) -> None:
         self._files = self._source_files()
         available = set().union(*(set(self._header(path)) for path in self._files))
+        self._esr_replay = None
+        if set(RAW_CHANNELS).issubset(available) and "raw_hex" in available:
+            metadata = json.loads(self._files[0].with_suffix(".json").read_text(encoding="utf-8"))
+            profile = metadata.get("calibration_snapshot")
+            if profile:
+                available.update(f"应变{i}" for i in range(1, 5))
+            missing = set(self.sensor_columns) - available
+            if missing:
+                raise ValueError(f"历史源帧缺少适用档案或通道：{sorted(missing)}")
+            self._esr_replay = iter(replay_source_capture(self._files[0]))
+            return
         missing = [name for name in self.sensor_columns if name not in available]
         if missing:
             raise ValueError(f"模拟数据缺少传感器列：{missing}")
@@ -3169,6 +3183,14 @@ class SimulatorDriver(SampleDriver):
         self._open_current()
 
     def read_sample(self) -> dict[str, float] | None:
+        if getattr(self, "_esr_replay", None) is not None:
+            try:
+                record = next(self._esr_replay)
+            except StopIteration:
+                self._esr_replay = iter(replay_source_capture(self._files[0]))
+                record = next(self._esr_replay)
+            values = dict(record, **record["calibrated_values"])
+            return {name: values[name] for name in self.sensor_columns}
         if not self._files or self._reader is None:
             return None
         for _ in range(len(self._files) + 1):
@@ -3186,6 +3208,10 @@ class SimulatorDriver(SampleDriver):
         return None
 
     def close(self) -> None:
+        replay = getattr(self, "_esr_replay", None)
+        self._esr_replay = None
+        if replay is not None:
+            replay.close()
         handle = self._handle
         self._handle = None
         self._reader = None
@@ -3908,6 +3934,29 @@ def _parse_roi(value: Any) -> tuple[int, int, int, int] | None:
         return None
 
 
+def uvc_source_observation_readiness(
+    observations: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> dict[str, Any]:
+    distinct: dict[int, float] = {}
+    for item in observations:
+        if not isinstance(item, dict):
+            continue
+        try:
+            sequence = int(item["source_sequence"])
+            observed = float(item["received_monotonic"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(observed):
+            distinct.setdefault(sequence, observed)
+    times = sorted(distinct.values())
+    span = max(0.0, times[-1] - times[0]) if len(times) > 1 else 0.0
+    return {
+        "ready": len(distinct) >= 3 and span >= 1.0,
+        "distinct_source_frames": len(distinct),
+        "observation_span_seconds": span,
+    }
+
+
 class UvcDriverError(RuntimeError):
     def __init__(
         self,
@@ -3947,8 +3996,13 @@ class UvcThermalDriver(SampleDriver):
         self._started = False
         self._native_lock = threading.Lock()
         self._native_timeout_stage = ""
+        self._connection_generation = 0
+        self._last_frame_counter: int | None = None
         self.source_timestamp: float | None = None
-        self.quality_metadata: dict[str, Any] = {}
+        self.quality_metadata: dict[str, Any] = {
+            "driver": "uvc_thermal",
+            "frame_kind": "temperature_matrix",
+        }
         self.yuv_buffer = (ctypes.c_ubyte * BSV_UVC_YUV_BYTES)()
         self.temp_buffer = (ctypes.c_ushort * BSV_UVC_PIXELS)()
 
@@ -4034,6 +4088,8 @@ class UvcThermalDriver(SampleDriver):
             ctypes.POINTER(ctypes.c_ushort), ctypes.c_int,
         ]
         self.dll.BsvGetFrame.restype = ctypes.c_int
+        self.dll.BsvGetFrameCounter.argtypes = []
+        self.dll.BsvGetFrameCounter.restype = ctypes.c_uint32
         self.dll.BsvGetLastError.argtypes = []
         self.dll.BsvGetLastError.restype = ctypes.c_int
         self.dll.BsvStop.argtypes = []
@@ -4065,7 +4121,7 @@ class UvcThermalDriver(SampleDriver):
                     last_error=self._safe_last_error(),
                 )
             result = int(self._native_call("open", self.dll.BsvOpen))
-            if result <= 0:
+            if result < 0:
                 raise UvcDriverError(
                     "device_open_failed",
                     "open",
@@ -4073,7 +4129,7 @@ class UvcThermalDriver(SampleDriver):
                     last_error=self._safe_last_error(),
                 )
             result = int(self._native_call("start", self.dll.BsvStart))
-            if result <= 0:
+            if result < 0:
                 raise UvcDriverError(
                     "device_open_failed",
                     "start",
@@ -4081,6 +4137,13 @@ class UvcThermalDriver(SampleDriver):
                     last_error=self._safe_last_error(),
                 )
             self._started = True
+            self._connection_generation += 1
+            self._last_frame_counter = None
+            self.quality_metadata = {
+                "driver": "uvc_thermal",
+                "frame_kind": "temperature_matrix",
+                "connection_generation": self._connection_generation,
+            }
         except Exception:
             self._release_native(raise_errors=False)
             raise
@@ -4104,11 +4167,25 @@ class UvcThermalDriver(SampleDriver):
         if self.dll is None:
             return None
         last_result: int | None = None
+        counter_copy_retries = 0
         for _ in range(self.poll_retries):
             has_frame = int(self._native_call("has_frame", self.dll.BsvHasFrame))
             if has_frame <= 0:
                 last_result = has_frame
                 continue
+            frame_counter_before = int(self._native_call(
+                "frame_counter", self.dll.BsvGetFrameCounter
+            ))
+            if (
+                self._last_frame_counter is not None
+                and frame_counter_before == self._last_frame_counter
+            ):
+                self.quality_metadata.update({
+                    "source_frame_counter": frame_counter_before,
+                    "repeated_frame": True,
+                    "counter_copy_retries": counter_copy_retries,
+                })
+                return None
             result = int(self._native_call(
                 "get_frame",
                 self.dll.BsvGetFrame,
@@ -4119,18 +4196,37 @@ class UvcThermalDriver(SampleDriver):
             ))
             last_result = result
             if result > 0:
+                frame_counter_after = int(self._native_call(
+                    "frame_counter", self.dll.BsvGetFrameCounter
+                ))
+                if frame_counter_after != frame_counter_before:
+                    counter_copy_retries += 1
+                    continue
                 temperature = self._roi_average_temperature()
                 if not math.isfinite(temperature):
                     raise UvcDriverError(
                         "invalid_temperature_matrix", "validate_frame"
                     )
+                self._last_frame_counter = frame_counter_after
                 self.source_timestamp = time.time()
                 self.quality_metadata = {
+                    "driver": "uvc_thermal",
                     "frame_kind": "temperature_matrix",
                     "width": BSV_UVC_WIDTH,
                     "height": BSV_UVC_HEIGHT,
+                    "source_frame_counter": frame_counter_after,
+                    "connection_generation": self._connection_generation,
+                    "repeated_frame": False,
+                    "counter_copy_retries": counter_copy_retries,
                 }
                 return {"ROI平均温度": temperature}
+        if counter_copy_retries:
+            raise UvcDriverError(
+                "frame_counter_unstable",
+                "get_frame",
+                return_code=last_result,
+                last_error=self._safe_last_error(),
+            )
         raise UvcDriverError(
             "no_valid_frame",
             "get_frame" if last_result not in (None, 0) else "has_frame",
@@ -4322,11 +4418,13 @@ class MultiInterfaceDriver(SampleDriver):
                             "device_binding": item.get("device_identity") or {},
                             "data_mode": item.get("data_mode"), "bridge": item.get("bridge"),
                             "calibration_digest": item.get("calibration_digest"),
+                            "measurement_context": deepcopy((item.get("channel_settings") or {}).get("esr_context", {})),
                         })
                     driver = Esr1001UsbDriver(
                         str(item.get("endpoint") or ""), data_mode=item.get("data_mode", "raw_adc"),
                         calibration=item.get("calibration_profile"), binding=item.get("device_identity"),
                         bridge=str(item.get("bridge") or ""), recorder=recorder,
+                        measurement_context=(item.get("channel_settings") or {}).get("esr_context"),
                         startup_policy=self.usb_startup_profiles.get(str(item.get("id") or ""), "fixed"),
                     )
                 elif driver_name == "modbus_rtu_esr1001":
@@ -5652,6 +5750,8 @@ class AcquisitionManager(AcquisitionStartMixin):
             channel_observations: dict[str, dict[str, Any]] = {}
             probe_errors: list[str] = []
             probe_diagnostics: dict[str, Any] = {}
+            uvc_readiness = uvc_source_observation_readiness([])
+            uvc_counted_frames = 0
             interface_driver = None
             try:
                 interface_driver = MultiInterfaceDriver(
@@ -5660,8 +5760,46 @@ class AcquisitionManager(AcquisitionStartMixin):
                 )
                 interface_driver.open()
                 probe_started = time.time()
-                while time.time() - probe_started < (float(item.get("first_frame_timeout_seconds", 2.0)) + 0.2 if item.get("driver") == "m3232_pressure" else max(0.5, min(float(timeout_seconds), 1.5))):
+                if item.get("driver") == "m3232_pressure":
+                    probe_window = float(item.get("first_frame_timeout_seconds", 2.0)) + 0.2
+                elif role == "thermal_uvc":
+                    probe_window = max(1.2, min(float(timeout_seconds), 5.0))
+                else:
+                    probe_window = max(0.5, min(float(timeout_seconds), 1.5))
+                while time.time() - probe_started < probe_window:
                     sample = interface_driver.read_sample()
+                    if role == "thermal_uvc":
+                        statuses = [
+                            status for status in interface_driver.worker_status()
+                            if str(status.get("interface_id") or "") == interface_id
+                        ]
+                        observations = (
+                            list(statuses[0].get("source_observations") or [])
+                            if statuses else []
+                        )
+                        uvc_readiness = uvc_source_observation_readiness(observations)
+                        frame_count = int(uvc_readiness["distinct_source_frames"])
+                        increment = max(0, frame_count - uvc_counted_frames)
+                        if sample and increment:
+                            sample_timestamp = time.time()
+                            for name in expected:
+                                value = _finite(sample.get(name)) if name in sample else None
+                                if value is None:
+                                    continue
+                                detected[name] = frame_count
+                                received[name] += increment
+                                channel_observations[name] = {
+                                    "value": value,
+                                    "source_timestamp": sample_timestamp,
+                                    "quality": "measured_new",
+                                }
+                            uvc_counted_frames = frame_count
+                        if uvc_readiness["ready"] and expected and all(
+                            detected.get(name, 0) >= 3 for name in expected
+                        ):
+                            break
+                        time.sleep(0.01)
+                        continue
                     if sample:
                         sample_timestamp = time.time()
                         for name in expected:
@@ -5698,6 +5836,8 @@ class AcquisitionManager(AcquisitionStartMixin):
                         interface_driver.close()
                     except Exception:
                         pass
+            if role == "thermal_uvc":
+                probe_diagnostics["source_readiness"] = deepcopy(uvc_readiness)
             if not detected and not probe_errors and interface_driver is not None:
                 worker_statuses = list(
                     getattr(interface_driver, "final_worker_status", []) or []
@@ -5712,13 +5852,22 @@ class AcquisitionManager(AcquisitionStartMixin):
             missing = [name for name in expected if detected.get(name, 0) <= 0]
             invalid_channels = [name for name in missing if invalid.get(name, 0) > 0]
             if detected:
-                if role in {"plc", "robot"} and (missing or invalid_channels):
+                if role == "thermal_uvc" and not uvc_readiness["ready"]:
+                    state = "uvc_new_frames_insufficient"
+                elif role == "thermal_uvc" and physical_verified:
+                    state = "data_ready"
+                elif role in {"plc", "robot"} and (missing or invalid_channels):
                     state = "partial_channels"
                 elif role in {"plc", "robot"} and physical_verified:
                     state = "data_ready"
                 else:
                     state = "ok" if physical_verified else "physical_unverified"
                 message = f"接口已收到有效数据：{'、'.join(sorted(detected))}"
+                if role == "thermal_uvc" and not uvc_readiness["ready"]:
+                    message += (
+                        f"；仅确认 {uvc_readiness['distinct_source_frames']} 个不同源帧，"
+                        f"观察跨度 {uvc_readiness['observation_span_seconds']:.3f} 秒"
+                    )
                 if missing:
                     if role in {"plc", "robot"}:
                         message += f"；缺少必需通道：{'、'.join(missing)}"
@@ -5774,12 +5923,16 @@ class AcquisitionManager(AcquisitionStartMixin):
                     "invalid": list(invalid_channels),
                 },
                 "freshness": {
-                    "state": "passed" if detected and not missing else "failed",
+                    "state": "passed" if (
+                        detected and not missing
+                        and (role != "thermal_uvc" or uvc_readiness["ready"])
+                    ) else "failed",
                     "freshness_seconds": float(
                         (item.get("device_profile") or {}).get("freshness_seconds")
                         or item.get("freshness_seconds")
                         or 0.0
                     ),
+                    **({"source_readiness": deepcopy(uvc_readiness)} if role == "thermal_uvc" else {}),
                 },
             }
             interface_results.append({
@@ -5802,7 +5955,9 @@ class AcquisitionManager(AcquisitionStartMixin):
                 "read_profile": item.get("read_profile"),
                 "driver_diagnostics": driver_diagnostics,
                 "protocol_verified": bool(driver_diagnostics.get("protocol_verified", bool(detected or invalid))),
-                "temperature_valid": bool(detected),
+                "temperature_valid": bool(
+                    detected and (role != "thermal_uvc" or uvc_readiness["ready"])
+                ),
             })
         configuration_issues = list(getattr(config, "configuration_issues", []) or [])
         issues_by_interface: dict[str, list[dict[str, Any]]] = {}
@@ -7186,7 +7341,7 @@ class AcquisitionManager(AcquisitionStartMixin):
                             ),
                             "channel_source_sequence_json": json.dumps({name: ch.source_sequence for name, ch in frame.channels.items()} if frame else {}, ensure_ascii=False),
                             "channel_interface_json": json.dumps({name: ch.interface_id for name, ch in frame.channels.items()} if frame else {}, ensure_ascii=False),
-                            "channel_source_record_json": json.dumps({name: {key: (ch.metadata.get("latest_record") or {}).get(key) for key in ("connection_generation", "receive_sequence", "sha256", "byte_offset")} for name, ch in frame.channels.items() if ch.metadata.get("latest_record")} if frame else {}, ensure_ascii=False),
+                            "channel_source_record_json": json.dumps({name: (dict(ch.metadata["latest_record"], calibration_snapshot=ch.metadata.get("calibration_snapshot")) if ch.metadata.get("driver") == USB_DRIVER else {key: ch.metadata["latest_record"].get(key) for key in ("connection_generation", "receive_sequence", "sha256", "byte_offset")}) for name, ch in frame.channels.items() if ch.metadata.get("latest_record")} if frame else {}, ensure_ascii=False),
                         }
                         capture_writer.submit(row, timestamp_row)
                         self.persistence_queue_depth = capture_writer.pending_rows
@@ -8026,6 +8181,60 @@ class AcquisitionManager(AcquisitionStartMixin):
             self.finalization_complete = False
         return self.status()
 
+    def esr_source_evidence_since(self, cursors, limit=200):
+        sources = dict(getattr(self.driver, "interface_quality_metadata", {}) or {})
+        for worker in list(getattr(self.driver, "workers", [])):
+            if isinstance(worker.driver, Esr1001UsbDriver) and worker.driver.recorder:
+                writer = worker.driver.recorder
+                sources[worker.interface_id] = dict(worker.driver.quality_metadata, raw_file=str(writer.path), saved_source_rows=writer.rows)
+        output, updated, remaining = [], dict(cursors), 0
+        for identity, evidence in sources.items():
+            if evidence.get("driver") != USB_DRIVER or not evidence.get("raw_file"):
+                continue
+            start = int(cursors.get(identity, 0))
+            count = int(evidence.get("saved_source_rows", 0))
+            with Path(evidence["raw_file"]).open(encoding="utf-8-sig", newline="") as stream:
+                for index, row in enumerate(csv.DictReader(stream)):
+                    if index >= count or len(output) >= limit:
+                        break
+                    if index < start:
+                        continue
+                    output.append({"interface_id": identity, "record": row,
+                                   "measurement_context": deepcopy(evidence.get("measurement_context") or {}),
+                                   "calibration_snapshot": evidence.get("calibration_snapshot"),
+                                   "capture_generation": evidence.get("capture_generation")})
+                    updated[identity] = index + 1
+            remaining += max(0, count - int(updated.get(identity, 0)))
+        return {"records": output, "cursors": updated, "remaining": remaining}
+
+    def esr_numeric_action(self, payload):
+        action = payload.get("action")
+        if action == "candidate":
+            return {"ok": True, "candidate": read_vendor_candidate(payload["path"])}
+        if action == "confirm":
+            profile = confirm_vendor_candidate(payload["candidate"], payload["confirmation"])
+            load_calibration(profile, binding=profile["device_binding"], parameters={"gain_code": profile["gain_code"]}, bridge=profile["bridge"])
+            return {"ok": True, "profile": profile}
+        with self.lifecycle_lock:
+            if not self.thread or not self.thread.is_alive() or self.config.acquisition_mode != "real":
+                raise ValueError("清零仅适用于当前正在采集的真实会话")
+            workers = getattr(self.driver, "workers", [])
+            worker = next((w for w in workers if w.interface_id == payload.get("interface_id") and isinstance(w.driver, Esr1001UsbDriver)), None)
+            if worker is None or worker.state != "running":
+                raise ValueError("当前ESR接口未运行")
+            driver = worker.driver
+            if payload.get("capture_generation") != driver.capture_generation or payload.get("connection_generation") != driver.connection_generation or payload.get("calibration_digest") != driver.calibration_digest:
+                raise ValueError("清零操作的会话、连接或标定已变化，请刷新当前状态")
+            if action == "zero":
+                with driver._io_lock:
+                    zero = driver.set_zero(expected_sequence=(driver.latest_record or {}).get("receive_sequence"),
+                        connection_generation=payload["connection_generation"], capture_generation=payload["capture_generation"], calibration_digest=payload["calibration_digest"])
+                return {"ok": True, "zero": zero}
+            if action == "clear_zero":
+                driver.clear_zero()
+                return {"ok": True}
+            raise ValueError("未知ESR数值操作")
+
     def status(self) -> dict:
         with self.lock:
             now = time.time()
@@ -8045,6 +8254,8 @@ class AcquisitionManager(AcquisitionStartMixin):
                     sensor_state = "no_data"
                 elif running and (age is None or age > (0.25 if name in RAW_CHANNELS or name in STRAIN_SENSOR_COLUMNS else 2.0)):
                     sensor_state = "stale"
+                elif not running:
+                    sensor_state = "historical"
                 else:
                     sensor_state = "ok"
                 sensors.append({
@@ -8059,6 +8270,7 @@ class AcquisitionManager(AcquisitionStartMixin):
                         "not_selected": "未选择采集", "waiting": "等待首个数据",
                         "no_data": "未检测到采集数据", "stale": "数据已中断",
                         "ok": "数据正常",
+                        "historical": "已停止；保留历史采集证据，不代表当前在线",
                     }[sensor_state],
                     "blocking": False,
                     "ok": sensor_state in {"not_selected", "ok"},
@@ -8108,7 +8320,9 @@ class AcquisitionManager(AcquisitionStartMixin):
                             name for name in expected
                             if sensor_by_name.get(name, {}).get("state") == "stale"
                         ]
-                        if healthy:
+                        if not running:
+                            state, message = "stopped", "接口已停止；以下计数与数据为历史会话证据"
+                        elif healthy:
                             state = "ok"
                             message = f"接口正在采集：{'、'.join(healthy)}"
                             unavailable = [*missing, *stale]

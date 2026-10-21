@@ -401,6 +401,39 @@ console.log(JSON.stringify(configs[0]));
         self.assertEqual(result["physical_port_id"], "dock:manual")
         self.assertEqual(result["selection_origin"], "manual")
 
+    def test_same_hub_esr_endpoint_refresh_and_uvc_stable_identity_relocation(self) -> None:
+        result = run_candidate_script(
+            r"""
+state.usbTopology = {usb_ports:[
+  {id:"hub:port:3", owner_kind:"hub", hub_id:"hub:1", label:"USB扩展设备 · USB-3", state:"occupied", user_connectable:true},
+  {id:"hub:port:4", owner_kind:"hub", hub_id:"hub:1", label:"USB扩展设备 · USB-4", state:"occupied", user_connectable:true},
+], devices:[]};
+state.physicalInterfaces = [
+  {id:"serial:COM10", kind:"serial", transport_family:"usb", parent_port_id:"hub:port:3", endpoint:"COM10", detected:true,
+   device_identity:{vid:6790,pid:29987,serial_number:"",location:"1-9.3"}},
+  {id:"uvc:bsv:current", kind:"usb_uvc", transport_family:"usb", parent_port_id:"hub:port:4", endpoint:"UVC Camera", detected:true,
+   device_identity:{vid:11231,pid:258,container_id:"{stable-container}",instance_id:"current"}},
+];
+const configs = [
+  {id:"strain",role:"esr1001_strain",driver:"esr1001_usb_ttl",endpoint:"COM5",physical_port_id:"hub:port:3",
+   physical_interface_id:"",selection_origin:"saved",protocol_verified:true,device_identity:{vid:6790,pid:29987,location:"1-9"}},
+  {id:"uvc",role:"thermal_uvc",driver:"uvc_thermal",endpoint:"BSV UVC",physical_port_id:"hub:old:4",
+   physical_interface_id:"uvc:bsv:old",selection_origin:"saved",protocol_verified:true,
+   device_identity:{vid:11231,pid:258,container_id:"{stable-container}",instance_id:"old"}},
+];
+autoAssignPhysicalInterfaces(configs);
+console.log(JSON.stringify(configs));
+"""
+        )
+        esr, uvc = result
+        self.assertEqual(esr["endpoint"], "COM10")
+        self.assertEqual(esr["physical_interface_id"], "serial:COM10")
+        self.assertEqual(esr["physical_port_id"], "hub:port:3")
+        self.assertFalse(esr["protocol_verified"])
+        self.assertEqual(uvc["physical_interface_id"], "uvc:bsv:current")
+        self.assertEqual(uvc["physical_port_id"], "hub:port:4")
+        self.assertFalse(uvc["protocol_verified"])
+
 
 if __name__ == "__main__":
     unittest.main()

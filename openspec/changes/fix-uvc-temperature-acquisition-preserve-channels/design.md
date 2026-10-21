@@ -4,9 +4,9 @@
 
 动机见 `proposal.md`，外部行为和验收以 `specs/uvc-temperature-acquisition/spec.md` 为准。
 
-当前权威实现为 `visualization_app/acquisition.py` 的 `UvcThermalDriver`、共享设备档、设备发现及检查/启动门禁；`local_direct_acquisition.py` 的独立适配器向 `real_acquisition.py` 缓存发布，统一采样器消费各设备质量。现有打开/启动以 `<= 0` 判失败，首帧读取仅连续轮询固定次数；成功取帧会更新主机时间，但尚无可靠的源帧递增校验。`test_uvc_dll_contract.py` 的成功夹具返回1，未锁定实际 DLL 的零成功合同。
+当前权威实现为 `visualization_app/acquisition.py` 的 `UvcThermalDriver`、共享设备档、设备发现及检查/启动门禁；`local_direct_acquisition.py` 的独立适配器向 `real_acquisition.py` 缓存发布，统一采样器消费各设备质量。设置量程、打开和启动以负值判失败，返回0为成功；是否有帧和取帧仍按各自合同判断。读取通过 `BsvGetFrameCounter` 在复制前后核对同一帧，重复计数不发布为新观测，连接代次区分重连后的计数空间。接口检查只有观察至少三个不同源帧且跨度不少于一秒才报告UVC温度就绪。
 
-目标已知身份为 `2BDF:0102`。现有实机诊断证据 `D:\AFP_Capture\diagnostics\fix-plc-abb-uvc-real-acquisition` 包含 Windows `usbvideo` 绑定、物理接口可识别、正式 `device_profile_incomplete` 和原生打开 `-2` 的证据；实施时必须重新取得当前状态，不将错误码直接解释为确定的驱动安装结论。
+目标已知身份为 `2BDF:0102`，当前容器身份为 `{F597BF78-50D1-5892-8FD2-B862328B48D9}`，Windows 使用 Microsoft `usbvideo.inf`。设备能枚举为UVC相机，但同摘要原生DLL打开返回 `-2`，共享设备档仍因Windows绑定、接口/端点、温度范围、帧格式、换算和新鲜度依据不足而阻断温度采集。现有资料未包含与该型号匹配的INF、签名驱动包或安装/回滚说明，因此不得把 `-2` 解释为已确定的驱动故障，也不得自行替换系统驱动。
 
 本机参考工程根目录：
 
@@ -18,7 +18,7 @@
 | `Services/BsvUvcService.cs` | 帧间超时保留连接；矩阵按 `raw/64-50` 换算；后台轮询及ROI计算 | 可生成行为夹具，不能直接照搬其质量、默认量程和计时 |
 | `NativeDependencies/BsvUvcNative.dll` | SHA256 `4c5923dbceb9729a0f5fd060a442ab14025e5a1370f662090877bb551fff75c9`，与AFP当前DLL一致 | 实施时核对实际交付摘要，摘要变化须重验ABI |
 
-原生 DLL 导出含 `BsvGetFrameCounter`、尺寸查询和取帧 API；其返回值、帧计数宽度/复位和缓冲一致性必须按实际二进制或可核验头文件确认。参考软件目录名、已有录像或DLL存在均不证明实物温度可用。
+原生 DLL 导出含 `BsvGetFrameCounter`、尺寸查询和取帧 API；当前适配按32位无符号计数读取，并以复制前后计数相同证明矩阵一致。帧计数复位、回绕和实机连续性仍须通过批准后端复验。参考软件目录名、已有录像或DLL存在均不证明实物温度可用。
 
 当前完整模式为 `new_collection_v13_0`，定义六接口、77路传感器。热电偶64路与ESR1001原生USB已存在独立变更及未提交工作，保护对象必须取实施时现状，不能套用旧17/21路方案或把ADC自动换成微应变。计划沿用本机已有任务分支上的相关工作；后续执行按 `AGENTS.md` 和 `local-branch-workflow` 核对本机身份、最新远程及工作区归属，禁止为切换分支暂存、隐藏或覆盖未知修改。
 

@@ -876,3 +876,23 @@ body.public-precomputed-demo .full-channel-chart {
   .panel-header { display: block; }
   .legend { justify-content: flex-start; margin-top: 7px; }
 }
+:is(.esr-import, #esrNumericPanel) pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 22rem;
+  overflow: auto;
+}
+.esr-import textarea { width: 100%; min-width: 18rem; }
+.esr-relative-channel { margin: 8px 0; padding: 8px; border: 1px solid #dce6ed; border-radius: 6px; }
+.esr-relative-channel output { display: block; font-size: 19px; font-weight: 600; }
+.esr-relative-channel small { display: block; overflow-wrap: anywhere; }
+.esr-relative-channel canvas { width: 100%; display: block; }
+.esr-numeric-panel { padding: 12px; max-height: 55vh; overflow: auto; }
+.esr-numeric-panel > p { margin: 5px 0; }
+.esr-numeric-panel #esrRelativeTrends { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+.esr-numeric-panel .esr-relative-channel output { font-size: 28px; color: #176b9a; }
+.esr-numeric-panel .esr-relative-channel p { margin: 4px 0; font-size: 12px; }
+.esr-numeric-panel .esr-relative-note { font-size: 12px; }
+.esr-numeric-panel #esrMeasurementContext { white-space: pre-line; }
+.main-content:has(#esrNumericPanel:not(.hidden)) { grid-template-rows: auto auto minmax(0, 1fr); overflow-y: auto; }
+.main-content:has(#esrNumericPanel:not(.hidden)):has(#sensorSharedDetail[open]) { grid-template-rows: auto auto minmax(400px, 1fr); }

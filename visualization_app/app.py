@@ -5942,6 +5942,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 )
                 return
             controlled_paths = {
+                "/api/acquisition/esr-numeric",
                 "/api/acquisition/render-evidence",
                 "/api/acquisition/test",
                 "/api/acquisition/reset-check",
@@ -6264,6 +6265,9 @@ class AppHandler(BaseHTTPRequestHandler):
                     finally:
                         self.model_call_lock.release()
                 self._send_json(result)
+                return
+            if parsed.path == "/api/acquisition/esr-numeric":
+                self._send_json(self.dashboard.acquisition.esr_numeric_action(payload))
                 return
             if parsed.path == "/api/acquisition/test":
                 identity = self._identity()

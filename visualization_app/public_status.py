@@ -47,6 +47,7 @@ _ESR1001_CHECKED_PROTOCOLS = {
 
 
 _PUBLIC_STATE_MESSAGES = {
+    "stopped": "接口已停止；保留历史采集证据，不代表当前在线",
     "data_ready": "接口数据就绪，请核对采集单位及标定状态",
     "usb_no_valid_frame": "USB未取得有效数据帧",
     "port_access_denied": "串口访问被拒绝，请关闭占用程序或检查权限",
@@ -100,7 +101,7 @@ def build_public_device_status(
             source_by_role[role] = item
 
     interfaces: list[dict[str, Any]] = []
-    if acquisition.get("running"):
+    if acquisition.get("running") or acquisition.get("capture_uuid"):
         for item in acquisition.get("interfaces") or []:
             if isinstance(item, dict) and item.get("role"):
                 source_by_role[str(item["role"])] = item

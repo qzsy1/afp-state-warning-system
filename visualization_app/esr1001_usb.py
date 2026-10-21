@@ -11,6 +11,9 @@ import queue
 import threading
 import time
 import uuid
+import copy
+import xml.etree.ElementTree as ET
+from decimal import Decimal, ROUND_HALF_UP
 from collections import deque
 from pathlib import Path
 
@@ -27,6 +30,164 @@ BOUNDED_START_PARAMETER_HEX = "26016306040001086800000000ff"
 RATE_CODES = {0xB0, 0xA1, 0x92, 0x82, 0x72, 0x63, 0x53, 0x43, 0x33, 0x23, 0x13, 0xF1, 0xF2}
 FRESHNESS_LIMIT_SECONDS = 0.25
 FRESHNESS_RECOVERY_INTERVALS = 3
+
+
+def content_digest(value):
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+
+
+def read_vendor_candidate(path):
+    """只读系数候选；配置参数仅作来源证据，不应用到设备。"""
+    source = Path(path).resolve(strict=True)
+    raw = source.read_bytes()
+    if len(raw) > 1024 * 1024 or b"<!DOCTYPE" in raw.upper() or b"<!ENTITY" in raw.upper():
+        raise ValueError("厂商配置过大或包含不允许的XML声明")
+    settings = ET.fromstring(raw).find("Seting")
+    if settings is None:
+        raise ValueError("缺少厂商Seting配置")
+    def field(name):
+        values = settings.findall(name)
+        if len(values) != 1 or not values[0].text:
+            raise ValueError(f"厂商字段缺失或重复：{name}")
+        return values[0].text.strip()
+    channels = [{"K": float(field(f"K{i}")), "B": float(field(f"B{i}"))} for i in range(1, 5)]
+    if not all(math.isfinite(c["K"]) and c["K"] != 0 and math.isfinite(c["B"]) for c in channels):
+        raise ValueError("厂商K/B必须有限且K非零")
+    return {"kind": "esr1001_vendor_candidate_v1", "confirmed": False,
+            "source": str(source), "source_sha256": hashlib.sha256(raw).hexdigest(),
+            "unit": field("Unit"), "display_format": field("Pec"), "channels": channels,
+            "vendor_settings": {k: field(k) for k in ("PGA", "Speed", "SendNum", "FilterNum")},
+            "applicability": "待逐路确认设备、接线、桥路、增益和标定依据；示例系数不能证明适用"}
+
+
+def confirm_vendor_candidate(candidate, confirmation):
+    current = read_vendor_candidate(candidate["source"])
+    if current != candidate:
+        raise ValueError("厂商配置或候选内容变化，请重新读取")
+    if confirmation.get("confirmed") is not True or current["unit"] != "με":
+        raise ValueError("必须明确确认微应变标定适用条件")
+    binding = confirmation.get("device_binding")
+    conditions = confirmation.get("channels")
+    if not binding or not isinstance(conditions, list) or len(conditions) != 4:
+        raise ValueError("必须提供实际设备绑定和四路接线/桥路/标定依据")
+    for c in conditions:
+        if c.get("connected") is not True or not all(str(c.get(k) or "").strip() for k in ("bridge", "resistance_ohm", "calibration_basis")):
+            raise ValueError("四路微应变需逐路确认已接传感器、桥路、阻值和标定依据；未接通道请继续使用ADC")
+        if not math.isfinite(float(c["resistance_ohm"])) or float(c["resistance_ohm"]) <= 0:
+            raise ValueError("桥路阻值必须为正的有限值")
+        if "range_microstrain" in c:
+            limits = c["range_microstrain"]
+            if (not isinstance(limits, list) or len(limits) != 2 or
+                    not all(math.isfinite(float(x)) for x in limits) or float(limits[0]) >= float(limits[1]) or
+                    not str(c.get("range_basis") or "").strip() or not str(c.get("reference_input") or "").strip()):
+                raise ValueError("合理范围需要有序上下限、量程依据及参考输入")
+    gain = confirmation.get("gain_code")
+    if type(gain) is not int or gain not in range(7):
+        raise ValueError("需要实际读回的增益代码")
+    bridge = confirmation.get("bridge")
+    if not isinstance(bridge, str) or not bridge.strip():
+        raise ValueError("需要与采集配置一致的桥路标识")
+    return {"version": 2, "unit": "με", "source": current["source"],
+            "source_sha256": current["source_sha256"], "device_binding": binding,
+            "bridge": bridge, "gain_code": gain, "channels": current["channels"],
+            "channel_conditions": copy.deepcopy(conditions), "confirmed": True}
+
+
+def calibrated_values(record, profile):
+    values = {f"应变{i + 1}": record[name] * float(c["K"]) + float(c["B"])
+              for i, (name, c) in enumerate(zip(RAW_CHANNELS, profile["channels"]))}
+    if not all(math.isfinite(v) for v in values.values()):
+        raise UsbProtocolError("calibration_invalid", "换算结果非有限值")
+    return values
+
+
+def vendor_display(value):
+    """厂商.NET Framework一位小数显示；原始计算值不舍入。"""
+    return format(Decimal(str(float(value))).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP), ".1f")
+
+
+def measurement_record(record, profile, zero=None):
+    absolute = calibrated_values(record, profile) if profile else {}
+    relative = {f"相对应变{i + 1}": absolute[f"应变{i + 1}"] - zero["calibrated_values"][f"应变{i + 1}"]
+                for i in range(4)} if zero and absolute else {}
+    if zero and not profile:
+        relative = {f"CH{i + 1}_ADC_relative": record[name] - zero["adc_values"][name]
+                    for i, name in enumerate(RAW_CHANNELS)}
+    ranges = []
+    for i, condition in enumerate((profile or {}).get("channel_conditions", [])):
+        limits = condition.get("range_microstrain") if profile.get("version") == 2 and condition.get("range_basis") and condition.get("reference_input") else None
+        ranges.append("range_unverified" if not limits else "within_reference_range" if
+                      float(limits[0]) <= absolute[f"应变{i + 1}"] <= float(limits[1]) else "outside_reference_range")
+    return {"calibrated_values": absolute, "relative_values": relative,
+            "display_values": {k: vendor_display(v) for k, v in absolute.items()},
+            "display_relative_values": {k: vendor_display(v) if profile else str(v) for k, v in relative.items()},
+            "relative_unit": "με" if profile else "adc_counts",
+            "zero_id": zero["id"] if zero else "", "zero_snapshot": copy.deepcopy(zero),
+            "range_assessment": ranges or ["range_unverified"] * 4,
+            "adc_at_rail": [record[name] in {-8388608, 8388607} for name in RAW_CHANNELS]}
+
+
+def verify_source_evidence(evidence):
+    row = evidence["record"]
+    adc = {name: int(row[name]) for name in RAW_CHANNELS}
+    if tuple(adc.values()) != decode_adc(bytes.fromhex(row["raw_hex"])):
+        raise ValueError("源帧ADC与原始字节不一致")
+    profile = evidence.get("calibration_snapshot")
+    if (content_digest(profile) if profile else "") != row.get("calibration_digest", ""):
+        raise ValueError("源帧标定快照摘要不一致")
+    zero = row.get("zero_snapshot") or json.loads(row.get("zero_snapshot_json") or "null")
+    if zero and (zero["calibration_digest"] != row["calibration_digest"] or
+                 zero["capture_generation"] != evidence.get("capture_generation") or
+                 zero["connection_generation"] != int(row["connection_generation"]) or
+                 zero["receive_sequence"] >= int(row["receive_sequence"]) or
+                 (calibrated_values(zero["adc_values"], profile) if profile else {}) != zero["calibrated_values"]):
+        raise ValueError("源帧零点条件不一致")
+    computed = measurement_record(adc, profile, zero)
+    for key in ("calibrated_values", "relative_values"):
+        saved = row.get(key)
+        if saved is None and row.get(key + "_json"):
+            saved = json.loads(row[key + "_json"])
+        if saved is not None and saved != computed[key]:
+            raise ValueError("源帧派生值不一致")
+    return computed
+
+
+def replay_source_capture(path):
+    """只按历史会话快照重算源帧，不读取当前配置。"""
+    source = Path(path)
+    metadata = json.loads(source.with_suffix(".json").read_text(encoding="utf-8"))
+    profile = metadata.get("calibration_snapshot")
+    digest = metadata.get("calibration_digest") or ""
+    if profile and content_digest(profile) != digest:
+        raise ValueError("历史标定快照摘要不匹配")
+    with source.open(encoding="utf-8-sig", newline="") as stream:
+        previous = 0
+        previous_adc = None
+        active_zero = None
+        for row in csv.DictReader(stream):
+            record = {name: int(row[name]) for name in RAW_CHANNELS}
+            sequence = int(row["receive_sequence"])
+            if sequence != previous + 1 or tuple(record.values()) != decode_adc(bytes.fromhex(row["raw_hex"])):
+                raise ValueError("历史源帧序号或ADC与原始字节不一致")
+            if row.get("calibration_digest", "") != digest:
+                raise ValueError("历史源帧标定摘要不一致")
+            previous = sequence
+            zero = json.loads(row.get("zero_snapshot_json") or "null")
+            if zero and (zero["calibration_digest"] != digest or zero["connection_generation"] != int(row["connection_generation"]) or
+                         zero["receive_sequence"] >= sequence or
+                         (calibrated_values(zero["adc_values"], profile) if profile else {}) != zero["calibrated_values"]):
+                raise ValueError("历史零点与源帧条件不匹配")
+            if zero and zero["id"] != active_zero:
+                if zero["receive_sequence"] != sequence - 1 or zero["adc_values"] != previous_adc:
+                    raise ValueError("零点基准不对应先前最新源帧")
+            computed = measurement_record(record, profile, zero)
+            for key in ("calibrated_values", "relative_values", "zero_id"):
+                saved = json.loads(row[key + "_json"]) if row.get(key + "_json") else row.get(key)
+                if saved is not None and saved != computed[key]:
+                    raise ValueError("保存的派生值与历史源帧复算不一致")
+            previous_adc = record
+            active_zero = zero["id"] if zero else None
+            yield dict(row, **record, **computed, measurement_context=copy.deepcopy(metadata.get("measurement_context") or {}))
 
 
 class UsbProtocolError(RuntimeError):
@@ -154,7 +315,7 @@ def load_calibration(source, *, binding, parameters, bridge):
         canonical = json.dumps(profile, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
     except (OSError, TypeError, ValueError) as exc:
         raise UsbProtocolError("calibration_invalid", "标定档案无法读取或包含非有限值") from exc
-    if (profile.get("version") != 1 or profile.get("unit") != "με"
+    if (profile.get("version") not in {1, 2} or profile.get("unit") != "με"
             or not profile.get("source") or not binding or profile.get("device_binding") != binding
             or not bridge or profile.get("bridge") != bridge
             or profile.get("gain_code") != parameters["gain_code"]):
@@ -168,12 +329,30 @@ def load_calibration(source, *, binding, parameters, bridge):
         valid = False
     if not valid:
         raise UsbProtocolError("calibration_invalid", "K/B必须有限且K非零")
+    if profile.get("version") == 2:
+        conditions = profile.get("channel_conditions")
+        if (profile.get("confirmed") is not True or not profile.get("source_sha256") or
+                not isinstance(conditions, list) or len(conditions) != 4):
+            raise UsbProtocolError("calibration_invalid", "标定适用条件未确认")
+        for c in conditions:
+            try:
+                valid = (c.get("connected") is True and all(str(c.get(k) or "").strip() for k in
+                         ("bridge", "resistance_ohm", "calibration_basis")) and
+                         math.isfinite(float(c["resistance_ohm"])) and float(c["resistance_ohm"]) > 0)
+                limits = c.get("range_microstrain")
+                if limits is not None:
+                    valid = valid and len(limits) == 2 and all(math.isfinite(float(v)) for v in limits) and float(limits[0]) < float(limits[1]) and bool(c.get("range_basis")) and bool(c.get("reference_input"))
+            except (TypeError, KeyError, ValueError):
+                valid = False
+            if not valid:
+                raise UsbProtocolError("calibration_invalid", "逐路接线、桥路、标定或范围依据无效")
     return profile, hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 class RawCaptureWriter:
     """有界源帧队列；写入错误和过载阻止成功收尾。"""
-    fields = ("receive_sequence", "host_wall_time", "host_monotonic", *RAW_CHANNELS, "unit", "raw_hex", "connection_generation", "calibration_digest")
+    fields = ("receive_sequence", "host_wall_time", "host_monotonic", *RAW_CHANNELS, "unit", "raw_hex", "connection_generation", "calibration_digest",
+              "calibrated_values_json", "relative_values_json", "zero_id", "zero_snapshot_json", "range_assessment_json", "adc_at_rail_json")
 
     def __init__(self, root, metadata, capacity=4096):
         root = Path(root)
@@ -181,7 +360,7 @@ class RawCaptureWriter:
             raise ValueError("原始保存目录必须存在")
         self.path = root / f"ESR1001_USB_{uuid.uuid4().hex}.csv"
         self.metadata_path = self.path.with_suffix(".json")
-        self.metadata = metadata
+        self.metadata = copy.deepcopy(metadata)
         self.queue = queue.Queue(maxsize=capacity)
         self.rows = 0
         self.error = ""
@@ -201,13 +380,27 @@ class RawCaptureWriter:
             self.error = "原始帧写入队列过载"
             raise UsbProtocolError("raw_writer_overflow", self.error)
 
+    def record_event(self, event):
+        try:
+            with self.path.with_suffix(".events.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(event, ensure_ascii=False, allow_nan=False) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError as exc:
+            self.error = str(exc)
+            raise UsbProtocolError("raw_writer_failed", self.error) from exc
+
     def _run(self):
         try:
             while True:
                 record = self.queue.get()
                 if record is None:
                     break
-                self.writer.writerow(record)
+                saved = dict(record)
+                for key in ("calibrated_values", "relative_values", "zero_snapshot", "range_assessment", "adc_at_rail"):
+                    saved[key + "_json"] = json.dumps(record.get(key), ensure_ascii=False, allow_nan=False)
+                self.writer.writerow(saved)
+                self.stream.flush()
                 self.rows += 1
             self.stream.flush()
             os.fsync(self.stream.fileno())
@@ -252,7 +445,7 @@ def require_helper_capabilities(config):
 class Esr1001UsbDriver:
     open_timeout_seconds = 7.0
 
-    def __init__(self, endpoint, *, data_mode="raw_adc", calibration=None, binding=None, bridge="", command_timeout=2.0, serial_factory=None, inventory=None, recorder=None, startup_policy="fixed"):
+    def __init__(self, endpoint, *, data_mode="raw_adc", calibration=None, binding=None, bridge="", command_timeout=2.0, serial_factory=None, inventory=None, recorder=None, startup_policy="fixed", measurement_context=None):
         self.endpoint = str(endpoint).strip()
         self.data_mode = data_mode
         if data_mode not in {"raw_adc", "microstrain"}:
@@ -260,6 +453,9 @@ class Esr1001UsbDriver:
         self.calibration_source = calibration
         self.binding = dict(binding or {})
         self.bridge = bridge
+        if measurement_context is not None and not isinstance(measurement_context, dict):
+            raise ValueError("ESR现场信息必须为对象")
+        self.measurement_context = copy.deepcopy(measurement_context or {})
         self.command_timeout = max(0.01, min(float(command_timeout), 2.0))
         self.serial_factory = serial_factory
         self.inventory = inventory
@@ -287,6 +483,10 @@ class Esr1001UsbDriver:
         self.gaps = []
         self.calibration = None
         self.calibration_digest = ""
+        self.zero = None
+        self.zero_events = []
+        self.capture_generation = uuid.uuid4().hex
+        self._last_zero_source_sequence = 0
         self.stop_error = ""
         self.stop_failures = []
         self._owns_port = False
@@ -308,7 +508,48 @@ class Esr1001UsbDriver:
         duration = (self.last_observation - self.first_observation) if self.first_observation is not None and self.last_observation is not None else 0
         metrics["actual_source_rate_hz"] = (self.sequence - 1) / duration if duration > 0 else None
         metrics.update(received_bytes=self.received_bytes, received_tail_hex=self.received_tail.hex(), commands=list(self.command_evidence), start_events=list(self.start_events), startup_policy=self._effective_startup_policy, current_stream_stable=bool(self.last_observation is not None and current_stream_is_stable(self, self.last_observation)))
-        return {"driver": USB_DRIVER, "data_mode": self.data_mode, "unit": "adc_counts" if self.data_mode == "raw_adc" else "με", "calibration_state": "confirmed" if self.calibration else "标定未确认", "calibration_digest": self.calibration_digest, "parameters": dict(self.parameters), "source_frames": self.sequence, "connection_generation": self.connection_generation, "max_interval_seconds": self.max_interval, "recent_intervals_seconds": list(self.recent_intervals), "freshness_recovery_intervals": FRESHNESS_RECOVERY_INTERVALS, "stop_error": self.stop_error, "stop_failures": list(self.stop_failures), "latest_record": dict(self.latest_record or {}), "gaps": list(self.gaps[-128:]), **metrics}
+        return {"driver": USB_DRIVER, "data_mode": self.data_mode, "unit": "adc_counts" if self.data_mode == "raw_adc" else "με", "measurement_context": copy.deepcopy(self.measurement_context), "calibration_state": "confirmed" if self.calibration else "标定未确认", "calibration_digest": self.calibration_digest, "calibration_snapshot": copy.deepcopy(self.calibration), "zero": copy.deepcopy(self.zero), "zero_events": copy.deepcopy(self.zero_events), "capture_generation": self.capture_generation, "parameters": dict(self.parameters), "source_frames": self.sequence, "connection_generation": self.connection_generation, "max_interval_seconds": self.max_interval, "recent_intervals_seconds": list(self.recent_intervals), "freshness_recovery_intervals": FRESHNESS_RECOVERY_INTERVALS, "stop_error": self.stop_error, "stop_failures": list(self.stop_failures), "latest_record": copy.deepcopy(self.latest_record or {}), "gaps": list(self.gaps[-128:]), **metrics}
+
+    def set_zero(self, *, expected_sequence, connection_generation, capture_generation, calibration_digest):
+        with self._io_lock:
+            record = self.latest_record
+            age = time.monotonic() - float((record or {}).get("host_monotonic", 0))
+            if (not self.started or not record or not 0 <= age <= FRESHNESS_LIMIT_SECONDS or
+                    (self.data_mode == "microstrain" and not self.calibration) or
+                    self.calibration_digest != (content_digest(self.calibration) if self.calibration else "") or
+                    record.get("calibration_digest", "") != self.calibration_digest or
+                    record["receive_sequence"] != expected_sequence or record["receive_sequence"] <= self._last_zero_source_sequence or self.connection_generation != connection_generation or
+                    self.capture_generation != capture_generation or self.calibration_digest != calibration_digest):
+                raise UsbProtocolError("zero_source_invalid", "清零需要本轮当前连接最新有效四路源帧；拒绝保持、过期或历史数据")
+            if len(self.zero_events) >= 1000:
+                raise UsbProtocolError("zero_event_limit", "零点事件达到会话上限，请停止并重新开始")
+            self.zero = {"id": uuid.uuid4().hex, "method": "vendor_latest_source_frame", "host_wall_time": time.time(),
+                         "host_monotonic": time.monotonic(), "source_host_wall_time": record["host_wall_time"],
+                         "source_host_monotonic": record["host_monotonic"], "receive_sequence": record["receive_sequence"],
+                         "adc_values": {name: record[name] for name in RAW_CHANNELS},
+                         "calibrated_values": calibrated_values(record, self.calibration) if self.calibration else {},
+                         "relative_unit": "με" if self.calibration else "adc_counts", "calibration_digest": self.calibration_digest,
+                         "connection_generation": self.connection_generation, "capture_generation": self.capture_generation}
+            self.zero_events.append(dict(action="set", **copy.deepcopy(self.zero)))
+            self._last_zero_source_sequence = record["receive_sequence"]
+            if self.recorder:
+                try:
+                    self.recorder.record_event(self.zero_events[-1])
+                except Exception:
+                    self.zero = None
+                    raise
+            return copy.deepcopy(self.zero)
+
+    def clear_zero(self, reason="operator"):
+        with self._io_lock:
+            if self.zero:
+                zero_id = self.zero["id"]
+                self.zero = None
+                self.zero_events.append({"action": "invalidate", "id": zero_id, "reason": reason,
+                                         "host_wall_time": time.time(), "host_monotonic": time.monotonic()})
+                if self.recorder:
+                    self.recorder.record_event(self.zero_events[-1])
+            self.zero = None
 
     def _read(self):
         pending = int(getattr(self.serial, "in_waiting", 0))
@@ -339,6 +580,7 @@ class Esr1001UsbDriver:
                         self.gaps = self.gaps[-128:]
                 self.last_observation = mono
                 record = dict(zip(RAW_CHANNELS, values), receive_sequence=self.sequence, host_wall_time=wall, host_monotonic=mono, raw_hex=raw.hex(), unit="adc_counts", connection_generation=self.connection_generation, calibration_digest=self.calibration_digest)
+                record.update(measurement_record(record, self.calibration, self.zero))
                 if self.recorder:
                     self.recorder.submit(record)
                 self.latest_record = record
@@ -456,7 +698,9 @@ class Esr1001UsbDriver:
                     calibration, digest = load_calibration(self.calibration_source, binding=self.binding, parameters=parameters, bridge=self.bridge)
                     if self.calibration_digest and self.calibration_digest != digest:
                         raise UsbProtocolError("calibration_mismatch", "会话期间标定内容变化，必须停止并重新检查")
-                    self.calibration, self.calibration_digest = calibration, digest
+                    self.calibration, self.calibration_digest = copy.deepcopy(calibration), digest
+                    if self.recorder:
+                        self.recorder.metadata.update(calibration_snapshot=copy.deepcopy(calibration), calibration_digest=digest)
                 self.connection_generation += 1
                 self.stop_error = ""
                 self.start_events.append({"stage": "start_settle_begin", "server_monotonic": time.monotonic()})
@@ -488,9 +732,7 @@ class Esr1001UsbDriver:
                 if self.data_mode == "raw_adc":
                     values = {name: record[name] for name in RAW_CHANNELS}
                 else:
-                    values = {f"应变{i + 1}": record[name] * float(c["K"]) + float(c["B"]) for i, (name, c) in enumerate(zip(RAW_CHANNELS, self.calibration["channels"]))}
-                    if not all(math.isfinite(value) for value in values.values()):
-                        raise UsbProtocolError("calibration_invalid", "换算结果非有限值")
+                    values = record["calibrated_values"]
                 result.append((values, record))
             return result
 
@@ -501,6 +743,11 @@ class Esr1001UsbDriver:
     def close(self):
         self.cancel_open()
         with self._io_lock:
+            try:
+                self.clear_zero("stop_or_disconnect")
+            except Exception as exc:
+                self.stop_error = str(exc)
+                self.stop_failures.append({"connection_generation": self.connection_generation, "error": self.stop_error})
             try:
                 if self.serial is not None and self.started:
                     try:

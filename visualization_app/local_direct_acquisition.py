@@ -116,6 +116,7 @@ class LocalDirectAdapter:
         self.last_sample_monotonic: float | None = None
         self.state = "idle"
         self.start_events = []
+        self.source_observations: list[dict[str, float | int]] = []
 
     def _event(self, stage):
         if len(self.start_events) < 64:
@@ -144,6 +145,12 @@ class LocalDirectAdapter:
         received_monotonic = float(record["host_monotonic"]) if record else self.clock()
         received_wall_time = float(record["host_wall_time"]) if record else self.wall_clock()
         self.source_sequence += 1
+        self.source_observations.append({
+            "source_sequence": self.source_sequence,
+            "received_monotonic": received_monotonic,
+            "received_wall_time": received_wall_time,
+        })
+        self.source_observations = self.source_observations[-128:]
         driver_metadata = getattr(self.driver, "quality_metadata", {})
         if isinstance(driver_metadata, Mapping) and driver_metadata.get("driver") == "huipu_tc64_modbus_rtu":
             received_monotonic = float(driver_metadata.get("received_monotonic") or received_monotonic)
@@ -324,6 +331,7 @@ class LocalDirectAdapter:
             "first_sample_received": first_sample_received,
             "read_calls": self.read_calls,
             "source_sequence": self.source_sequence,
+            "source_observations": list(self.source_observations),
             "reconnect_attempts": self.reconnect_attempts,
             "consecutive_reconnect_attempts": self._consecutive_reconnect_attempts,
             "reconnect_window_seconds": self.reconnect_window_seconds,

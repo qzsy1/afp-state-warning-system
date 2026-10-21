@@ -116,6 +116,21 @@ class ServerCaptureJournalTests(unittest.TestCase):
         self.assertIsNotNone(record)
         self.assertEqual([row["温度"] for row in record.rows], [1])
 
+    def test_esr_source_evidence_is_durable_and_part_of_duplicate_identity(self):
+        from esr1001_usb import RAW_CHANNELS, measurement_record
+        from esr1001_fixtures import USB_DATA, USB_EXPECTED_ADC
+        row = dict(zip(RAW_CHANNELS, USB_EXPECTED_ADC), raw_hex=USB_DATA.hex(), receive_sequence=1,
+                   calibration_digest="", connection_generation=1)
+        row.update(measurement_record(row, None))
+        batch = sample(0, [1], final=True, count=1)
+        batch["esr_source_records"] = [{"interface_id": "esr", "record": row, "calibration_snapshot": None}]
+        self.assertTrue(self.journal.ingest("session-a", batch, self.mirrors)["ok"])
+        record = self.journal.ready_capture("session-a", "transport-capture-a")
+        self.assertEqual(list(record.rows.source_records()), batch["esr_source_records"])
+        self.assertTrue(self.journal.ingest("session-a", batch, self.mirrors)["duplicate"])
+        changed = dict(batch, esr_source_records=[])
+        self.assertEqual(self.journal.ingest("session-a", changed, self.mirrors)["error"], "sample_sequence_conflict")
+
     def test_restart_restores_mirror_before_duplicate_and_next_batch(self):
         for sequence, value in enumerate((1, 2)):
             current = sample(sequence, [value])

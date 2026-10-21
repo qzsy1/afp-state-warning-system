@@ -322,6 +322,7 @@
             </div>
             <button id="stopAcquisitionButton" class="secondary-button full-button">停止并保存</button>
             <div id="acquisitionStatus" class="acquisition-status">尚未启动真实采集</div>
+
             <div id="persistenceRecoveryPanel" class="control-note hidden">
               <span id="persistenceRecoveryStatus"></span>
               <button id="discardPersistenceRecoveryButton" class="secondary-button hidden" type="button">重置并丢弃所列阻塞项</button>
@@ -413,6 +414,17 @@
       </div>
 
       <main class="main-content">
+            <section id="esrNumericPanel" class="panel esr-numeric-panel hidden" aria-label="ESR数值含义">
+              <strong>ESR1001-A · 原始值 / 标定绝对值 / 相对变化</strong>
+              <p id="esrNumericState"></p>
+              <label class="esr-focus-selector">聚焦通道 <select id="esrFocusChannel"><option value="all">全部通道</option><option value="1">CH1</option><option value="2">CH2</option><option value="3">CH3</option><option value="4">CH4</option></select></label>
+              <p id="esrMeasurementContext" class="control-note"></p>
+              <details><summary>查看四路原始值、标定值与量程诊断</summary><pre id="esrNumericValues"></pre></details>
+              <button id="esrZeroButton" type="button">以最新有效四路源帧设置相对零点</button>
+              <button id="esrClearZeroButton" type="button">关闭相对清零</button>
+              <div id="esrRelativeTrends" class="hidden"></div>
+              <p><span class="esr-relative-note">点击设置零点后，相对变化从该源帧的零点起算；ADC模式显示相对计数，有效标定后显示相对微应变。清零不减小真实波动或漂移，各路趋势独立缩放。相对清零默认关闭，停止、故障、重连或重启后失效。相对值独立保存，不进入模型。未接传感器的通道仅作ADC诊断；合理范围需要接线、标定、量程和参考输入依据。</span></p>
+            </section>
         <details id="sensorSharedDetail" class="panel chart-panel primary-workbench collapsible-panel">
           <summary class="panel-header collapsible-panel-summary">
             <div><p class="panel-kicker">LIVE I-MODERNTCN FORECAST</p><h1 id="seriesTitle">实测值与未来预测值</h1></div>

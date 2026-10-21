@@ -399,7 +399,8 @@ class PlcAbbUvcFaultIsolationTests(unittest.TestCase):
             sensor_status = {item["name"]: item for item in result["sensors"]}
             interface_status = {item["id"]: item for item in result["interfaces"]}
             for interface_id, expected in config.interface_channel_assignments.items():
-                self.assertEqual(interface_status[interface_id]["state"], "ok")
+                self.assertEqual(interface_status[interface_id]["state"], "stopped")
+                self.assertNotIn("正在采集", interface_status[interface_id]["message"])
                 self.assertEqual(
                     set(interface_status[interface_id]["detected_channels"]),
                     set(expected),

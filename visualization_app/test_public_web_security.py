@@ -378,6 +378,20 @@ class PublicWebAccessTests(unittest.TestCase):
 
 
 class PublicWebHttpTests(unittest.TestCase):
+    def test_esr_numeric_route_dispatches_locally_and_denies_guest(self):
+        self.request_json("GET", "/api/auth/session")
+        request = {"action": "zero", "interface_id": "esr", "capture_generation": "current",
+                   "connection_generation": 1, "calibration_digest": ""}
+        with patch.object(self.server.dashboard.acquisition, "esr_numeric_action", create=True, return_value={"ok": True, "zero": {"relative_unit": "adc_counts"}}) as action:
+            status, result, _ = self.request_json("POST", "/api/acquisition/esr-numeric", request)
+            self.assertEqual(status, 403, result)
+            action.assert_not_called()
+            with patch.object(self.server.RequestHandlerClass, "access_context", "local_admin"):
+                status, result, _ = self.request_json("POST", "/api/acquisition/esr-numeric", request)
+            self.assertEqual(status, 200, result)
+            self.assertTrue(result["ok"])
+            action.assert_called_once_with(request)
+
     def test_local_interface_plans_persist_without_credentials_or_readiness(self):
         route = "/api/admin/acquisition/interface-plans"
         status, _, _ = self.request_json("GET", route)

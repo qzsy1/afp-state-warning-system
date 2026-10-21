@@ -2,9 +2,11 @@
 
 ## Why
 
-ESR1001-A 原生 USB 使用专用 USB/TTL 协议，现有 AFP 应变驱动只支持 RS485 Modbus RTU，导致 USB 串口可以打开却无法通过接口检查或采集数据。修复目标是让软件正确关联实际接口、验证设备协议，并在软件内连续显示、采集和保存四通道数据。
+ESR1001-A 原生 USB 使用专用 USB/TTL 协议，其原始ADC、标定微应变和清零后相对变化必须分清含义。AFP需要正确关联实际接口、验证设备协议和标定适用条件，并连续显示、采集和保存可复算四通道数据；端口可开或显示接近零不能替代量值依据。
 
 ## What Changes
+
+- 提供厂商K/B只读候选与逐路适用性确认、独立相对变化及显式最新源帧清零、历史快照复算与全部保存目标的源帧证据；数值合理范围仅依据实际接线、标定、量程和参考输入，保留真实异常。
 
 - 为同一个 `esr1001_strain` 逻辑接口提供原生 USB 和 RS485 两种明确区分的协议配置；保留已有 RS485 配置和数据兼容。
 - 增加原生 USB 115200-8-N-1 参数查询、应答校验、受控启停、流式分帧、四路有符号 24 位 ADC 解码和通道映射。
@@ -29,4 +31,4 @@ ESR1001-A 原生 USB 使用专用 USB/TTL 协议，现有 AFP 应变驱动只支
 - 发现与展示：`windows_usb_topology.py`、`interface_transport_catalog.py`、`app.py`、`public_status.py`、`static/app.js`、`native_integrated_app.py`。
 - helper 与交付：`local_capture_agent.py`、`pre_sensor_config.py`、`pre_sensor/config`、`pre_sensor/release-contract.json`、模块驱动清单及现有装配脚本。
 - 验证：原生 USB 协议夹具、接口误识别、配置往返、就绪失效、采集保存和断线恢复测试，以及对应 Harness 回归项。复用 `pyserial`，不要求新硬件或改装 RS485 接线。
-- 本变更只规划修复，不授权安装设备驱动、更改计量参数或发布正式软件；发布与实物验收按各自条件执行。
+- 软件更新按仓库常规授权自动执行；安装设备驱动、更改计量参数或现场条件另需明确授权，软件交付与实物验收按各自条件分别判定。
