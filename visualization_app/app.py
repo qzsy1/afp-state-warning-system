@@ -153,12 +153,16 @@ def build_thermocouple64_live_payload(
     model_metadata: dict | None = None,
     quality_history: list[dict[str, str]] | None = None,
 ) -> dict | None:
-    """Split the v13 live response into raw, derived and non-thermocouple views."""
+    """Project numbered temperatures into a separate display without changing the source schema."""
 
-    if dataset_schema != THERMOCOUPLE64_MODE_ID:
+    if dataset_schema not in {
+        "new_collection_v11_3", "new_collection_v12_0", THERMOCOUPLE64_MODE_ID,
+    }:
         return None
     by_name = {str(item.get("name") or ""): item for item in channels}
     raw_channels = [by_name[name] for name in THERMOCOUPLE64_CHANNELS if name in by_name]
+    if not raw_channels and dataset_schema != THERMOCOUPLE64_MODE_ID:
+        return None
     history_length = max((len(item.get("actual") or []) for item in raw_channels), default=0)
     time_axis = list(raw_channels[0].get("x_observed") or []) if raw_channels else []
     raw_history: list[list[float | None]] = []
@@ -196,6 +200,8 @@ def build_thermocouple64_live_payload(
     return {
         "snapshot_version": 1,
         "sequence": history_length,
+        "source_dataset_schema": dataset_schema,
+        "selected_raw_channels": [item["name"] for item in raw_channels],
         "time_axis": time_axis,
         "raw_directory": raw_directory,
         "derived_directory": derived_directory,
@@ -4121,6 +4127,13 @@ class DashboardData:
             },
             "channels": channels,
             "selected_channel": channels[sensor_id],
+            "thermocouple64": build_thermocouple64_live_payload(
+                channels,
+                dataset_schema=requested_schema,
+                model_input_sensors=list(active_profile.get("input_sensors") or []),
+                model_metadata=active_profile,
+                quality_history=quality_rows,
+            ),
             "window": realtime_window,
             "layer": layer_aggregate,
             "specimen": specimen_aggregate,

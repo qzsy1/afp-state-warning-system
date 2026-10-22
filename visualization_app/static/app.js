@@ -3890,6 +3890,10 @@ function applyRealtimePayload(payload, renderOptions = {}) {
       && captureStatus.status_monotonic < state.acquisitionStatus.status_monotonic) return;
   if (controls.acquisitionMode?.value === "real" && captureStatus?.data_connection
       && (!captureStatus.running || !captureStatus.capture_start_monotonic)) {
+    if (!(payload.channels || []).some(channel => (channel.actual || []).some(Number.isFinite))) {
+      state.payload = payload;
+      render(payload, renderOptions);
+    }
     renderAcquisitionStatus(captureStatus);
     document.querySelector(".live-dot")?.classList.remove("active");
     return;
@@ -4988,6 +4992,9 @@ function updateThermocouple64DisplayedCount() {
   $('thermocouple64Status').textContent = state.thermocouple64View === 'raw'
     ? `8张组图 × 8条原始曲线 · 已显示 ${displayedChannels}/64 通道`
     : '8张组图 × 1条严格均值曲线 · 共8个组均值';
+  if (cache.selectedCount < 64) {
+    $('thermocouple64Status').textContent += ` · 当前方案含${cache.selectedCount}/64路，未选通道无数据`;
+  }
   if (!cache.sequence) $('thermocouple64Status').textContent = `等待64路快照 · ${$('thermocouple64Status').textContent}`;
 }
 
@@ -5137,6 +5144,7 @@ function renderThermocouple64(payload) {
   const derivedSeries = Array.from({length: 8}, (_, index) => derivedRows.map(row => row[index] ?? null));
   const latest = payload.derived_directory.channels.map(name => payload.derived_latest?.[name] || {});
   state.thermocouple64Cache = {rawNames, rawSeries, derivedSeries, latest, scope: payload.scope,
+    selectedCount: payload.selected_raw_channels?.length ?? rawNames.length,
     qualities: payload.raw_latest_quality || [], timeAxis: (payload.time_axis || []).slice(-THERMOCOUPLE64_HISTORY_LIMIT), sequence: payload.sequence};
   if (!state.thermocouple64VisibilityInitialized) {
     rawNames.forEach((_, index) => state.thermocouple64Visible.add(index));

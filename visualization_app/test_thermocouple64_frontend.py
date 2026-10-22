@@ -82,12 +82,27 @@ class Thermocouple64FrontendContractsTests(unittest.TestCase):
         )
         self.assertFalse(payload["model_support"])
 
-    def test_non_v13_mode_has_no_64_channel_panel_payload(self) -> None:
+    def test_legacy_original_retains_its_channel_view(self) -> None:
         self.assertIsNone(
             build_thermocouple64_live_payload(
-                self._channels(), dataset_schema="new_collection_v12_0"
+                self._channels(), dataset_schema="legacy_original"
             )
         )
+
+    def test_eight_temperature_schemes_keep_thermocouples_separate_without_expanding_capture(self) -> None:
+        channels = self._channels()[:8] + [self._channels()[-1]]
+        original = deepcopy(channels)
+        for schema in ("new_collection_v11_3", "new_collection_v12_0"):
+            with self.subTest(schema=schema):
+                payload = build_thermocouple64_live_payload(channels, dataset_schema=schema)
+                self.assertEqual(payload["source_dataset_schema"], schema)
+                self.assertEqual(payload["selected_raw_channels"], [f"温度{i}" for i in range(1, 9)])
+                self.assertEqual(payload["other_channels"], [channels[-1]])
+                self.assertEqual(payload["raw_history"][0], list(map(float, range(1, 9))) + [None] * 56)
+                self.assertEqual(payload["derived_history"][0], [4.5] + [None] * 7)
+                self.assertFalse(payload["model_support"])
+                self.assertEqual(channels, original)
+                self.assertIsNone(build_thermocouple64_live_payload([channels[-1]], dataset_schema=schema))
 
     def test_empty_capture_uses_requested_view_without_changing_recovery_status(self) -> None:
         status = {
@@ -128,7 +143,10 @@ class Thermocouple64FrontendContractsTests(unittest.TestCase):
                         {"°C"},
                     )
                 else:
-                    self.assertIsNone(payload["thermocouple64"])
+                    panel = payload["thermocouple64"]
+                    self.assertEqual(panel["selected_raw_channels"], [f"温度{i}" for i in range(1, 9)])
+                    self.assertEqual(len(panel["other_channels"]), 13)
+                    self.assertEqual(panel["raw_history"], [])
         status["config"] = {"dataset_schema": "new_collection_v13_0"}
         with self.assertRaisesRegex(ValueError, "界面数据方案与当前采集会话不一致"):
             dashboard.live(
@@ -179,8 +197,38 @@ class Thermocouple64FrontendContractsTests(unittest.TestCase):
         self.assertIn("SENSOR_PANEL_SPLIT_STORAGE_KEY", script)
         self.assertIn("const defaultRatio = 0.42", script)
         self.assertIn('handle.addEventListener("dblclick", resetRatio)', script)
-        self.assertIn("/app.js?v=20261021-low-latency-1", html)
+        self.assertIn("/app.js?v=20261022-thermocouple-layout-2", html)
         self.assertIn("/styles.css?v=20261021-strain-cards-1", html)
+
+    def test_standby_renders_empty_layout_and_rejects_samples_outside_capture(self) -> None:
+        script = (APP_DIR / "static" / "app.js").read_text(encoding="utf-8")
+        function = script[script.index("function applyRealtimePayload("):
+                          script.index("const SIMULATION_PLAYBACK_CACHE_ROWS")]
+        executable = r'''
+const assert=require('node:assert/strict');
+const controls={acquisitionMode:{value:'real'}};
+const window={};
+const state={acquisitionStatus:{}};
+const document={querySelector(){return {classList:{remove(){}}};}};
+const expandLivePayload=p=>p;
+const renders=[];const statuses=[];
+function render(p){renders.push(p);}
+function renderAcquisitionStatus(s){statuses.push(s);}
+''' + function + r'''
+for(const connection of ['disconnected','connected']){
+  const empty={channels:[{name:'温度1',actual:[]}],acquisition:{running:false,data_connection:{state:connection}}};
+  applyRealtimePayload(empty);
+  assert.equal(state.payload,empty);
+  assert.equal(renders.at(-1),empty);
+  const count=renders.length;
+  applyRealtimePayload({channels:[{name:'温度1',actual:[24.5]}],acquisition:empty.acquisition});
+  assert.equal(renders.length,count);
+  assert.equal(state.payload,empty);
+}
+assert.equal(statuses.length,4);
+'''
+        completed = subprocess.run(["node", "-e", executable], cwd=APP_DIR, capture_output=True, text=True, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_group_drawing_has_eight_raw_lines_one_mean_and_preserves_gaps(self) -> None:
         script = (APP_DIR / "static" / "app.js").read_text(encoding="utf-8")
