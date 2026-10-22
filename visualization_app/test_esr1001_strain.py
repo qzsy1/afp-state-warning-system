@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from acquisition_clock import monotonic
 
 import acquisition  # noqa: E402
 from esr1001_fixtures import (  # noqa: E402
@@ -116,7 +117,7 @@ class Esr1001ProtocolTests(unittest.TestCase):
         serial_port = FakeSerial([b"\x99", MANUAL_RESPONSE[:2], MANUAL_RESPONSE[2:8], MANUAL_RESPONSE[8:]])
         driver = acquisition.Esr1001StrainDriver("COM7", serial_factory=lambda **_: serial_port)
         driver.serial = serial_port
-        with patch("acquisition.time.monotonic", side_effect=[0.0, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06]):
+        with patch("acquisition.monotonic", side_effect=[0.0, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06]):
             frame = driver._transact(READ_REQUEST, expected_function=0x04, deadline_seconds=0.5)
         self.assertEqual(frame, MANUAL_RESPONSE)
         self.assertEqual(serial_port.writes, [READ_REQUEST])

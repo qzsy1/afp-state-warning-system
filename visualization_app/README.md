@@ -122,6 +122,16 @@ PLC 独立线程按单调截止时间调度 100 ms 目标轮次；配置中的�
 
 数值夹具的参考期望来自已核对 C# 源码的复算，不能替代执行参考程序或现场稳定载荷对照。正常正压力持续偏差的根因尚未确认；实物数据一致性须以同工况原始寄存器、实际时间、配置、参考载荷与批准容差验收。
 
+真实 ABB 使用 `fibercontrol_abb_v1` 测量档，读取配置端点的 `/rw/motionsystem/mechunits/ROB_1/robtarget?coordinate=Base&json=1`。ROB_1/Base 的 XYZ 直接解析为毫米，不增加倍率、偏置、坐标变换或滤波。独立线程以主机单调时钟调度 100 ms 目标周期，请求耗时包含在轮次内；慢读跳过截止点，不重入、不积压、不突发补读。接口状态区分目标周期、实际轮次间隔、响应耗时和跳过数，目标不代表实际严格 10 Hz。
+
+线速度为同一连接代次相邻两个有效位置的三维距离除以主机实际单调接收间隔，保留两位小数；没有机器人设备时间。墙钟只用于对账，行时间与源响应时间分开。首点和非正间隔速度未验证，两个相同位置的正间隔才得到有效零。故障、重连或超新鲜度间隔后重新建立两点依据；沿用不更新源序号、不重新差分，过期留空。`zMovespeed` 是工艺速度设定值，不代替位置差分实测速度。
+
+采集主机的来源时间、ABB 调度、缓存年龄、统一帧截止、启动边界和显示传输统一使用 `acquisition_clock.monotonic()`，其底层为 `time.perf_counter()`（Windows QPC）。不与 Python 3.11 的 `GetTickCount64` 读数相减；其他传感器只统一主机时间戳，协议、采样目标、换算与质量规则保持原合同。ABB 等待在截止前复核剩余时间，长等待可被停止事件唤醒，末段使用高精度短等待；慢轮次跳过，不补读。来源声明 `clock_domain=host_perf_counter`；墙钟仅用于离线对照，机器人内部采样时刻与延迟未知。helper 先在自身主机完成帧截止和年龄计算，服务器保留该来源与年龄，不用服务器接收时间重算速度或跨主机单调时差。主机接收到帧可用的耗时、网络传输和浏览器绘制是不同的可测边界，不能称为设备采样延迟。
+
+每个位置来源保存白名单原始 XYZ、解析值、资源身份、收发墙钟/单调时间、源序号、连接代次和处理档；速度附前后位置、距离和实际间隔。来源在统一帧确定时固定，经 WebSocket、helper、CSV 时间戳侧车 `channel_source_record_json` 和 MySQL `afp_source_evidence` 的 `abb_frame` 关联到同一行，异步保存不读取更新后的驱动状态。会话清单记录测量档和算法；旧文件无需迁移，主列、单位及模型质量准入不变。helper 必须声明 `abb_measurement_contract=fibercontrol_abb_v1` 及 `abb_clock_domain=host_perf_counter`，缺少能力或有效来源时拒绝采集，不回退服务器设备。页面显示目标、年龄及速度依据，完整关联仅在授权诊断中查看。
+
+ABB 保持 Digest、nonce 更新、Cookie/连接复用、禁系统代理、工业源地址绑定及核验；退出只释放本客户端会话。认证、资源、解析、数值、会话上限和通信故障保持明确错误，不用旧缓存通过检查。软件轨迹与保存回归不证明实物精度；双方控制器、坐标配置、原始响应、批准运动与容差缺失时，实物一致性及偏差根因均待验证。
+
 管理员页面使用 `POST /api/acquisition/test` 执行当前配置的只读检查，使用 `POST /api/acquisition/start` 启动正式采集，使用 `GET /api/acquisition/status?acquisition_mode=real` 读取运行状态。本机 Helper 对外声明 `plc_abb_uvc_readiness_v1` 和 `unified_device_readiness_v1`；缺少该能力的 Helper 不能启动真实采集。检查响应中的每个接口都保留设备协议端点、独立物理绑定、原始最终状态码和以下显式阶段：`physical_binding`、`device_identity`、`driver`、`network_path`、`usb_binding`、`authentication`、`protocol`、`channels`、`freshness`、`stability`。
 
 `data_ready` 表示设备身份、协议和全部必需通道均已取得有效新鲜数据；`partial_channels` 表示 PLC 或 ABB 只取得部分必需通道；`authentication_failed` 表示 ABB Digest 认证失败；`driver_incompatible`、`device_open_failed` 和 `no_valid_frame` 分别表示 UVC 驱动/API 不兼容、设备无法打开和未取得有效温度帧；`device_profile_incomplete` 表示批准设备档仍缺少正式检查所需事实。未知状态码继续按失败显示，不会转换为 `unchecked` 或通用未连接。

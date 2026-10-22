@@ -16,6 +16,7 @@ import queue
 import sys
 import threading
 import time
+from acquisition_clock import monotonic
 import urllib.parse
 from dataclasses import fields
 from pathlib import Path
@@ -129,7 +130,7 @@ class HelperSamplePump:
             transport["helper_ack_rtt_ms"] = self._rtt_ms
             transport["paired_route_type"] = self.route_type
         self._in_flight = (capture_uuid, sequence)
-        self._last_sent_at = time.monotonic() if now is None else float(now)
+        self._last_sent_at = monotonic() if now is None else float(now)
         message = {"type": "sample_batch", "batch": batch}
         if self.ingress_generation is not None:
             message["ingress_generation"] = self.ingress_generation
@@ -149,7 +150,7 @@ class HelperSamplePump:
         accepted = self.agent.ack_sample_batch(str(capture_uuid), int(sequence))
         if accepted:
             self._in_flight = None
-            self._last_ack_at = time.monotonic() if now is None else float(now)
+            self._last_ack_at = monotonic() if now is None else float(now)
             if self._last_sent_at is not None:
                 measured = max(0.0, (self._last_ack_at - self._last_sent_at) * 1000.0)
                 self._rtt_ms = measured if self._rtt_ms is None else (0.75 * self._rtt_ms + 0.25 * measured)
@@ -581,6 +582,8 @@ def helper_capabilities(server_url: str = "") -> dict[str, Any]:
         "device_readiness_contract": DEVICE_READINESS_CONTRACT,
         "unified_device_readiness_v1": True,
         "plc_measurement_contract": "fibercontrol_plc_v1",
+        "abb_measurement_contract": "fibercontrol_abb_v1",
+        "abb_clock_domain": "host_perf_counter",
         "async_capture_start_v1": True,
         "command_lifecycle": "isolated_hardware_check",
         "hardware_check_timeout_seconds": HARDWARE_CHECK_TIMEOUT_SECONDS,
@@ -1347,7 +1350,7 @@ def run_forever(
                 connection.settimeout(1.0)
             except Exception:
                 pass
-            last_heartbeat = time.monotonic()
+            last_heartbeat = monotonic()
             while True:
                 if sender_errors:
                     raise sender_errors[0]
@@ -1360,9 +1363,9 @@ def run_forever(
                     if exc.__class__.__name__ == "WebSocketTimeoutException":
                         if sender_errors:
                             raise sender_errors[0]
-                        if time.monotonic() - last_heartbeat >= 10.0:
+                        if monotonic() - last_heartbeat >= 10.0:
                             send_json({"type": "heartbeat"})
-                            last_heartbeat = time.monotonic()
+                            last_heartbeat = monotonic()
                         continue
                     raise
                 if raw is None or raw == "" or raw == b"":

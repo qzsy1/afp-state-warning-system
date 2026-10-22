@@ -17,6 +17,15 @@ from acquisition import AcquisitionManager
 
 
 class PublicDeviceStatusTests(unittest.TestCase):
+    def test_public_abb_status_never_exposes_position_or_speed_sources(self):
+        payload=self._module().build_public_device_status({}, {}, {"running":True,"interfaces":[{
+            "role":"robot","driver":"abb_robot","ok":True,"state":"ok",
+            "abb_evidence":{"latest_record":{"xyz":[123.456,234.567,345.678],"controller_endpoint":"PRIVATE-ABB",
+                "speed_basis":{"previous":{"xyz":[111,222,333]}}}}}]})
+        encoded=json.dumps(payload)
+        for value in ("abb_evidence","speed_basis","xyz","123.456","PRIVATE-ABB"):
+            self.assertNotIn(value,encoded)
+
     def test_public_plc_status_never_exposes_measurement_register_evidence(self):
         payload = self._module().build_public_device_status({}, {}, {
             "running":True, "interfaces":[{"role":"plc","driver":"modbus_tcp","ok":True,"state":"ok",

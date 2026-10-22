@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import threading
 import time
+from acquisition_clock import monotonic
 import unittest
 from unittest.mock import patch
 
@@ -101,8 +102,8 @@ class ConnectionTests(unittest.TestCase):
                     self.assertFalse(manager.connection_status()['ready'])
                     with self.assertRaisesRegex(RuntimeError, 'data_connection_not_ready'):
                         manager.require_data_connection(cfg)
-                deadline = time.monotonic()+3
-                while not manager.connection_status()['ready'] and time.monotonic()<deadline:
+                deadline = monotonic()+3
+                while not manager.connection_status()['ready'] and monotonic()<deadline:
                     time.sleep(.01)
                 self.assertTrue(manager.connection_status()['ready'])
                 cfg.layer += 1
@@ -180,8 +181,8 @@ class ConnectionTests(unittest.TestCase):
         device.serial = SerialStub()
         device.serial.reset_input_buffer = device.serial.buffer.clear
         device.started = True
-        device.started_monotonic = time.monotonic()
-        device.last_observation = time.monotonic()-.08
+        device.started_monotonic = monotonic()
+        device.last_observation = monotonic()-.08
         device.recent_intervals.extend([.08]*3)
         device._pending.append({'old': True})
         device.parser.buffer.extend(USB_DATA[:5])
@@ -231,7 +232,7 @@ class ConnectionTests(unittest.TestCase):
             manager = a.AcquisitionManager(Path(root), recovery_scan=False)
             manager._connection_config = config(root)
             manager._connection_driver = SimpleNamespace(cache=cache, workers=[object()], worker_status=lambda: states)
-            with patch('acquisition_connection.time.monotonic', side_effect=lambda: clock[0]):
+            with patch('acquisition_connection.monotonic', side_effect=lambda: clock[0]):
                 self.assertEqual(manager._connection_health(), '')
 
     def test_quality_recovery_requires_two_new_observations_and_keeps_sampling_policy(self):
@@ -251,7 +252,7 @@ class ConnectionTests(unittest.TestCase):
             manager._connection_config = config(root)
             manager._connection_driver = SimpleNamespace(cache=cache, workers=[object()], worker_status=lambda: states)
             manager._connection.update(state='connected', ready=True, ready_attempts={'one':0,'two':0})
-            with patch('acquisition_connection.time.monotonic', side_effect=lambda:clock[0]):
+            with patch('acquisition_connection.monotonic', side_effect=lambda:clock[0]):
                 publish(1,False);manager._refresh_connected_readiness()
                 self.assertEqual(manager.connection_status()['state'],'waiting_data')
                 self.assertFalse(manager.stop_event.is_set())

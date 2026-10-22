@@ -7,6 +7,7 @@ import json
 import math
 import os
 import time
+from acquisition_clock import monotonic
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -61,41 +62,41 @@ def _probe_interface(item, duration_seconds, sample_rate_hz):
     source = path["actual_source_address"]
     driver = (
         a.ModbusTcpDriver(item["endpoint"], register_map=item["register_map"], slave_id=item["slave_id"], source_address=source)
-        if role == "plc" else a.AbbRobotDriver(item["endpoint"], source_address=source)
+        if role == "plc" else a.AbbRobotDriver(item["endpoint"], username=item.get("username", a.DEFAULT_ABB_USER),
+            password=item.get("password", a.DEFAULT_ABB_PASSWORD), timeout=item.get("timeout", 1.5),
+            freshness_seconds=item.get("freshness_seconds", 1.0), source_address=source)
     )
-    start = time.monotonic()
+    start = monotonic()
     try:
         driver.open()
-        start = time.monotonic()
+        start = monotonic()
         deadline = start + duration_seconds
         next_poll = start
-        period = 0.1 if role == "plc" else 1.0 / sample_rate_hz
+        period = 0.1
         result["target_poll_interval_seconds"] = period
         result["skipped_poll_cycles"] = 0
-        while time.monotonic() < deadline:
+        while monotonic() < deadline:
             values, records = {}, {}
             try:
-                if role == "plc" and hasattr(driver, "read_samples"):
+                if hasattr(driver, "read_samples"):
                     for payload, record in driver.read_samples():
                         values.update(payload)
-                        records[record["channel"]] = record
+                        for channel in payload:
+                            records[channel] = record
                 else:
                     values = driver.read_sample() or {}
             finally:
                 result["samples"].append({
-                    "at": time.time(), "elapsed_seconds": time.monotonic() - start,
+                    "at": time.time(), "elapsed_seconds": monotonic() - start,
                     "values": {name: _finite(values.get(name)) for name in CHANNELS[role]},
                     "channel_source_records": records,
                     "actual_source_address": driver.actual_source_address,
                 })
             if driver.actual_source_address != source:
                 raise RuntimeError("network_path_invalid: protocol connection source changed")
-            if role == "plc":
-                next_poll, skipped = LocalDirectAdapter.next_poll_deadline(next_poll, time.monotonic(), period)
-                result["skipped_poll_cycles"] += skipped
-            else:
-                next_poll += period
-            time.sleep(max(0.0, min(next_poll, deadline) - time.monotonic()))
+            next_poll, skipped = LocalDirectAdapter.next_poll_deadline(next_poll, monotonic(), period)
+            result["skipped_poll_cycles"] += skipped
+            time.sleep(max(0.0, min(next_poll, deadline) - monotonic()))
     except Exception as exc:
         result["errors"].append(str(exc))
     finally:
@@ -103,7 +104,7 @@ def _probe_interface(item, duration_seconds, sample_rate_hz):
             driver.close()
         except Exception as exc:
             result["errors"].append(str(exc))
-    elapsed = time.monotonic() - start
+    elapsed = monotonic() - start
     result["elapsed_seconds"] = elapsed
     result["channels"] = summarize_samples(result["samples"], CHANNELS[role], elapsed)
     result["observed_polls_per_second"] = len(result["samples"]) / elapsed if elapsed > 0 else 0.0

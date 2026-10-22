@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import ast
+import json
 import sys
 import tempfile
 import threading
 import time
 import types
 import unittest
+from acquisition_clock import monotonic
 import struct
 from collections import deque
 from pathlib import Path
@@ -203,6 +205,56 @@ class AcquisitionModeConfigurationTests(unittest.TestCase):
 
 
 class AcquisitionModeEquivalenceTests(unittest.TestCase):
+    def test_abb_cutoff_hold_expiry_and_both_helper_contracts_keep_source_snapshot(self):
+        from acquisition import AbbRobotDriver
+        from plc_measurement import frame_source_records
+        from thermocouple64 import raw_catalog
+        import copy
+        now = [10.0]
+        positions = iter([(0,0,0),(3,4,0),(6,8,0)])
+        driver = AbbRobotDriver("http://fixture", clock=lambda:now[0], wall_clock=lambda:1000 + now[0])
+        driver._fetch_position = lambda:next(positions)
+        driver.open()
+        names = ["ABB_X", "ABB_Y", "ABB_Z", "线速度"]
+        cache = ChannelSampleCache()
+        adapter = LocalDirectAdapter("abb", driver, names, cache)
+        for values, record in driver.read_samples(): adapter._publish(values,record)
+        assembler = FrameAssembler(names, 10, dict.fromkeys(names,.5), start_monotonic=10,
+                                   start_wall_time=1000, clock=lambda:now[0])
+        first = assembler.assemble(cache,10.0)
+        self.assertIsNone(first.channels["线速度"].value)
+        now[0] = 10.12
+        for values, record in driver.read_samples(): adapter._publish(values,record)
+        early = assembler.assemble(cache,10.1)
+        self.assertEqual(early.channels["ABB_X"].value,0)
+        self.assertIsNone(early.channels["线速度"].value)
+        frame = assembler.assemble(cache,10.2)
+        self.assertEqual(frame.channels["线速度"].value,41.67)
+        old = copy.deepcopy(frame_source_records(frame))
+        held = assembler.assemble(cache,10.3)
+        self.assertEqual(held.channels["线速度"].quality,ChannelQuality.HELD_WITHIN_FRESHNESS)
+        self.assertEqual(held.channels["线速度"].source_sequence,2)
+        stale = assembler.assemble(cache,11)
+        self.assertEqual(stale.channels["线速度"].quality,ChannelQuality.STALE)
+        self.assertIsNone(stale.channels["线速度"].value)
+        now[0] = 11.2
+        for values, record in driver.read_samples(): adapter._publish(values,record)
+        self.assertIsNone(cache.latest("线速度").value)
+        driver.latest_record["xyz"][0] = 999
+        driver.quality_metadata["latest_record"]["xyz"][0] = 999
+        self.assertEqual(frame_source_records(frame),old)
+        for sample in (first,early,frame,held,stale):
+            v1 = UnifiedFrame.from_envelope(json.loads(json.dumps(sample.to_envelope("abb-capture",{}),allow_nan=False)))
+            catalog = raw_catalog(names,{})
+            v2 = UnifiedFrame.from_envelope_v2(json.loads(json.dumps(sample.to_envelope_v2(
+                session_id="abb-capture",mode_id="test",catalog=catalog),allow_nan=False)),
+                expected_session_id="abb-capture",expected_mode_id="test",catalog=catalog)
+            for restored in (v1,v2):
+                self.assertEqual(restored.values(),sample.values())
+                self.assertEqual(restored.quality(),sample.quality())
+                self.assertEqual(frame_source_records(restored),frame_source_records(sample))
+                self.assertEqual(restored.channels["ABB_X"].received_monotonic,sample.channels["ABB_X"].received_monotonic)
+
     def test_plc_negative_zero_fault_and_held_sources_match_both_frame_contracts(self):
         from test_plc_modbus_contract import PlcModbusContractTests
         from plc_measurement import frame_source_records
@@ -353,7 +405,7 @@ class AcquisitionModeEquivalenceTests(unittest.TestCase):
                     interface_id="temperature-device",
                     channel_name="温度",
                     value=42.5,
-                    received_monotonic=time.monotonic(),
+                    received_monotonic=monotonic(),
                     source_sequence=1,
                 )
             )
@@ -699,7 +751,7 @@ class SharedAcquisitionCoreTests(unittest.TestCase):
                 driver.cache.publish(ChannelSample(
                     interface_id="temperature-device", channel_name="温度",
                     value=value, source_sequence=sequence,
-                    received_monotonic=time.monotonic(),
+                    received_monotonic=monotonic(),
                 ))
         driver.open = publish_current_samples
         return driver

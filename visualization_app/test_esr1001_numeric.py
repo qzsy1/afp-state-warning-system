@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from acquisition_clock import monotonic
 from esr1001_usb import (RAW_CHANNELS, Esr1001UsbDriver, RawCaptureWriter, UsbProtocolError,
     calibrated_values, content_digest, measurement_record, read_vendor_candidate,
     confirm_vendor_candidate, load_calibration, normalize_vendor_candidate, replay_source_capture,
@@ -38,7 +39,7 @@ def fixture_vendor_candidate():
 
 def source_record(sequence=1):
     return dict(zip(RAW_CHANNELS, USB_EXPECTED_ADC), receive_sequence=sequence,
-        host_wall_time=time.time(), host_monotonic=time.monotonic(), raw_hex=USB_DATA.hex(),
+        host_wall_time=time.time(), host_monotonic=monotonic(), raw_hex=USB_DATA.hex(),
         unit="adc_counts", connection_generation=1, calibration_digest=content_digest(fixture_profile()))
 
 
@@ -58,8 +59,8 @@ class NumericTests(unittest.TestCase):
             self.assertTrue(manager.test_connection(config)["ok"])
             manager.start(config)
             try:
-                deadline = time.monotonic() + 2
-                while manager.total_sample_count < 3 and time.monotonic() < deadline:
+                deadline = monotonic() + 2
+                while manager.total_sample_count < 3 and monotonic() < deadline:
                     time.sleep(.01)
             finally:
                 result = manager.stop()
@@ -452,7 +453,7 @@ assert(source.includes('card.classList.toggle("adc-saturated", measurement.warni
         with self.assertRaises(UsbProtocolError): self.set_zero(driver)
 
     def test_zero_refuses_stale_foreign_generation_and_sequence(self):
-        for mutate in (lambda d: d.latest_record.update(host_monotonic=time.monotonic() - 1),
+        for mutate in (lambda d: d.latest_record.update(host_monotonic=monotonic() - 1),
                        lambda d: setattr(d, "connection_generation", 2),
                        lambda d: setattr(d, "started", False)):
             driver = self.driver(); mutate(driver)
@@ -649,7 +650,7 @@ $rows=@(-8388608,-7149977,-9254,-1,0,1,68794,8388607) | ForEach-Object {
                 interfaces=[{"id": "esr", "role": "esr1001_strain", "driver": "esr1001_usb_ttl", "endpoint": "COM91", "physical_interface_id": "serial:COM91", "physical_interface_kind": "serial", "data_mode": "raw_adc", "enabled": True}], processing_mode="capture_only")
             manager.channel_observed[RAW_CHANNELS[0]] = 3
             manager.capture_phase = "completed"; manager.finalization_complete = True
-            manager._start_job = {"state": "running", "started_monotonic": time.monotonic() - 10}
+            manager._start_job = {"state": "running", "started_monotonic": monotonic() - 10}
             status = manager.status()
             self.assertFalse(status["running"])
             self.assertEqual(status["start_operation"]["state"], "completed")

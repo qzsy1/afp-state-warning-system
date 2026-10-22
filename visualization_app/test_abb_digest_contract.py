@@ -40,6 +40,7 @@ class DigestFixture:
         password: str = "secret",
         mode: str = "ok",
         rotate_nonce: bool = False,
+        positions=None,
     ) -> None:
         fixture = self
 
@@ -61,6 +62,11 @@ class DigestFixture:
                 self.end_headers()
 
             def do_GET(self) -> None:
+                fixture.paths.append(self.path)
+                if fixture.mode == "disconnect":
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                    self.connection.close()
+                    return
                 fixture.client_ports.append(self.client_address[1])
                 authorization = self.headers.get("Authorization")
                 fixture.authorization_headers.append(authorization)
@@ -134,8 +140,9 @@ class DigestFixture:
                 body = (
                     b"not-json"
                     if fixture.mode == "invalid_json"
-                    else json.dumps(
-                        {"_embedded": {"_state": [{"x": "1", "y": "2", "z": "3"}]}}
+                    else json.dumps(fixture.payload if fixture.payload is not None else
+                        {"_embedded": {"_state": [dict(zip(("x", "y", "z"),
+                            next(fixture.positions) if fixture.positions else ("1", "2", "3")))]}}
                     ).encode("utf-8")
                 )
                 try:
@@ -153,6 +160,9 @@ class DigestFixture:
         self.username = username
         self.password = password
         self.mode = mode
+        self.positions = iter(positions) if positions is not None else None
+        self.payload = None
+        self.paths = []
         self.rotate_nonce = rotate_nonce
         self.nonce = "nonce-a"
         self.successes = 0
@@ -364,8 +374,175 @@ class AbbDigestContractTests(unittest.TestCase):
         serialized = json.dumps(result, ensure_ascii=False)
         self.assertNotIn("wrong-secret", serialized)
 
+    def test_http_motion_uses_receive_monotonic_time_and_preserves_raw_xyz(self):
+        times = iter([9.98, 10.0, 10.08, 10.1, 10.18, 10.2])
+        walls = iter([1000, 1000.02, 900, 900.02, 2000, 2000.02])
+        with DigestFixture(positions=[("-1.25", "2.5", "-3.125"), ("1.75", "6.5", "-3.125"),
+                                      ("1.75", "6.5", "-3.125")]) as fixture:
+            driver = AbbRobotDriver(fixture.endpoint, username="operator", password="secret",
+                                    clock=lambda: next(times), wall_clock=lambda: next(walls))
+            driver.open()
+            first = driver.read_sample()
+            self.assertEqual(first, {"ABB_X": -1.25, "ABB_Y": 2.5, "ABB_Z": -3.125})
+            self.assertNotIn("线速度", first)
+            self.assertEqual(driver.read_sample()["线速度"], 50.0)
+            record = driver.latest_record
+            self.assertEqual(record["raw_xyz"], {"x":"1.75", "y":"6.5", "z":"-3.125"})
+            self.assertAlmostEqual(record["response_seconds"], .02)
+            basis = record["speed_basis"]
+            self.assertEqual(basis["distance_mm"], 5)
+            self.assertAlmostEqual(basis["interval_seconds"], .1)
+            self.assertEqual(basis["previous"]["source_sequence"], 1)
+            self.assertEqual(basis["current"]["source_sequence"], 2)
+            self.assertEqual(record["time_basis"], "host_receive_monotonic")
+            self.assertIsNone(record["device_timestamp"])
+            self.assertEqual(driver.read_sample()["线速度"], 0)
+            self.assertTrue(all(path == record["resource_path"] for path in fixture.paths))
+            self.assertIn("ROB_1/robtarget?coordinate=Base&json=1", record["resource_path"])
+            self.assertEqual(basis["current"]["host_wall_time"], 900.02)
+            self.assertNotIn("secret", json.dumps(record, allow_nan=False))
+            driver.close()
+
+    def test_http_invalid_structure_and_nonfinite_never_create_source(self):
+        for payload, error in (({}, "resource_invalid"), ({"_embedded":{"_state":[]}}, "resource_invalid"),
+                ({"_embedded":{"_state":[{"x":"NaN","y":"2","z":"3"}]}}, "numeric_invalid"),
+                ({"_embedded":{"_state":[{"x":"1","y":"Infinity","z":"3"}]}}, "numeric_invalid")):
+            with self.subTest(payload=payload), DigestFixture() as fixture:
+                fixture.payload = payload
+                driver = AbbRobotDriver(fixture.endpoint, username="operator", password="secret")
+                with self.assertRaisesRegex(Exception, error):
+                    driver.read_sample()
+                self.assertEqual(driver.source_sequence, 0)
+                self.assertIsNone(driver.latest_record)
+                self.assertFalse(driver.protocol_verified)
+                json.dumps(driver.quality_metadata, allow_nan=False)
+                driver.close()
+
+    def test_http_disconnect_and_reconnect_rebuild_two_point_speed(self):
+        from itertools import count
+        ticks = count(0, .02)
+        with DigestFixture() as fixture:
+            driver = AbbRobotDriver(fixture.endpoint, username="operator", password="secret", clock=lambda:next(ticks))
+            driver.open()
+            driver.read_sample()
+            self.assertEqual(driver.read_sample()["线速度"], 0)
+            sequence = driver.source_sequence
+            fixture.mode = "disconnect"
+            with self.assertRaisesRegex(Exception, "transport_error"):
+                driver.read_sample()
+            self.assertEqual(driver.source_sequence, sequence)
+            fixture.mode = "ok"
+            self.assertNotIn("线速度", driver.read_sample())
+            self.assertEqual(driver.read_sample()["线速度"], 0)
+            driver.close()
+            driver.open()
+            self.assertNotIn("线速度", driver.read_sample())
+            self.assertEqual(driver.latest_record["connection_generation"], 2)
+            self.assertIsNone(driver.latest_record["speed_basis"])
+            self.assertEqual(driver.read_sample()["线速度"], 0)
+            self.assertEqual(driver.latest_record["speed_basis"]["previous"]["connection_generation"], 2)
+            driver.close()
+
+    def test_real_http_adapter_recovers_generation_and_stops_with_other_device(self):
+        from local_direct_acquisition import LocalDirectAdapter
+        from real_acquisition import ChannelSampleCache
+        from copy import deepcopy
+        class Other:
+            def open(self): pass
+            def close(self): pass
+            def read_sample(self): return {"温度":25}
+        cache=ChannelSampleCache()
+        other=LocalDirectAdapter("other",Other(),["温度"],cache)
+        with DigestFixture() as fixture:
+            driver=AbbRobotDriver(fixture.endpoint,username="operator",password="secret",timeout=.1)
+            observed=[]
+            adapter=LocalDirectAdapter("abb",driver,["ABB_X","线速度"],cache,reconnect_backoff_seconds=.03)
+            publish=adapter._publish
+            def remember(values,record=None):
+                observed.append((deepcopy(values),deepcopy(record)))
+                return publish(values,record)
+            adapter._publish=remember
+            def until(predicate):
+                deadline=time.monotonic()+2
+                while not predicate() and time.monotonic()<deadline: time.sleep(.005)
+                self.assertTrue(predicate())
+            other.start()
+            adapter.start()
+            try:
+                until(lambda:len(observed)>=2)
+                fixture.mode="disconnect"
+                until(lambda:adapter.reconnect_attempts>=1)
+                self.assertGreater(other.read_calls,2)
+                fixture.mode="ok"
+                until(lambda:sum(record["connection_generation"]>1 for _,record in observed)>=2)
+                recovered=[(values,record) for values,record in observed if record["connection_generation"]>1]
+                self.assertIsNone(recovered[0][0]["线速度"])
+                self.assertIsNone(recovered[0][1]["speed_basis"])
+                self.assertEqual(recovered[1][0]["线速度"],0)
+                self.assertEqual(recovered[1][1]["speed_basis"]["previous"]["connection_generation"],recovered[1][1]["connection_generation"])
+            finally:
+                start=time.monotonic()
+                self.assertTrue(adapter.stop(1))
+                self.assertTrue(other.stop(1))
+                self.assertLess(time.monotonic()-start,2)
+
+    def test_helper_rejects_missing_tampered_or_nonfinite_motion_evidence(self):
+        from real_acquisition import ChannelSample
+        from copy import deepcopy
+        now=[10.0]
+        positions=iter([(0,0,0),(3,4,0)])
+        driver=AbbRobotDriver("http://fixture",clock=lambda:now[0])
+        driver._fetch_position=lambda:next(positions)
+        driver.read_sample()
+        now[0]=10.1
+        driver.read_sample()
+        valid=driver.latest_record
+        variants=[None,dict(valid,Authorization="secret"),dict(valid,host_monotonic=float("nan"))]
+        tampered=deepcopy(valid)
+        tampered["speed_basis"]["previous"]["connection_generation"]+=1
+        variants.append(tampered)
+        for record in variants:
+            with self.subTest(record=record),self.assertRaisesRegex(ValueError,"abb_measurement_evidence_invalid"):
+                ChannelSample("abb","线速度",50,metadata={"driver":"abb_robot","latest_record":record})
+
+    def test_expired_success_gap_restarts_speed_basis(self):
+        times = iter([10, 12, 12.1])
+        driver = AbbRobotDriver("http://fixture", clock=lambda:next(times), freshness_seconds=1)
+        driver._fetch_position = lambda:(3,4,0)
+        self.assertNotIn("线速度", driver.read_sample())
+        self.assertNotIn("线速度", driver.read_sample())
+        self.assertEqual(driver.latest_record["speed_quality"], "unverified_after_expiry")
+        self.assertEqual(driver.read_sample()["线速度"], 0)
+
+    def test_abb_fixed_deadline_includes_twenty_ms_read_and_skips_slow_round(self):
+        from local_direct_acquisition import LocalDirectAdapter
+        from real_acquisition import ChannelSampleCache
+        current, starts = [0.0], []
+        durations = iter([.02, .02, .25, .01])
+        driver = AbbRobotDriver("http://fixture", clock=lambda:current[0], wall_clock=lambda:1000)
+        def fetch():
+            starts.append(current[0])
+            current[0] += next(durations)
+            return (0,0,0)
+        driver._fetch_position = fetch
+        class Stop:
+            done = False
+            def is_set(self): return self.done
+            def wait(self, delay):
+                current[0] += delay
+                self.done = len(starts) == 4
+        adapter = LocalDirectAdapter("abb", driver, ["ABB_X", "线速度"], ChannelSampleCache(), clock=lambda:current[0])
+        adapter.stop_event = Stop()
+        adapter._run()
+        self.assertEqual(len(starts),4)
+        for actual, expected in zip(starts,[0,.1,.2,.5]):
+            self.assertAlmostEqual(actual, expected)
+        self.assertEqual(adapter.skipped_poll_cycles,2)
+        self.assertAlmostEqual(adapter.last_round_seconds,.01)
+        self.assertAlmostEqual(adapter.observed_poll_interval_seconds,.3)
+
     def test_position_timestamp_and_two_point_speed_quality(self) -> None:
-        times = iter((100.0, 102.0))
+        times = iter((100.0, 100.1))
         positions = iter(((1.0, 2.0, 3.0), (4.0, 6.0, 3.0)))
         driver = AbbRobotDriver(
             "http://fixture", clock=lambda: next(times)
@@ -378,7 +555,7 @@ class AbbDigestContractTests(unittest.TestCase):
         second = driver.read_sample()
 
         self.assertEqual(first, {"ABB_X": 1.0, "ABB_Y": 2.0, "ABB_Z": 3.0})
-        self.assertEqual(first_timestamp, 100.0)
+        self.assertIsNone(first_timestamp)
         self.assertEqual(first_quality["speed_quality"], "unverified_first_sample")
         self.assertEqual(
             second,
@@ -386,10 +563,10 @@ class AbbDigestContractTests(unittest.TestCase):
                 "ABB_X": 4.0,
                 "ABB_Y": 6.0,
                 "ABB_Z": 3.0,
-                "线速度": 2.5,
+                "线速度": 50.0,
             },
         )
-        self.assertEqual(driver.source_timestamp, 102.0)
+        self.assertIsNone(driver.source_timestamp)
         self.assertEqual(driver.quality_metadata["speed_quality"], "measured_new")
         self.assertEqual(driver.quality_metadata["coordinate_system"], "Base")
 

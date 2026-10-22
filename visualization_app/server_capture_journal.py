@@ -72,7 +72,7 @@ class JournalRows:
                                  if envelope.get("contract_version") == "unified_frame_v2"
                                  else UnifiedFrame.from_envelope(envelope))
                         records = {name: record for name, record in frame_source_records(frame).items()
-                                   if record.get("measurement_profile") == "fibercontrol_plc_v1"}
+                                   if record.get("measurement_profile") in {"fibercontrol_plc_v1", "fibercontrol_abb_v1"}}
                         if records:
                             recovered["_channel_source_records"] = records
                     yield recovered

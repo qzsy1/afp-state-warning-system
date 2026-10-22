@@ -15,6 +15,7 @@ import struct
 import subprocess
 import threading
 import time
+from acquisition_clock import monotonic, wait_interruptible, ACQUISITION_CLOCK_DOMAIN
 import tempfile
 import sys
 import urllib.request
@@ -64,6 +65,7 @@ from real_acquisition import (
 )
 from local_direct_acquisition import LocalDirectAdapter, minimum_poll_interval
 from plc_measurement import frame_source_records
+from abb_measurement import ABB_MEASUREMENT_CONTRACT, ABB_TIME_BASIS
 from release_contract import assert_config_contract, load_release_contract
 from thermocouple64 import (
     THERMOCOUPLE64_CHANNELS,
@@ -1129,9 +1131,9 @@ class BoundedCsvWriter:
     def close(self, *, timeout_seconds: float = 5.0) -> None:
         if not self._closed:
             self._closed = True
-            deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+            deadline = monotonic() + max(0.0, float(timeout_seconds))
             while True:
-                remaining = deadline - time.monotonic()
+                remaining = deadline - monotonic()
                 if remaining <= 0:
                     raise RuntimeError("persistence_writer_stop_timeout")
                 try:
@@ -1139,7 +1141,7 @@ class BoundedCsvWriter:
                     break
                 except queue.Full:
                     continue
-            self._thread.join(max(0.0, deadline - time.monotonic()))
+            self._thread.join(max(0.0, deadline - monotonic()))
             if self._thread.is_alive():
                 raise RuntimeError("persistence_writer_stop_timeout")
         self._raise_error()
@@ -1844,7 +1846,7 @@ def publish_thermocouple64_snapshot(
 
     wall_time = float(received_wall_time if received_wall_time is not None else time.time())
     monotonic = float(
-        received_monotonic if received_monotonic is not None else time.monotonic()
+        received_monotonic if received_monotonic is not None else monotonic()
     )
     quality_map = {
         "measured_new": ChannelQuality.MEASURED_NEW,
@@ -2141,6 +2143,12 @@ class AcquisitionConfig:
                 )
             )
             _apply_sensor_interface_profile(interface)
+            if interface["driver"] == "abb_robot":
+                interface["measurement_profile"] = str(interface.get("measurement_profile") or ABB_MEASUREMENT_CONTRACT)
+                if interface["measurement_profile"] != ABB_MEASUREMENT_CONTRACT:
+                    raise ValueError("unsupported ABB measurement_profile")
+                interface["poll_interval_seconds"] = 0.1
+                interface["freshness_seconds"] = float(interface.get("freshness_seconds") or 1.0)
             if interface["driver"] == "modbus_tcp":
                 interface["measurement_profile"] = str(interface.get("measurement_profile") or "fibercontrol_plc_v1")
                 if interface["measurement_profile"] != "fibercontrol_plc_v1":
@@ -3043,9 +3051,9 @@ class Esr1001StrainDriver(SampleDriver):
     ) -> bytes:
         if self.serial is None:
             raise Esr1001ProtocolError("port_closed", "串口尚未打开")
-        deadline = time.monotonic() + max(0.001, float(deadline_seconds))
+        deadline = monotonic() + max(0.001, float(deadline_seconds))
         last_error: Esr1001ProtocolError | None = None
-        while time.monotonic() < deadline:
+        while monotonic() < deadline:
             slave_byte = self.slave_id & 0xFF
             while self._rx_buffer and self._rx_buffer[0] != slave_byte:
                 del self._rx_buffer[0]
@@ -3479,7 +3487,7 @@ class ModbusTcpDriver(SampleDriver):
     def __init__(self, endpoint: str, register_map: dict[str, int] | None = None,
                  slave_id: int = DEFAULT_PLC_SLAVE_ID, timeout: float = 1.0,
                  source_address: str = "", measurement_profile: str = "fibercontrol_plc_v1",
-                 clock=time.monotonic, wall_clock=time.time) -> None:
+                 clock=monotonic, wall_clock=time.time) -> None:
         if measurement_profile != "fibercontrol_plc_v1":
             raise ValueError("unsupported PLC measurement_profile")
         self.measurement_profile = measurement_profile
@@ -3881,8 +3889,15 @@ class AbbRobotDriver(SampleDriver):
                  username: str = DEFAULT_ABB_USER,
                  password: str = DEFAULT_ABB_PASSWORD,
                  timeout: float = 1.5,
-                 clock: Any = time.time,
-                 source_address: str = "") -> None:
+                 clock: Any = monotonic,
+                 source_address: str = "", *, wall_clock: Any = time.time,
+                 freshness_seconds: float = 1.0,
+                 measurement_profile: str = ABB_MEASUREMENT_CONTRACT) -> None:
+        if measurement_profile != ABB_MEASUREMENT_CONTRACT:
+            raise ValueError("unsupported ABB measurement_profile")
+        self.fixed_poll_interval_seconds = 0.1
+        self.measurement_profile = measurement_profile
+        self.freshness_seconds = max(0.001, float(freshness_seconds))
         if str(endpoint).startswith("http"):
             self.base_url = str(endpoint).rstrip("/")
         else:
@@ -3891,14 +3906,24 @@ class AbbRobotDriver(SampleDriver):
         self.password = password
         self.timeout = max(0.1, float(timeout))
         self.clock = clock
+        self.wall_clock = wall_clock
+        self.connection_generation = 0
+        self.source_sequence = 0
+        self.latest_record = None
+        self._previous_position = None
+        self._response_times = None
+        self._raw_xyz = None
+        self.protocol_verified = False
         self.source_address = str(source_address)
         self.actual_source_address = ""
-        self._last_time: float | None = None
-        self._last_x: float | None = None
-        self._last_y: float | None = None
-        self._last_z: float | None = None
         self.source_timestamp: float | None = None
         self.quality_metadata: dict[str, Any] = {
+            "driver": "abb_robot",
+            "clock_domain": ACQUISITION_CLOCK_DOMAIN,
+            "measurement_profile": self.measurement_profile,
+            "algorithm_version": 1,
+            "time_basis": ABB_TIME_BASIS,
+            "poll_interval_seconds": 0.1,
             "mechanical_unit": "ROB_1",
             "coordinate_system": "Base",
             "speed_quality": "unverified_first_sample",
@@ -3911,7 +3936,11 @@ class AbbRobotDriver(SampleDriver):
         self._cookies = self._session.cookies
 
     def open(self) -> None:
-        self._last_time = self._last_x = self._last_y = self._last_z = None
+        self.connection_generation += 1
+        self._previous_position = None
+        self.latest_record = None
+        self.protocol_verified = False
+        self.quality_metadata.pop("latest_record", None)
         self.source_timestamp = None
         self.quality_metadata["speed_quality"] = "unverified_first_sample"
 
@@ -3928,10 +3957,17 @@ class AbbRobotDriver(SampleDriver):
             self._session.close()
 
     def _request_json(self, path: str) -> dict[str, Any]:
+        started = self.clock()
+        started_wall = self.wall_clock()
         try:
             with self._session.get(f"{self.base_url}{path}", headers={"Accept": "application/json"}, timeout=self.timeout) as response:
                 status = response.status_code
-                raw = response.content.decode("utf-8")
+                body = response.content
+                self._response_times = (started, started_wall, self.clock(), self.wall_clock())
+                try:
+                    raw = body.decode("utf-8")
+                except UnicodeError:
+                    raise AbbRwsError("invalid_json", "parsing") from None
             if status in {401, 403}:
                 raise AbbRwsError("authentication_failed", "authentication") from None
             if status == 404:
@@ -3961,6 +3997,8 @@ class AbbRobotDriver(SampleDriver):
             raise AbbRwsError("resource_invalid", "parsing") from None
         if not all(math.isfinite(value) for value in values):
             raise AbbRwsError("numeric_invalid", "value")
+        self._raw_xyz = {axis: state[axis] if isinstance(state[axis], str) else value
+                         for axis, value in zip(("x", "y", "z"), values)}
         return values
 
     @staticmethod
@@ -3998,28 +4036,71 @@ class AbbRobotDriver(SampleDriver):
         return str(value)
 
     def read_sample(self) -> dict[str, float] | None:
-        x, y, z = self._fetch_position()
-        if not all(math.isfinite(value) for value in (x, y, z)):
-            raise AbbRwsError("numeric_invalid", "value")
-        now = float(self.clock())
-        self.source_timestamp = now
+        self._response_times = self._raw_xyz = None
+        try:
+            x, y, z = self._fetch_position()
+            if not all(math.isfinite(value) for value in (x, y, z)):
+                raise AbbRwsError("numeric_invalid", "value")
+        except Exception as exc:
+            self._previous_position = None
+            self.protocol_verified = False
+            self.quality_metadata.update(speed_quality="unverified_after_fault",
+                                         error_category=getattr(exc, "code", "transport_error"))
+            raise
+        if self._response_times is None:
+            now, wall = float(self.clock()), float(self.wall_clock())
+            self._response_times = (now, wall, now, wall)
+        started, started_wall, now, wall = self._response_times
+        self.source_sequence += 1
+        self.source_timestamp = None
+        self.protocol_verified = True
         result = {"ABB_X": x, "ABB_Y": y, "ABB_Z": z}
-        if self._last_time is not None and self._last_x is not None:
-            delta_time = now - self._last_time
-            if delta_time > 0:
-                speed = round(math.sqrt(
-                    (x - self._last_x) ** 2
-                    + (y - self._last_y) ** 2
-                    + (z - self._last_z) ** 2
-                ) / delta_time, 2)
-                result["线速度"] = speed
-                self.quality_metadata["speed_quality"] = "measured_new"
+        position = {"source_sequence": self.source_sequence, "connection_generation": self.connection_generation,
+                    "host_monotonic": now, "host_wall_time": wall, "xyz": [x, y, z]}
+        previous = self._previous_position
+        speed_quality = "unverified_first_sample"
+        speed_basis = None
+        if previous is not None:
+            delta = now - previous["host_monotonic"]
+            if delta <= 0:
+                speed_quality = "unverified_zero_delta"
+            elif delta > self.freshness_seconds:
+                speed_quality = "unverified_after_expiry"
             else:
-                self.quality_metadata["speed_quality"] = "unverified_zero_delta"
-        else:
-            self.quality_metadata["speed_quality"] = "unverified_first_sample"
-        self._last_time, self._last_x, self._last_y, self._last_z = now, x, y, z
+                distance = math.dist(previous["xyz"], position["xyz"])
+                speed = round(distance / delta, 2)
+                if math.isfinite(speed):
+                    result["线速度"] = speed
+                    speed_quality = "measured_new"
+                    speed_basis = {"previous": deepcopy(previous), "current": deepcopy(position),
+                                   "distance_mm": distance, "interval_seconds": delta,
+                                   "time_basis": ABB_TIME_BASIS, "value_mm_s": speed}
+                else:
+                    speed_quality = "unverified_numeric"
+        self._previous_position = position
+        self.latest_record = {
+            "measurement_profile": self.measurement_profile, "algorithm_version": 1,
+            "connection_generation": self.connection_generation, "source_sequence": self.source_sequence,
+            "controller_endpoint": urllib.parse.urlunsplit((urllib.parse.urlsplit(self.base_url).scheme,
+                urllib.parse.urlsplit(self.base_url).netloc.rsplit("@", 1)[-1], "", "", "")),
+            "resource_path": ABB_ROBTARGET_PATH,
+            "mechanical_unit": "ROB_1", "coordinate_system": "Base", "unit": "mm",
+            "raw_xyz": self._raw_xyz or dict(zip(("x", "y", "z"), (x, y, z))), "xyz": [x, y, z],
+            "request_started_monotonic": started, "request_started_wall_time": started_wall,
+            "host_monotonic": now, "host_wall_time": wall,
+            "response_seconds": max(0.0, now - started), "time_basis": ABB_TIME_BASIS,
+            "clock_domain": ACQUISITION_CLOCK_DOMAIN,
+            "device_timestamp": None, "device_sequence": None,
+            "speed_quality": speed_quality, "speed_basis": speed_basis,
+        }
+        self.quality_metadata.update(latest_record=deepcopy(self.latest_record), speed_quality=speed_quality,
+                                     error_category="", connection_generation=self.connection_generation)
         return result
+
+    def read_samples(self):
+        payload = self.read_sample()
+        # 首点显式发布无效速度，使重连前的旧速度不能进入新代次。
+        yield dict(payload, **{"线速度": payload.get("线速度")}), deepcopy(self.latest_record)
 
 
 def _parse_roi(value: Any) -> tuple[int, int, int, int] | None:
@@ -4434,7 +4515,7 @@ class MultiInterfaceDriver(SampleDriver):
         self.drivers = []
         self.final_worker_status = []
         self.interface_quality_metadata = {}
-        opening_started = time.monotonic()
+        opening_started = monotonic()
         try:
             for item in self.configs:
                 if self._opening_cancel.is_set():
@@ -4470,6 +4551,8 @@ class MultiInterfaceDriver(SampleDriver):
                         str(item.get("username") or DEFAULT_ABB_USER),
                         str(item.get("password") or DEFAULT_ABB_PASSWORD),
                         float(item.get("timeout") or 1.5),
+                        freshness_seconds=float(item.get("freshness_seconds") or 1.0),
+                        measurement_profile=str(item.get("measurement_profile") or ABB_MEASUREMENT_CONTRACT),
                     )
                 elif driver_name == "uvc_thermal":
                     driver = UvcThermalDriver(
@@ -4590,7 +4673,7 @@ class MultiInterfaceDriver(SampleDriver):
                     not worker.opened.is_set()
                     and worker.thread is not None
                     and worker.thread.is_alive()
-                    and time.monotonic() < open_deadline
+                    and monotonic() < open_deadline
                 ):
                     if self._opening_cancel.is_set():
                         raise RuntimeError("capture_start_cancelled")
@@ -4624,7 +4707,7 @@ class MultiInterfaceDriver(SampleDriver):
 
     def close(self, timeout_seconds: float = 0.5) -> None:
         pending: list[LocalDirectAdapter] = []
-        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        deadline = monotonic() + max(0.0, float(timeout_seconds))
         self._opening_cancel.set()
         with self._workers_lock:
             workers = list(self.workers)
@@ -4633,7 +4716,7 @@ class MultiInterfaceDriver(SampleDriver):
         for worker in workers:
             worker.stop(timeout_seconds=0)
         for worker in workers:
-            if not worker.stop(timeout_seconds=max(0.0, deadline-time.monotonic())):
+            if not worker.stop(timeout_seconds=max(0.0, deadline-monotonic())):
                 pending.append(worker)
         statuses = {row["interface_id"]: row for row in self.final_worker_status}
         statuses.update({worker.interface_id: worker.status() for worker in workers})
@@ -5954,7 +6037,7 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                             if name not in sample:
                                 continue
                             source_sample = (interface_driver.cache.latest(name)
-                                             if item.get("driver") == "modbus_tcp" and isinstance(getattr(interface_driver, "cache", None), ChannelSampleCache)
+                                             if item.get("driver") in {"modbus_tcp", "abb_robot"} and isinstance(getattr(interface_driver, "cache", None), ChannelSampleCache)
                                              else None)
                             source_evidence = ({"source_sequence": source_sample.source_sequence,
                                                 "received_monotonic": source_sample.received_monotonic,
@@ -5979,7 +6062,9 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                                     "quality": "measured_new",
                                     **source_evidence,
                                 }
-                    if expected and all(detected.get(name, 0) > 0 or invalid.get(name, 0) > 0 for name in expected):
+                    if expected and all(detected.get(name, 0) > 0 or (
+                        invalid.get(name, 0) > 0 and not (item.get("driver") == "abb_robot" and name == "线速度")
+                    ) for name in expected):
                         break
                     time.sleep(0.01)
             except Exception as exc:
@@ -6056,6 +6141,7 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                     "unit": str((SENSOR_CHANNEL_METADATA.get(name) or {}).get("unit") or ""),
                     "source_timestamp": observation.get("source_timestamp"),
                     "quality": str(observation.get("quality") or "missing"),
+                    **{key: observation[key] for key in ("source_sequence", "received_monotonic", "source_record") if key in observation},
                 }
             stages = {
                 "network_path": {
@@ -6372,6 +6458,14 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                 **dict(identity_previous.get("layer_sensor_channels") or {}),
                 str(config.layer + 1): list(config.selected_sensors or []),
             },
+            "abb_measurement": {
+                item["id"]: {"measurement_profile": ABB_MEASUREMENT_CONTRACT, "algorithm_version": 1,
+                             "poll_interval_seconds": 0.1, "time_basis": ABB_TIME_BASIS,
+                             "mechanical_unit": "ROB_1", "coordinate_system": "Base",
+                             "resource_path": ABB_ROBTARGET_PATH, "speed_rule": "two_positions_distance_over_monotonic_interval"}
+                for item in config.interfaces or []
+                if config.acquisition_mode == "real" and item.get("enabled", True) and item.get("driver") == "abb_robot"
+            },
             "plc_measurement": {
                 item["id"]: {"measurement_profile": item["measurement_profile"], "algorithm_version": 1,
                              "poll_interval_seconds": item["poll_interval_seconds"],
@@ -6619,7 +6713,7 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
     ) -> dict[str, Any]:
         event = {
             "stage": str(stage),
-            "server_monotonic": time.monotonic(),
+            "server_monotonic": monotonic(),
             **details,
         }
         audit["events"].append(event)
@@ -6748,7 +6842,7 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                                 elapsed_ms=max(
                                     0.0,
                                     (
-                                        time.monotonic()
+                                        monotonic()
                                         - float(probe_begin["server_monotonic"])
                                     )
                                     * 1000.0,
@@ -7147,8 +7241,8 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
         if config.acquisition_mode == "real":
             required_channels = set(config.selected_sensors or [])
             observed: set[str] = set()
-            deadline = time.monotonic() + config.first_sample_timeout_seconds
-            while time.monotonic() < deadline:
+            deadline = monotonic() + config.first_sample_timeout_seconds
+            while monotonic() < deadline:
                 self._assert_start_not_cancelled()
                 with self.lock:
                     self._record_start_frame()
@@ -7162,7 +7256,7 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                     break
                 if not alive:
                     break
-                self.wait_for_stream_activity(min(0.01, max(0.0, deadline - time.monotonic())))
+                self.wait_for_stream_activity(min(0.01, max(0.0, deadline - monotonic())))
             if required_channels and (observed != required_channels or not self._curve_start_saved):
                 missing = sorted(required_channels - observed)
                 self.last_error = "first_sample_timeout: " + ", ".join(missing)
@@ -7391,7 +7485,7 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                         os.fsync(raw_file.fileno())
                         os.fsync(time_file.fileno())
                     first_written = True
-                    now_written = time.monotonic()
+                    now_written = monotonic()
                     self.record_start_event("first_valid_sample_written", row_index=timestamp["row_index"],
                         frame_sequence=timestamp["frame_sequence"], durable=bool(self.save_enabled))
                     with self._start_job_lock:
@@ -7418,9 +7512,9 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                         config.selected_sensors or [],
                         config.sample_rate_hz,
                         _freshness_by_channel(config),
-                        clock=time.monotonic,
+                        clock=monotonic,
                         wall_clock=time.time,
-                        wait=self.stop_event.wait,
+                        wait=lambda delay: wait_interruptible(self.stop_event, delay),
                     )
                     if config.acquisition_mode == "real"
                     else None
@@ -7586,7 +7680,7 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                             capture_writer.high_water_rows,
                         )
                         if frame is None:
-                            target_monotonic = time.monotonic()
+                            target_monotonic = monotonic()
                             frame = UnifiedFrame(
                                 capture_sequence=row_index,
                                 target_monotonic=target_monotonic,
@@ -8603,7 +8697,7 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                     if item.get("driver") == USB_DRIVER and usb_evidence:
                         frames = int(usb_evidence.get("source_frames") or 0)
                         latest = usb_evidence.get("latest_record") or {}
-                        frame_age = max(0.0, time.monotonic() - float(latest.get("host_monotonic") or 0)) if latest else None
+                        frame_age = max(0.0, monotonic() - float(latest.get("host_monotonic") or 0)) if latest else None
                         message += f"；源帧 {frames}；单位 {usb_evidence.get('unit')}"
                         source_rate = usb_evidence.get("actual_source_rate_hz")
                         message += f"；实际帧率 {source_rate:.2f} Hz" if source_rate is not None else "；实际帧率待确认"
@@ -8616,6 +8710,10 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                     if item.get("driver") == "m3232_pressure" and usb_evidence:
                         message += f"；{usb_evidence.get('baudrate')}/8N1；{usb_evidence.get('matrix_shape')}；{usb_evidence.get('unit')}；有效矩阵 {usb_evidence.get('valid_frames')}；拒绝 {usb_evidence.get('rejected_frames')}"
                         if not usb_evidence.get("calibrated"): message += "；原始响应未标定"
+                    if item.get("driver") == "abb_robot" and usb_evidence:
+                        latest = usb_evidence.get("latest_record") or {}
+                        age = max(0.0, monotonic() - latest["host_monotonic"]) if latest else None
+                        usb_evidence = dict(usb_evidence, age_seconds=age)
                     if adapter_state in {"failed", "stop_timed_out"}:
                         state = adapter_state
                         message = str(adapter_status.get("last_error") or adapter_state)
@@ -8635,7 +8733,11 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                         "observed_poll_interval_seconds": adapter_status.get("observed_poll_interval_seconds"),
                         "last_round_seconds": adapter_status.get("last_round_seconds"),
                         "skipped_poll_cycles": adapter_status.get("skipped_poll_cycles", 0),
+                        "read_calls": adapter_status.get("read_calls", 0),
+                        "successful_read_calls": adapter_status.get("successful_read_calls", 0),
+                        "read_success_ratio": adapter_status.get("read_success_ratio"),
                         "plc_evidence": usb_evidence if item.get("driver") == "modbus_tcp" else None,
+                        "abb_evidence": deepcopy(usb_evidence) if item.get("driver") == "abb_robot" else None,
                         "start_events": adapter_status.get("start_events", []),
                         "usb_evidence": usb_evidence if item.get("driver") == USB_DRIVER else None,
                         "m3232_evidence": usb_evidence if item.get("driver") == "m3232_pressure" else None,
@@ -8656,7 +8758,7 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                 "running": running,
                 "data_connection": self.connection_status(),
                 "capture_start_monotonic": self._capture_start_monotonic,
-                "status_monotonic": time.monotonic(),
+                "status_monotonic": monotonic(),
                 "start_operation": self.start_operation_status(),
                 "capture_generation": self._start_job.get("capture_generation") or getattr(self.config, "capture_generation", ""),
                 "start_request_id": self._start_job.get("start_request_id") or getattr(self.config, "start_request_id", ""),

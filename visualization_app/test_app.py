@@ -6,6 +6,7 @@ import http.client
 import tempfile
 import time
 import unittest
+from acquisition_clock import monotonic
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -82,7 +83,7 @@ class SourceCurvePayloadTests(unittest.TestCase):
     def test_capture_only_startup_points_use_real_observation_times_in_seconds(self):
         points = [{"value": 12.0, "source_sequence": 4, "received_monotonic": 99.8},
                   {"value": 13.0, "source_sequence": 5, "received_monotonic": 99.9}]
-        with patch("app.time.monotonic", return_value=100.0):
+        with patch("app.monotonic", return_value=100.0):
             payload = DashboardData._capture_only_live(
                 SimpleNamespace(sensors=[]), status={"config": {"acquisition_mode": "real"}},
                 rows=[], sensor_columns=["CH1_ADC_signed"], sensor_id=0, history=120,
@@ -991,7 +992,7 @@ class LanServerTests(unittest.TestCase):
         lock = _operation_lock("acquisition-check")
         self.assertTrue(lock.acquire(blocking=False))
         try:
-            _OPERATION_LOCK_STARTED["acquisition-check"] = time.monotonic() - 1
+            _OPERATION_LOCK_STARTED["acquisition-check"] = monotonic() - 1
             with patch("app.OPERATION_LOCK_TTL_SECONDS", 0.0, create=True):
                 status, payload = self.request("POST", "/api/acquisition/reset-check", {})
         finally:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+from acquisition_clock import monotonic, wait_interruptible
 from copy import deepcopy
 from typing import Any, Callable, Iterable, Mapping
 
@@ -71,7 +72,7 @@ class LocalDirectAdapter:
         max_reconnect_attempts: int = 5,
         reconnect_window_seconds: float | None = None,
         before_open: Callable[[], Any] | None = None,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] = monotonic,
         wall_clock: Callable[[], float] = time.time,
     ) -> None:
         self.interface_id = str(interface_id)
@@ -117,6 +118,7 @@ class LocalDirectAdapter:
         self._stop_close_thread: threading.Thread | None = None
         self.source_sequence = 0
         self.read_calls = 0
+        self.successful_read_calls = 0
         self.reconnect_attempts = 0
         self._consecutive_reconnect_attempts = 0
         self._reconnect_window_started_monotonic: float | None = None
@@ -156,7 +158,8 @@ class LocalDirectAdapter:
         received_monotonic = float(record["host_monotonic"]) if record else self.clock()
         received_wall_time = float(record["host_wall_time"]) if record else self.wall_clock()
         plc_record = record if isinstance(record, Mapping) and record.get("measurement_profile") == "fibercontrol_plc_v1" else None
-        self.source_sequence = int(plc_record["source_sequence"]) if plc_record else self.source_sequence + 1
+        abb_record = record if isinstance(record, Mapping) and record.get("measurement_profile") == "fibercontrol_abb_v1" else None
+        self.source_sequence = int(record["source_sequence"]) if plc_record or abb_record else self.source_sequence + 1
         self.source_observations.append({
             "source_sequence": self.source_sequence,
             "received_monotonic": received_monotonic,
@@ -172,6 +175,9 @@ class LocalDirectAdapter:
         if plc_record:
             driver_metadata = {"driver": "modbus_tcp", "measurement_profile": plc_record["measurement_profile"],
                                "latest_record": deepcopy(plc_record)}
+        if abb_record:
+            driver_metadata = {"driver": "abb_robot", "measurement_profile": abb_record["measurement_profile"],
+                               "latest_record": deepcopy(abb_record), "time_basis": abb_record["time_basis"]}
         samples = []
         for name, raw_value in accepted:
             value = _finite(raw_value)
@@ -209,7 +215,7 @@ class LocalDirectAdapter:
         started = self._reconnect_window_started_monotonic
         if started is None:
             return 0.0
-        current = time.monotonic() if now is None else float(now)
+        current = self.clock() if now is None else float(now)
         return max(0.0, self.reconnect_window_seconds - (current - started))
 
     def _safe_close(self) -> None:
@@ -264,10 +270,15 @@ class LocalDirectAdapter:
                                     if self._publish(payload):
                                         self.consecutive_failures = 0
                         self.last_round_seconds = max(0.0, self.clock() - round_start)
+                        self.successful_read_calls += 1
                         if self.fixed_poll_interval_seconds is not None:
                             next_poll, skipped = self.next_poll_deadline(next_poll, self.clock(), self.actual_poll_interval_seconds)
                             self.skipped_poll_cycles += skipped
-                            self.stop_event.wait(max(0.0, next_poll - self.clock()))
+                            delay = max(0.0, next_poll - self.clock())
+                            if _driver_name(self.driver) == "abb_robot" and self.clock is monotonic:
+                                wait_interruptible(self.stop_event, delay, clock=self.clock)
+                            else:
+                                self.stop_event.wait(delay)
                         else:
                             self.stop_event.wait(self.actual_poll_interval_seconds)
                     break
@@ -282,7 +293,7 @@ class LocalDirectAdapter:
                     if (_driver_name(self.driver) == "huipu_tc64_modbus_rtu" and getattr(exc, "code", "") == "binding_unconfirmed") or "binding_unconfirmed:" in str(exc):
                         self.state = "failed"
                         break
-                    now = time.monotonic()
+                    now = self.clock()
                     recovery_window_enabled = (
                         self.max_reconnect_attempts > 0
                         and self.reconnect_window_seconds > 0.0
@@ -329,7 +340,7 @@ class LocalDirectAdapter:
         return deadline + skipped * period, skipped
 
     def stop(self, timeout_seconds: float = 0.5) -> bool:
-        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        deadline = monotonic() + max(0.0, float(timeout_seconds))
         self.stop_event.set()
         cancel = getattr(self.driver, "cancel_open", None)
         if callable(cancel):
@@ -343,10 +354,10 @@ class LocalDirectAdapter:
             )
             self._stop_close_thread = close_thread
             close_thread.start()
-        close_thread.join(max(0.0, deadline - time.monotonic()))
+        close_thread.join(max(0.0, deadline - monotonic()))
         thread = self.thread
         if thread is not None:
-            thread.join(max(0.0, deadline - time.monotonic()))
+            thread.join(max(0.0, deadline - monotonic()))
         stopped = (
             (thread is None or not thread.is_alive())
             and not close_thread.is_alive()
@@ -376,6 +387,8 @@ class LocalDirectAdapter:
             "opened_monotonic": self.opened_monotonic,
             "first_sample_received": first_sample_received,
             "read_calls": self.read_calls,
+            "successful_read_calls": self.successful_read_calls,
+            "read_success_ratio": self.successful_read_calls / self.read_calls if self.read_calls else None,
             "source_sequence": self.source_sequence,
             "source_observations": list(self.source_observations),
             "reconnect_attempts": self.reconnect_attempts,

@@ -10,6 +10,7 @@ import os
 import queue
 import threading
 import time
+from acquisition_clock import monotonic
 import uuid
 import copy
 import xml.etree.ElementTree as ET
@@ -256,7 +257,7 @@ class UsbProtocolError(RuntimeError):
 
 def current_stream_is_stable(driver, latest_host_monotonic, *, now=None):
     """Return current readiness after a recovered gap while preserving gap evidence."""
-    current = time.monotonic() if now is None else float(now)
+    current = monotonic() if now is None else float(now)
     intervals = tuple(getattr(driver, "recent_intervals", ()))
     parser = driver.parser
     return (
@@ -581,7 +582,7 @@ class Esr1001UsbDriver:
     def set_zero(self, *, expected_sequence, connection_generation, capture_generation, calibration_digest):
         with self._io_lock:
             record = self.latest_record
-            age = time.monotonic() - float((record or {}).get("host_monotonic", 0))
+            age = monotonic() - float((record or {}).get("host_monotonic", 0))
             if (not self.started or not record or not 0 <= age <= FRESHNESS_LIMIT_SECONDS or
                     (self.data_mode == "microstrain" and not self.calibration) or
                     self.calibration_digest != (content_digest(self.calibration) if self.calibration else "") or
@@ -592,7 +593,7 @@ class Esr1001UsbDriver:
             if len(self.zero_events) >= 1000:
                 raise UsbProtocolError("zero_event_limit", "零点事件达到会话上限，请停止并重新开始")
             self.zero = {"id": uuid.uuid4().hex, "method": "vendor_latest_source_frame", "host_wall_time": time.time(),
-                         "host_monotonic": time.monotonic(), "source_host_wall_time": record["host_wall_time"],
+                         "host_monotonic": monotonic(), "source_host_wall_time": record["host_wall_time"],
                          "source_host_monotonic": record["host_monotonic"], "receive_sequence": record["receive_sequence"],
                          "adc_values": {name: record[name] for name in RAW_CHANNELS},
                          "calibrated_values": calibrated_values(record, self.calibration) if self.calibration else {},
@@ -616,7 +617,7 @@ class Esr1001UsbDriver:
                 zero_id = self.zero["id"]
                 self.zero = None
                 self.zero_events.append({"action": "invalidate", "id": zero_id, "reason": reason,
-                                         "host_wall_time": time.time(), "host_monotonic": time.monotonic()})
+                                         "host_wall_time": time.time(), "host_monotonic": monotonic()})
                 if self.recorder:
                     self.recorder.record_event(self.zero_events[-1])
             self.zero = None
@@ -642,7 +643,7 @@ class Esr1001UsbDriver:
                     self._capture_discard_frames -= 1
                     continue
                 values = decode_adc(raw, self.parser.channels)
-                mono, wall = time.monotonic(), time.time()
+                mono, wall = monotonic(), time.time()
                 self.sequence += 1
                 if self.sequence <= FRESHNESS_RECOVERY_INTERVALS + 1:
                     self.start_events.append({"stage": "source_frame", "sequence": self.sequence, "server_monotonic": mono})
@@ -674,10 +675,10 @@ class Esr1001UsbDriver:
         self._controls.clear()
         self._parameter_frames.clear()
         self.serial.write(command)
-        command_record = {"command_hex": command.hex(), "host_monotonic": time.monotonic(), "matched_response_hex": ""}
+        command_record = {"command_hex": command.hex(), "host_monotonic": monotonic(), "matched_response_hex": ""}
         self.command_evidence.append(command_record)
-        deadline = time.monotonic() + self.command_timeout
-        while time.monotonic() < deadline:
+        deadline = monotonic() + self.command_timeout
+        while monotonic() < deadline:
             if command != STOP and self._cancel_open.is_set():
                 raise UsbProtocolError("capture_start_cancelled", "设备启动已取消")
             self._read()
@@ -699,7 +700,7 @@ class Esr1001UsbDriver:
         self._cancel_open.set()
 
     def _wait_open_until(self, deadline):
-        if self._cancel_open.wait(max(0.0, deadline-time.monotonic())):
+        if self._cancel_open.wait(max(0.0, deadline-monotonic())):
             raise UsbProtocolError("capture_start_cancelled", "设备启动已取消")
 
     def open(self):
@@ -709,7 +710,7 @@ class Esr1001UsbDriver:
             self.open_stages.clear()
             self._effective_startup_policy = "fixed" if self.open_attempts else self.startup_policy
             self.open_attempts += 1
-            self.start_events = [{"stage": "open_begin", "server_monotonic": time.monotonic()}]
+            self.start_events = [{"stage": "open_begin", "server_monotonic": monotonic()}]
             self.protocol_verified = False
             if not self.endpoint:
                 raise ValueError("必须显式选择USB串口")
@@ -724,7 +725,7 @@ class Esr1001UsbDriver:
                 from serial.tools import list_ports
                 inventory = self.inventory or list_ports.comports
                 ports = [p for p in inventory() if p.device.casefold() == key]
-                self.start_events.append({"stage": "enumeration_end", "server_monotonic": time.monotonic()})
+                self.start_events.append({"stage": "enumeration_end", "server_monotonic": monotonic()})
                 if not ports:
                     raise UsbProtocolError("port_not_present", "所选端口当前不存在，请重新识别")
                 self.open_stages.add("port_present")
@@ -744,10 +745,10 @@ class Esr1001UsbDriver:
                         raise UsbProtocolError("port_access_denied", "串口访问被拒绝；请关闭其他占用程序或检查访问权限") from exc
                     raise
                 self.open_stages.add("driver_open")
-                self.start_events.append({"stage": "port_settle_begin", "server_monotonic": time.monotonic()})
+                self.start_events.append({"stage": "port_settle_begin", "server_monotonic": monotonic()})
                 port_guard = PORT_READY_GUARD_SECONDS if self._effective_startup_policy != "fixed" else PORT_SETTLE_SECONDS
-                self._wait_open_until(time.monotonic() + port_guard)
-                self.start_events.append({"stage": "port_settle_end", "server_monotonic": time.monotonic()})
+                self._wait_open_until(monotonic() + port_guard)
+                self.start_events.append({"stage": "port_settle_end", "server_monotonic": monotonic()})
                 for key in self._previous_metrics:
                     self._previous_metrics[key] += self.parser.metrics()[key]
                 self.parser = UsbStreamParser()
@@ -761,7 +762,7 @@ class Esr1001UsbDriver:
                         if pending:
                             self.serial.read(pending)
                 parameters = self._command(QUERY)
-                self.start_events.append({"stage": "query_matched", "server_monotonic": time.monotonic()})
+                self.start_events.append({"stage": "query_matched", "server_monotonic": monotonic()})
                 if (self._effective_startup_policy == "guarded_response"
                         and parameters["raw_hex"] != GUARDED_START_PARAMETER_HEX):
                     raise UsbProtocolError("binding_unconfirmed", "设备参数与已检查的启动配置不同，请重新检查接口")
@@ -783,15 +784,15 @@ class Esr1001UsbDriver:
                         self.recorder.metadata.update(calibration_snapshot=copy.deepcopy(calibration), calibration_digest=digest)
                 self.connection_generation += 1
                 self.stop_error = ""
-                self.start_events.append({"stage": "start_settle_begin", "server_monotonic": time.monotonic()})
+                self.start_events.append({"stage": "start_settle_begin", "server_monotonic": monotonic()})
                 start_deadline = (self.command_evidence[-1]["host_monotonic"] + QUERY_START_SPACING_SECONDS
-                                  if self._effective_startup_policy == "bounded_response" else time.monotonic() + START_SETTLE_SECONDS)
+                                  if self._effective_startup_policy == "bounded_response" else monotonic() + START_SETTLE_SECONDS)
                 self._wait_open_until(start_deadline)
-                self.start_events.append({"stage": "start_settle_end", "server_monotonic": time.monotonic()})
+                self.start_events.append({"stage": "start_settle_end", "server_monotonic": monotonic()})
                 self.started = True
-                self.started_monotonic = time.monotonic()
+                self.started_monotonic = monotonic()
                 self._command(START)
-                self.start_events.append({"stage": "start_matched", "server_monotonic": time.monotonic()})
+                self.start_events.append({"stage": "start_matched", "server_monotonic": monotonic()})
             except Exception:
                 self.close()
                 raise
@@ -805,7 +806,7 @@ class Esr1001UsbDriver:
                 raise UsbProtocolError("raw_writer_failed", self.recorder.error)
             records = list(self._pending)
             self._pending.clear()
-            if not records and time.monotonic() - (self.last_observation or self.started_monotonic) > 1.0:
+            if not records and monotonic() - (self.last_observation or self.started_monotonic) > 1.0:
                 raise UsbProtocolError("usb_no_valid_frame", "连续一秒没有有效源帧")
             result = []
             for record in records:
@@ -850,7 +851,7 @@ class Esr1001UsbDriver:
             self.gaps = []
             self.received_bytes = 0
             self.received_tail = b''
-            self.started_monotonic = time.monotonic()
+            self.started_monotonic = monotonic()
             self.capture_generation = uuid.uuid4().hex
             self.start_events = self.start_events[-32:]
             # A trailing fragment cannot establish this capture's first frame.
@@ -893,15 +894,15 @@ def probe_usb(interface, *, driver_factory=Esr1001UsbDriver, data_window=3.0):
     driver = driver_factory(interface.get("endpoint", ""), data_mode=interface.get("data_mode", "raw_adc"), calibration=interface.get("calibration_profile"), binding=interface.get("device_identity"), bridge=interface.get("bridge", ""))
     samples = []
     state, message = "usb_no_valid_frame", "USB无有效四路帧"
-    started = time.monotonic()
+    started = monotonic()
     overall_deadline = started + 12.0
     try:
         driver.open()
         for name in ("port_present", "endpoint_compatible", "driver_open", "protocol_identified"):
             stage_states[name] = "passed"
-        deadline = time.monotonic() + max(3.0, min(float(data_window), 5.0))
-        while time.monotonic() < deadline:
-            if time.monotonic() >= overall_deadline:
+        deadline = monotonic() + max(3.0, min(float(data_window), 5.0))
+        while monotonic() < deadline:
+            if monotonic() >= overall_deadline:
                 raise UsbProtocolError("usb_probe_timeout", "USB检查整体期限已到")
             try:
                 samples.extend(driver.read_samples())
@@ -947,5 +948,5 @@ def probe_usb(interface, *, driver_factory=Esr1001UsbDriver, data_window=3.0):
         "sample_counts": {name: driver.sequence for name in expected}, "errors": [] if report.ready else [message],
         "channel_results": {name: {"value": samples[-1][0].get(name) if samples else None, "unit": "adc_counts" if driver.data_mode == "raw_adc" else "με", "quality": "measured_new" if report.ready else "missing"} for name in expected},
         "stages": {stage.name: stage.to_dict() for stage in stages}, "readiness_report": report.to_dict(),
-        "usb_evidence": evidence, "elapsed_seconds": time.monotonic() - started, "overall_deadline_seconds": 12.0,
+        "usb_evidence": evidence, "elapsed_seconds": monotonic() - started, "overall_deadline_seconds": 12.0,
     }

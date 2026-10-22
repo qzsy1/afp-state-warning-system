@@ -972,6 +972,11 @@ class HelperRegistry:
                 return {"ok": False, "queued": False, "error": "helper_offline"}
             if command in {"start_capture", "check_capture"}:
                 from plc_measurement import requires_plc_measurement, PLC_MEASUREMENT_CONTRACT
+                from abb_measurement import requires_abb_measurement, ABB_MEASUREMENT_CONTRACT
+                if requires_abb_measurement(dict(payload or {})) and (helper.capabilities.get("abb_measurement_contract") != ABB_MEASUREMENT_CONTRACT
+                    or helper.capabilities.get("abb_clock_domain") != "host_perf_counter"):
+                    return {"ok": False, "queued": False, "error": "abb_measurement_incompatible",
+                            "message": "helper requires fibercontrol_abb_v1 with host_perf_counter"}
                 if requires_plc_measurement(dict(payload or {})) and helper.capabilities.get("plc_measurement_contract") != PLC_MEASUREMENT_CONTRACT:
                     return {"ok": False, "queued": False, "error": "plc_measurement_incompatible",
                             "required_contract": PLC_MEASUREMENT_CONTRACT}

@@ -20,6 +20,7 @@ import select
 import sys
 import threading
 import time
+from acquisition_clock import monotonic
 import webbrowser
 from http.cookies import SimpleCookie
 from http import HTTPStatus
@@ -2873,7 +2874,7 @@ class DashboardData:
         startup_observations: dict | None = None,
     ) -> dict:
         config = config if config is not None else status.get("config") or {}
-        source_time_origin = time.monotonic()
+        source_time_origin = monotonic()
         sample_rate = _finite(config.get("sample_rate_hz"), 10.0)
         total_count = int(status.get("sample_count") or len(rows))
         observed_start = max(0, len(rows) - history)
@@ -2979,7 +2980,7 @@ class DashboardData:
         )
         return {
             "mode": "capture_only",
-            "curve_transport": {"clock_domain": "server_monotonic", "assembled": time.monotonic(),
+            "curve_transport": {"clock_domain": "server_monotonic", "assembled": monotonic(),
                                 "capture_generation": status.get("capture_generation")},
             "selection": {
                 "specimen": str(config.get("specimen_id", "LIVE_SPECIMEN")),
@@ -4866,7 +4867,7 @@ class AppHandler(BaseHTTPRequestHandler):
         self._pending_cookies = []
 
     def _begin_operation(self, name: str) -> threading.Lock | None:
-        now = time.monotonic()
+        now = monotonic()
         with _OPERATION_LOCKS_GUARD:
             lock = _OPERATION_LOCKS.setdefault(name, threading.Lock())
             if lock.acquire(blocking=False):
@@ -4906,7 +4907,7 @@ class AppHandler(BaseHTTPRequestHandler):
     def _send_json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
         if isinstance(payload.get("curve_transport"), dict):
             payload = {**payload, "curve_transport": {
-                **payload["curve_transport"], "send_started": time.monotonic(), "transport": "http",
+                **payload["curve_transport"], "send_started": monotonic(), "transport": "http",
             }}
         raw, compressed = encode_json_response(
             payload, self.headers.get("Accept-Encoding", "")
@@ -5086,10 +5087,10 @@ class AppHandler(BaseHTTPRequestHandler):
             )
         try:
             next_push = 0.0
-            next_heartbeat = time.monotonic() + 5.0
+            next_heartbeat = monotonic() + 5.0
             payload_cache = VersionedPayloadCache()
             while True:
-                now = time.monotonic()
+                now = monotonic()
                 wait_for = max(
                     0.0,
                     min(LIVE_PAYLOAD_VERSION_POLL_SECONDS, next_push - now),
@@ -5109,7 +5110,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     if opcode == 0x9:  # ping
                         self.request.sendall(encode_server_frame(b"", opcode=0xA))
                     continue
-                if time.monotonic() < next_push:
+                if monotonic() < next_push:
                     continue
                 payload_error = False
                 try:
@@ -5118,9 +5119,9 @@ class AppHandler(BaseHTTPRequestHandler):
                         lambda: self._live_payload(query, acquisition=acquisition),
                     )
                     if payload is None:
-                        if time.monotonic() < next_heartbeat:
+                        if monotonic() < next_heartbeat:
                             next_push = (
-                                time.monotonic()
+                                monotonic()
                                 + LIVE_PAYLOAD_VERSION_POLL_SECONDS
                             )
                             continue
@@ -5128,10 +5129,10 @@ class AppHandler(BaseHTTPRequestHandler):
                             "type": "heartbeat",
                             "stream_version": payload_cache.version,
                         }
-                        next_heartbeat = time.monotonic() + 5.0
+                        next_heartbeat = monotonic() + 5.0
                     if isinstance(payload.get("curve_transport"), dict):
                         payload = {**payload, "curve_transport": {
-                            **payload["curve_transport"], "send_started": time.monotonic(), "transport": "websocket",
+                            **payload["curve_transport"], "send_started": monotonic(), "transport": "websocket",
                         }}
                     frame = encode_json_frame(payload)
                 except Exception as exc:
@@ -5139,7 +5140,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     frame = encode_json_frame({"type": "error", "error": str(exc)})
                 self.request.sendall(frame)
                 next_push = (
-                    time.monotonic()
+                    monotonic()
                     + (
                         LIVE_PAYLOAD_ERROR_RETRY_SECONDS
                         if payload_error
@@ -5663,7 +5664,7 @@ class AppHandler(BaseHTTPRequestHandler):
         self._send_file(target)
 
     def do_POST(self) -> None:  # noqa: N802
-        request_received_monotonic = time.monotonic()
+        request_received_monotonic = monotonic()
         parsed = urlparse(self.path)
         if self._reject_unsafe_request():
             return
@@ -6150,7 +6151,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 def run_model() -> dict:
                     if not self.model_call_lock.acquire(blocking=False):
                         raise RuntimeError("模型调用正在进行，请稍后重试")
-                    started = time.monotonic()
+                    started = monotonic()
                     try:
                         result = run_interface_diagnoses(
                             events,
@@ -6171,7 +6172,7 @@ class AppHandler(BaseHTTPRequestHandler):
                             remote_label=self._remote_label(),
                             details={
                                 "model_name": model_name,
-                                "elapsed_seconds": round(max(0.0, time.monotonic() - started), 3),
+                                "elapsed_seconds": round(max(0.0, monotonic() - started), 3),
                                 "job_fingerprint": fingerprint,
                             },
                         )
@@ -6257,7 +6258,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         result["error"] = "model_rate_limited"
                         self._send_json(result, HTTPStatus.TOO_MANY_REQUESTS)
                         return
-                    started = time.monotonic()
+                    started = monotonic()
                     self.model_limiter.allow("model", session_key, 3, 60.0)
                     try:
                         discovery, acquisition_status = self._diagnostic_context(
@@ -6285,7 +6286,7 @@ class AppHandler(BaseHTTPRequestHandler):
                             details={
                                 "model_name": model_name,
                                 "elapsed_seconds": round(
-                                    max(0.0, time.monotonic() - started), 3
+                                    max(0.0, monotonic() - started), 3
                                 ),
                             },
                         )
@@ -6868,7 +6869,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 result["prediction_model"] = model_validation
                 result["request_timing"] = {
                     "clock_domain": "server_monotonic", "received": request_received_monotonic,
-                    "accepted": time.monotonic(), "start_request_id": config.start_request_id,
+                    "accepted": monotonic(), "start_request_id": config.start_request_id,
                 }
                 self._replay_put(replay_key, HTTPStatus.OK, result)
                 self._send_json(result)

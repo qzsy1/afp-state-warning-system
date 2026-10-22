@@ -10,7 +10,9 @@ import re
 import socket
 import threading
 import time
+from acquisition_clock import monotonic, wait_interruptible
 from collections import Counter, deque
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -520,7 +522,7 @@ class ChannelSample:
     quality: ChannelQuality = ChannelQuality.MEASURED_NEW
     device_timestamp: float | None = None
     received_wall_time: float = field(default_factory=time.time)
-    received_monotonic: float = field(default_factory=time.monotonic)
+    received_monotonic: float = field(default_factory=monotonic)
     source_sequence: int | None = None
     protocol_ok: bool | None = None
     error: str = ""
@@ -533,6 +535,9 @@ class ChannelSample:
             else ChannelQuality(str(self.quality))
         )
         value = _finite(self.value)
+        if (self.metadata or {}).get("driver") == "abb_robot":
+            from abb_measurement import validate_abb_sample
+            validate_abb_sample(str(self.channel_name), value, self.metadata.get("latest_record"))
         if value is None and quality not in {
             ChannelQuality.MISSING,
             ChannelQuality.STALE,
@@ -545,7 +550,7 @@ class ChannelSample:
         object.__setattr__(self, "device_timestamp", _finite(self.device_timestamp))
         object.__setattr__(self, "received_wall_time", float(self.received_wall_time))
         object.__setattr__(self, "received_monotonic", float(self.received_monotonic))
-        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        object.__setattr__(self, "metadata", deepcopy(dict(self.metadata or {})))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -672,7 +677,7 @@ class DriverWorker:
         cache: ChannelSampleCache,
         *,
         poll_interval_seconds: float = 0.002,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] = monotonic,
         wall_clock: Callable[[], float] = time.time,
     ) -> None:
         self.interface_id = str(interface_id)
@@ -831,7 +836,7 @@ class UnifiedFrame:
                 "quality": sample.quality.value,
                 "source_timestamp": (
                     sample.device_timestamp
-                    if sample.device_timestamp is not None
+                    if sample.device_timestamp is not None or sample.metadata.get("driver") == "abb_robot"
                     else sample.received_wall_time
                 ),
                 "received_timestamp": sample.received_wall_time,
@@ -913,6 +918,11 @@ class UnifiedFrame:
                 metadata["age_seconds"] = sample.metadata.get("age_seconds")
                 metadata["received_monotonic"] = sample.received_monotonic
                 metadata["received_wall_time"] = sample.received_wall_time
+            if sample.metadata.get("driver") == "abb_robot":
+                metadata["abb_source"] = deepcopy(sample.metadata.get("latest_record") or {})
+                metadata["age_seconds"] = sample.metadata.get("age_seconds")
+                metadata["received_monotonic"] = sample.received_monotonic
+                metadata["received_wall_time"] = sample.received_wall_time
             if any(value not in (None, "") for value in metadata.values()):
                 source[str(index)] = metadata
         return {
@@ -966,7 +976,9 @@ class UnifiedFrame:
                 device_timestamp=raw_sample.get("source_timestamp"),
                 received_wall_time=received_wall,
                 received_monotonic=(
-                    target_monotonic - age if age is not None else target_monotonic
+                    raw_sample["metadata"]["latest_record"]["host_monotonic"]
+                    if (raw_sample.get("metadata") or {}).get("driver") == "abb_robot"
+                    else target_monotonic - age if age is not None else target_monotonic
                 ),
                 source_sequence=(
                     int(raw_sample["source_sequence"])
@@ -1075,7 +1087,8 @@ class UnifiedFrame:
                 error=str(item.get("error") or ""),
                 metadata={"adc_source": item.get("adc_source"), "calibration_digest": item.get("calibration_digest"),
                           **({"driver": "m3232_pressure", "matrix_source": item["matrix_source"]} if item.get("matrix_source") else {}),
-                          **({"driver": "modbus_tcp", "measurement_profile": "fibercontrol_plc_v1", "latest_record": item["plc_source"], "age_seconds": item.get("age_seconds")} if item.get("plc_source") else {})},
+                          **({"driver": "modbus_tcp", "measurement_profile": "fibercontrol_plc_v1", "latest_record": item["plc_source"], "age_seconds": item.get("age_seconds")} if item.get("plc_source") else {}),
+                          **({"driver": "abb_robot", "measurement_profile": "fibercontrol_abb_v1", "latest_record": item["abb_source"], "age_seconds": item.get("age_seconds")} if item.get("abb_source") else {})},
             )
         return cls(
             capture_sequence=sequence,
@@ -1117,7 +1130,7 @@ class FrameAssembler:
         frame_rate_hz: float,
         freshness_by_channel: Mapping[str, float] | None = None,
         *,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] = monotonic,
         wall_clock: Callable[[], float] = time.time,
         wait: Callable[[float], Any] = time.sleep,
         start_monotonic: float | None = None,
@@ -1149,11 +1162,14 @@ class FrameAssembler:
     def wait_next_deadline(self, stop_event: threading.Event | None = None) -> float:
         deadline = self.deadline(self.next_sequence)
         delay = deadline - self.clock()
-        if delay > 0:
-            if stop_event is not None:
-                stop_event.wait(delay)
+        while delay > 0:
+            if stop_event is not None and stop_event.is_set():
+                break
+            if stop_event is not None and self.wait is time.sleep:
+                wait_interruptible(stop_event, delay, clock=self.clock)
             else:
                 self.wait(delay)
+            delay = deadline - self.clock()
         return deadline
 
     def assemble(
@@ -1378,7 +1394,7 @@ def capture_m3232_raw_serial(
     duration_seconds: float = 10.0,
     baudrate: int = 115200,
     serial_instance: Any | None = None,
-    clock: Callable[[], float] = time.monotonic,
+    clock: Callable[[], float] = monotonic,
     wall_clock: Callable[[], float] = time.time,
     wait: Callable[[float], Any] = time.sleep,
     max_bytes: int = 16 * 1024 * 1024,

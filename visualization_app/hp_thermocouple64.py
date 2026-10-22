@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import struct
 import time
+from acquisition_clock import monotonic
 import threading
 from copy import deepcopy
 from typing import Any
@@ -273,7 +274,7 @@ class HpThermocouple64Driver:
 
     def _scan(self) -> dict[str, float | None]:
         started = time.perf_counter()
-        started_monotonic = time.monotonic()
+        started_monotonic = monotonic()
         started_wall = time.time()
         self._scan_deadline = started + self.scan_timeout_seconds
         values: dict[str, float | None] = {}
@@ -335,7 +336,7 @@ class HpThermocouple64Driver:
             "channel_settings": settings_evidence,
             "scan_started_wall_time": started_wall,
             "scan_started_monotonic": started_monotonic,
-            "received_monotonic": time.monotonic(),
+            "received_monotonic": monotonic(),
             "scan_duration_seconds": time.perf_counter() - started,
             "received_wall_time": time.time(),
             "timestamp_origin": "host_scan_completion",

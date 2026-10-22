@@ -33,6 +33,96 @@ from training_data import read_excel_or_folder  # noqa: E402
 
 
 class AcquisitionIntegrityTests(unittest.TestCase):
+    def test_abb_http_frames_csv_sidecar_and_mysql_share_two_point_sources(self):
+        self._assert_abb_capture_sources("local_direct")
+
+    def test_abb_helper_http_capture_and_transmitted_sources_match_csv(self):
+        self._assert_abb_capture_sources("remote_helper")
+
+    def _assert_abb_capture_sources(self, execution_mode):
+        from test_abb_digest_contract import DigestFixture
+        from test_mysql_identity import _FakeConnection
+        from mysql_storage import MySQLCaptureStore
+        from contextlib import ExitStack
+        from itertools import cycle
+        staging = Path(r"D:\AFP_Runtime\.afp-staging")
+        staging.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=staging,prefix="abb-contract-") as temp, DigestFixture(
+                positions=cycle([("-1.25","2.5","-3.125"),("1.75","6.5","-3.125")])) as fixture:
+            names = ["ABB_X","ABB_Y","ABB_Z","线速度"]
+            config = AcquisitionConfig(processing_mode="capture_only",acquisition_mode="real",real_acquisition_mode=execution_mode,
+                execution_host="helper_local" if execution_mode=="remote_helper" else "server_local",
+                helper_session_id="fixture" if execution_mode=="remote_helper" else "",
+                dataset_schema="new_collection_v11_3",selected_sensors=names,sample_rate_hz=20,save_root=temp,condition_id="ABB_FIXTURE",
+                interfaces=[{"id":"abb","role":"robot","driver":"abb_robot","endpoint":fixture.endpoint,
+                    "username":"operator","password":"secret","freshness_seconds":1,
+                    "physical_interface_id":"ethernet:fixture","physical_interface_kind":"ethernet","physical_verified":True}],
+                interface_channel_assignments={"abb":names})
+            from local_capture_agent import LocalCaptureAgent
+            from local_capture_helper_entry import helper_capabilities
+            from real_acquisition import UnifiedFrame
+            from plc_measurement import frame_source_records
+            config.helper_capabilities = helper_capabilities() if execution_mode=="remote_helper" else {}
+            manager = AcquisitionManager(Path(temp),recovery_scan=False)
+            agent = LocalCaptureAgent(manager,simulation_cache_root=Path(temp)/"cache")
+            remote = execution_mode=="remote_helper"
+            route = {"ok":True,"actual_source_address":"127.0.0.1"}
+            with ExitStack() as stack:
+                for method in ("require_network_path","validate_network_path"):
+                    stack.enter_context(patch("acquisition."+method,return_value=route))
+                stack.enter_context(patch("acquisition.device_profile_readiness",return_value={"ready":True,"missing_device_facts":[]}))
+                checked = agent.check_capture(config) if remote else manager.test_connection(config)
+                self.assertTrue(checked["ok"], checked)
+                (agent.start_capture if remote else manager.start)(config)
+                try:
+                    deadline = time.monotonic()+4
+                    while manager.total_sample_count < 10 and time.monotonic()<deadline: time.sleep(.01)
+                finally:
+                    stopped = agent.stop_capture() if remote else manager.stop()
+                if remote:
+                    batch = agent.next_sample_batch()
+                    self.assertTrue(batch["frames"])
+                    for row, envelope in zip(batch["rows"],batch["frames"]):
+                        restored = UnifiedFrame.from_envelope(envelope)
+                        for name in names:
+                            self.assertEqual(restored.channels[name].value,acquisition._finite(row.get(name)))
+                        if any(value is not None for value in restored.values().values()):
+                            self.assertTrue(frame_source_records(restored))
+                    self.assertTrue(agent.ack_sample_batch(batch["capture_uuid"],batch["sequence"]))
+            self.assertTrue(stopped["capture_saved"],stopped.get("last_error"))
+            with Path(stopped["layer_file"]).open(encoding="gb18030",newline="") as handle: rows=list(csv.DictReader(handle))
+            with Path(stopped["timestamp_file"]).open(encoding="utf-8-sig",newline="") as handle: sidecar=list(csv.DictReader(handle))
+            self.assertEqual(len(rows),len(sidecar))
+            records_by_row=[]
+            for row,stamp in zip(rows,sidecar):
+                records=json.loads(stamp["channel_source_record_json"])
+                records_by_row.append(records)
+                for name in names:
+                    if row.get(name) in (None,""): continue
+                    record=records[name]
+                    if name=="线速度":
+                        basis=record["speed_basis"]
+                        self.assertEqual(float(row[name]),round(basis["distance_mm"]/basis["interval_seconds"],2))
+                        self.assertEqual(basis["current"]["source_sequence"],record["source_sequence"])
+                    else:
+                        self.assertEqual(float(row[name]),record["xyz"][names.index(name)])
+                    self.assertNotIn("secret",json.dumps(record,allow_nan=False))
+            self.assertTrue(any(row.get("线速度") not in (None,"") for row in rows))
+            connection=_FakeConnection()
+            store=MySQLCaptureStore(MySQLSettings(enabled=True,database="afp_fixture"))
+            with patch.object(store,"_connect",return_value=("fake",connection)):
+                result=store.save_layer(config,rows=iter(rows),layer_file=stopped["layer_file"],full_specimen_file=None,
+                    timestamp_file=stopped["timestamp_file"],folder_path=None,summary={})
+            self.assertTrue(result["ok"],result)
+            evidence=[(json.loads(value[4])["frame_sequence"], json.loads(value[4])["channels"])
+                      for sql,values in connection.cursor_instance.executed
+                      if "INSERT INTO afp_source_evidence" in sql for value in values if value[2]=="abb_frame"]
+            self.assertEqual(evidence,[(index,records) for index,records in enumerate(records_by_row) if records])
+            for row,records in zip(rows,records_by_row):
+                if not records: self.assertTrue(all(row.get(name) in (None,"") for name in names))
+            manifest=json.loads(manager.session_metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["abb_measurement"]["abb"]["time_basis"],"host_receive_monotonic")
+
     def test_plc_production_frames_csv_sidecar_and_mysql_share_clamped_sources(self):
         from test_plc_modbus_contract import PlcModbusContractTests
         from test_mysql_identity import _FakeConnection
@@ -59,7 +149,8 @@ class AcquisitionIntegrityTests(unittest.TestCase):
                 stack.enter_context(patch("acquisition.require_network_path", return_value=route))
                 stack.enter_context(patch("acquisition.validate_network_path", return_value=route))
                 stack.enter_context(patch("acquisition.device_profile_readiness", return_value={"ready":True,"missing_device_facts":[]}))
-                self.assertTrue(manager.test_connection(config)["ok"])
+                checked = manager.test_connection(config)
+                self.assertTrue(checked["ok"], checked)
                 manager.start(config)
                 try:
                     deadline = time.monotonic() + 3

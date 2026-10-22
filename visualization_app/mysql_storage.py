@@ -1385,15 +1385,16 @@ class MySQLCaptureStore:
 
             for index, row in enumerate(rows):
                 records = row.get("_channel_source_records") or next(timestamp_sources, {})
-                plc_records = {name: evidence for name, evidence in records.items()
-                               if evidence.get("measurement_profile") == "fibercontrol_plc_v1"}
-                if plc_records:
-                    plc_evidence.append((specimen_key, layer_no, "plc_frame", index,
-                                         json.dumps({"frame_sequence": index, "channels": plc_records}, ensure_ascii=False, allow_nan=False)))
-                    plc_source_count += 1
-                    if len(plc_evidence) >= 200:
-                        cursor.executemany("INSERT INTO afp_source_evidence VALUES (%s,%s,%s,%s,%s)", plc_evidence)
-                        plc_evidence = []
+                for profile, evidence_kind in (("fibercontrol_plc_v1", "plc_frame"), ("fibercontrol_abb_v1", "abb_frame")):
+                    records_for_profile = {name: evidence for name, evidence in records.items()
+                                           if evidence.get("measurement_profile") == profile}
+                    if records_for_profile:
+                        plc_evidence.append((specimen_key, layer_no, evidence_kind, index,
+                                             json.dumps({"frame_sequence": index, "channels": records_for_profile}, ensure_ascii=False, allow_nan=False)))
+                        plc_source_count += 1
+                        if len(plc_evidence) >= 200:
+                            cursor.executemany("INSERT INTO afp_source_evidence VALUES (%s,%s,%s,%s,%s)", plc_evidence)
+                            plc_evidence = []
                 sensor_values = {
                     name: _finite(row.get(name))
                     for name in sensor_names

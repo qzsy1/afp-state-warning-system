@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from acquisition_clock import monotonic
 
 from esr1001_fixtures import USB_PARAMETERS, USB_START_RESPONSE, USB_STOP_RESPONSE, USB_DATA, USB_EXPECTED_ADC
 from esr1001_usb import (UsbStreamParser, UsbProtocolError, Esr1001UsbDriver, RawCaptureWriter,
@@ -50,13 +51,13 @@ class StreamingSerial(SerialStub):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.streaming = False
-        self.last_frame = time.monotonic()
+        self.last_frame = monotonic()
 
     @property
     def in_waiting(self):
-        if self.streaming and time.monotonic() - self.last_frame >= 0.01:
+        if self.streaming and monotonic() - self.last_frame >= 0.01:
             self.buffer.extend(USB_DATA)
-            self.last_frame = time.monotonic()
+            self.last_frame = monotonic()
         return len(self.buffer)
 
     def write(self, data):
@@ -196,7 +197,7 @@ class UsbProtocolTests(unittest.TestCase):
                     self.buffer[:] = bytes.fromhex(GUARDED_START_PARAMETER_HEX)
         driver, _ = self.driver(GuardedSerial(), startup_policy="guarded_response")
         waits = []
-        with patch.object(driver, "_wait_open_until", side_effect=lambda deadline: waits.append(deadline - time.monotonic())):
+        with patch.object(driver, "_wait_open_until", side_effect=lambda deadline: waits.append(deadline - monotonic())):
             driver.open()
             try:
                 self.assertEqual(driver.quality_metadata["startup_policy"], "guarded_response")
@@ -246,7 +247,7 @@ class UsbProtocolTests(unittest.TestCase):
         driver, _ = self.driver(DelayedSerial(), startup_policy="bounded_response")
         driver.command_timeout = .5
         driver._cancel_open = Event()
-        with patch("esr1001_usb.time.monotonic", side_effect=lambda: clock[0]):
+        with patch("esr1001_usb.monotonic", side_effect=lambda: clock[0]):
             driver.open()
             try:
                 commands = list(driver.command_evidence)
@@ -268,14 +269,14 @@ class UsbProtocolTests(unittest.TestCase):
             worker = threading.Thread(target=open_driver)
             worker.start()
             try:
-                deadline = time.monotonic() + 1
-                while not driver.command_evidence and time.monotonic() < deadline:
+                deadline = monotonic() + 1
+                while not driver.command_evidence and monotonic() < deadline:
                     time.sleep(.001)
-                cancelled = time.monotonic()
+                cancelled = monotonic()
                 driver.cancel_open()
                 worker.join(.5)
                 self.assertFalse(worker.is_alive())
-                self.assertLess(time.monotonic()-cancelled, .5)
+                self.assertLess(monotonic()-cancelled, .5)
                 self.assertTrue(any("capture_start_cancelled" in error for error in errors))
                 self.assertNotIn(START, stub.writes)
                 self.assertFalse(stub.is_open)
@@ -294,15 +295,15 @@ class UsbProtocolTests(unittest.TestCase):
         write, read = stub.write, stub.read
         def opened(*args, **kwargs):
             result = configure(*args, **kwargs)
-            stamps["opened"] = time.monotonic()
+            stamps["opened"] = monotonic()
             return result
         def sent(data):
-            stamps[data] = time.monotonic()
+            stamps[data] = monotonic()
             write(data)
         def received(size):
             data = read(size)
             if data == USB_PARAMETERS:
-                stamps["parameters_received"] = time.monotonic()
+                stamps["parameters_received"] = monotonic()
             return data
         driver.serial_factory = opened
         stub.write, stub.read = sent, received
@@ -1106,21 +1107,21 @@ console.log(JSON.stringify(config));
         try:
             adapter.start(); other.start()
             self.assertTrue(adapter.opened.wait(4))
-            deadline = time.monotonic() + 1
-            while driver.sequence < 3 and time.monotonic() < deadline:
+            deadline = monotonic() + 1
+            while driver.sequence < 3 and monotonic() < deadline:
                 time.sleep(0.005)
             serials[0].disconnected = True
             initial_other = other.source_sequence
             time.sleep(0.27)
-            frame = FrameAssembler(RAW_CHANNELS, 10.0, start_monotonic=time.monotonic(), start_wall_time=time.time()).assemble(cache)
+            frame = FrameAssembler(RAW_CHANNELS, 10.0, start_monotonic=monotonic(), start_wall_time=time.time()).assemble(cache)
             self.assertTrue(all(s.value is None for s in frame.channels.values()))
             self.assertGreater(other.source_sequence, initial_other)
-            deadline = time.monotonic() + 4
-            while driver.connection_generation < 2 and time.monotonic() < deadline:
+            deadline = monotonic() + 4
+            while driver.connection_generation < 2 and monotonic() < deadline:
                 time.sleep(0.005)
             self.assertEqual(driver.connection_generation, 2)
-            deadline = time.monotonic() + 2
-            while not driver.gaps and time.monotonic() < deadline:
+            deadline = monotonic() + 2
+            while not driver.gaps and monotonic() < deadline:
                 time.sleep(0.005)
             self.assertTrue(driver.gaps)
         finally:
@@ -1165,21 +1166,21 @@ console.log(JSON.stringify(config));
         self.assertEqual(adapter.status()["reconnect_window_seconds"], 60.0)
         adapter.start()
         try:
-            deadline = time.monotonic() + 0.5
-            while adapter.source_sequence < 1 and time.monotonic() < deadline:
+            deadline = monotonic() + 0.5
+            while adapter.source_sequence < 1 and monotonic() < deadline:
                 time.sleep(0.005)
             self.assertGreaterEqual(adapter.source_sequence, 1)
             driver.disconnected.set()
-            deadline = time.monotonic() + 0.5
-            while adapter.reconnect_attempts < 3 and time.monotonic() < deadline:
+            deadline = monotonic() + 0.5
+            while adapter.reconnect_attempts < 3 and monotonic() < deadline:
                 time.sleep(0.005)
             self.assertGreaterEqual(adapter.reconnect_attempts, 3, adapter.status())
             self.assertTrue(adapter.status()["reconnect_window_active"])
             sequence_before_recovery = adapter.source_sequence
 
             driver.disconnected.clear()
-            deadline = time.monotonic() + 0.5
-            while adapter.source_sequence <= sequence_before_recovery and time.monotonic() < deadline:
+            deadline = monotonic() + 0.5
+            while adapter.source_sequence <= sequence_before_recovery and monotonic() < deadline:
                 time.sleep(0.005)
             status = adapter.status()
             self.assertGreater(adapter.source_sequence, sequence_before_recovery, status)
@@ -1226,13 +1227,13 @@ console.log(JSON.stringify(config));
             max_reconnect_attempts=1,
             reconnect_window_seconds=0.16,
         )
-        started = time.monotonic()
+        started = monotonic()
         adapter.start()
         try:
             deadline = started + 1.0
-            while adapter.status()["running"] and time.monotonic() < deadline:
+            while adapter.status()["running"] and monotonic() < deadline:
                 time.sleep(0.005)
-            elapsed = time.monotonic() - started
+            elapsed = monotonic() - started
             status = adapter.status()
             self.assertEqual(status["state"], "failed", status)
             self.assertGreaterEqual(elapsed, 0.12)

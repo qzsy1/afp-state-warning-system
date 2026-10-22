@@ -216,6 +216,12 @@ class RemoteAcquisitionMirror:
                             raise ValueError("frame capture_uuid mismatch")
                     if restored.capture_sequence < 0:
                         raise ValueError("frame_sequence invalid")
+                    from abb_measurement import requires_abb_measurement, validate_abb_sample
+                    capture_config = (batch.get("status") or {}).get("config") or self._status.get("config") or {}
+                    if requires_abb_measurement(capture_config):
+                        for name, sample in restored.channels.items():
+                            if name in {"ABB_X", "ABB_Y", "ABB_Z", "线速度"} and sample.value is not None:
+                                validate_abb_sample(name, sample.value, sample.metadata.get("latest_record"))
                     frame_sequences.append(restored.capture_sequence)
                     restored_frames.append(restored)
             except (TypeError, ValueError) as exc:

@@ -11,6 +11,7 @@ from pathlib import Path
 import queue
 import threading
 import time
+from acquisition_clock import monotonic
 import uuid
 
 PROTOCOL = "m3232_uart_text_v1"
@@ -84,7 +85,7 @@ def require_helper_capabilities(config):
 
 
 class MatrixParser:
-    def __init__(self, rows=32, cols=32, max_bytes=262144, timeout=2.0, clock=time.monotonic):
+    def __init__(self, rows=32, cols=32, max_bytes=262144, timeout=2.0, clock=monotonic):
         self.rows, self.cols, self.max_bytes, self.timeout, self.clock = rows, cols, max_bytes, timeout, clock
         self.buffer = bytearray()
         self.started = None
@@ -213,7 +214,7 @@ class MatrixRecorder:
 
     def _run(self):
         try:
-            flushed = time.monotonic()
+            flushed = monotonic()
             while True:
                 record = self.queue.get()
                 if record is None: break
@@ -241,11 +242,11 @@ class MatrixRecorder:
                         row.update(zip(self.pixel_columns, (v for pixels in matrix for v in pixels)))
                         self.csv_writer.writerow(row)
                         self.csv_rows += 1
-                if time.monotonic() - flushed >= 0.5:
+                if monotonic() - flushed >= 0.5:
                     self.stream.flush()
                     if self.csv_stream:
                         self.csv_stream.flush()
-                    flushed = time.monotonic()
+                    flushed = monotonic()
             self.stream.flush()
             os.fsync(self.stream.fileno())
             if self.csv_stream:
@@ -283,7 +284,7 @@ class M3232PressureDriver:
                  data_mode="raw_matrix", device_identity=None, calibration_profile=None,
                  protocol_profile=PROTOCOL, first_frame_timeout_seconds=2.0, freshness_seconds=2.0,
                  frame_timeout_seconds=2.0, max_buffer_bytes=262144, serial_factory=None,
-                 inventory=None, recorder=None, clock=time.monotonic, wall_clock=time.time):
+                 inventory=None, recorder=None, clock=monotonic, wall_clock=time.time):
         self.config = normalize_config(dict(protocol_profile=protocol_profile, matrix_rows=matrix_rows,
             matrix_cols=matrix_cols, data_mode=data_mode, device_identity=device_identity or {},
             calibration_profile=calibration_profile, first_frame_timeout_seconds=first_frame_timeout_seconds,

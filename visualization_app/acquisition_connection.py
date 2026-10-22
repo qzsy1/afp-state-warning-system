@@ -3,6 +3,7 @@ from contextlib import ExitStack
 from copy import deepcopy
 import threading
 import time
+from acquisition_clock import monotonic
 import uuid
 
 from real_acquisition import readiness_config_fingerprint
@@ -50,7 +51,7 @@ class AcquisitionConnectionMixin:
                     or (not connecting and row["reconnect_attempts"] != attempts.get(row["interface_id"], 0))):
                 return f"{row['interface_id']}连接失效：{row['last_error'] or row['state']}"
         samples = driver.cache.snapshot()
-        now = time.monotonic()
+        now = monotonic()
         freshness = _freshness_by_channel(config)
         for name in config.selected_sensors:
             sample = samples.get(name)
@@ -110,13 +111,13 @@ class AcquisitionConnectionMixin:
                 self._connection = {"id": uuid.uuid4().hex, "state": "connecting", "ready": False,
                     "reason": "正在打开设备、协议握手并等待持续接收就绪",
                     "fingerprint": readiness_config_fingerprint(config), "clock_domain": "server_monotonic",
-                    "started_monotonic": time.monotonic(), "ready_monotonic": None}
+                    "started_monotonic": monotonic(), "ready_monotonic": None}
 
                 def run():
                     try:
                         driver.open()
-                        deadline = time.monotonic() + clean.first_sample_timeout_seconds
-                        while time.monotonic() < deadline:
+                        deadline = monotonic() + clean.first_sample_timeout_seconds
+                        while monotonic() < deadline:
                             if self._connection_cancel.is_set():
                                 raise RuntimeError("设备连接已取消")
                             if self._connection.get("state") != "connecting":
@@ -133,7 +134,7 @@ class AcquisitionConnectionMixin:
                                     if self._connection_cancel.is_set() or self._connection.get("state") != "connecting":
                                         raise RuntimeError(self._connection.get("reason") or "设备连接已失效")
                                     self._connection.update(state="connected", ready=True, reason="已连接，等待采集",
-                                        ready_monotonic=time.monotonic(), ready_attempts={row['interface_id']: row['reconnect_attempts'] for row in driver.worker_status()})
+                                        ready_monotonic=monotonic(), ready_attempts={row['interface_id']: row['reconnect_attempts'] for row in driver.worker_status()})
                                 break
                             self._connection_cancel.wait(.01)
                         else:
@@ -163,7 +164,7 @@ class AcquisitionConnectionMixin:
         config, driver = self._connection_config, self._connection_driver
         freshness = _freshness_by_channel(config)
         samples = driver.cache.events()
-        now = time.monotonic()
+        now = monotonic()
         counts = {name: set() for name in config.selected_sensors}
         for sample in reversed(samples):
             if sample.channel_name not in counts or len(counts[sample.channel_name]) >= 2:
@@ -189,7 +190,7 @@ class AcquisitionConnectionMixin:
         rows = driver.worker_status()
         states_healthy = bool(rows) and all(row['running'] and row['state'] == 'running'
             and row['reconnect_attempts'] == attempts.get(row['interface_id'], 0) for row in rows)
-        if states_healthy and time.monotonic() < getattr(self, '_connection_boundary_grace', 0):
+        if states_healthy and monotonic() < getattr(self, '_connection_boundary_grace', 0):
             return
         reason = self._connection_health()
         if not states_healthy:
@@ -197,7 +198,7 @@ class AcquisitionConnectionMixin:
                 self._connection.update(state='fault', ready=False, reason=reason or '设备接收连接已失效')
             self.invalidate_readiness(reason='data_connection_invalid')
             return
-        now = time.monotonic()
+        now = monotonic()
         if reason:
             with self._connection_lock:
                 if self._connection['state'] != 'waiting_data':
@@ -217,7 +218,7 @@ class AcquisitionConnectionMixin:
             for worker in driver.workers:
                 stack.enter_context(worker.receive_lock)
             self.require_data_connection(config)
-            self._connection_boundary_grace = time.monotonic() + config.first_sample_timeout_seconds
+            self._connection_boundary_grace = monotonic() + config.first_sample_timeout_seconds
             for worker in driver.workers:
                 device = worker.driver
                 boundary = getattr(device, "begin_capture_boundary", None)
@@ -225,7 +226,7 @@ class AcquisitionConnectionMixin:
                     boundary()
                 worker.source_observations.clear()
             driver.cache.clear()
-            self._capture_start_monotonic = time.monotonic()
+            self._capture_start_monotonic = monotonic()
             driver.interface_quality_metadata = {}
             driver._closed_matrix_sources = {}
             for worker in driver.workers:
@@ -295,7 +296,7 @@ class AcquisitionConnectionMixin:
             if self.thread and self.thread.is_alive():
                 raise RuntimeError("采样尚未安全停止，不能断开或退出")
             self._connection_cancel.set()
-            started = time.monotonic()
+            started = monotonic()
             connection_thread = self._connection_thread
             if connection_thread and connection_thread.is_alive():
                 connection_thread.join(10)
@@ -312,7 +313,7 @@ class AcquisitionConnectionMixin:
                     raise RuntimeError("停止设备输出失败：" + "; ".join(errors))
             with self._connection_lock:
                 self._connection_driver = None
-                self._connection.update(state="disconnected", ready=False, reason="设备数据已断开", disconnected_monotonic=time.monotonic(),
-                    disconnect_seconds=time.monotonic()-started)
+                self._connection.update(state="disconnected", ready=False, reason="设备数据已断开", disconnected_monotonic=monotonic(),
+                    disconnect_seconds=monotonic()-started)
             self.invalidate_readiness(reason="data_disconnected")
             return self.status()

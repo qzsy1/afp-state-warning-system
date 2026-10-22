@@ -42,6 +42,32 @@ class MutableIngressLoader:
 
 
 class HelperRelayTests(unittest.TestCase):
+    def test_abb_helper_requires_high_resolution_clock_before_dispatch(self):
+        registry = HelperRegistry()
+        paired = self.pair(registry)
+        sent = []
+        config = {"acquisition_mode": "real", "interfaces": [{"driver": "abb_robot"}]}
+        capabilities = {"abb_measurement_contract": "fibercontrol_abb_v1"}
+        for clock in (None, "GetTickCount64", "host_perf_counter"):
+            with self.subTest(clock=clock):
+                registry.attach("session-a", "device-a", paired["pairing_token"], sent.append,
+                                capabilities=dict(capabilities, abb_clock_domain=clock))
+                result = registry.command("session-a", "check_capture", config)
+                self.assertEqual(result["ok"], clock == "host_perf_counter")
+                if clock != "host_perf_counter":
+                    self.assertEqual(result["error"], "abb_measurement_incompatible")
+                    self.assertEqual(sent, [])
+
+    def test_legacy_helper_rejects_abb_measurement_before_queuing(self):
+        registry = HelperRegistry()
+        self.pair(registry)
+        for command in ("start_capture", "check_capture"):
+            result = registry.command("session-a", command, {
+                "acquisition_mode":"real", "interfaces":[{"driver":"abb_robot", "enabled":True}]})
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["error"],"abb_measurement_incompatible")
+            self.assertFalse(result["queued"])
+
     def test_legacy_helper_rejects_plc_measurement_before_queuing(self):
         registry = HelperRegistry()
         self.pair(registry)

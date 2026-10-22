@@ -163,7 +163,7 @@ status.capture_generation='current';evidence.latest_matrix.matrix[0]=[NaN];rende
                         received_monotonic=started + sequence * .01, source_sequence=sequence, protocol_ok=True))
             held = UnifiedFrame(0, started+.1, 1, {"温度": ChannelSample("one", "温度", 42,
                 ChannelQuality.HELD_WITHIN_FRESHNESS, source_sequence=2, received_monotonic=started+.02)}, False, started+.1)
-            with patch("acquisition_start.time.monotonic", return_value=started+.1):
+            with patch("acquisition_start.monotonic", return_value=started+.1):
                 manager._record_start_frame()
             self.assertTrue(manager._curve_start_saved)
             self.assertEqual(manager.total_sample_count, 0)
@@ -171,7 +171,7 @@ status.capture_generation='current';evidence.latest_matrix.matrix[0]=[NaN];rende
                                 and point["start_request_id"] == "new-click"
                                 for points in manager._curve_start_observations.values() for point in points))
             self.assertEqual([point["source_sequence"] for point in manager._curve_start_observations["温度"]], [1, 2])
-            with patch("acquisition_start.time.monotonic", return_value=started+2):
+            with patch("acquisition_start.monotonic", return_value=started+2):
                 manager._begin_capture_timeline(cfg)
                 manager._record_start_frame(held)
             self.assertFalse(manager._curve_start_saved)

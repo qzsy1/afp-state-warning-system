@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import threading
 import time
+from acquisition_clock import monotonic
 import unittest
 import subprocess
 from unittest.mock import patch
@@ -57,7 +58,7 @@ class StartLifecycleTests(unittest.TestCase):
     def test_stream_version_is_constant_within_one_status_tick_and_advances_on_changes(self):
         with tempfile.TemporaryDirectory() as root:
             manager = a.AcquisitionManager(Path(root), recovery_scan=False)
-            with patch("acquisition_start.time.monotonic", return_value=100.25):
+            with patch("acquisition_start.monotonic", return_value=100.25):
                 initial = manager.stream_version()
                 self.assertEqual(manager.stream_version(), initial)
 
@@ -77,14 +78,14 @@ class StartLifecycleTests(unittest.TestCase):
                 event_version = manager.stream_version()
                 self.assertNotEqual(event_version, ready)
 
-            with patch("acquisition_start.time.monotonic", return_value=100.50):
+            with patch("acquisition_start.monotonic", return_value=100.50):
                 active_tick = manager.stream_version()
                 self.assertGreater(active_tick, event_version)
 
             manager.capture_phase = "completed"
-            with patch("acquisition_start.time.monotonic", return_value=200.10):
+            with patch("acquisition_start.monotonic", return_value=200.10):
                 idle_tick = manager.stream_version()
-            with patch("acquisition_start.time.monotonic", return_value=200.90):
+            with patch("acquisition_start.monotonic", return_value=200.90):
                 self.assertEqual(manager.stream_version(), idle_tick)
 
     def test_failed_start_before_config_install_preserves_request_identity(self):
@@ -129,10 +130,10 @@ class StartLifecycleTests(unittest.TestCase):
         worker = LocalDirectAdapter("usb", driver, ["CH1_ADC_signed"], ChannelSampleCache())
         multi = a.MultiInterfaceDriver([], ["CH1_ADC_signed"])
         multi.workers = [worker]
-        t = time.monotonic()
+        t = monotonic()
         multi.close(timeout_seconds=1)
-        self.assertGreaterEqual(time.monotonic()-t, .6)
-        self.assertLess(time.monotonic()-t, 1.2)
+        self.assertGreaterEqual(monotonic()-t, .6)
+        self.assertLess(monotonic()-t, 1.2)
         self.assertEqual(multi.workers, [])
 
     def test_status_and_cancel_during_slow_open(self):
@@ -159,9 +160,9 @@ class StartLifecycleTests(unittest.TestCase):
                     accepted = manager.start_async(config(root))
                     self.assertTrue(accepted["accepted"])
                     self.assertTrue(entered.wait(2))
-                    t = time.monotonic()
+                    t = monotonic()
                     self.assertEqual(manager.status()["start_operation"]["state"], "starting")
-                    self.assertLess(time.monotonic()-t, .1)
+                    self.assertLess(monotonic()-t, .1)
                     with self.assertRaisesRegex(RuntimeError, "capture_start_in_progress"):
                         manager.start_async(config(root))
                     self.assertEqual(manager.stop()["capture_phase"], "cancelling_start")

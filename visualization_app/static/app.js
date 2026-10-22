@@ -1399,6 +1399,18 @@ function renderEsrNumeric(status) {
   clear.onclick = async () => { try { await esrNumericAction(request("clear_zero")); toast("相对清零已关闭"); } catch (error) { toast(error.message); } };
 }
 
+function abbMeasurementText(status) {
+  return (status.interfaces || []).filter(item => item.driver === "abb_robot").map(item => {
+    const evidence = item.abb_evidence || {};
+    const record = evidence.latest_record || {};
+    const period = item.observed_poll_interval_seconds;
+    const age = evidence.age_seconds;
+    return `${item.id} · ROB_1/Base · 目标100 ms · 实际轮次间隔${period == null ? "待测" : (period * 1000).toFixed(1) + " ms"} · 跳过${item.skipped_poll_cycles || 0}轮`
+      + `\n位置年龄${age == null ? "待测" : age.toFixed(3) + " s"} · 速度依据：相邻位置距离 / 主机单调接收间隔 · ${record.speed_quality || "首点待验证"}`
+      + "\n首点速度未验证；新鲜度内沿用原来源，过期留空；故障恢复重新建立两点依据。";
+  }).join("\n\n");
+}
+
 function plcMeasurementText(status) {
   const interfaces = (status.interfaces || []).filter(item => item.driver === "modbus_tcp" && item.plc_evidence);
   return interfaces.map(item => {
@@ -1424,6 +1436,11 @@ function renderAcquisitionStatus(status) {
   state.acquisitionStatus = status;
   const plcEvidence = document.getElementById("plcMeasurementEvidence");
   if (plcEvidence) plcEvidence.textContent = state.accessRole === "guest" ? "" : plcMeasurementText(status);
+  const abbEvidence = document.getElementById("abbMeasurementEvidence");
+  if (abbEvidence) abbEvidence.textContent = state.accessRole === "guest" ? "" : abbMeasurementText(status);
+  const abbSource = document.getElementById("abbMeasurementSource");
+  if (abbSource) abbSource.textContent = state.accessRole === "guest" ? "" : JSON.stringify(
+    (status.interfaces || []).filter(item => item.driver === "abb_robot").map(item => ({id: item.id, source: item.abb_evidence?.latest_record})), null, 2);
   if (!status.data_connection || status.running) renderEsrNumeric(status);
   else {
     const numericState = document.getElementById("esrNumericState");

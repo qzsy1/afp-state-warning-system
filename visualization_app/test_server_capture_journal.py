@@ -56,6 +56,52 @@ def unified_frame(sequence, value, *, timestamp=None):
 
 
 class ServerCaptureJournalTests(unittest.TestCase):
+    def test_abb_motion_source_survives_durable_helper_journal_and_target_mysql(self):
+        import json
+        from real_acquisition import ChannelSampleCache, FrameAssembler
+        from local_direct_acquisition import LocalDirectAdapter
+        from test_mysql_identity import _FakeConnection
+        from mysql_storage import MySQLCaptureStore, MySQLSettings
+        from acquisition import AcquisitionConfig, AbbRobotDriver
+        from unittest.mock import patch
+        now=[10.0]
+        positions=iter([(0,0,0),(3,4,0)])
+        driver=AbbRobotDriver("http://fixture",clock=lambda:now[0],wall_clock=lambda:1000+now[0])
+        driver._fetch_position=lambda:next(positions)
+        driver.open()
+        cache=ChannelSampleCache()
+        names=["ABB_X","ABB_Y","ABB_Z","线速度"]
+        adapter=LocalDirectAdapter("abb",driver,names,cache)
+        for values,record in driver.read_samples(): adapter._publish(values,record)
+        now[0]=10.1
+        for values,record in driver.read_samples(): adapter._publish(values,record)
+        frame=FrameAssembler(names,10,dict.fromkeys(names,1),start_monotonic=10,start_wall_time=1000).assemble(cache,10.2)
+        envelope=frame.to_envelope("abb-remote",dict.fromkeys(names[:3],"mm") | {"线速度":"mm/s"})
+        self.journal.disarm("session-a")
+        self.journal.arm("session-a","selection-a",config={"selected_sensors":names})
+        self.mirrors.configure_capture_contract("session-a","abb-remote",names,{})
+        batch={"capture_uuid":"abb-remote","sequence":0,"rows":[frame.values()],"timestamps":[1000.2],
+               "frames":[envelope],"required_frame_contract":"unified_frame_v1",
+               "status":{"running":False,"finalization_complete":True,"sample_count":1}}
+        ingested=self.journal.ingest("session-a",batch,self.mirrors)
+        self.assertTrue(ingested["ok"],ingested)
+        capture=self.journal.ready_capture("session-a","abb-remote")
+        # 较新驱动状态不能改写已持久化帧的证据。
+        driver.latest_record["xyz"][0]=999
+        row=list(capture.rows)[0]
+        record=row["_channel_source_records"]["线速度"]
+        self.assertEqual(record["speed_basis"]["value_mm_s"],50)
+        self.assertEqual(record["xyz"],[3,4,0])
+        connection=_FakeConnection()
+        store=MySQLCaptureStore(MySQLSettings(enabled=True,database="afp_fixture"))
+        with patch.object(store,"_connect",return_value=("fake",connection)):
+            result=store.save_layer(AcquisitionConfig(dataset_schema="new_collection_v11_3",selected_sensors=names),rows=capture.rows,layer_file=None,
+                full_specimen_file=None,timestamp_file=None,folder_path=None,summary={},source_records=capture.rows.source_records())
+        self.assertTrue(result["ok"],result)
+        evidence=[json.loads(value[4]) for sql,values in connection.cursor_instance.executed
+                  if "INSERT INTO afp_source_evidence" in sql for value in values if value[2]=="abb_frame"]
+        self.assertEqual(evidence[0]["channels"],row["_channel_source_records"])
+
     def test_plc_source_survives_durable_helper_journal_and_target_mysql(self):
         import json
         from real_acquisition import ChannelSampleCache, FrameAssembler

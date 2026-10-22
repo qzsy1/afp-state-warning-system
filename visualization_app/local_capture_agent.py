@@ -206,6 +206,8 @@ class LocalCaptureAgent:
                 "device_readiness_contract": DEVICE_READINESS_CONTRACT,
                 "unified_device_readiness_v1": True,
                 "plc_measurement_contract": "fibercontrol_plc_v1",
+                "abb_measurement_contract": "fibercontrol_abb_v1",
+                "abb_clock_domain": "host_perf_counter",
                 "hardware_discovery": True,
                 "usb_topology_v1": bool(discovered.get("usb_topology")),
                 "usb_topology_v2": bool(discovered.get("usb_topology")),
@@ -657,6 +659,8 @@ class LocalCaptureAgent:
                 "device_readiness_contract": DEVICE_READINESS_CONTRACT,
                 "unified_device_readiness_v1": True,
                 "plc_measurement_contract": "fibercontrol_plc_v1",
+                "abb_measurement_contract": "fibercontrol_abb_v1",
+                "abb_clock_domain": "host_perf_counter",
             },
         )
         self._readiness_snapshot = snapshot

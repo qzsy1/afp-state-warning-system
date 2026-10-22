@@ -12,6 +12,19 @@ APP_JS = Path(__file__).with_name("static") / "app.js"
 
 
 class PlcMeasurementFrontendTests(unittest.TestCase):
+    def test_abb_view_explains_measured_period_age_and_first_point(self):
+        source=APP_JS.read_text(encoding="utf-8")
+        function=source[source.index("function abbMeasurementText("):source.index("function plcMeasurementText(")]
+        script = r'''
+const status={interfaces:[{id:"abb",driver:"abb_robot",observed_poll_interval_seconds:.102,
+  skipped_poll_cycles:2,abb_evidence:{age_seconds:.04,latest_record:{speed_quality:"unverified_first_sample"}}}]};
+console.log(JSON.stringify(abbMeasurementText(status)));
+'''
+        result=subprocess.run(["node","-e",function+script],check=True,capture_output=True,text=True,encoding="utf-8")
+        text=json.loads(result.stdout)
+        for expected in ("目标100 ms","102.0 ms","0.040 s","主机单调接收间隔","首点速度未验证","过期留空"):
+            self.assertIn(expected,text)
+
     def test_pressure_source_view_distinguishes_clamp_zero_and_missing(self):
         source = APP_JS.read_text(encoding="utf-8")
         function = source[source.index("function plcMeasurementText("):source.index("function renderAcquisitionStatus(")]

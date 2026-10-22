@@ -6,6 +6,7 @@ import hashlib
 import json
 import threading
 import time
+from acquisition_clock import monotonic
 import uuid
 
 from real_acquisition import readiness_config_fingerprint
@@ -44,7 +45,7 @@ class AcquisitionStartMixin:
                     or self.capture_phase
                     in {"starting", "running", "stopping_sampling", "finalizing"}
                 )
-                status_tick = int(time.monotonic() * (4 if active else 1))
+                status_tick = int(monotonic() * (4 if active else 1))
                 signature = (
                     status_tick,
                     bool(thread is not None and thread.is_alive()),
@@ -80,7 +81,7 @@ class AcquisitionStartMixin:
     def record_start_event(self, stage, **details):
         with self._start_job_lock:
             if len(self._start_events) < 256:
-                self._start_events.append({"stage": stage, "server_monotonic": time.monotonic(), **details})
+                self._start_events.append({"stage": stage, "server_monotonic": monotonic(), **details})
 
     def capture_timeline(self):
         with self._start_job_lock:
@@ -92,7 +93,7 @@ class AcquisitionStartMixin:
         if threading.current_thread() is not self._start_thread:
             config.capture_generation = uuid.uuid4().hex
             self._start_job = {}
-        self._capture_start_monotonic = time.monotonic()
+        self._capture_start_monotonic = monotonic()
         self._start_events = []
         self._source_observations = {}
         self._curve_start_observations = {}
@@ -151,7 +152,7 @@ class AcquisitionStartMixin:
         with self._start_job_lock:
             result = dict(self._start_job)
         if result:
-            end = result.get("finished_monotonic") or time.monotonic()
+            end = result.get("finished_monotonic") or monotonic()
             result["elapsed_seconds"] = max(0.0, end - result["started_monotonic"])
             if result.get("state") == "running" and not (self.thread and self.thread.is_alive()):
                 result["startup_result"] = "running"
@@ -183,7 +184,7 @@ class AcquisitionStartMixin:
             self._start_job = {"id": uuid.uuid4().hex, "state": "starting",
                                "start_request_id": config.start_request_id,
                                "capture_generation": config.capture_generation,
-                               "capture_uuid": config.capture_uuid, "started_monotonic": time.monotonic(),
+                               "capture_uuid": config.capture_uuid, "started_monotonic": monotonic(),
                                "first_sample_seconds": None, "all_channels_seconds": None, "error": ""}
 
             def run():
@@ -218,7 +219,7 @@ class AcquisitionStartMixin:
                         self.last_error = error
                 finally:
                     with self._start_job_lock:
-                        self._start_job.update(state=state, error=error, finished_monotonic=time.monotonic())
+                        self._start_job.update(state=state, error=error, finished_monotonic=monotonic())
                         if state == "running":
                             self._start_job["all_channels_seconds"] = (
                                 self._start_job["finished_monotonic"] - self._start_job["started_monotonic"])
@@ -258,7 +259,7 @@ class AcquisitionStartMixin:
             if cache is None and frame is None:
                 return
             samples = reversed(cache.events()) if cache is not None else frame.channels.values()
-            now = time.monotonic()
+            now = monotonic()
             for sample in samples:
                 name = sample.channel_name
                 if name not in self.config.selected_sensors:

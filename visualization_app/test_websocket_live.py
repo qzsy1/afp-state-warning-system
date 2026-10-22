@@ -9,6 +9,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 class WebSocketLiveProtocolTests(unittest.TestCase):
+    def test_abb_status_sources_survive_compaction_without_mutating_frame(self):
+        from websocket_live import compact_live_payload
+        status={"interfaces":[{"driver":"abb_robot","abb_evidence":{"latest_record":{
+            "source_sequence":3,"connection_generation":2,"xyz":[-1.25,2.5,3],
+            "speed_basis":{"distance_mm":5,"interval_seconds":.1,"value_mm_s":50}}}}]}
+        original=deepcopy(status)
+        packed=compact_live_payload({"channels":[],"acquisition":status})
+        self.assertEqual(packed["acquisition"],original)
+        json.dumps(packed,allow_nan=False)
+
     def test_plc_status_evidence_survives_websocket_compaction(self):
         from websocket_live import compact_live_payload
         record = {"words":[0,49184],"decoded_value":-2.5,"normalized_value":0,
