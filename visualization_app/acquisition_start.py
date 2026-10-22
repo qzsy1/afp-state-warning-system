@@ -241,6 +241,8 @@ class AcquisitionStartMixin:
             self.stop_event.set()
             self._start_job["state"] = "cancelling"
         driver = self.driver
+        if driver is not None and driver is self._connection_driver:
+            self.invalidate_data_connection("启动已取消，正在释放设备；下次采集请重新连接数据")
         cancel = getattr(driver, "cancel_open", None)
         if callable(cancel):
             cancel()
@@ -250,8 +252,6 @@ class AcquisitionStartMixin:
 
     def _record_start_frame(self, frame=None):
         with self._start_job_lock:
-            if frame is not None and self._start_job and self._start_job["state"] == "starting" and self._start_job["first_sample_seconds"] is None:
-                self._start_job["first_sample_seconds"] = time.monotonic() - self._start_job["started_monotonic"]
             if self._capture_start_monotonic is None:
                 return
             cache = getattr(self.driver, "cache", None)

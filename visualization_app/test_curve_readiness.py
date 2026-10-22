@@ -29,8 +29,8 @@ const originalCurveCanvasVisible=()=>true;
 const performance={now:()=>120};let saved=0;
 const persistCurveRenderEvidence=()=>saved++;
 ''' + function + r'''
-const evidence={protocol_verified:true,connection_generation:'connection',frame_age_seconds:.01,valid_frame_rate_hz:8,matrix_shape:[32,32],latest_matrix:{connection_generation:'connection',receive_sequence:1,raw_total:0,matrix:Array.from({length:32},()=>Array(32).fill(0))}};
-const status={running:true,capture_generation:'current',start_request_id:'click',interfaces:[{enabled:true,driver:'m3232_pressure',m3232_evidence:evidence}]};
+const evidence={protocol_verified:true,connection_generation:'connection',frame_age_seconds:.01,valid_frame_rate_hz:8,matrix_shape:[32,32],latest_matrix:{host_monotonic:101,connection_generation:'connection',receive_sequence:1,raw_total:0,matrix:Array.from({length:32},()=>Array(32).fill(0))}};
+const status={capture_start_monotonic:100,running:true,capture_generation:'current',start_request_id:'click',interfaces:[{enabled:true,driver:'m3232_pressure',m3232_evidence:evidence}]};
 renderM3232Matrix(status);assert.equal(paints.length,1024);assert.match(nodes.m3232MatrixValues.textContent,/完整全零帧/);
 while(callbacks.length)callbacks.shift()();assert.equal(saved,1);
 evidence.latest_matrix.matrix[15][16]=27;evidence.latest_matrix.receive_sequence=2;evidence.latest_matrix.raw_total=27;
@@ -40,6 +40,7 @@ assert.match(nodes.m3232MatrixValues.textContent,/0 \/ 27 \/ 0 \/ 0/);assert.mat
 while(callbacks.length)callbacks.shift()();assert.equal(window.afpM3232MatrixEvidence.source_sequence,2);
 evidence.frame_age_seconds=3;renderM3232Matrix(status);assert.equal(paints.length,0);assert.equal(window.afpM3232MatrixEvidence,null);
 evidence.frame_age_seconds=.01;status.capture_generation='old';renderM3232Matrix(status);assert.equal(paints.length,0);
+status.capture_generation='current';evidence.latest_matrix.host_monotonic=99;renderM3232Matrix(status);assert.equal(paints.length,0);
 status.capture_generation='current';evidence.latest_matrix.matrix[0]=[NaN];renderM3232Matrix(status);assert.equal(paints.length,0);
 '''
         result = subprocess.run(["node", "-"], input=script, text=True, capture_output=True, timeout=15)
@@ -74,6 +75,13 @@ status.capture_generation='current';evidence.latest_matrix.matrix[0]=[NaN];rende
             self.assertFalse(result["pass"])
             self.assertAlmostEqual(result["elapsed_ms"],3000.1)
             self.assertTrue(Path(result["path"]).is_file())
+            manager.driver = acquisition_module.MultiInterfaceDriver([], ["压力"])
+            manager._capture_start_monotonic = 100
+            for point in points:
+                manager.driver.cache.publish(ChannelSample(channel_name="压力", value=1., protocol_ok=True,
+                    interface_id="one", source_sequence=point['source_sequence'], received_monotonic=point['received_monotonic']))
+            manager._curve_start_observations = {"压力": [dict(p, source_sequence=p['source_sequence']+10) for p in points]}
+            self.assertTrue(save_render_evidence(manager,payload)['ok'])
             for field,value in [("capture_generation","old"),("input",dict(valid=False,trusted=False,timestamp=100)),
                                 ("observations",{"压力":[dict(p,source_sequence=99) for p in points]})]:
                 invalid = deepcopy(payload)
@@ -200,8 +208,16 @@ status.capture_generation='current';evidence.latest_matrix.matrix[0]=[NaN];rende
 const assert=require('node:assert/strict');const window={};
 const controls={acquisitionMode:{value:'real'}};
 const renderEsrNumeric=()=>{};
+const document={getElementById:()=>null};
 const state={hardwareCheck:{ok:true,readiness_session_id:'backend',readiness_version:3},hardwareCheckFingerprint:'same'};
 ''' + source[start:end] + "}\n" + r'''
+window.afpCurveTrace={id:'rejected-click',generation:'',accepts:()=>false};
+renderAcquisitionStatus({start_request_id:'saved-capture',data_connection:{state:'disconnected'}});
+assert.equal(state.acquisitionStatus.data_connection.state,'disconnected');
+window.afpCurveTrace={id:'active',generation:'active-generation',accepts:()=>false};
+renderAcquisitionStatus({start_request_id:'old',running:true});
+assert.equal(state.acquisitionStatus.start_request_id,'saved-capture');
+window.afpCurveTrace=null;
 renderAcquisitionStatus({readiness_session_id:'backend',readiness_version:2,readiness_session_valid:false});
 assert.equal(state.hardwareCheck.ok,true);
 renderAcquisitionStatus({readiness_session_id:'backend',readiness_version:3,readiness_session_valid:true});

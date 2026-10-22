@@ -56,6 +56,43 @@ def unified_frame(sequence, value, *, timestamp=None):
 
 
 class ServerCaptureJournalTests(unittest.TestCase):
+    def test_plc_source_survives_durable_helper_journal_and_target_mysql(self):
+        import json
+        from real_acquisition import ChannelSampleCache, FrameAssembler
+        from local_direct_acquisition import LocalDirectAdapter
+        from test_plc_modbus_contract import PlcModbusContractTests
+        from test_mysql_identity import _FakeConnection
+        from mysql_storage import MySQLCaptureStore, MySQLSettings
+        from acquisition import AcquisitionConfig
+        from unittest.mock import patch
+        driver = PlcModbusContractTests().make_driver({"压力": -2.5}, clock=lambda:10.0, wall_clock=lambda:1000.0)
+        cache = ChannelSampleCache()
+        adapter = LocalDirectAdapter("plc", driver, ["压力"], cache)
+        for values, record in driver.read_samples():
+            adapter._publish(values, record)
+        frame = FrameAssembler(["压力"], 10, {"压力":.5}, start_monotonic=10, start_wall_time=1000).assemble(cache,10.1)
+        envelope = frame.to_envelope("plc-remote", {"压力":"N"})
+        self.journal.disarm("session-a")
+        self.journal.arm("session-a", "selection-a", config={"selected_sensors":["压力"]})
+        self.mirrors.configure_capture_contract("session-a", "plc-remote", ["压力"], {"压力":"N"})
+        batch = {"capture_uuid":"plc-remote", "sequence":0, "rows":[{"压力":0.0}],
+                 "timestamps":[1000.1], "frames":[envelope], "required_frame_contract":"unified_frame_v1",
+                 "status":{"running":False,"finalization_complete":True,"sample_count":1}}
+        self.assertTrue(self.journal.ingest("session-a", batch, self.mirrors)["ok"])
+        capture = self.journal.ready_capture("session-a", "plc-remote")
+        row = list(capture.rows)[0]
+        self.assertEqual(row["_channel_source_records"]["压力"]["decoded_value"], -2.5)
+        connection = _FakeConnection()
+        store = MySQLCaptureStore(MySQLSettings(enabled=True, database="afp_fixture"))
+        with patch.object(store, "_connect", return_value=("fake",connection)):
+            result = store.save_layer(AcquisitionConfig(selected_sensors=["压力"]), rows=capture.rows,
+                                      layer_file=None,full_specimen_file=None,timestamp_file=None,
+                                      folder_path=None,summary={},source_records=capture.rows.source_records())
+        self.assertTrue(result["ok"], result)
+        evidence = [json.loads(value[4]) for sql, values in connection.cursor_instance.executed
+                    if "INSERT INTO afp_source_evidence" in sql for value in values]
+        self.assertEqual(evidence[0]["channels"], row["_channel_source_records"])
+
     def test_async_start_binds_target_before_first_sample(self):
         self.journal.disarm("session-a")
         self.journal.arm_start("session-a", "request-1", "selection-a", config={"selected_sensors": ["温度"]})

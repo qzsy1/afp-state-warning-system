@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import json
 import struct
 import sys
 import unittest
@@ -113,7 +114,162 @@ class PlcModbusContractTests(unittest.TestCase):
         sample = driver.read_sample()
 
         self.assertEqual(sample, expected)
-        self.assertEqual(len(driver.sock.requests), 1)
+        self.assertEqual([struct.unpack(">HHHBBHH", request)[-2:] for request in driver.sock.requests],
+                         [(28, 2), (23, 2), (37, 2)])
+
+    def make_driver(self, values, addresses=None, **kwargs):
+        addresses = addresses or {"温度": 28, "张力": 23, "压力": 37}
+        registers = {}
+        for name, value in values.items():
+            low, high = _float_words(value)
+            registers[addresses[name]] = low
+            registers[addresses[name] + 1] = high
+        driver = ModbusTcpDriver("192.168.125.5:502", register_map={name: addresses[name] for name in values}, **kwargs)
+        driver.sock = ModbusFixtureSocket(registers)
+        return driver
+
+    def test_reference_source_recomputed_values_and_pressure_evidence(self):
+        # Expectations recompute the verified C# rules; the C# program is not executed.
+        for raw, expected in [(123.456, 123.46), (906.25, 906.25), (1.125, 1.12),
+                              (1.375, 1.38), (-2.5, 0.0), (0.0, 0.0), (-0.001, 0.0)]:
+            with self.subTest(raw=raw):
+                driver = self.make_driver({"温度": -1.125, "张力": -2.5, "压力": raw})
+                self.assertEqual(driver.read_sample(), {"温度": -1.12, "张力": -2.5, "压力": expected})
+                record = driver.quality_metadata["channel_records"]["压力"]
+                self.assertEqual(record["words"], list(_float_words(raw)))
+                self.assertEqual(record["decoded_value"], struct.unpack("<f", struct.pack("<f", raw))[0])
+                self.assertEqual(record["normalized_value"], expected)
+                self.assertEqual(record["negative_pressure_clamped"], raw == -2.5)
+                json.dumps(driver.quality_metadata, allow_nan=False)
+
+    def test_real_configuration_normalizes_period_and_preserves_explicit_mapping(self):
+        config = AcquisitionConfig(diagnostic_validation=True, acquisition_mode="real", real_acquisition_mode="local_direct",
+            selected_sensors=["压力"], interfaces=[{"id":"plc", "role":"plc", "driver":"modbus_tcp",
+            "endpoint":"192.168.125.8:1502", "slave_id":17, "register_map":{"压力":100}, "poll_interval_seconds":.05}],
+            interface_channel_assignments={"plc":["压力"]})
+        item = config.interfaces[0]
+        self.assertEqual(item["endpoint"], "192.168.125.8:1502")
+        self.assertEqual(item["slave_id"], 17)
+        self.assertEqual(item["register_map"], {"压力":100})
+        self.assertEqual(item["poll_interval_seconds"], .1)
+        self.assertEqual(item["measurement_profile"], "fibercontrol_plc_v1")
+
+    def test_normalized_zero_passes_existing_model_quality_gate_fault_and_stale_do_not(self):
+        from real_acquisition import recent_complete_window
+        self.assertTrue(recent_complete_window([{"压力":0}], ["压力"], 1,
+                        quality_rows=[{"压力":"measured_new"}])["ready"])
+        self.assertTrue(recent_complete_window([{"压力":0}], ["压力"], 1,
+                        quality_rows=[{"压力":"held_within_freshness"}])["ready"])
+        for quality in ("invalid", "missing", "stale"):
+            self.assertFalse(recent_complete_window([{"压力":None}], ["压力"], 1,
+                             quality_rows=[{"压力":quality}])["ready"])
+
+    def test_custom_map_and_nonpressure_names_remain_uncropped(self):
+        driver = self.make_driver({"温度": -3.5, "压力": -2.5}, {"温度": 150, "压力": 500})
+        self.assertEqual(driver.read_sample(), {"温度": -3.5, "压力": 0})
+        self.assertEqual([struct.unpack(">HHHBBHH", request)[-2:] for request in driver.sock.requests], [(150, 2), (500, 2)])
+        driver = self.make_driver({"薄膜压力": -2.5}, {"薄膜压力": 40})
+        self.assertEqual(driver.read_sample(), {"薄膜压力": -2.5})
+
+    def test_nonfinite_and_protocol_fault_keep_json_safe_evidence_and_good_channels(self):
+        for value in (math.nan, math.inf, -math.inf):
+            with self.subTest(value=value):
+                driver = self.make_driver({"温度": 102.25, "张力": 12.75, "压力": value})
+                events = driver.read_samples()
+                good = [next(events), next(events)]
+                bad = next(events)
+                with self.assertRaisesRegex(ValueError, "非有限"):
+                    next(events)
+                self.assertEqual(good[0][0], {"温度": 102.25})
+                self.assertEqual(good[1][0], {"张力": 12.75})
+                self.assertEqual(bad[0], {"压力": None})
+                self.assertEqual(bad[1]["error_category"], "nonfinite_value")
+                self.assertEqual(bad[1]["words"], list(_float_words(value)))
+                self.assertIsNone(bad[1]["decoded_value"])
+                self.assertFalse(driver.protocol_verified)
+                json.dumps(driver.quality_metadata, allow_nan=False)
+        driver = ModbusTcpDriver("192.168.125.5:502")
+        driver.sock = StaticResponseSocket(_response(transaction=9))
+        with self.assertRaises(IOError):
+            driver.read_sample()
+        self.assertEqual(set(driver.channel_records), {"温度", "张力", "压力"})
+        self.assertTrue(all(item["normalized_value"] is None for item in driver.channel_records.values()))
+        self.assertTrue(all(item["error_category"] == "protocol_error" for item in driver.channel_records.values()))
+
+    def test_channel_completion_cutoff_hold_stale_and_source_immutability(self):
+        from plc_measurement import frame_source_records
+        from real_acquisition import UnifiedFrame
+        clock_values = iter([10.01, 10.03, 10.12])
+        driver = self.make_driver({"温度": 102.25, "张力": 12.75, "压力": -2.5},
+                                  clock=lambda: next(clock_values), wall_clock=lambda: 100.0)
+        cache = ChannelSampleCache()
+        adapter = LocalDirectAdapter("plc", driver, ["温度", "张力", "压力"], cache)
+        for payload, record in driver.read_samples():
+            adapter._publish(payload, record)
+        assembler = FrameAssembler(["温度", "张力", "压力"], 10, {"温度": .5, "张力": .5, "压力": .5},
+                                   start_monotonic=10, start_wall_time=100, clock=lambda: 10.2)
+        early = assembler.assemble(cache, 10.1)
+        self.assertIsNone(early.channels["压力"].value)
+        frame = assembler.assemble(cache, 10.2)
+        self.assertEqual(frame.channels["压力"].value, 0)
+        self.assertEqual(frame.channels["温度"].quality, ChannelQuality.HELD_WITHIN_FRESHNESS)
+        held = assembler.assemble(cache, 10.3)
+        self.assertEqual(held.channels["压力"].quality, ChannelQuality.HELD_WITHIN_FRESHNESS)
+        self.assertEqual(held.channels["压力"].received_monotonic, 10.12)
+        self.assertEqual(held.channels["压力"].source_sequence, frame.channels["压力"].source_sequence)
+        stale = assembler.assemble(cache, 11)
+        self.assertEqual(stale.channels["压力"].quality, ChannelQuality.STALE)
+        self.assertIsNone(stale.channels["压力"].value)
+        driver.channel_records["压力"] = {"decoded_value": 99}
+        evidence = frame_source_records(frame)
+        self.assertEqual(evidence["压力"]["decoded_value"], -2.5)
+        self.assertEqual(evidence["压力"]["host_monotonic"], 10.12)
+        envelope = frame.to_envelope("capture", {"压力": "N"})
+        restored = UnifiedFrame.from_envelope(json.loads(json.dumps(envelope, allow_nan=False)))
+        self.assertEqual(frame_source_records(restored), evidence)
+
+    def test_fixed_deadline_scheduler_waits_remainder_and_skips_slow_rounds(self):
+        current = [0.0]
+        starts = []
+        durations = iter([.03, .03, .25, .01])
+        class Driver:
+            fixed_poll_interval_seconds = .1
+            def open(self): pass
+            def close(self): pass
+            def read_sample(self):
+                starts.append(current[0])
+                current[0] += next(durations)
+                return {"压力": 1}
+        class Stop:
+            done = False
+            def is_set(self): return self.done
+            def wait(self, delay):
+                current[0] += delay
+                self.done = len(starts) == 4
+        adapter = LocalDirectAdapter("plc", Driver(), ["压力"], ChannelSampleCache(),
+                                     poll_interval_seconds=.05, clock=lambda: current[0])
+        adapter.stop_event = Stop()
+        adapter._run()
+        for actual, expected in zip(starts, [0, .1, .2, .5]):
+            self.assertAlmostEqual(actual, expected)
+        self.assertEqual(adapter.skipped_poll_cycles, 2)
+        self.assertEqual(adapter.status()["actual_poll_interval_seconds"], .1)
+
+    def test_partial_success_does_not_reset_plc_failed_round_reconnect_limit(self):
+        driver = self.make_driver({"温度":102.25, "压力":math.inf})
+        driver.open = lambda: None
+        driver.close = lambda: None
+        adapter = LocalDirectAdapter("plc", driver, ["温度", "压力"], ChannelSampleCache(),
+            max_reconnect_attempts=2, reconnect_backoff_seconds=.001, max_reconnect_backoff_seconds=.001)
+        adapter.start()
+        adapter.thread.join(1)
+        try:
+            self.assertEqual(adapter.state, "failed")
+            self.assertEqual(adapter.reconnect_attempts, 2)
+            self.assertEqual(adapter.cache.latest("压力").quality, ChannelQuality.INVALID)
+            self.assertIsNone(adapter.cache.latest("压力").value)
+        finally:
+            self.assertTrue(adapter.stop(1))
 
     def test_fc03_rejects_each_protocol_identity_or_shape_error(self) -> None:
         exception_pdu = struct.pack(">HHHB", 1, 0, 3, 255) + bytes((0x83, 2))

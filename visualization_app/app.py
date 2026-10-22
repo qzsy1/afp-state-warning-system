@@ -3105,15 +3105,21 @@ class DashboardData:
     ) -> dict:
         """Real acquisition -> live model -> live HI features -> warning."""
         active_acquisition = acquisition or self.acquisition
-        status = active_acquisition.status()
         quality_rows, source_rows, startup_observations = None, None, None
-        effective_processing = processing_mode or (status.get("config") or {}).get("processing_mode")
-        if effective_processing == "capture_only" and callable(getattr(active_acquisition, "live_curve_snapshot", None)):
+        snapshot_reader = getattr(active_acquisition, "live_curve_snapshot", None)
+        status = None if processing_mode == "capture_only" and callable(snapshot_reader) else active_acquisition.status()
+        effective_processing = processing_mode or ((status or {}).get("config") or {}).get("processing_mode")
+        if effective_processing == "capture_only" and callable(snapshot_reader):
             status, rows, timestamps, quality_rows, source_rows, startup_observations = active_acquisition.live_curve_snapshot(history)
         else:
             rows, timestamps = active_acquisition.numeric_matrix()
             quality_rows = list(getattr(active_acquisition, "frame_quality", []) or [])
             source_rows = list(getattr(active_acquisition, "frame_sources", []) or [])
+        standby = bool(not status.get("running") and (
+            (status.get("config") or {}).get("acquisition_mode") == "real"
+            or (status.get("data_connection") or {}).get("state", "disconnected") != "disconnected"))
+        if standby:
+            rows, timestamps, quality_rows, source_rows, startup_observations = [], [], [], [], {}
         config = status.get("config") or {}
         requested_schema = (
             dataset_schema
@@ -3145,7 +3151,7 @@ class DashboardData:
         rho = float(np.clip(rho, 0.0, 1.0))
         prediction_horizon = int(np.clip(prediction_horizon, 1, 600))
         forecast_lead = int(np.clip(forecast_lead, 1, 24))
-        if config.get("processing_mode") == "capture_only":
+        if config.get("processing_mode") == "capture_only" or standby:
             return self._capture_only_live(
                 status=status,
                 rows=rows,
@@ -4739,6 +4745,8 @@ class AppHandler(BaseHTTPRequestHandler):
             blockers.add("local_acquisition_status_unavailable")
         if isinstance(local_status, dict) and local_status.get("running"):
             captures.add(str(local_status.get("capture_uuid") or "local_capture"))
+        if isinstance(local_status, dict) and (local_status.get("data_connection") or {}).get("state", "disconnected") != "disconnected":
+            blockers.add("local_data_connection_not_released")
 
         mirrors = self.dashboard.remote_acquisitions
         with mirrors._lock:
@@ -5735,7 +5743,7 @@ class AppHandler(BaseHTTPRequestHandler):
             # probe.  Keep its mutex independent so a timed-out/slow model
             # request cannot block reset/recheck of the physical interfaces.
             operation_name = "agent-diagnose"
-        elif parsed.path in {"/api/acquisition/start", "/api/acquisition/stop"}:
+        elif parsed.path in {"/api/acquisition/start", "/api/acquisition/stop", "/api/acquisition/connect", "/api/acquisition/disconnect"}:
             operation_name = "acquisition-control"
         elif parsed.path in {"/api/training/start", "/api/training/stop"}:
             operation_name = "training-control"
@@ -5964,6 +5972,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 "/api/acquisition/reset-check",
                 "/api/acquisition/start",
                 "/api/acquisition/stop",
+                "/api/acquisition/connect",
+                "/api/acquisition/disconnect",
+                "/api/acquisition/invalidate-connection",
                 "/api/acquisition/integrate",
                 "/api/training/import",
                 "/api/training/start",
@@ -6746,6 +6757,23 @@ class AppHandler(BaseHTTPRequestHandler):
                 from render_evidence import save_render_evidence
                 self._send_json(save_render_evidence(self.dashboard.acquisition, payload))
                 return
+            if parsed.path == "/api/acquisition/invalidate-connection":
+                self.dashboard.acquisition.invalidate_data_connection("设备配置已变化，请断开数据后重新连接")
+                self._send_json(self.dashboard.acquisition.status())
+                return
+            if parsed.path == "/api/acquisition/connect":
+                config = acquisition_config_from_payload(payload)
+                if not self.dashboard.helper_registry.begin_capture_start(require_ingress_ready=False, require_cutover_clear=True):
+                    raise RuntimeError("ingress_cutover_in_progress")
+                try:
+                    result = self.dashboard.acquisition.connect_data(config)
+                finally:
+                    self.dashboard.helper_registry.end_capture_start()
+                self._send_json(result)
+                return
+            if parsed.path == "/api/acquisition/disconnect":
+                self._send_json(self.dashboard.acquisition.disconnect_data())
+                return
             if parsed.path == "/api/acquisition/start":
                 identity = self._identity()
                 remote_simulation = (
@@ -6809,6 +6837,9 @@ class AppHandler(BaseHTTPRequestHandler):
                         str(payload.get("simulation_mysql_query", ""))
                     )
                 config = acquisition_config_from_payload(payload)
+                if config.acquisition_mode == "real" and config.real_acquisition_mode == "local_direct":
+                    self.dashboard.acquisition.require_data_connection(config)
+                    config._require_data_connection = True
                 model_validation = self.dashboard.validate_prediction_setup(
                     config, load_model=True
                 )

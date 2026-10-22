@@ -624,6 +624,10 @@ class Esr1001UsbDriver:
     def _read(self):
         pending = int(getattr(self.serial, "in_waiting", 0))
         data = self.serial.read(min(max(pending, 1), 16384))
+        skip = min(len(data), getattr(self, '_capture_boundary_skip_bytes', 0))
+        if skip:
+            data = data[skip:]
+            self._capture_boundary_skip_bytes -= skip
         self.received_bytes += len(data)
         self.received_tail = (self.received_tail + data)[-96:]
         for raw in self.parser.feed(data):
@@ -634,6 +638,9 @@ class Esr1001UsbDriver:
             elif raw[0] == 0x25:
                 self._controls.append(raw)
             elif self.started:
+                if getattr(self, "_capture_discard_frames", 0):
+                    self._capture_discard_frames -= 1
+                    continue
                 values = decode_adc(raw, self.parser.channels)
                 mono, wall = time.monotonic(), time.time()
                 self.sequence += 1
@@ -812,6 +819,42 @@ class Esr1001UsbDriver:
     def read_sample(self):
         samples = self.read_samples()
         return samples[-1][0] if samples else None
+
+    def begin_capture_boundary(self):
+        with self._io_lock:
+            self.clear_zero("capture_boundary")
+            if not self.parser.synced or self.parser.discarded_bytes or self.parser.overflows:
+                raise UsbProtocolError('usb_boundary_not_synchronized', '当前USB流未同步，不能建立采集边界')
+            pending = int(self.serial.in_waiting)
+            if pending > self.parser.capacity:
+                raise UsbProtocolError('usb_boundary_overflow', 'USB边界待处理数据超过有界容量')
+            drained = self.serial.read(pending) if pending else b''
+            if len(drained) != pending:
+                raise UsbProtocolError('usb_boundary_incomplete_drain', 'USB边界读取未完成')
+            for raw in self.parser.feed(drained):
+                if raw[0] == 0x26 and self.parameters and parse_parameters(raw) != self.parameters:
+                    raise UsbProtocolError('device_identity_mismatch', '设备参数变化，不能复用连接')
+            if self.parser.discarded_bytes or self.parser.overflows or not self.parser.synced:
+                raise UsbProtocolError('usb_boundary_not_synchronized', 'USB边界出现协议错误')
+            tail = self.parser.buffer
+            size = (2 + self.parser.channels*3) if tail and tail[0] == 0x24 else 14
+            self._capture_boundary_skip_bytes = size-len(tail) if tail else 0
+            self.parser = UsbStreamParser(self.parser.channels)
+            self._pending.clear()
+            self.latest_record = None
+            self.sequence = 0
+            self.first_observation = None
+            self.last_observation = None
+            self.recent_intervals.clear()
+            self.max_interval = 0.
+            self.gaps = []
+            self.received_bytes = 0
+            self.received_tail = b''
+            self.started_monotonic = time.monotonic()
+            self.capture_generation = uuid.uuid4().hex
+            self.start_events = self.start_events[-32:]
+            # A trailing fragment cannot establish this capture's first frame.
+            self._capture_discard_frames = 1
 
     def close(self):
         self.cancel_open()

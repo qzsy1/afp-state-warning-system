@@ -205,6 +205,7 @@ class LocalCaptureAgent:
             "capabilities": {
                 "device_readiness_contract": DEVICE_READINESS_CONTRACT,
                 "unified_device_readiness_v1": True,
+                "plc_measurement_contract": "fibercontrol_plc_v1",
                 "hardware_discovery": True,
                 "usb_topology_v1": bool(discovered.get("usb_topology")),
                 "usb_topology_v2": bool(discovered.get("usb_topology")),
@@ -399,6 +400,8 @@ class LocalCaptureAgent:
             and str(getattr(config, "real_acquisition_mode", "")) == "remote_helper"
         ):
             capabilities = getattr(config, "helper_capabilities", None) or {}
+            from plc_measurement import require_helper_measurement
+            require_helper_measurement(config)
             assert_helper_contract(capabilities, RELEASE_CONTRACT)
             required_contract = (
                 "unified_frame_v2"
@@ -632,6 +635,8 @@ class LocalCaptureAgent:
             }
 
     def check_capture(self, config: Any) -> dict[str, Any]:
+        from plc_measurement import require_helper_measurement
+        require_helper_measurement(config)
         from esr1001_usb import require_helper_capabilities
         require_helper_capabilities(config)
         from m3232_serial import require_helper_capabilities as require_m3232_capabilities
@@ -651,6 +656,7 @@ class LocalCaptureAgent:
                 "unified_frame_contract": "unified_frame_v2",
                 "device_readiness_contract": DEVICE_READINESS_CONTRACT,
                 "unified_device_readiness_v1": True,
+                "plc_measurement_contract": "fibercontrol_plc_v1",
             },
         )
         self._readiness_snapshot = snapshot

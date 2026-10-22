@@ -320,7 +320,7 @@ class M3232PressureDriver:
             received_bytes=self.total_bytes, valid_frames=self.total_frames, rejected_frames=self.parser.rejected,
             last_error=self.parser.last_error, received_monotonic=self.last_frame,
             frame_age_seconds=None if self.last_frame is None else now-self.last_frame,
-            valid_frame_rate_hz=self.sequence/max(now-self.started, 0.001), checksum="structure_only_no_vendor_crc",
+            valid_frame_rate_hz=self.total_frames/max(now-self.started, 0.001), checksum="structure_only_no_vendor_crc",
             connection_generation=getattr(self, "generation", ""), device_identity=self.binding,
             stop_error=getattr(self, "stop_error", ""),
             writer_error=self.recorder.error if self.recorder else "",
@@ -332,6 +332,7 @@ class M3232PressureDriver:
             self.recorder.submit({"connection_generation": self.generation, "host_monotonic": self.clock(), "host_wall_time": self.wall_clock(), **record})
 
     def open(self):
+        self._close_receive_pending = None
         if not self.endpoint or not self.binding.get("confirmed") or self.binding.get("endpoint", "").casefold() != self.endpoint.casefold():
             raise ValueError("binding_unconfirmed: 请确认M3232接线/拔插与当前串口归属")
         from serial.tools import list_ports
@@ -366,6 +367,12 @@ class M3232PressureDriver:
         if self.serial is None: return []
         pending = int(self.serial.in_waiting)
         chunk = self.serial.read(min(pending, 65536)) if pending else b""
+        if getattr(self, "_boundary_discard_line", False):
+            boundary = chunk.find(b"\n")
+            if boundary < 0:
+                return []
+            chunk = chunk[boundary + 1:]
+            self._boundary_discard_line = False
         if chunk:
             self._evidence(kind="serial", direction="rx", byte_offset=self.parser.offset + len(self.parser.buffer), raw_hex=chunk.hex())
             self.total_bytes += len(chunk)
@@ -393,6 +400,16 @@ class M3232PressureDriver:
             raise TimeoutError("M3232断流" if self.last_frame is not None else "M3232等待有效首帧超时")
         return results
 
+    def begin_capture_boundary(self):
+        self.serial.reset_input_buffer()
+        self.parser = self._parser()
+        self._boundary_discard_line = True
+        self.last_record = None
+        self.last_frame = None
+        self.protocol_verified = False
+        self.started = self.clock()
+        self.total_frames = self.total_bytes = 0
+
     def read_sample(self):
         results = self.read_samples()
         return results[-1][0] if results else None
@@ -407,6 +424,83 @@ class M3232PressureDriver:
             raise
         finally:
             try:
-                self.serial.close()
+                try:
+                    self._close_receive_pending = int(self.serial.in_waiting)
+                except Exception:
+                    self._close_receive_pending = None
+                try:
+                    self.serial.close()
+                except Exception:
+                    self._close_receive_pending = None
+                    raise
             finally:
                 self.serial = None
+
+
+def archive_empty_cancelled_matrix(driver, recorder, *, session_dir, context):
+    """Retain a closed, zero-data cancelled matrix file outside recovery scans."""
+    if (not isinstance(recorder, MatrixRecorder) or not recorder.closed
+            or recorder.thread.is_alive() or not recorder.queue.empty()
+            or recorder.rows or recorder.csv_rows or recorder.error
+            or driver.serial is not None or getattr(driver, "_close_receive_pending", None) != 0
+            or driver.total_bytes or driver.total_frames or driver.parser.buffer
+            or driver.parser.rejected or driver.parser.last_error or getattr(driver, "stop_error", "")
+            or not recorder.csv_path or not recorder.csv_stream or not recorder.csv_stream.closed):
+        return None
+    if any(recorder.metadata.get(key) != value for key, value in context.items()):
+        return None
+    root = Path(session_dir).resolve()
+    source = Path(recorder.csv_path).resolve()
+    try:
+        source.relative_to(root)
+    except ValueError:
+        return None
+    expected = matrix_csv_path(root / context["main_csv"])
+    if source != expected.with_name(expected.name + ".partial") or not source.is_file():
+        return None
+    generation = context["capture_generation"]
+    if len(generation) != 32 or any(c not in "0123456789abcdef" for c in generation):
+        return None
+    try:
+        with source.open(encoding="utf-8-sig", newline="") as stream:
+            reader = csv.reader(stream)
+            if next(reader, None) != recorder.csv_writer.fieldnames or next(reader, None) is not None:
+                return None
+        for path in recorder.files:
+            with Path(path).open(encoding="utf-8") as stream:
+                for line in stream:
+                    record = json.loads(line)
+                    if (not isinstance(record, dict) or record.get("kind") != "serial" or record.get("direction") != "tx"
+                            or record.get("raw_hex") not in (b"begin\n".hex(), b"end\n".hex())):
+                        return None
+        content = source.read_bytes()
+    except (OSError, UnicodeError, ValueError, csv.Error):
+        return None
+    digest = hashlib.sha256(content).hexdigest()
+    directory = root / "历史版本" / "已取消空采集" / generation
+    destination = directory / (source.name + ".cancelled-empty")
+    audit = directory / "cancelled_empty_matrix.json"
+    temporary = audit.with_suffix(".json.tmp")
+    try:
+        destination.resolve().relative_to(root)
+    except ValueError:
+        return None
+    if destination.exists() or audit.exists() or temporary.exists():
+        return None
+    directory.mkdir(parents=True, exist_ok=True)
+    evidence = {"schema_version": 1, "state": "cancelled_no_samples", **context,
+                "source_path": str(source), "archived_path": str(destination),
+                "sha256": digest, "size_bytes": len(content), "data_rows": 0}
+    with temporary.open("x", encoding="utf-8") as stream:
+        json.dump(evidence, stream, ensure_ascii=False, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+    if hashlib.sha256(source.read_bytes()).hexdigest() != digest:
+        return None
+    os.replace(source, destination)
+    try:
+        os.replace(temporary, audit)
+    except OSError:
+        os.replace(destination, source)
+        raise
+    return evidence

@@ -970,6 +970,11 @@ class HelperRegistry:
                     helper.sender = None
             if not helper.online:
                 return {"ok": False, "queued": False, "error": "helper_offline"}
+            if command in {"start_capture", "check_capture"}:
+                from plc_measurement import requires_plc_measurement, PLC_MEASUREMENT_CONTRACT
+                if requires_plc_measurement(dict(payload or {})) and helper.capabilities.get("plc_measurement_contract") != PLC_MEASUREMENT_CONTRACT:
+                    return {"ok": False, "queued": False, "error": "plc_measurement_incompatible",
+                            "required_contract": PLC_MEASUREMENT_CONTRACT}
             if command == "start_capture":
                 mismatches = helper_capability_mismatches(
                     RELEASE_CONTRACT, helper.capabilities

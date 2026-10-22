@@ -17,6 +17,15 @@ from acquisition import AcquisitionManager
 
 
 class PublicDeviceStatusTests(unittest.TestCase):
+    def test_public_plc_status_never_exposes_measurement_register_evidence(self):
+        payload = self._module().build_public_device_status({}, {}, {
+            "running":True, "interfaces":[{"role":"plc","driver":"modbus_tcp","ok":True,"state":"ok",
+                "plc_evidence":{"measurement_profile":"fibercontrol_plc_v1","channel_records":{"压力":{
+                    "words":[1234,49184],"decoded_value":-2.5,"normalized_value":0,"register_address":37}}}}]})
+        encoded = json.dumps(payload)
+        for key in ("words", "decoded_value", "register_address", "channel_records", "plc_evidence"):
+            self.assertNotIn(key, encoded)
+
     def _module(self):
         spec = importlib.util.find_spec("public_status")
         self.assertIsNotNone(

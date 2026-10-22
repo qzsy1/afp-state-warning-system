@@ -11,6 +11,30 @@ from visualization_app.test_usb_interface_candidates import run_candidate_script
 APP_JS = Path(__file__).with_name("static") / "app.js"
 
 
+class PlcMeasurementFrontendTests(unittest.TestCase):
+    def test_pressure_source_view_distinguishes_clamp_zero_and_missing(self):
+        source = APP_JS.read_text(encoding="utf-8")
+        function = source[source.index("function plcMeasurementText("):source.index("function renderAcquisitionStatus(")]
+        script = r'''
+const record = {register_address:37,words:[0,49184],decoded_value:-2.5,normalized_value:0,
+  negative_pressure_clamped:true,source_sequence:3,host_wall_time:100,quality:"measured_new"};
+const status = {running:true,interfaces:[{id:"plc",driver:"modbus_tcp",plc_evidence:{channel_records:{"压力":record}},
+ observed_poll_interval_seconds:0.102,skipped_poll_cycles:2}],sensors:[{name:"压力",state:"ok"}]};
+const clamped = plcMeasurementText(status);
+record.decoded_value = record.normalized_value = null; record.negative_pressure_clamped = false;
+record.quality = "invalid"; record.error_category = "nonfinite_value";
+const missing = plcMeasurementText(status);
+console.log(JSON.stringify({clamped,missing}));
+'''
+        result = subprocess.run(["node", "-e", function + script], check=True, capture_output=True, text=True, encoding="utf-8")
+        text = json.loads(result.stdout)
+        self.assertIn("未裁剪值 -2.5 N", text["clamped"])
+        self.assertIn("规范压力 0 N", text["clamped"])
+        self.assertIn("102.0 ms", text["clamped"])
+        self.assertIn("规范压力 缺测 N", text["missing"])
+        self.assertIn("invalid", text["missing"])
+
+
 def run_remembered_selection_script(assertions: str) -> list[dict]:
     source = APP_JS.read_text(encoding="utf-8")
     start = source.index("function mergeRememberedInterfaceSelections")
@@ -88,6 +112,8 @@ const state = {accessRole:"local_admin", acquisitionStatus:{running:false},
   bootstrap:{application:{}}, simulationPackages:[], helperStatus:{},
   mysqlConnectionTests:{}};
 let helper = false;
+let connectionReady = true;
+async function fetch(){return {json:async()=>({data_connection:{ready:connectionReady,reason:'请连接数据'}})};}
 let requests = [];
 let messages = [];
 let clock = 0;
@@ -205,7 +231,7 @@ class PlcAbbPhysicalBindingFrontendTests(unittest.TestCase):
                     )
                     check_path = "check_capture" if helper else "/api/acquisition/test"
                     start_path = "start_capture" if helper else "/api/acquisition/start"
-                    expected = [start_path] if situation == "fresh" else [check_path, start_path]
+                    expected = [start_path] if not helper or situation == "fresh" else [check_path, start_path]
                     self.assertEqual([item["path"] for item in result["requests"]], expected)
                     self.assertEqual(result["messages"], [])
                     self.assertTrue(result["consumed"])
@@ -224,7 +250,7 @@ class PlcAbbPhysicalBindingFrontendTests(unittest.TestCase):
 })().catch(error=>{console.error(error);process.exit(1);});
 '''
                 )
-                self.assertEqual(len(result["requests"]), 2)
+                self.assertEqual(len(result["requests"]), 2 if helper else 1)
                 self.assertEqual(result["messages"], [])
 
     def test_normal_stop_save_and_next_layer_reuse_versioned_session_detection(self):
@@ -296,7 +322,7 @@ console.log(JSON.stringify({current:hardwareCheckIsCurrent("config")}));
 })().catch(error=>{console.error(error);process.exit(1);});
 '''
                         )
-                        recoverable = "readiness_required" in error
+                        recoverable = helper and "readiness_required" in error
                         self.assertEqual(len(result["requests"]), 3 if recoverable else 1)
                         self.assertEqual(len(result["messages"]), int(repeat or not recoverable))
                         self.assertFalse(result["busy"])
@@ -304,7 +330,7 @@ console.log(JSON.stringify({current:hardwareCheckIsCurrent("config")}));
                             self.assertIn("自动重检后仍无法启动", result["messages"][0])
 
     def test_failed_recheck_or_changed_configuration_blocks_start(self) -> None:
-        for helper in (False, True):
+        for helper in (True,):
             for situation in ("expired_failure", "retry_failure", "config_changed"):
                 with self.subTest(helper=helper, situation=situation):
                     result = run_real_start_script(
@@ -325,6 +351,14 @@ console.log(JSON.stringify({current:hardwareCheckIsCurrent("config")}));
                     starts = [item for item in result["requests"] if item["path"].endswith(("/start", "start_capture"))]
                     self.assertEqual(len(starts), int(situation == "retry_failure"))
                     self.assertEqual(len(result["messages"]), 1)
+
+    def test_local_start_requires_current_connection_and_never_runs_hidden_probe(self):
+        result = run_real_start_script(r'''
+(async()=>{connectionReady=false;await startAcquisition();
+console.log(JSON.stringify({requests,messages}));})().catch(e=>{console.error(e);process.exit(1)});
+''')
+        self.assertEqual(result['requests'], [])
+        self.assertIn('请连接数据', result['messages'][0])
 
     def test_failed_check_identifies_execution_host_without_claiming_device_failure(self) -> None:
         source = APP_JS.read_text(encoding="utf-8")

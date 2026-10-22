@@ -342,6 +342,7 @@ def readiness_config_fingerprint(config: Any) -> str:
         "data_mode", "channel_count", "calibration_digest", "calibration_profile", "bridge",
                 "read_profile", "timeout", "channel_settings", "scan_timeout_seconds",
                 "freshness_seconds", "poll_interval_seconds", "reconnect_window_seconds",
+                "measurement_profile", "register_map",
             )
         }
         interface_facts.update({
@@ -614,6 +615,13 @@ class ChannelSampleCache:
     def latest(self, channel_name: str) -> ChannelSample | None:
         with self._lock:
             return self._latest.get(channel_name)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._events.clear()
+            self._latest.clear()
+            self._updates.clear()
+            self._dropped_events = 0
 
     def latest_at_or_before(
         self, channel_name: str, deadline_monotonic: float
@@ -900,6 +908,11 @@ class UnifiedFrame:
                     "byte_offset", "sha256", "raw_total", "unit", "calibration_digest")}
                 metadata["received_monotonic"] = sample.received_monotonic
                 metadata["received_wall_time"] = sample.received_wall_time
+            if sample.metadata.get("driver") == "modbus_tcp":
+                metadata["plc_source"] = dict(sample.metadata.get("latest_record") or {})
+                metadata["age_seconds"] = sample.metadata.get("age_seconds")
+                metadata["received_monotonic"] = sample.received_monotonic
+                metadata["received_wall_time"] = sample.received_wall_time
             if any(value not in (None, "") for value in metadata.values()):
                 source[str(index)] = metadata
         return {
@@ -1061,7 +1074,8 @@ class UnifiedFrame:
                 protocol_ok=item.get("protocol_ok"),
                 error=str(item.get("error") or ""),
                 metadata={"adc_source": item.get("adc_source"), "calibration_digest": item.get("calibration_digest"),
-                          **({"driver": "m3232_pressure", "matrix_source": item["matrix_source"]} if item.get("matrix_source") else {})},
+                          **({"driver": "m3232_pressure", "matrix_source": item["matrix_source"]} if item.get("matrix_source") else {}),
+                          **({"driver": "modbus_tcp", "measurement_profile": "fibercontrol_plc_v1", "latest_record": item["plc_source"], "age_seconds": item.get("age_seconds")} if item.get("plc_source") else {})},
             )
         return cls(
             capture_sequence=sequence,

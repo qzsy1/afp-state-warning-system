@@ -9,6 +9,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 class WebSocketLiveProtocolTests(unittest.TestCase):
+    def test_plc_status_evidence_survives_websocket_compaction(self):
+        from websocket_live import compact_live_payload
+        record = {"words":[0,49184],"decoded_value":-2.5,"normalized_value":0,
+                  "negative_pressure_clamped":True,"source_sequence":3,"host_wall_time":100,
+                  "measurement_profile":"fibercontrol_plc_v1"}
+        status = {"interfaces":[{"driver":"modbus_tcp","plc_evidence":{"channel_records":{"压力":record}}}]}
+        payload = {"channels":[],"acquisition":status}
+        packed = compact_live_payload(payload)
+        self.assertEqual(packed["acquisition"], status)
+        json.dumps(packed, allow_nan=False)
+
     def test_compact_live_payload_round_trips_all_evidence_in_browser(self):
         from websocket_live import compact_live_payload
 
@@ -22,6 +33,8 @@ class WebSocketLiveProtocolTests(unittest.TestCase):
                     for index in range(64)]
         channels[0]["source_observations"][0] = None
         channels[1]["source_observations"][0]["extra"] = {"reference": [1, 2]}
+        channels[2]["source_observations"][24]["quality"] = "held_within_freshness"
+        channels[3]["source_observations"][24]["capture_generation"] = "another-generation"
         payload = {"channels": channels, "selected_channel": channels[0],
                    "thermocouple64": {"other_channels": [channels[-1]], "raw_history": [[1, None]]},
                    "acquisition": {"running": True, "sample_count": 48}}
@@ -48,6 +61,34 @@ assert.equal(expandLivePayload(original),original);
         from websocket_live import compact_live_payload
         payload = {"type": "error", "error": "device offline"}
         self.assertIs(compact_live_payload(payload), payload)
+
+    def test_compaction_round_trips_copied_and_distinct_secondary_channels(self):
+        from websocket_live import compact_live_payload
+
+        channels = [{"id": index, "name": f"channel{index}", "actual": list(range(48)),
+                     "source_observations": [{"source_sequence": n, "quality": "measured_new"} for n in range(48)]}
+                    for index in range(3)]
+        distinct = deepcopy(channels[0])
+        distinct["actual"][17] = -999
+        payload = {"channels": channels, "selected_channel": deepcopy(channels[1]),
+                   "thermocouple64": {"other_channels": [deepcopy(channels[2]), distinct]}}
+        original = deepcopy(payload)
+        packed = compact_live_payload(payload)
+        self.assertEqual(packed["selected_channel"], {"live_channel_index": 1})
+        self.assertEqual(packed["thermocouple64"]["other_channels"][0], {"live_channel_index": 2})
+        self.assertNotIn("live_channel_index", packed["thermocouple64"]["other_channels"][1])
+        source = (Path(__file__).parent / "static" / "app.js").read_text(encoding="utf-8")
+        decoder = source[source.index("function expandLivePayload("):source.index("function applyRealtimePayload(")]
+        script = "const fs=require('fs'),assert=require('assert/strict');\n" + decoder + "\n" + r'''
+const {original,packed}=JSON.parse(fs.readFileSync(0,'utf8'));
+assert.deepEqual(expandLivePayload(packed),original);
+packed.selected_channel.actual[0]=-1;
+assert.notEqual(packed.thermocouple64.other_channels[1].actual[0],-1);
+'''
+        result = subprocess.run(["node", "-e", script], input=json.dumps({"original": original, "packed": packed}),
+                                text=True, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload, original)
 
     def test_version_poll_interval_is_bounded_for_first_curve_delivery(self):
         from websocket_live import (

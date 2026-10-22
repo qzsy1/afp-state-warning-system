@@ -16,7 +16,7 @@ LEGACY_MARKERS = (
 
 
 class SingleRuntimeDocumentationTests(unittest.TestCase):
-    def test_operator_docs_define_fixed_runtime_and_two_approval_gates(self) -> None:
+    def test_operator_docs_define_fixed_runtime_and_current_authorization(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         field_ops = (ROOT / "pre_sensor" / "FIELD-OPERATIONS.md").read_text(
             encoding="utf-8"

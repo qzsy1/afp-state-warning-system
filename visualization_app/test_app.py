@@ -54,6 +54,18 @@ class HealthPayloadTests(unittest.TestCase):
 
 
 class SourceCurvePayloadTests(unittest.TestCase):
+    def test_connected_standby_without_capture_config_never_enters_prediction(self):
+        dashboard = DashboardData.__new__(DashboardData)
+        manager = SimpleNamespace(status=lambda: {'running': False, 'data_connection': {'state': 'connected'}},
+            numeric_matrix=lambda: ([], []))
+        dashboard.acquisition = manager
+        with patch.object(dashboard, '_capture_only_live', return_value={'standby': True}) as idle, \
+             patch.object(dashboard, 'candidate', side_effect=AssertionError('prediction in standby')):
+            result = dashboard.live(sensor_id=0, history=48, step=1, threshold=.5, rho=.5,
+                indicator='TC-HI', model_kind='random_forest', processing_mode='prediction_warning', prediction_horizon=24)
+        self.assertTrue(result['standby'])
+        self.assertEqual(idle.call_args.kwargs['rows'], [])
+
     def test_live_downsampling_always_keeps_latest_measurement(self):
         for step in (1, 2, 4, 6, 12, 24):
             with self.subTest(step=step):
@@ -85,8 +97,23 @@ class SourceCurvePayloadTests(unittest.TestCase):
 
 
 class DashboardTests(unittest.TestCase):
+    def test_capture_only_live_uses_one_consistent_status_snapshot(self):
+        reads = []
+        def status():
+            reads.append(True)
+            return {"running": True, "sample_count": 2, "config": {
+                "processing_mode": "capture_only", "dataset_schema": "new_collection_v11_3",
+                "selected_sensors": ["温度"], "acquisition_mode": "real", "sample_rate_hz": 10}}
+        acquisition = SimpleNamespace(status=status, live_curve_snapshot=lambda limit: (
+            status(), [{"温度": 20.0}, {"温度": 21.0}], [1.0, 1.1],
+            [{"温度": "measured_new"}] * 2, [], {}))
+        payload = self.dashboard.live(0, 120, 1, .5, .5, "TC-HI", "random_forest", 24,
+                                      acquisition=acquisition, processing_mode="capture_only")
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(payload["channels"][0]["actual"], [20.0, 21.0])
+
     def test_capture_only_accepts_remote_mirror_without_local_snapshot_method(self):
-        remote = SimpleNamespace(status=lambda: {"sample_count": 2, "config": {
+        remote = SimpleNamespace(status=lambda: {"running": True, "sample_count": 2, "config": {
             "processing_mode": "capture_only", "dataset_schema": "new_collection_v11_3",
             "selected_sensors": ["温度"], "acquisition_mode": "real", "sample_rate_hz": 10}},
             numeric_matrix=lambda: ([{"温度": 20.0}, {"温度": 20.0}], [1.0, 1.1]),
@@ -882,6 +909,7 @@ class LanServerTests(unittest.TestCase):
                  patch.object(dashboard, "helper_registry", registry, create=True), \
                  patch.object(dashboard, "validate_prediction_setup", lambda c, **kw: DashboardData.validate_prediction_setup(dashboard, c, **kw), create=True), \
                  patch.object(dashboard.acquisition, "start_async", return_value=accepted, create=True) as start, \
+                 patch.object(dashboard.acquisition, "require_data_connection", return_value=None, create=True), \
                  patch("app.inspect_prediction_model", side_effect=AssertionError("unexpected model scan")), \
                  patch("app.model_catalog", side_effect=AssertionError("unexpected model enumeration")):
                 status, result = self.request("POST", "/api/acquisition/start", asdict(cfg))
@@ -889,6 +917,31 @@ class LanServerTests(unittest.TestCase):
             self.assertTrue(result["accepted"])
             self.assertFalse(result["prediction_model"]["model_required"])
             self.assertEqual(start.call_count, 1)
+
+    def test_local_start_refuses_missing_connection_before_start_task(self):
+        from dataclasses import asdict
+        from test_acquisition_start import config
+        dashboard = self.server.RequestHandlerClass.dashboard
+        with tempfile.TemporaryDirectory() as root, \
+             patch.object(dashboard.acquisition, 'require_data_connection', side_effect=RuntimeError('data_connection_not_ready'), create=True), \
+             patch.object(dashboard.acquisition, 'start_async', create=True) as start:
+            status, result = self.request('POST', '/api/acquisition/start', asdict(config(root)))
+        self.assertEqual(status, 400)
+        self.assertIn('data_connection_not_ready', result['error'])
+        start.assert_not_called()
+
+    def test_connect_refuses_reserved_runtime_update(self):
+        from dataclasses import asdict
+        from test_acquisition_start import config
+        dashboard = self.server.RequestHandlerClass.dashboard
+        registry = SimpleNamespace(begin_capture_start=lambda **_: False)
+        with tempfile.TemporaryDirectory() as root, \
+             patch.object(dashboard, 'helper_registry', registry, create=True), \
+             patch.object(dashboard.acquisition, 'connect_data', create=True) as connect:
+            status, result = self.request('POST', '/api/acquisition/connect', asdict(config(root)))
+        self.assertEqual(status, 400)
+        self.assertIn('ingress_cutover_in_progress', result['error'])
+        connect.assert_not_called()
 
     def test_cross_origin_mutation_is_rejected(self):
         status, _ = self.request(

@@ -291,6 +291,10 @@
               <p class="agent-scope-note">覆盖 64 路热电偶、PLC、UVC、ABB、M3232 薄膜压力与 ESR1001-A 应变传感器接口。只展示诊断结论和证据来源，不展示调用轨迹；异常失败时保留本地规则兜底。Key 不保存、不写日志。</p>
               </div>
             </details>
+            <details class="collapsible-subsection"><summary>PLC 压力与来源</summary>
+              <p>真实 PLC 压力保留两位小数后将负值规范为 0 N，原始值保留；缺测留空，无实时三点平均。曲线、CSV、MySQL 与模型使用同一规范值及质量准入。参考状态栏一位小数与两位小数导出可存在末位显示差异。</p>
+              <pre id="plcMeasurementEvidence"></pre>
+            </details>
             <details id="acquisitionParameterPanel" class="acquisition-parameter-panel collapsible-subsection" aria-labelledby="acquisitionParameterTitle">
               <summary id="acquisitionParameterTitle" class="sensor-selector-title acquisition-parameter-title">采集参数设置</summary>
               <div class="collapsible-subsection-content">
@@ -318,6 +322,7 @@
               </div>
             </details>
             <div class="transport">
+              <button id="connectDataButton" class="secondary-button">连接数据</button>
               <button id="startAcquisitionButton" class="primary-button">开始采集</button>
             </div>
             <button id="stopAcquisitionButton" class="secondary-button full-button">停止并保存</button>

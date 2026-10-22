@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+from copy import deepcopy
 from typing import Any, Callable, Iterable, Mapping
 
 from real_acquisition import ChannelQuality, ChannelSample, ChannelSampleCache
@@ -14,7 +15,7 @@ _MINIMUM_POLL_SECONDS = {
     "serial_json": 0.005,
     "smrf_hid": 0.02,
     "tcp_json": 0.01,
-    "modbus_tcp": 0.05,
+    "modbus_tcp": 0.1,
     "abb_robot": 0.1,
     "uvc_thermal": 0.03,
     "rtsp_thermal": 0.03,
@@ -80,6 +81,13 @@ class LocalDirectAdapter:
         self.actual_poll_interval_seconds = max(
             float(poll_interval_seconds), float(minimum_poll_seconds), 0.0
         )
+        self.fixed_poll_interval_seconds = getattr(driver, "fixed_poll_interval_seconds", None)
+        if self.fixed_poll_interval_seconds is not None:
+            self.actual_poll_interval_seconds = float(self.fixed_poll_interval_seconds)
+        self.skipped_poll_cycles = 0
+        self.last_round_seconds = None
+        self.observed_poll_interval_seconds = None
+        self._previous_round_start = None
         self.reconnect_backoff_seconds = max(0.0, float(reconnect_backoff_seconds))
         self.max_reconnect_backoff_seconds = max(
             self.reconnect_backoff_seconds,
@@ -103,6 +111,7 @@ class LocalDirectAdapter:
         self.wall_clock = wall_clock
         self.stop_event = threading.Event()
         self.opened = threading.Event()
+        self.opened_monotonic = None
         self.thread: threading.Thread | None = None
         self._close_lock = threading.Lock()
         self._stop_close_thread: threading.Thread | None = None
@@ -113,10 +122,12 @@ class LocalDirectAdapter:
         self._reconnect_window_started_monotonic: float | None = None
         self.consecutive_failures = 0
         self.last_error = ""
+        self.release_error = ""
         self.last_sample_monotonic: float | None = None
         self.state = "idle"
         self.start_events = []
         self.source_observations: list[dict[str, float | int]] = []
+        self.receive_lock = threading.RLock()
 
     def _event(self, stage):
         if len(self.start_events) < 64:
@@ -144,7 +155,8 @@ class LocalDirectAdapter:
             return False
         received_monotonic = float(record["host_monotonic"]) if record else self.clock()
         received_wall_time = float(record["host_wall_time"]) if record else self.wall_clock()
-        self.source_sequence += 1
+        plc_record = record if isinstance(record, Mapping) and record.get("measurement_profile") == "fibercontrol_plc_v1" else None
+        self.source_sequence = int(plc_record["source_sequence"]) if plc_record else self.source_sequence + 1
         self.source_observations.append({
             "source_sequence": self.source_sequence,
             "received_monotonic": received_monotonic,
@@ -157,6 +169,9 @@ class LocalDirectAdapter:
             received_wall_time = float(driver_metadata.get("received_wall_time") or received_wall_time)
         if record and isinstance(driver_metadata, Mapping):
             driver_metadata = dict(driver_metadata, latest_record=dict(record))
+        if plc_record:
+            driver_metadata = {"driver": "modbus_tcp", "measurement_profile": plc_record["measurement_profile"],
+                               "latest_record": deepcopy(plc_record)}
         samples = []
         for name, raw_value in accepted:
             value = _finite(raw_value)
@@ -174,7 +189,8 @@ class LocalDirectAdapter:
                     received_monotonic=received_monotonic,
                     device_timestamp=getattr(self.driver, "source_timestamp", None),
                     source_sequence=self.source_sequence,
-                    protocol_ok=getattr(self.driver, "protocol_verified", None),
+                    protocol_ok=plc_record["protocol_ok"] if plc_record else getattr(self.driver, "protocol_verified", None),
+                    error=str(plc_record.get("error") or "") if plc_record else "",
                     metadata=(
                         driver_metadata if isinstance(driver_metadata, Mapping) else {}
                     ),
@@ -184,8 +200,9 @@ class LocalDirectAdapter:
         if self.source_sequence <= 2:
             self._event("source_first" if self.source_sequence == 1 else "source_second")
         self.last_sample_monotonic = received_monotonic
-        self._consecutive_reconnect_attempts = 0
-        self._reconnect_window_started_monotonic = None
+        if not plc_record:
+            self._consecutive_reconnect_attempts = 0
+            self._reconnect_window_started_monotonic = None
         return True
 
     def _reconnect_window_remaining(self, now: float | None = None) -> float:
@@ -199,11 +216,14 @@ class LocalDirectAdapter:
         with self._close_lock:
             try:
                 self.driver.close()
+                self.release_error = ""
             except Exception as exc:
+                self.release_error = str(exc)
                 if not self.last_error:
                     self.last_error = str(exc)
 
     def _run(self) -> None:
+        round_start = None
         try:
             while not self.stop_event.is_set():
                 try:
@@ -219,23 +239,41 @@ class LocalDirectAdapter:
                     if self.stop_event.is_set():
                         break
                     self.driver.open()
+                    self.opened_monotonic = self.clock()
                     self._event("protocol_open_end")
                     self.opened.set()
                     self.state = "running"
+                    next_poll = self.clock()
                     while not self.stop_event.is_set():
-                        self.read_calls += 1
-                        if hasattr(self.driver, "read_samples"):
-                            for payload, record in self.driver.read_samples():
-                                if self._publish(payload, record):
-                                    self.consecutive_failures = 0
+                        round_start = self.clock()
+                        if self._previous_round_start is not None:
+                            self.observed_poll_interval_seconds = round_start - self._previous_round_start
+                        self._previous_round_start = round_start
+                        with self.receive_lock:
+                            self.read_calls += 1
+                            if hasattr(self.driver, "read_samples"):
+                                for payload, record in self.driver.read_samples():
+                                    if self._publish(payload, record):
+                                        self.consecutive_failures = 0
+                                if self.fixed_poll_interval_seconds is not None:
+                                    self._consecutive_reconnect_attempts = 0
+                                    self._reconnect_window_started_monotonic = None
+                            else:
+                                payload = self.driver.read_sample()
+                                if isinstance(payload, Mapping) and payload:
+                                    if self._publish(payload):
+                                        self.consecutive_failures = 0
+                        self.last_round_seconds = max(0.0, self.clock() - round_start)
+                        if self.fixed_poll_interval_seconds is not None:
+                            next_poll, skipped = self.next_poll_deadline(next_poll, self.clock(), self.actual_poll_interval_seconds)
+                            self.skipped_poll_cycles += skipped
+                            self.stop_event.wait(max(0.0, next_poll - self.clock()))
                         else:
-                            payload = self.driver.read_sample()
-                            if isinstance(payload, Mapping) and payload:
-                                if self._publish(payload):
-                                    self.consecutive_failures = 0
-                        self.stop_event.wait(self.actual_poll_interval_seconds)
+                            self.stop_event.wait(self.actual_poll_interval_seconds)
                     break
                 except Exception as exc:
+                    if self.fixed_poll_interval_seconds is not None and round_start is not None:
+                        self.last_round_seconds = max(0.0, self.clock() - round_start)
                     self.last_error = str(exc) or exc.__class__.__name__
                     self.consecutive_failures += 1
                     self._safe_close()
@@ -284,6 +322,12 @@ class LocalDirectAdapter:
             if self.state != "failed":
                 self.state = "stopped"
 
+    @staticmethod
+    def next_poll_deadline(previous: float, completed: float, period: float) -> tuple[float, int]:
+        deadline = previous + period
+        skipped = max(0, math.floor((completed - deadline) / period) + 1) if completed > deadline else 0
+        return deadline + skipped * period, skipped
+
     def stop(self, timeout_seconds: float = 0.5) -> bool:
         deadline = time.monotonic() + max(0.0, float(timeout_seconds))
         self.stop_event.set()
@@ -307,6 +351,7 @@ class LocalDirectAdapter:
             (thread is None or not thread.is_alive())
             and not close_thread.is_alive()
             and not bool(getattr(self.driver, "native_call_pending", False))
+            and not self.release_error
         )
         if not stopped:
             self.state = "stop_timed_out"
@@ -328,6 +373,7 @@ class LocalDirectAdapter:
             "state": reported_state,
             "running": bool(thread is not None and thread.is_alive()),
             "opened": self.opened.is_set(),
+            "opened_monotonic": self.opened_monotonic,
             "first_sample_received": first_sample_received,
             "read_calls": self.read_calls,
             "source_sequence": self.source_sequence,
@@ -342,7 +388,11 @@ class LocalDirectAdapter:
             "reconnect_window_remaining_seconds": reconnect_window_remaining,
             "consecutive_failures": self.consecutive_failures,
             "actual_poll_interval_seconds": self.actual_poll_interval_seconds,
+            "observed_poll_interval_seconds": self.observed_poll_interval_seconds,
+            "last_round_seconds": self.last_round_seconds,
+            "skipped_poll_cycles": self.skipped_poll_cycles,
             "last_sample_monotonic": self.last_sample_monotonic,
             "last_error": self.last_error,
+            "release_error": self.release_error,
             "start_events": list(self.start_events),
         }

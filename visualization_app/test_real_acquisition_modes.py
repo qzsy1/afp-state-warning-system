@@ -203,6 +203,35 @@ class AcquisitionModeConfigurationTests(unittest.TestCase):
 
 
 class AcquisitionModeEquivalenceTests(unittest.TestCase):
+    def test_plc_negative_zero_fault_and_held_sources_match_both_frame_contracts(self):
+        from test_plc_modbus_contract import PlcModbusContractTests
+        from plc_measurement import frame_source_records
+        from thermocouple64 import raw_catalog
+        fixture = PlcModbusContractTests()
+        for raw in (-2.5, 0.0, float("inf")):
+            driver = fixture.make_driver({"压力": raw}, clock=lambda: 10.0, wall_clock=lambda: 1000.0)
+            cache = ChannelSampleCache()
+            adapter = LocalDirectAdapter("plc", driver, ["压力"], cache)
+            events = driver.read_samples()
+            payload, record = next(events)
+            adapter._publish(payload, record)
+            assembler = FrameAssembler(["压力"], 10, {"压力": .5}, start_monotonic=10,
+                                       start_wall_time=1000, clock=lambda: 10.1)
+            first = assembler.assemble(cache, 10.1)
+            for frame in (first, assembler.assemble(cache, 10.2)):
+                v1 = frame.to_envelope("plc-capture", {"压力": "N"})
+                restored = UnifiedFrame.from_envelope(v1)
+                self.assertEqual(restored.values(), frame.values())
+                self.assertEqual(restored.quality(), frame.quality())
+                self.assertEqual(frame_source_records(restored), frame_source_records(frame))
+                catalog = raw_catalog(["压力"], {"压力": "N"})
+                v2 = frame.to_envelope_v2(session_id="plc-capture", mode_id="test", catalog=catalog)
+                restored = UnifiedFrame.from_envelope_v2(v2, expected_session_id="plc-capture", expected_mode_id="test", catalog=catalog)
+                self.assertEqual(restored.values(), frame.values())
+                self.assertEqual(restored.quality(), frame.quality())
+                self.assertEqual(frame_source_records(restored), frame_source_records(frame))
+            self.assertEqual(first.channels["压力"].received_monotonic, 10)
+
     def test_local_adapter_and_remote_mirror_normalize_identical_input_equivalently(self) -> None:
         class Driver:
             protocol_verified = True

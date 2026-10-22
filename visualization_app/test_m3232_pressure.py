@@ -6,6 +6,10 @@ import tempfile
 import unittest
 import math
 import types
+import hashlib
+import csv
+import threading
+import os
 from unittest.mock import patch
 
 from m3232_serial import MatrixParser, MatrixRecorder, RAW_CHANNEL, PROTOCOL, load_calibration, matrix_csv_path
@@ -410,6 +414,158 @@ class M3232PressureDriverTests(unittest.TestCase):
         )
         self.assertEqual(assignments["plc_process"], ["压力"])
         self.assertEqual(assignments["m3232_pressure"], [RAW_CHANNEL])
+
+
+class EmptyCancelledMatrixTests(unittest.TestCase):
+    def test_failed_serial_release_cannot_prove_empty_cancellation(self):
+        driver, serial = driver_double()
+        driver.open()
+        with patch.object(serial, "close", side_effect=OSError("close_failed")):
+            with self.assertRaisesRegex(OSError, "close_failed"):
+                driver.close()
+        self.assertIsNone(driver._close_receive_pending)
+
+    def fixture(self, root):
+        context = dict(capture_uuid="capture", capture_generation="a" * 32, run_id="capture-L1",
+                       layer_id=1, main_csv="main.csv", interface_id="film")
+        target = matrix_csv_path(Path(root) / "main.csv")
+        recorder = MatrixRecorder(root, context, csv_path=target.with_name(target.name + ".partial"))
+        driver = types.SimpleNamespace(serial=None, _close_receive_pending=0, total_bytes=0,
+                                       total_frames=0, parser=MatrixParser(), stop_error="")
+        return driver, recorder, context
+
+    def test_confirmed_empty_file_is_preserved_and_does_not_block_reopened_manager(self):
+        from acquisition import AcquisitionManager, scan_persistence_recovery
+        from m3232_serial import archive_empty_cancelled_matrix
+        with tempfile.TemporaryDirectory() as root:
+            driver, recorder, context = self.fixture(root)
+            recorder.close({})
+            original = recorder.csv_path.read_bytes()
+            self.assertTrue(scan_persistence_recovery(root)["blocked"])
+            result = archive_empty_cancelled_matrix(driver, recorder, session_dir=root, context=context)
+            self.assertEqual(Path(result["archived_path"]).read_bytes(), original)
+            self.assertEqual(result["sha256"], hashlib.sha256(original).hexdigest())
+            self.assertFalse(recorder.csv_path.exists())
+            reopened = AcquisitionManager(Path(root))
+            self.assertFalse(reopened.recovery_state["blocked"])
+            self.assertEqual(reopened.capture_phase, "idle")
+            other = Path(root) / "other.csv.partial"
+            other.write_text("real,data\n1,2\n")
+            self.assertTrue(scan_persistence_recovery(root)["blocked"])
+            self.assertEqual(other.read_text(), "real,data\n1,2\n")
+
+    def test_uncertain_or_nonempty_files_remain_recovery_blockers(self):
+        from acquisition import scan_persistence_recovery
+        from m3232_serial import archive_empty_cancelled_matrix
+        for case in ["live_writer", "received_bytes", "frame", "half_frame", "pending_receive",
+                     "unknown_receive", "writer_error", "stop_error", "raw_receive", "malformed_header",
+                     "csv_data", "wrong_owner"]:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as root:
+                driver, recorder, context = self.fixture(root)
+                try:
+                    if case == "raw_receive":
+                        recorder.submit(dict(kind="serial", direction="rx", raw_hex="5b5b30"))
+                    if case == "frame":
+                        recorder.submit(dict(kind="matrix", matrix=ZERO_MATRIX, host_wall_time=1700000000,
+                                             receive_sequence=1))
+                    if case != "live_writer":
+                        recorder.close({})
+                    if case == "received_bytes": driver.total_bytes = 1
+                    if case == "half_frame": driver.parser.buffer.extend(b"[[0")
+                    if case == "pending_receive": driver._close_receive_pending = 1
+                    if case == "unknown_receive": driver._close_receive_pending = None
+                    if case == "writer_error": recorder.error = "disk_full"
+                    if case == "stop_error": driver.stop_error = "release_failed"
+                    if case == "wrong_owner": context = {**context, "capture_generation": "b" * 32}
+                    if case == "malformed_header": recorder.csv_path.write_text("R01C01\n", encoding="utf8")
+                    if case == "csv_data":
+                        with recorder.csv_path.open("a", encoding="utf-8", newline="") as stream:
+                            csv.writer(stream).writerow(["0"] * 1041)
+                    before = recorder.csv_path.read_bytes()
+                    self.assertIsNone(archive_empty_cancelled_matrix(driver, recorder, session_dir=root, context=context))
+                    self.assertEqual(recorder.csv_path.read_bytes(), before)
+                    self.assertTrue(scan_persistence_recovery(root)["blocked"])
+                finally:
+                    recorder.close({})
+
+    def test_only_matching_cancelled_start_with_no_samples_can_archive(self):
+        import acquisition as a
+        for blocked in [None, "samples", "generation", "not_cancelled"]:
+            with self.subTest(blocked=blocked), tempfile.TemporaryDirectory() as root:
+                driver, recorder, context = self.fixture(root)
+                recorder.close({})
+                manager = a.AcquisitionManager(Path(root), recovery_scan=False)
+                config = types.SimpleNamespace(capture_generation=context["capture_generation"],
+                    run_id=context["run_id"], layer=0,
+                    interfaces=[dict(id="film", enabled=True, driver="m3232_pressure")])
+                manager.config, manager.capture_uuid = config, context["capture_uuid"]
+                manager.session_dir, manager.raw_path = Path(root), Path(root) / context["main_csv"]
+                manager.driver = object.__new__(a.MultiInterfaceDriver)
+                manager.driver._closed_matrix_sources = {"film": ("film", driver, recorder)}
+                manager._start_thread = threading.current_thread()
+                manager._start_cancel.set()
+                manager._start_job = dict(state="cancelling", capture_generation=context["capture_generation"])
+                if blocked == "samples": manager.total_sample_count = 1
+                if blocked == "generation": manager._start_job["capture_generation"] = "b" * 32
+                if blocked == "not_cancelled": manager._start_cancel.clear()
+                manager._archive_cancelled_empty_matrix_files(config)
+                self.assertEqual(recorder.csv_path.exists(), blocked is not None)
+
+    def test_archive_failure_restores_original_recovery_blocker(self):
+        from acquisition import scan_persistence_recovery
+        from m3232_serial import archive_empty_cancelled_matrix
+        with tempfile.TemporaryDirectory() as root:
+            driver, recorder, context = self.fixture(root)
+            recorder.close({})
+            before = recorder.csv_path.read_bytes()
+            replace = os.replace
+            def fail_audit(source, destination):
+                if Path(destination).name == "cancelled_empty_matrix.json":
+                    raise OSError("disk_full")
+                return replace(source, destination)
+            with patch("m3232_serial.os.replace", side_effect=fail_audit):
+                with self.assertRaisesRegex(OSError, "disk_full"):
+                    archive_empty_cancelled_matrix(driver, recorder, session_dir=root, context=context)
+            self.assertEqual(recorder.csv_path.read_bytes(), before)
+            self.assertTrue(scan_persistence_recovery(root)["blocked"])
+
+    def test_cancel_during_device_open_archives_only_its_empty_matrix(self):
+        import acquisition as a
+        with tempfile.TemporaryDirectory() as root:
+            manager = a.AcquisitionManager(Path(root), recovery_scan=False)
+            cfg = a.AcquisitionConfig(acquisition_mode="real", processing_mode="capture_only",
+                dataset_schema="new_collection_v13_0", selected_sensors=[RAW_CHANNEL], save_root=root,
+                interfaces=[dict(id="film", role="pressure", driver="m3232_pressure", endpoint="COM_TEST",
+                    device_identity=dict(confirmed=True, endpoint="COM_TEST", location="fixture-only"),
+                    physical_interface_id="serial:COM_TEST", physical_verified=True)])
+            entered = threading.Event()
+            records = []
+            def build(current):
+                item = current.interfaces[0]
+                context = {**item["_matrix_csv_context"], "interface_id": "film"}
+                recorder = MatrixRecorder(item["_raw_capture_root"], context,
+                                          csv_path=item["_matrix_csv_work_path"])
+                recorder.close({})
+                closed = types.SimpleNamespace(serial=None, _close_receive_pending=0, total_bytes=0,
+                    total_frames=0, parser=MatrixParser(), stop_error="")
+                multi = a.MultiInterfaceDriver([], [RAW_CHANNEL])
+                multi._closed_matrix_sources = {"film": ("film", closed, recorder)}
+                def opening():
+                    entered.set()
+                    manager._start_cancel.wait(3)
+                    raise RuntimeError("capture_start_cancelled")
+                multi.open = opening
+                records.append(recorder)
+                return multi
+            with patch("acquisition.build_driver", side_effect=build):
+                manager.start_async(cfg)
+                self.assertTrue(entered.wait(2))
+                manager.cancel_start()
+                manager._start_thread.join(3)
+            self.assertFalse(manager._start_thread.is_alive())
+            self.assertEqual(manager.start_operation_status()["state"], "cancelled")
+            self.assertFalse(records[0].csv_path.exists())
+            self.assertFalse(a.AcquisitionManager(Path(root)).recovery_state["blocked"])
 
 
 if __name__ == "__main__":

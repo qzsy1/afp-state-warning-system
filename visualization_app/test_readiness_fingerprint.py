@@ -10,6 +10,16 @@ except ModuleNotFoundError:
 
 
 class ReadinessFingerprintTests(unittest.TestCase):
+    def test_plc_register_mapping_and_measurement_profile_revoke_readiness(self):
+        config = self._config()
+        config["interfaces"][0].update(role="plc", driver="modbus_tcp",
+            measurement_profile="fibercontrol_plc_v1", register_map={"压力":37})
+        baseline = readiness_config_fingerprint(config)
+        for key, value in {"register_map":{"压力":100}, "measurement_profile":"unsupported"}.items():
+            changed = copy.deepcopy(config)
+            changed["interfaces"][0][key] = value
+            self.assertNotEqual(readiness_config_fingerprint(changed), baseline)
+
     def test_tc64_parameters_and_missing_profile_migration_revoke_readiness(self):
         config = self._config()
         config["interfaces"][0].update(role="thermocouple64", driver="huipu_tc64_modbus_rtu")

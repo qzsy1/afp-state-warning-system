@@ -29,6 +29,37 @@ DEVICE_CASES = (
 )
 
 
+class PlcSlowRoundIsolationTests(unittest.TestCase):
+    def test_production_plc_late_pressure_does_not_block_another_interface(self):
+        from test_plc_modbus_contract import PlcModbusContractTests
+        fixture = PlcModbusContractTests().make_driver({"温度": 102.25, "张力": 12.75, "压力": -2.5})
+        fixture.open = lambda: None
+        original = fixture._read_holding_registers
+        entered, release = threading.Event(), threading.Event()
+        def delayed(address, quantity):
+            if address == 37:
+                entered.set()
+                release.wait(1)
+            return original(address, quantity)
+        fixture._read_holding_registers = delayed
+        fixture.close = lambda: release.set()
+        cache = ChannelSampleCache()
+        plc = LocalDirectAdapter("plc", fixture, ["温度", "压力", "张力"], cache)
+        other = LocalDirectAdapter("other", RecoveringDriver("ABB_X"), ["ABB_X"], cache)
+        plc.start()
+        other.start()
+        try:
+            self.assertTrue(entered.wait(.5))
+            self.assertTrue(wait_until(lambda: other.read_calls >= 2))
+            self.assertIsNotNone(cache.latest("温度"))
+            self.assertIsNone(cache.latest("压力"))
+            self.assertGreaterEqual(other.read_calls, 2)
+        finally:
+            release.set()
+            self.assertTrue(plc.stop(1))
+            self.assertTrue(other.stop(1))
+
+
 def wait_until(predicate, timeout: float = 1.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import http.client
+import io
 import json
 import sys
 import tempfile
@@ -32,6 +33,111 @@ from training_data import read_excel_or_folder  # noqa: E402
 
 
 class AcquisitionIntegrityTests(unittest.TestCase):
+    def test_plc_production_frames_csv_sidecar_and_mysql_share_clamped_sources(self):
+        from test_plc_modbus_contract import PlcModbusContractTests
+        from test_mysql_identity import _FakeConnection
+        from mysql_storage import MySQLCaptureStore
+        from contextlib import ExitStack
+        staging = Path(r"D:\AFP_Runtime\.afp-staging")
+        staging.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=staging, prefix="plc-contract-") as temp:
+            root = Path(temp)
+            driver = PlcModbusContractTests().make_driver({"温度": 102.25, "张力": 12.75, "压力": -2.5})
+            driver.open = lambda: None
+            driver.close = lambda: None
+            config = AcquisitionConfig(
+                processing_mode="capture_only", acquisition_mode="real", real_acquisition_mode="local_direct",
+                dataset_schema="new_collection_v11_3", selected_sensors=["温度", "压力", "张力"],
+                sample_rate_hz=20, save_root=str(root), condition_id="PLC_FIXTURE",
+                interfaces=[{"id":"plc", "role":"plc", "driver":"modbus_tcp", "endpoint":"192.168.125.5:502",
+                             "physical_interface_id":"ethernet:fixture", "physical_interface_kind":"ethernet", "physical_verified":True}],
+                interface_channel_assignments={"plc":["温度", "压力", "张力"]})
+            manager = AcquisitionManager(root, recovery_scan=False)
+            route = {"ok":True, "actual_source_address":"192.168.125.209"}
+            with ExitStack() as stack:
+                stack.enter_context(patch("acquisition.ModbusTcpDriver", return_value=driver))
+                stack.enter_context(patch("acquisition.require_network_path", return_value=route))
+                stack.enter_context(patch("acquisition.validate_network_path", return_value=route))
+                stack.enter_context(patch("acquisition.device_profile_readiness", return_value={"ready":True,"missing_device_facts":[]}))
+                self.assertTrue(manager.test_connection(config)["ok"])
+                manager.start(config)
+                try:
+                    deadline = time.monotonic() + 3
+                    while manager.total_sample_count < 8 and time.monotonic() < deadline:
+                        time.sleep(.01)
+                finally:
+                    stopped = manager.stop()
+            self.assertTrue(stopped["capture_saved"], stopped.get("last_error"))
+            with Path(stopped["layer_file"]).open(encoding="gb18030", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            with Path(stopped["timestamp_file"]).open(encoding="utf-8-sig", newline="") as handle:
+                sidecar = list(csv.DictReader(handle))
+            self.assertEqual(len(rows), len(sidecar))
+            source_rows = []
+            for row, timestamp in zip(rows, sidecar):
+                records = json.loads(timestamp["channel_source_record_json"])
+                if row.get("压力") not in (None, ""):
+                    self.assertEqual(float(row["压力"]), 0)
+                    self.assertEqual(records["压力"]["decoded_value"], -2.5)
+                    self.assertEqual(records["压力"]["normalized_value"], 0)
+                    self.assertTrue(records["压力"]["negative_pressure_clamped"])
+                    self.assertEqual(records["压力"]["source_sequence"], json.loads(timestamp["channel_source_sequence_json"])["压力"])
+                    source_rows.append(records["压力"])
+            self.assertGreaterEqual(len(source_rows), 5)
+            self.assertIn("held_within_freshness", {record["frame_quality"] for record in source_rows})
+            self.assertGreater(len({record["source_sequence"] for record in source_rows}), 1)
+            connection = _FakeConnection()
+            store = MySQLCaptureStore(MySQLSettings(enabled=True, database="afp_fixture"))
+            with patch.object(store, "_connect", return_value=("fake", connection)):
+                result = store.save_layer(config, rows=iter(rows), layer_file=stopped["layer_file"], full_specimen_file=None,
+                    timestamp_file=stopped["timestamp_file"], folder_path=None, summary={})
+            self.assertTrue(result["ok"], result)
+            evidence = [json.loads(value[4]) for sql, values in connection.cursor_instance.executed
+                        if "INSERT INTO afp_source_evidence" in sql for value in values]
+            self.assertEqual(len(evidence), len(sidecar))
+            for item, timestamp in zip(evidence, sidecar):
+                self.assertEqual(item["channels"], json.loads(timestamp["channel_source_record_json"]))
+            samples = [value for sql, values in connection.cursor_instance.executed if "INSERT INTO afp_sensor_sample" in sql for value in values]
+            self.assertTrue(all(json.loads(value[5]).get("压力", 0) == 0 for value in samples))
+            manifest = json.loads(manager.session_metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["plc_measurement"]["plc"]["measurement_profile"], "fibercontrol_plc_v1")
+
+    def test_start_blocker_message_identifies_file_and_recovery_action(self) -> None:
+        manager = AcquisitionManager(recovery_scan=False)
+        manager.finalization_complete = False
+        manager.capture_phase = "finalization_failed"
+        manager.recovery_state["files"] = [{"name": "unfinished-matrix.csv.partial"}]
+        with self.assertRaisesRegex(RuntimeError, "unfinished-matrix.csv.partial.*恢复.*补传"):
+            manager._start_new(AcquisitionConfig())
+
+    def test_csv_merge_preserves_mapping_quoting_and_irregular_row_behavior(self) -> None:
+        cases = [
+            ("a,b\r\n1,2\r\n\r\n3\r\n", ["a", "b"], "raise"),
+            ('a,b\r\n"a,b","line1\r\nline2"\r\n', ["a", "b"], "raise"),
+            ("b,a\r\n2,1\r\n", ["a", "b"], "raise"),
+            ("a,a\r\n1,2\r\n", ["a", "a"], "raise"),
+            ("a,b\r\n1,2,3\r\n", ["a", "b"], "ignore"),
+            ("a,b\r\n1,2,3\r\n", ["a", "b"], "raise"),
+            ("", ["a", "b"], "raise"),
+        ]
+        for text, columns, extrasaction in cases:
+            with self.subTest(text=text, columns=columns, extrasaction=extrasaction):
+                outputs, failures = [], []
+                for optimized in (False, True):
+                    output = io.StringIO(newline="")
+                    reader = csv.DictReader(io.StringIO(text, newline=""))
+                    try:
+                        if optimized:
+                            acquisition._append_csv_rows(output, reader, columns, extrasaction=extrasaction)
+                        else:
+                            csv.DictWriter(output, fieldnames=columns, extrasaction=extrasaction).writerows(reader)
+                        failures.append(None)
+                    except ValueError as error:
+                        failures.append(str(error))
+                    outputs.append(output.getvalue())
+                self.assertEqual(outputs[0], outputs[1])
+                self.assertEqual(failures[0], failures[1])
+
     def test_simulation_five_interface_defaults_materialize_distinct_channel_assignments(self) -> None:
         interfaces = acquisition.default_capture_interfaces()
         config = acquisition.AcquisitionConfig(
@@ -962,6 +1068,15 @@ class AcquisitionIntegrityTests(unittest.TestCase):
             self.assertTrue(first["capture_saved"])
             self.assertEqual(first["raw_file"], second["raw_file"])
             self.assertEqual(FakeStore.save_calls, 1)
+            stages = [event["stage"] for event in first["capture_timeline"]["events"]]
+            expected = ["stop_requested", "sampling_loop_stopped", "persistence_drain_begin",
+                        "persistence_drain_end", "devices_released", "file_finalize_begin",
+                        "file_finalize_end", "specimen_rebuild_begin", "specimen_rebuild_end",
+                        "finalization_result"]
+            self.assertEqual([stage for stage in stages if stage in expected], expected)
+            result = first["capture_timeline"]["events"][-1]
+            self.assertTrue(result["complete"])
+            self.assertTrue(result["capture_saved"])
 
     def test_completed_layer_is_saved_to_local_and_target_mysql(self) -> None:
         class FakeStore:

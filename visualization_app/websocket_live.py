@@ -32,6 +32,7 @@ def compact_live_payload(payload: dict[str, Any]) -> dict[str, Any]:
     observation_indices: dict[Any, int] = {}
     shared_arrays: list[list[Any]] = []
     array_indices: dict[Any, int] = {}
+    source_arrays: dict[int, list[tuple[list[Any], list[Any]]]] = {}
 
     def reference(source):
         if source is None:
@@ -48,11 +49,19 @@ def compact_live_payload(payload: dict[str, Any]) -> dict[str, Any]:
             observations.append(source)
         return index
 
-    packed = []
-    for channel in channels:
+    def pack_sources(values):
+        candidates = source_arrays.setdefault(len(values), [])
+        for original, packed_values in candidates:
+            if original == values:
+                return packed_values
+        packed_values = [reference(value) for value in values]
+        candidates.append((values, packed_values))
+        return packed_values
+
+    def pack_channel(channel):
         item = dict(channel)
         if isinstance(item.get("source_observations"), list):
-            item["source_observations"] = [reference(source) for source in item["source_observations"]]
+            item["source_observations"] = pack_sources(item["source_observations"])
         for field in ("x_observed", "x_future", "actual", "quality_history", "source_observations",
                       "prediction_observed", "prediction_future"):
             values = item.get(field)
@@ -68,20 +77,35 @@ def compact_live_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 array_indices[key] = index
                 shared_arrays.append(values)
             item[field] = {"live_array_index": index}
-        packed.append(item)
+        return item
+
+    packed = [pack_channel(channel) for channel in channels]
     indices = {id(channel): index for index, channel in enumerate(channels)}
+    candidates = {}
+    for index, channel in enumerate(channels):
+        candidates.setdefault((channel.get("id"), channel.get("name")), []).append(index)
+
+    def channel_reference(channel):
+        index = indices.get(id(channel))
+        if index is None and isinstance(channel, dict):
+            index = next((candidate for candidate in candidates.get((channel.get("id"), channel.get("name")), [])
+                          if channels[candidate] == channel), None)
+        if index is not None:
+            return {"live_channel_index": index}
+        return pack_channel(channel) if isinstance(channel, dict) else channel
+
     result = {**payload, "channels": packed,
               "live_encoding": {"version": 1, "source_observations": observations,
                                 "shared_arrays": shared_arrays}}
     selected = payload.get("selected_channel")
-    if id(selected) in indices:
-        result["selected_channel"] = {"live_channel_index": indices[id(selected)]}
+    if isinstance(selected, dict):
+        result["selected_channel"] = channel_reference(selected)
     thermocouples = payload.get("thermocouple64")
     if isinstance(thermocouples, dict):
         result["thermocouple64"] = {
             **thermocouples,
             "other_channels": [
-                {"live_channel_index": indices[id(channel)]} if id(channel) in indices else channel
+                channel_reference(channel)
                 for channel in thermocouples.get("other_channels", [])
             ],
         }

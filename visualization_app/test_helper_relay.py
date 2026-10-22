@@ -42,6 +42,16 @@ class MutableIngressLoader:
 
 
 class HelperRelayTests(unittest.TestCase):
+    def test_legacy_helper_rejects_plc_measurement_before_queuing(self):
+        registry = HelperRegistry()
+        self.pair(registry)
+        result = registry.command("session-a", "start_capture", {
+            "acquisition_mode": "real", "interfaces": [{"driver": "modbus_tcp", "enabled": True}],
+        })
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "plc_measurement_incompatible")
+        self.assertFalse(result["queued"])
+
     def setUp(self):
         self.runtime_directory = tempfile.TemporaryDirectory()
 

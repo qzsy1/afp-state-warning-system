@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 import acquisition as a
+from local_direct_acquisition import LocalDirectAdapter
 
 
 CHANNELS = {"plc": ["温度", "压力", "张力"], "robot": ["ABB_X", "ABB_Y", "ABB_Z", "线速度"]}
@@ -68,16 +69,32 @@ def _probe_interface(item, duration_seconds, sample_rate_hz):
         start = time.monotonic()
         deadline = start + duration_seconds
         next_poll = start
+        period = 0.1 if role == "plc" else 1.0 / sample_rate_hz
+        result["target_poll_interval_seconds"] = period
+        result["skipped_poll_cycles"] = 0
         while time.monotonic() < deadline:
-            values = driver.read_sample() or {}
-            result["samples"].append({
-                "at": time.time(), "elapsed_seconds": time.monotonic() - start,
-                "values": {name: _finite(values.get(name)) for name in CHANNELS[role]},
-                "actual_source_address": driver.actual_source_address,
-            })
+            values, records = {}, {}
+            try:
+                if role == "plc" and hasattr(driver, "read_samples"):
+                    for payload, record in driver.read_samples():
+                        values.update(payload)
+                        records[record["channel"]] = record
+                else:
+                    values = driver.read_sample() or {}
+            finally:
+                result["samples"].append({
+                    "at": time.time(), "elapsed_seconds": time.monotonic() - start,
+                    "values": {name: _finite(values.get(name)) for name in CHANNELS[role]},
+                    "channel_source_records": records,
+                    "actual_source_address": driver.actual_source_address,
+                })
             if driver.actual_source_address != source:
                 raise RuntimeError("network_path_invalid: protocol connection source changed")
-            next_poll += 1.0 / sample_rate_hz
+            if role == "plc":
+                next_poll, skipped = LocalDirectAdapter.next_poll_deadline(next_poll, time.monotonic(), period)
+                result["skipped_poll_cycles"] += skipped
+            else:
+                next_poll += period
             time.sleep(max(0.0, min(next_poll, deadline) - time.monotonic()))
     except Exception as exc:
         result["errors"].append(str(exc))

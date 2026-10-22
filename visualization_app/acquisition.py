@@ -45,6 +45,7 @@ from esr1001_usb import (
     vendor_display,
 )
 from m3232_serial import (M3232PressureDriver, MatrixRecorder, normalize_config as normalize_m3232,
+    archive_empty_cancelled_matrix,
     matrix_csv_path,
     BAUDRATE as M3232_BAUDRATE, RAW_CHANNEL as M3232_RAW_CHANNEL)
 from simulation_replay import MonotonicReplayScheduler
@@ -62,6 +63,7 @@ from real_acquisition import (
     readiness_config_fingerprint,
 )
 from local_direct_acquisition import LocalDirectAdapter, minimum_poll_interval
+from plc_measurement import frame_source_records
 from release_contract import assert_config_contract, load_release_contract
 from thermocouple64 import (
     THERMOCOUPLE64_CHANNELS,
@@ -1068,6 +1070,7 @@ class BoundedCsvWriter:
         *,
         max_queue_rows: int = 1024,
         submit_timeout_seconds: float = 0.05,
+        on_written=None,
     ) -> None:
         self.row_writer = row_writer
         self.timestamp_writer = timestamp_writer
@@ -1075,6 +1078,7 @@ class BoundedCsvWriter:
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, int(max_queue_rows)))
         self._error: BaseException | None = None
         self._closed = False
+        self.on_written = on_written
         self.high_water_rows = 0
         self._thread = threading.Thread(
             target=self._run,
@@ -1090,9 +1094,11 @@ class BoundedCsvWriter:
                 if item is self._STOP:
                     return
                 if self._error is None:
-                    row, timestamp = item
+                    row, timestamp, valid_sample = item
                     self.row_writer.writerow(row)
                     self.timestamp_writer.writerow(timestamp)
+                    if self.on_written is not None and valid_sample:
+                        self.on_written(row, timestamp)
             except BaseException as exc:
                 self._error = exc
             finally:
@@ -1102,13 +1108,13 @@ class BoundedCsvWriter:
         if self._error is not None:
             raise RuntimeError(f"persistence_write_failed: {self._error}") from self._error
 
-    def submit(self, row: dict[str, Any], timestamp: dict[str, Any]) -> None:
+    def submit(self, row: dict[str, Any], timestamp: dict[str, Any], *, valid_sample=False) -> None:
         if self._closed:
             raise RuntimeError("persistence_writer_closed")
         self._raise_error()
         try:
             self._queue.put(
-                (dict(row), dict(timestamp)),
+                (dict(row), dict(timestamp), valid_sample),
                 timeout=self.submit_timeout_seconds,
             )
             self.high_water_rows = max(self.high_water_rows, self._queue.qsize())
@@ -2135,6 +2141,11 @@ class AcquisitionConfig:
                 )
             )
             _apply_sensor_interface_profile(interface)
+            if interface["driver"] == "modbus_tcp":
+                interface["measurement_profile"] = str(interface.get("measurement_profile") or "fibercontrol_plc_v1")
+                if interface["measurement_profile"] != "fibercontrol_plc_v1":
+                    raise ValueError("unsupported PLC measurement_profile")
+                interface["poll_interval_seconds"] = 0.1
             if self.acquisition_mode == "simulation" and interface.get("driver") == "m3232_pressure":
                 interface["channels"] = ["薄膜压力"]
             authoritative_device_profile = SHARED_DEVICE_PROFILES.get(interface["role"])
@@ -3467,9 +3478,18 @@ class ModbusTcpDriver(SampleDriver):
 
     def __init__(self, endpoint: str, register_map: dict[str, int] | None = None,
                  slave_id: int = DEFAULT_PLC_SLAVE_ID, timeout: float = 1.0,
-                 source_address: str = "") -> None:
+                 source_address: str = "", measurement_profile: str = "fibercontrol_plc_v1",
+                 clock=time.monotonic, wall_clock=time.time) -> None:
+        if measurement_profile != "fibercontrol_plc_v1":
+            raise ValueError("unsupported PLC measurement_profile")
+        self.measurement_profile = measurement_profile
+        self.fixed_poll_interval_seconds = 0.1
+        self.clock, self.wall_clock = clock, wall_clock
+        self.source_sequence = 0
+        self.channel_records: dict[str, dict[str, Any]] = {}
+        self.protocol_verified = False
         self.endpoint = endpoint or f"{DEFAULT_PLC_IP}:{DEFAULT_PLC_PORT}"
-        self.register_map = dict(register_map or PLC_DEFAULT_REGISTER_MAP)
+        self.register_map = dict(PLC_DEFAULT_REGISTER_MAP if register_map is None else register_map)
         self.slave_id = int(slave_id)
         self.timeout = max(0.1, float(timeout))
         self.source_address = str(source_address)
@@ -3585,54 +3605,71 @@ class ModbusTcpDriver(SampleDriver):
             raise ValueError("PLC寄存器解析得到非有限浮点值")
         return round(float(value), 2)
 
-    def _read_registers(self) -> dict[int, int]:
-        addresses = sorted({
-            offset
-            for address in self.register_map.values()
-            for offset in (address, address + 1)
-        })
-        registers: dict[int, int] = {}
-        cursor = 0
-        while cursor < len(addresses):
-            group_start = addresses[cursor]
-            group_end = group_start
-            next_cursor = cursor
-            while (
-                next_cursor < len(addresses)
-                and addresses[next_cursor] - group_start < 120
-            ):
-                group_end = addresses[next_cursor]
-                next_cursor += 1
-            values = self._read_holding_registers(
-                group_start, group_end - group_start + 1
-            )
-            registers.update({
-                group_start + offset: value
-                for offset, value in enumerate(values)
-            })
-            cursor = next_cursor
-        return registers
+    @property
+    def quality_metadata(self) -> dict[str, Any]:
+        return {"driver": "modbus_tcp", "measurement_profile": self.measurement_profile,
+                "poll_interval_seconds": self.fixed_poll_interval_seconds,
+                "protocol_verified": self.protocol_verified,
+                "channel_records": deepcopy(self.channel_records)}
+
+    def read_samples(self):
+        """Yield each channel at its actual FC03 completion, including invalid evidence."""
+        order = [name for name in ("温度", "张力", "压力") if name in self.register_map]
+        order.extend(name for name in self.register_map if name not in order)
+        transport_error = None
+        numeric_error = None
+        for name in order:
+            address = self.register_map[name]
+            words = None
+            error = ""
+            category = ""
+            decoded = rounded = normalized = None
+            try:
+                if transport_error is not None:
+                    raise transport_error
+                if self.sock is None:
+                    raise IOError("PLC connection unavailable")
+                words = self._read_holding_registers(address, 2)
+                decoded = struct.unpack("<f", struct.pack("<HH", *words))[0]
+                if not math.isfinite(decoded):
+                    decoded = None
+                    raise ValueError("PLC寄存器解析得到非有限浮点值")
+                rounded = self._registers_to_float(*words)
+                normalized = max(0.0, rounded) if name == "压力" else rounded
+            except ValueError as exc:
+                numeric_error = exc
+                category, error = "nonfinite_value", str(exc)
+            except OSError as exc:
+                transport_error = exc
+                category = "protocol_error" if "Modbus" in str(exc) else "transport_error"
+                error = str(exc)
+            self.source_sequence += 1
+            record = {
+                "measurement_profile": self.measurement_profile, "algorithm_version": 1,
+                "endpoint": self.endpoint, "unit_id": self.slave_id,
+                "actual_source_address": self.actual_source_address,
+                "channel": name, "register_address": address, "words": words,
+                "decoded_value": decoded, "rounded_value": rounded,
+                "normalized_value": normalized,
+                "negative_pressure_clamped": name == "压力" and rounded is not None and rounded < 0,
+                "unit": (SENSOR_CHANNEL_METADATA.get(name) or {}).get("unit", ""),
+                "source_sequence": self.source_sequence,
+                "host_monotonic": self.clock(), "host_wall_time": self.wall_clock(),
+                "protocol_ok": words is not None, "error_category": category, "error": error,
+                "quality": "invalid" if error else "measured_new",
+            }
+            self.channel_records[name] = record
+            self.protocol_verified = all(not item.get("error") for item in self.channel_records.values())
+            yield {name: normalized}, record
+        if transport_error is not None:
+            raise transport_error
+        if numeric_error is not None:
+            raise numeric_error
 
     def read_sample(self) -> dict[str, float] | None:
-        if self.sock is None:
-            self._reconnect()
-        if self.sock is None:
-            return None
-        try:
-            registers = self._read_registers()
-        except (OSError, IOError):
-            self._reconnect()
-            if self.sock is None:
-                return None
-            try:
-                registers = self._read_registers()
-            except (OSError, IOError):
-                return None
-        result: dict[str, float] = {}
-        for name, address in self.register_map.items():
-            low, high = registers.get(address), registers.get(address + 1)
-            if low is not None and high is not None:
-                result[name] = self._registers_to_float(low, high)
+        result = {}
+        for payload, _ in self.read_samples():
+            result.update({name: value for name, value in payload.items() if value is not None})
         return result or None
 
     def close(self) -> None:
@@ -4383,6 +4420,7 @@ class MultiInterfaceDriver(SampleDriver):
         self.interface_quality_metadata: dict[str, dict[str, Any]] = {}
         self._opening_cancel = threading.Event()
         self._workers_lock = threading.RLock()
+        self._closed_matrix_sources = {}
 
     def cancel_open(self) -> None:
         self._opening_cancel.set()
@@ -4416,11 +4454,15 @@ class MultiInterfaceDriver(SampleDriver):
                     driver = TcpJsonDriver(str(item.get("endpoint") or ""), role, channel_map, float(item.get("timeout") or 0.05))
                 elif driver_name == "modbus_tcp":
                     register_map = item.get("register_map") if isinstance(item.get("register_map"), dict) else None
+                    if register_map and self.assignments.get(str(item.get("id"))):
+                        register_map = {name: address for name, address in register_map.items()
+                                        if name in self.assignments[str(item.get("id"))]}
                     driver = ModbusTcpDriver(
                         str(item.get("endpoint") or f"{DEFAULT_PLC_IP}:{DEFAULT_PLC_PORT}"),
                         register_map=register_map,
                         slave_id=int(item.get("slave_id") or DEFAULT_PLC_SLAVE_ID),
                         timeout=float(item.get("timeout") or 1.0),
+                        measurement_profile=str(item.get("measurement_profile") or "fibercontrol_plc_v1"),
                     )
                 elif driver_name == "abb_robot":
                     driver = AbbRobotDriver(
@@ -4596,16 +4638,22 @@ class MultiInterfaceDriver(SampleDriver):
         statuses = {row["interface_id"]: row for row in self.final_worker_status}
         statuses.update({worker.interface_id: worker.status() for worker in workers})
         self.final_worker_status = list(statuses.values())
-        self.interface_quality_metadata.update({
-            worker.interface_id: dict(metadata)
-            for worker in workers
-            for metadata in [getattr(worker.driver, "quality_metadata", {})]
-            if isinstance(metadata, dict)
-        })
+        for worker in workers:
+            metadata = getattr(worker.driver, "quality_metadata", {})
+            if not isinstance(metadata, dict):
+                continue
+            saved = self.interface_quality_metadata.get(worker.interface_id, {})
+            if saved.get("raw_file") and getattr(worker.driver, "recorder", None) is None:
+                # Closed capture evidence remains exportable after standby reception.
+                saved.update({key: metadata[key] for key in ("stop_error", "stop_failures", "commands") if key in metadata})
+            else:
+                self.interface_quality_metadata[worker.interface_id] = dict(metadata)
         for worker in workers:
             recorder = getattr(worker.driver, "recorder", None)
             if recorder is not None and worker not in pending:
                 recorder.close(worker.driver.quality_metadata)
+                if isinstance(recorder, MatrixRecorder):
+                    self._closed_matrix_sources[str(recorder.csv_path)] = (worker.interface_id, worker.driver, recorder)
                 self.interface_quality_metadata.setdefault(worker.interface_id, {}).update({
                     "raw_file": str(recorder.path), "raw_metadata_file": str(recorder.metadata_path),
                     "saved_source_rows": recorder.rows, "writer_error": recorder.error,
@@ -4878,7 +4926,30 @@ def read_real_process_parameters(
 from acquisition_start import AcquisitionStartMixin
 
 
-class AcquisitionManager(AcquisitionStartMixin):
+def _append_csv_rows(output, reader, columns, *, extrasaction="raise") -> None:
+    """Append CSV records with the same column mapping and missing-field rules."""
+    writer = csv.DictWriter(output, fieldnames=columns, extrasaction=extrasaction)
+    if reader.fieldnames != columns or len(set(columns)) != len(columns):
+        writer.writerows(reader)
+        return
+    raw_writer = csv.writer(output)
+    width = len(columns)
+    for values in reader.reader:
+        if not values:
+            continue
+        if len(values) == width:
+            raw_writer.writerow(values)
+        else:
+            record = dict(zip(columns, values))
+            if len(values) > width:
+                record[None] = values[width:]
+            writer.writerow(record)
+
+
+from acquisition_connection import AcquisitionConnectionMixin
+
+
+class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
     def __init__(
         self,
         capture_root: Path = DEFAULT_CAPTURE_ROOT,
@@ -4951,6 +5022,7 @@ class AcquisitionManager(AcquisitionStartMixin):
         }
         self._readiness_snapshot: ReadinessSnapshot | None = None
         self._init_start_lifecycle()
+        self._init_connection()
         self._last_start_preflight: dict[str, Any] = {
             "clock_domain": "server_monotonic",
             "readiness_session_id": self.readiness_session_id,
@@ -5524,6 +5596,8 @@ class AcquisitionManager(AcquisitionStartMixin):
         self, config: AcquisitionConfig, timeout_seconds: float = 2.5, *, force: bool = False
     ) -> dict:
         """Run one real probe per fingerprint and serialize physical access."""
+        if getattr(config, "acquisition_mode", "real") == "real" and self._connection_driver is not None:
+            raise RuntimeError("port_busy: 数据连接持有设备，请先断开数据再执行接口检查")
         if getattr(config, "acquisition_mode", "real") != "real":
             return self._test_connection_once(config, timeout_seconds)
         key = (readiness_config_fingerprint(config), float(timeout_seconds), bool(force))
@@ -5879,21 +5953,31 @@ class AcquisitionManager(AcquisitionStartMixin):
                         for name in expected:
                             if name not in sample:
                                 continue
+                            source_sample = (interface_driver.cache.latest(name)
+                                             if item.get("driver") == "modbus_tcp" and isinstance(getattr(interface_driver, "cache", None), ChannelSampleCache)
+                                             else None)
+                            source_evidence = ({"source_sequence": source_sample.source_sequence,
+                                                "received_monotonic": source_sample.received_monotonic,
+                                                "source_record": deepcopy(source_sample.metadata.get("latest_record") or {})}
+                                               if source_sample is not None else {})
+                            observed_time = source_sample.received_wall_time if source_sample is not None else sample_timestamp
                             if _finite(sample[name]) is None:
                                 invalid[name] = invalid.get(name, 0) + 1
                                 invalid_received[name] += 1
                                 channel_observations[name] = {
                                     "value": None,
-                                    "source_timestamp": sample_timestamp,
+                                    "source_timestamp": observed_time,
                                     "quality": "invalid",
+                                    **source_evidence,
                                 }
                             else:
                                 detected[name] = detected.get(name, 0) + 1
                                 received[name] += 1
                                 channel_observations[name] = {
                                     "value": _finite(sample[name]),
-                                    "source_timestamp": sample_timestamp,
+                                    "source_timestamp": observed_time,
                                     "quality": "measured_new",
+                                    **source_evidence,
                                 }
                     if expected and all(detected.get(name, 0) > 0 or invalid.get(name, 0) > 0 for name in expected):
                         break
@@ -6288,6 +6372,14 @@ class AcquisitionManager(AcquisitionStartMixin):
                 **dict(identity_previous.get("layer_sensor_channels") or {}),
                 str(config.layer + 1): list(config.selected_sensors or []),
             },
+            "plc_measurement": {
+                item["id"]: {"measurement_profile": item["measurement_profile"], "algorithm_version": 1,
+                             "poll_interval_seconds": item["poll_interval_seconds"],
+                             "register_map": dict(item.get("register_map") or {}),
+                             "pressure_rule": "round_2_then_clamp_negative", "fault_rule": "invalid_never_zero"}
+                for item in config.interfaces or []
+                if config.acquisition_mode == "real" and item.get("enabled", True) and item.get("driver") == "modbus_tcp"
+            },
         }
         # Commit this identity only after at least one valid sample has been
         # finalized.  Until then, the previous specimen remains authoritative.
@@ -6491,11 +6583,36 @@ class AcquisitionManager(AcquisitionStartMixin):
                 if value.get("driver") == USB_DRIVER
             }
             summary["m3232"] = {key: dict(value) for key, value in self.driver.interface_quality_metadata.items() if value.get("driver") == "m3232_pressure"}
+            summary["plc_measurement"] = {key: dict(value) for key, value in self.driver.interface_quality_metadata.items() if value.get("driver") == "modbus_tcp"}
             summary["thermocouple64"] = {
                 key: dict(value) for key, value in self.driver.interface_quality_metadata.items()
                 if value.get("driver") == THERMOCOUPLE64_DRIVER
             }
         return summary
+
+    def _archive_cancelled_empty_matrix_files(self, config):
+        if (threading.current_thread() is not self._start_thread
+                or not self._start_cancel.is_set() or self.config is not config
+                or self._start_job.get("capture_generation") != config.capture_generation
+                or self._start_job.get("state") != "cancelling"
+                or self.total_sample_count != 0
+                or (self.thread is not None and self.thread.is_alive())
+                or not isinstance(self.driver, MultiInterfaceDriver) or not self.session_dir):
+            return
+        enabled = {item["id"] for item in config.interfaces or []
+                   if item.get("enabled", True) and item.get("driver") == "m3232_pressure"}
+        for interface_id, driver, recorder in self.driver._closed_matrix_sources.values():
+            if interface_id not in enabled:
+                continue
+            context = {"capture_uuid": self.capture_uuid, "capture_generation": config.capture_generation,
+                       "run_id": config.run_id, "layer_id": config.layer + 1,
+                       "main_csv": self.raw_path.name, "interface_id": interface_id}
+            try:
+                evidence = archive_empty_cancelled_matrix(driver, recorder, session_dir=self.session_dir, context=context)
+                if evidence:
+                    self.record_start_event("empty_cancelled_matrix_archived", sha256=evidence["sha256"])
+            except (OSError, ValueError) as exc:
+                self.record_start_event("empty_cancelled_matrix_archive_failed", error=str(exc))
 
     def _record_start_preflight(
         self, audit: dict[str, Any], stage: str, **details: Any
@@ -6545,7 +6662,12 @@ class AcquisitionManager(AcquisitionStartMixin):
         probed_network_paths = 0
         try:
             assert_config_contract(config, RELEASE_CONTRACT)
-            if config.acquisition_mode == "real":
+            connected_capture = config.acquisition_mode == "real" and (
+                getattr(config, "_require_data_connection", False) or self._connection_driver is not None)
+            if connected_capture:
+                self.require_data_connection(config)
+                self._record_start_preflight(preflight, "data_connection_reused", connection_id=self._connection.get("id"))
+            if config.acquisition_mode == "real" and not connected_capture:
                 requires_readiness = False
                 with self.lock:
                     snapshot = self._readiness_snapshot
@@ -6722,7 +6844,13 @@ class AcquisitionManager(AcquisitionStartMixin):
             ):
                 raise RuntimeError(
                     f"previous_capture_{self.capture_phase}: "
-                    "上一采集仍有未完成的持久化收尾，必须先处理后再开始新采集"
+                    "上一采集仍有未完成的持久化收尾，暂不能开始新采集。"
+                    + (
+                        "涉及文件：" + "、".join(str(item.get("name") or "未知文件")
+                                                for item in self.recovery_state.get("files", [])[:3]) + "。"
+                        if self.recovery_state.get("files") else ""
+                    )
+                    + "请在持久化恢复提示中核查文件并完成恢复或数据库补传；确认无需恢复时再使用恢复处理入口。"
                 )
             if (
                 self.thread is not None
@@ -6933,12 +7061,16 @@ class AcquisitionManager(AcquisitionStartMixin):
                         "run_id": config.run_id, "layer_id": config.layer + 1, "main_csv": self.raw_path.name,
                     }
         config._session_usb_profiles = self.usb_startup_profiles(config)
-        self.driver = build_driver(config)
+        reuse_connection = config.acquisition_mode == "real" and self._connection_driver is not None
+        self.driver = self.require_data_connection(config) if reuse_connection else build_driver(config)
         self.record_start_event("storage_paths_end")
         try:
             self._assert_start_not_cancelled()
             self.record_start_event("devices_open_begin")
-            self.driver.open()
+            if reuse_connection:
+                self._begin_connected_capture(config)
+            else:
+                self.driver.open()
             self.record_start_event("devices_open_end")
             self._assert_start_not_cancelled()
             if self.save_enabled:
@@ -6995,6 +7127,7 @@ class AcquisitionManager(AcquisitionStartMixin):
                     self.finalization_complete = False
                     self.capture_phase = "stop_timed_out"
                 else:
+                    self._archive_cancelled_empty_matrix_files(config)
                     self.driver = None
                     self.finalization_complete = True
             raise
@@ -7035,7 +7168,7 @@ class AcquisitionManager(AcquisitionStartMixin):
                 self.last_error = "first_sample_timeout: " + ", ".join(missing)
                 self.capture_phase = "start_failed"
                 self.stop_event.set()
-                if self.driver is not None:
+                if self.driver is not None and self.driver is not self._connection_driver:
                     self.driver.close()
                 if self.thread is not None:
                     self.thread.join(timeout=config.stop_force_timeout_seconds)
@@ -7112,8 +7245,7 @@ class AcquisitionManager(AcquisitionStartMixin):
                 writer.writeheader()
                 for _, layer_path in available:
                     with layer_path.open("r", encoding="gb18030", newline="") as layer_file:
-                        reader = csv.DictReader(layer_file)
-                        writer.writerows(reader)
+                        _append_csv_rows(output_file, csv.DictReader(layer_file), union_columns, extrasaction="ignore")
                 output_file.flush()
                 os.fsync(output_file.fileno())
             os.replace(temporary, combined_path)
@@ -7134,7 +7266,7 @@ class AcquisitionManager(AcquisitionStartMixin):
                         if matrix_writer is None:
                             matrix_writer = csv.DictWriter(output, fieldnames=reader.fieldnames)
                             matrix_writer.writeheader()
-                        matrix_writer.writerows(reader)
+                        _append_csv_rows(output, reader, matrix_writer.fieldnames)
                 output.flush()
                 os.fsync(output.fileno())
             os.replace(work_matrix, combined_matrix)
@@ -7245,11 +7377,32 @@ class AcquisitionManager(AcquisitionStartMixin):
                 )
                 writer.writeheader()
                 timestamp_writer.writeheader()
+                first_written = False
+                def record_written(row, timestamp):
+                    nonlocal first_written
+                    if first_written:
+                        return
+                    qualities = json.loads(timestamp["channel_quality_json"])
+                    if not any(value == "measured_new" for value in qualities.values()):
+                        return
+                    raw_file.flush()
+                    time_file.flush()
+                    if self.save_enabled:
+                        os.fsync(raw_file.fileno())
+                        os.fsync(time_file.fileno())
+                    first_written = True
+                    now_written = time.monotonic()
+                    self.record_start_event("first_valid_sample_written", row_index=timestamp["row_index"],
+                        frame_sequence=timestamp["frame_sequence"], durable=bool(self.save_enabled))
+                    with self._start_job_lock:
+                        if self._start_job:
+                            self._start_job["first_sample_seconds"] = now_written - self._start_job["started_monotonic"]
                 capture_writer = BoundedCsvWriter(
                     writer,
                     timestamp_writer,
                     max_queue_rows=config.writer_queue_rows,
                     submit_timeout_seconds=config.writer_submit_timeout_seconds,
+                    on_written=record_written,
                 )
                 replay_scheduler = (
                     MonotonicReplayScheduler(
@@ -7419,9 +7572,14 @@ class AcquisitionManager(AcquisitionStartMixin):
                             ),
                             "channel_source_sequence_json": json.dumps({name: ch.source_sequence for name, ch in frame.channels.items()} if frame else {}, ensure_ascii=False),
                             "channel_interface_json": json.dumps({name: ch.interface_id for name, ch in frame.channels.items()} if frame else {}, ensure_ascii=False),
-                            "channel_source_record_json": json.dumps({name: (dict(ch.metadata["latest_record"], calibration_snapshot=ch.metadata.get("calibration_snapshot"), vendor_candidate_snapshot=ch.metadata.get("vendor_candidate_snapshot")) if ch.metadata.get("driver") == USB_DRIVER else {key: ch.metadata["latest_record"].get(key) for key in ("connection_generation", "receive_sequence", "sha256", "byte_offset")}) for name, ch in frame.channels.items() if ch.metadata.get("latest_record")} if frame else {}, ensure_ascii=False),
+                            "channel_source_record_json": json.dumps(frame_source_records(frame) if frame else {}, ensure_ascii=False, allow_nan=False),
                         }
-                        capture_writer.submit(config.saved_row(row, frame), timestamp_row)
+                        valid_written_sample = any(
+                            ch.quality == ChannelQuality.MEASURED_NEW and ch.value is not None
+                            and ch.protocol_ok is not False and ch.metadata.get("current_stream_stable") is not False
+                            and ch.received_monotonic >= (self._capture_start_monotonic or 0)
+                            for ch in frame.channels.values()) if frame is not None else valid_sample
+                        capture_writer.submit(config.saved_row(row, frame), timestamp_row, valid_sample=valid_written_sample)
                         self.persistence_queue_depth = capture_writer.pending_rows
                         self.persistence_queue_high_water_rows = max(
                             self.persistence_queue_high_water_rows,
@@ -7497,6 +7655,8 @@ class AcquisitionManager(AcquisitionStartMixin):
                             self._stream_activity.notify_all()
                     if replay_scheduler is not None:
                         replay_scheduler.wait_next()
+                self.record_start_event("sampling_loop_stopped")
+                self.record_start_event("persistence_drain_begin", pending_rows=capture_writer.pending_rows)
                 capture_writer.close(timeout_seconds=config.writer_stop_timeout_seconds)
                 self.persistence_queue_depth = 0
                 raw_file.flush()
@@ -7504,6 +7664,7 @@ class AcquisitionManager(AcquisitionStartMixin):
                 if self.save_enabled:
                     os.fsync(raw_file.fileno())
                     os.fsync(time_file.fileno())
+                self.record_start_event("persistence_drain_end", pending_rows=0)
         except Exception as exc:
             self.last_error = str(exc)
             self.persistence_failed = bool(self.save_enabled)
@@ -7516,7 +7677,13 @@ class AcquisitionManager(AcquisitionStartMixin):
         finally:
             try:
                 if self.driver is not None:
-                    self.driver.close()
+                    if self.driver is self._connection_driver and not self._start_cancel.is_set():
+                        self._finish_connected_recorders()
+                    else:
+                        self.driver.close()
+            except Exception as exc:
+                self.last_error = str(exc)
+                self.persistence_failed = bool(self.save_enabled)
             finally:
                 self.stopped_at = time.time()
 
@@ -7811,6 +7978,7 @@ class AcquisitionManager(AcquisitionStartMixin):
         ):
             return self.status()
         self.capture_phase = "stopping_sampling"
+        self.record_start_event("stop_requested")
         self.stop_event.set()
         thread = self.thread
         if thread is not None:
@@ -7834,7 +8002,10 @@ class AcquisitionManager(AcquisitionStartMixin):
                 )
                 self.capture_phase = "stop_timed_out"
                 return self.status()
-        if isinstance(self.driver, MultiInterfaceDriver):
+        keep_connection = (self.driver is self._connection_driver
+                           and self._connection.get("state") in {"connected", "waiting_data"}
+                           and not self._start_cancel.is_set())
+        if isinstance(self.driver, MultiInterfaceDriver) and not keep_connection:
             usb_stop = any(isinstance(worker.driver, Esr1001UsbDriver) for worker in self.driver.workers)
             close_budget = (self.config.stop_force_timeout_seconds if self.config else 2.0) if usb_stop else 0.5
             self.driver.close(timeout_seconds=close_budget)
@@ -7847,6 +8018,7 @@ class AcquisitionManager(AcquisitionStartMixin):
                 self.finalization_complete = False
                 self.capture_phase = "stop_timed_out"
                 return self.status()
+        self.record_start_event("capture_stopped_connected" if keep_connection else "devices_released")
         usb_errors = []
         if isinstance(self.driver, MultiInterfaceDriver):
             for evidence in self.driver.interface_quality_metadata.values():
@@ -7989,12 +8161,16 @@ class AcquisitionManager(AcquisitionStartMixin):
                             self._archive_existing(
                                 combined, "完整试样快照"
                             )
+                    self.record_start_event("file_finalize_begin")
                     self._finalize_working_files()
+                    self.record_start_event("file_finalize_end")
+                    self.record_start_event("specimen_rebuild_begin")
                     full_specimen_path = (
                         self._rebuild_whole_specimen()
                         if self.raw_path is not None and self.raw_path.is_file()
                         else None
                     )
+                    self.record_start_event("specimen_rebuild_end")
                     self.capture_saved = bool(
                         self.raw_path is not None and self.raw_path.is_file()
                     )
@@ -8257,6 +8433,8 @@ class AcquisitionManager(AcquisitionStartMixin):
             self.last_error = "; ".join(usb_errors)
             self.capture_phase = "finalization_failed"
             self.finalization_complete = False
+        self.record_start_event("finalization_result", complete=self.finalization_complete,
+                                capture_saved=self.capture_saved, phase=self.capture_phase)
         return self.status()
 
     def esr_source_evidence_since(self, cursors, limit=200):
@@ -8454,6 +8632,10 @@ class AcquisitionManager(AcquisitionStartMixin):
                         "reconnect_attempts": int(adapter_status.get("reconnect_attempts") or 0),
                         "last_error": str(adapter_status.get("last_error") or ""),
                         "poll_interval_seconds": adapter_status.get("actual_poll_interval_seconds"),
+                        "observed_poll_interval_seconds": adapter_status.get("observed_poll_interval_seconds"),
+                        "last_round_seconds": adapter_status.get("last_round_seconds"),
+                        "skipped_poll_cycles": adapter_status.get("skipped_poll_cycles", 0),
+                        "plc_evidence": usb_evidence if item.get("driver") == "modbus_tcp" else None,
                         "start_events": adapter_status.get("start_events", []),
                         "usb_evidence": usb_evidence if item.get("driver") == USB_DRIVER else None,
                         "m3232_evidence": usb_evidence if item.get("driver") == "m3232_pressure" else None,
@@ -8472,6 +8654,8 @@ class AcquisitionManager(AcquisitionStartMixin):
             )
             return {
                 "running": running,
+                "data_connection": self.connection_status(),
+                "capture_start_monotonic": self._capture_start_monotonic,
                 "status_monotonic": time.monotonic(),
                 "start_operation": self.start_operation_status(),
                 "capture_generation": self._start_job.get("capture_generation") or getattr(self.config, "capture_generation", ""),

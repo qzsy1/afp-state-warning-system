@@ -217,14 +217,14 @@ foreach ($fieldDocument in @("FIELD-OPERATIONS.md", "real-device-only-checklist.
 }
 
 $legacyFiles = @(
-    "app.py", "interface_agent.py", "agentic_diagnosis.py", "diagnostic_tools.py", "acquisition.py", "acquisition_start.py", "acquisition_readiness.py", "real_acquisition.py", "local_direct_acquisition.py", "esr1001_usb.py", "m3232_serial.py", "render_evidence.py", "smrf_hid.py", "mysql_storage.py",
+    "app.py", "interface_agent.py", "agentic_diagnosis.py", "diagnostic_tools.py", "acquisition.py", "acquisition_connection.py", "acquisition_start.py", "acquisition_readiness.py", "real_acquisition.py", "local_direct_acquisition.py", "esr1001_usb.py", "m3232_serial.py", "render_evidence.py", "smrf_hid.py", "mysql_storage.py",
     "online_inference.py", "atavn.py", "online_health_features.py",
     "causal_online_runtime.py", "runtime_scaler.py", "new_collection_health.py",
     "runtime_health_primitives.py", "web_training.py", "web_training_pipeline.py",
     "training_data.py", "training_center.py", "training_center_cli.py",
     "native_integrated_app.py", "fit_new_collection_health.py", "websocket_live.py",
     "helper_relay.py", "edge_capture.py", "local_capture_agent.py", "local_capture_helper_entry.py", "release_contract.py", "public_ingress_state.py", "pre_sensor_config.py", "pre_sensor_preflight.py", "pre_sensor_drill.py", "pre_sensor_endurance.py", "pre_sensor_evidence.py", "windows_usb_topology.py", "interface_transport_catalog.py",
-    "simulation_replay.py", "simulation_source_transfer.py", "uvc_temperature.py", "uvc_windows.py",
+    "simulation_replay.py", "simulation_source_transfer.py", "uvc_temperature.py", "uvc_windows.py", "plc_measurement.py",
     "public_demo_bundles.py",
     "remote_mysql_setup.py", "server_target_mysql.py", "server_capture_journal.py", "generate_pressure_simulation.py",
     "web_auth.py", "web_access.py", "public_status.py", "guest_simulation.py", "control_lease.py", "json_safety.py",

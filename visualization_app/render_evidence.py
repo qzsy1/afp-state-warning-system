@@ -22,6 +22,17 @@ def save_render_evidence(manager, payload):
             raise ValueError("render_evidence_clock_invalid")
         if any(not isinstance(v, (int, float)) or not math.isfinite(v) or v < start for v in displayed.values()):
             raise ValueError("render_evidence_clock_invalid")
+        identity = lambda sample: (sample.get("source_sequence"), sample.get("received_monotonic"), sample.get("interface_id"))
+        known_by_channel = {name: {identity(point) for point in points}
+                            for name, points in manager._curve_start_observations.items()}
+        cache = getattr(manager.driver, "cache", None)
+        if cache is not None:
+            for sample in cache.events():
+                if (sample.received_monotonic >= (manager._capture_start_monotonic or 0)
+                        and sample.value is not None and sample.quality.value == "measured_new"
+                        and sample.protocol_ok is not False and sample.metadata.get("current_stream_stable") is not False):
+                    known_by_channel.setdefault(sample.channel_name, set()).add(
+                        (sample.source_sequence, sample.received_monotonic, sample.interface_id))
         for name in config.selected_sensors:
             points = trace.get("observations", {}).get(name, [])
             if len(points) < 2 or len({p.get("source_sequence") for p in points}) < 2:
@@ -29,10 +40,7 @@ def save_render_evidence(manager, payload):
             if any(p.get("capture_generation") != config.capture_generation or p.get("start_request_id") != config.start_request_id
                    or p.get("quality") != "measured_new" or p.get("after_start") is not True or p.get("protocol_ok") is False for p in points):
                 raise ValueError("render_evidence_source_invalid")
-            known = manager._curve_start_observations.get(name, [])
-            if not all(any(p.get("source_sequence") == k.get("source_sequence")
-                           and p.get("received_monotonic") == k.get("received_monotonic")
-                           and p.get("interface_id") == k.get("interface_id") for k in known) for p in points):
+            if not all(identity(point) in known_by_channel.get(name, set()) for point in points):
                 raise ValueError("render_evidence_unknown_source")
         elapsed = max(displayed.values()) - start
         trace = dict(trace, elapsed_ms=elapsed, target_ms=3000, maximum_ms=3000, pass_=elapsed <= 3000)

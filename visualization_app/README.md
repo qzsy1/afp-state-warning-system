@@ -114,6 +114,14 @@ ESR1001-A 应变接口有两个显式协议：`modbus_rtu_esr1001` 使用独立 
 
 ### PLC、ABB 与 BSV UVC Readiness API
 
+真实 PLC 使用 `fibercontrol_plc_v1` 测量档：FC03、默认 Unit ID 255，温度 DT28/29、张力 DT23/24、压力 DT37/38，逐通道读取两个寄存器（低字在前 float32），保留两位小数。仅合法有限压力将舍入后的负值规范为 0 N，温度、张力、模拟和历史文件不截零；没有额外倍率、偏置或实时三点平均。规范压力供曲线、主 CSV、MySQL 与模型使用，模型质量准入和维度保持原有规则。协议错误、通信失败、NaN/Infinity 和过期样本不能成为有效零。
+
+PLC 独立线程按单调截止时间调度 100 ms 目标轮次；配置中的旧周期规范化为 0.1 秒并回显。读完只等待剩余时间，慢轮次跳过过期截止点，不并发重入或突发补读。接口状态回显实测间隔、轮次耗时及跳过数。每通道按实际完成时间和源序号进入统一帧，截止后到达的压力不倒填；暂无新样本时仅在新鲜度内沿用旧来源，过期留空。
+
+时间戳侧车 `channel_source_record_json` 按统一帧保存原始 words、地址、未裁剪值、舍入值、规范值、截零标记、处理档、源时间/序号和帧质量。MySQL 的 `afp_source_evidence.evidence_json` 以 `plc_frame` 和采样行序号保存同一关联；会话清单标明算法。无效浮点保存原始位模式及错误分类，JSON 不写 NaN/Infinity。旧文件缺少这些字段时仍按原值读取，不回填或重写。页面“PLC 压力与来源”区分最近读取与当前通道状态；合法截零不代表零点已校准。helper 必须声明 `plc_measurement_contract=fibercontrol_plc_v1`，不兼容时拒绝真实 PLC 启动。
+
+数值夹具的参考期望来自已核对 C# 源码的复算，不能替代执行参考程序或现场稳定载荷对照。正常正压力持续偏差的根因尚未确认；实物数据一致性须以同工况原始寄存器、实际时间、配置、参考载荷与批准容差验收。
+
 管理员页面使用 `POST /api/acquisition/test` 执行当前配置的只读检查，使用 `POST /api/acquisition/start` 启动正式采集，使用 `GET /api/acquisition/status?acquisition_mode=real` 读取运行状态。本机 Helper 对外声明 `plc_abb_uvc_readiness_v1` 和 `unified_device_readiness_v1`；缺少该能力的 Helper 不能启动真实采集。检查响应中的每个接口都保留设备协议端点、独立物理绑定、原始最终状态码和以下显式阶段：`physical_binding`、`device_identity`、`driver`、`network_path`、`usb_binding`、`authentication`、`protocol`、`channels`、`freshness`、`stability`。
 
 `data_ready` 表示设备身份、协议和全部必需通道均已取得有效新鲜数据；`partial_channels` 表示 PLC 或 ABB 只取得部分必需通道；`authentication_failed` 表示 ABB Digest 认证失败；`driver_incompatible`、`device_open_failed` 和 `no_valid_frame` 分别表示 UVC 驱动/API 不兼容、设备无法打开和未取得有效温度帧；`device_profile_incomplete` 表示批准设备档仍缺少正式检查所需事实。未知状态码继续按失败显示，不会转换为 `unchecked` 或通用未连接。

@@ -59,9 +59,22 @@ class JournalRows:
             )
             for (body,) in cursor:
                 payload = json.loads(body)
-                for row, timestamp in zip(payload["rows"], payload["timestamps"]):
+                for index, (row, timestamp) in enumerate(zip(payload["rows"], payload["timestamps"])):
                     recovered = dict(row)
                     recovered.setdefault("timestamp_unix", float(timestamp))
+                    frames = payload.get("frames") or []
+                    if index < len(frames):
+                        from real_acquisition import UnifiedFrame
+                        from plc_measurement import frame_source_records
+                        envelope = frames[index]
+                        frame = (UnifiedFrame.from_envelope_v2(envelope, expected_session_id=envelope["session_id"],
+                                 expected_mode_id=envelope["mode_id"], catalog=payload["frame_catalog"])
+                                 if envelope.get("contract_version") == "unified_frame_v2"
+                                 else UnifiedFrame.from_envelope(envelope))
+                        records = {name: record for name, record in frame_source_records(frame).items()
+                                   if record.get("measurement_profile") == "fibercontrol_plc_v1"}
+                        if records:
+                            recovered["_channel_source_records"] = records
                     yield recovered
 
     def source_records(self):

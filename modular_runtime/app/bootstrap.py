@@ -217,13 +217,13 @@ def _stop_stale_local_afp_servers(
     return sorted(seen)
 
 
-def _show_desktop_window(context: Any, url: str) -> None:
+def _show_desktop_window(context: Any, url: str, acquisition=None) -> None:
     try:
         import webview
     except ImportError as exc:
         raise RuntimeError("桌面界面组件缺失，请使用已打包的软件或安装 pywebview。") from exc
     ui_config = context.config.get("ui", {})
-    webview.create_window(
+    window = webview.create_window(
         str(ui_config.get("title", "AFP 实时预测、状态预警与模型训练系统（模块化版）")),
         url,
         width=int(ui_config.get("width", 1660)),
@@ -231,6 +231,19 @@ def _show_desktop_window(context: Any, url: str) -> None:
         min_size=(1180, 760),
         text_select=True,
     )
+    if acquisition is not None:
+        def close_devices():
+            try:
+                result = acquisition.disconnect_data()
+                empty = result.get("capture_phase") == "idle" and not result.get("capture_uuid")
+                if (result.get("running") or result.get("data_connection", {}).get("state") != "disconnected"
+                        or (not result.get("finalization_complete") and not empty)):
+                    raise RuntimeError(result.get("last_error") or "采集保存或设备释放尚未完成")
+            except Exception as exc:
+                window.create_confirmation_dialog("尚未安全退出", str(exc))
+                return False
+            return True
+        window.events.closing += close_devices
     storage = context.paths.runtime_dir / "webview"
     storage.mkdir(parents=True, exist_ok=True)
     # Separate browser environments prevent concurrent windows with different
@@ -775,7 +788,7 @@ def _launch_public_web(
         if server_only or not config.open_desktop_window:
             threads[1].join()
             return
-        _show_desktop_window(context, urls["local_admin"])
+        _show_desktop_window(context, urls["local_admin"], servers[1].dashboard.acquisition)
     finally:
         # Closing the desktop webview must not tear down the HTTP origin.  In
         # public mode that origin is also the target of the Cloudflare Tunnel;

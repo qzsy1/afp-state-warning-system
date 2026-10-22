@@ -1071,6 +1071,10 @@ function acquisitionDisplayPhase(status) {
     return {key: "local_stopped_flushing", label: "本地已停止，正在同步历史数据"};
   }
   if (status?.running) return {key: "running", label: "采集中"};
+  if (status?.data_connection?.state === "connected") return {key: "connected", label: "已连接，等待采集"};
+  if (status?.data_connection?.state === "waiting_data") return {key: "waiting_data", label: `已连接，接收尚未就绪：${status.data_connection.reason}`};
+  if (status?.data_connection?.state === "connecting") return {key: "connecting", label: "正在连接数据"};
+  if (["fault", "release_failed"].includes(status?.data_connection?.state)) return {key: "connection_fault", label: status.data_connection.reason};
   if (flushState === "completed") return {key: "completed", label: "停止并保存完成"};
   return {key: "stopped", label: "已停止"};
 }
@@ -1143,6 +1147,7 @@ function renderM3232Matrix(status) {
     && Number.isFinite(evidence.frame_age_seconds) && evidence.frame_age_seconds <= 2
     && Array.isArray(matrix) && matrix.length === 32
     && matrix.every(line => Array.isArray(line) && line.length === 32 && line.every(Number.isFinite))
+    && record.host_monotonic >= status.capture_start_monotonic
     && (!trace || trace.accepts(status));
   if (!valid) {
     canvas.getContext("2d").clearRect(0,0,256,256);
@@ -1394,14 +1399,39 @@ function renderEsrNumeric(status) {
   clear.onclick = async () => { try { await esrNumericAction(request("clear_zero")); toast("相对清零已关闭"); } catch (error) { toast(error.message); } };
 }
 
+function plcMeasurementText(status) {
+  const interfaces = (status.interfaces || []).filter(item => item.driver === "modbus_tcp" && item.plc_evidence);
+  return interfaces.map(item => {
+    const records = item.plc_evidence.channel_records || {};
+    const pressure = records["压力"];
+    const period = Number(item.observed_poll_interval_seconds);
+    const header = `${item.id} · 目标100 ms · 实际轮次间隔${Number.isFinite(period) && item.observed_poll_interval_seconds != null ? (period * 1000).toFixed(1) + " ms" : "待测"} · 跳过${item.skipped_poll_cycles || 0}轮`;
+    if (!pressure) return header + "\n尚无压力来源；缺测不等于0 N";
+    const current = (status.sensors || []).find(sensor => sensor.name === "压力");
+    return header + `\n最近读取 DT${pressure.register_address}/${pressure.register_address + 1} · words=${JSON.stringify(pressure.words)} · 源序号${pressure.source_sequence} · 源时间${pressure.host_wall_time}`
+      + `\n未裁剪值 ${pressure.decoded_value ?? "缺测"} N · 规范压力 ${pressure.normalized_value ?? "缺测"} N · ${pressure.negative_pressure_clamped ? "负压力规范为0，原始值保留" : pressure.error_category || "未截零"}`
+      + `\n来源质量 ${pressure.quality} · 当前通道状态 ${current?.state || "待确认"}${status.running ? "" : " · 历史会话"}`;
+  }).join("\n\n");
+}
+
 function renderAcquisitionStatus(status) {
   if (controls.acquisitionMode?.value === "real" && window.afpCurveTrace
+      && (window.afpCurveTrace.generation || status.start_request_id === window.afpCurveTrace.id)
       && !window.afpCurveTrace.accepts(status)) return;
   if (state.acquisitionStatus?.readiness_session_id === status.readiness_session_id
       && Number.isFinite(status.status_monotonic) && Number.isFinite(state.acquisitionStatus?.status_monotonic)
       && status.status_monotonic < state.acquisitionStatus.status_monotonic) return;
   state.acquisitionStatus = status;
-  renderEsrNumeric(status);
+  const plcEvidence = document.getElementById("plcMeasurementEvidence");
+  if (plcEvidence) plcEvidence.textContent = state.accessRole === "guest" ? "" : plcMeasurementText(status);
+  if (!status.data_connection || status.running) renderEsrNumeric(status);
+  else {
+    const numericState = document.getElementById("esrNumericState");
+    if (numericState) numericState.textContent = status.sample_count
+      ? "已停止实时展示；以下仅为历史采集数值" : "连接待机，尚未开始本轮数值展示";
+    document.getElementById("esrZeroButton")?.setAttribute("disabled", "");
+    document.getElementById("esrClearZeroButton")?.setAttribute("disabled", "");
+  }
   if (typeof renderM3232Matrix === "function") renderM3232Matrix(status);
   const evidence = state.hardwareCheck;
   const sameReadinessSession = status.readiness_session_id === evidence?.readiness_session_id;
@@ -1446,8 +1476,10 @@ function renderAcquisitionStatus(status) {
     const unsafe = Number(recovery.unsafe_files || 0);
     controls.persistenceRecoveryStatus.textContent =
       `上一采集仍有 ${Number(recovery.database_pending_retry || 0)} 条数据库待补传和 ` +
-      `${Number(recovery.incomplete_files || 0)} 个未完成文件。默认保留并阻止新正式采集。` +
+      `${Number(recovery.incomplete_files || 0)} 个未完成文件，暂不能开始新采集。请先核查并恢复文件或补传数据库。` +
+      `${recovery.files?.length ? ` 涉及文件：${recovery.files[0].name}${recovery.files.length > 1 ? ` 等 ${recovery.files.length} 项` : ""}。` : ""}` +
       `${unsafe ? ` 其中 ${unsafe} 项路径异常，只能人工核查。` : ""}`;
+    controls.persistenceRecoveryStatus.title = (recovery.files || []).map(item => item.name).join("\n");
   }
   if (controls.discardPersistenceRecovery) {
     controls.discardPersistenceRecovery.classList.toggle("hidden", !mayDiscardRecovery);
@@ -1532,6 +1564,11 @@ function renderAcquisitionStatus(status) {
     `${status.layer_file ? ` · 分层文件：${status.layer_file}` : ""}` +
     `${status.full_specimen_file ? ` · 完整试样：${status.full_specimen_file}` : ""}` +
     `${status.last_error ? ` · 错误：${status.last_error}` : ""}`;
+  if (!status.running && status.data_connection && controls.dataMode.value === "live") {
+    const stream = $("streamStatus");
+    if (stream) stream.textContent = phase.label;
+    document.querySelector(".live-dot")?.classList.remove("active");
+  }
   synchronizeAcquisitionButtons();
 }
 
@@ -2797,6 +2834,54 @@ function stopPublicDemo() {
   return true;
 }
 
+async function toggleDataConnection(event) {
+  if (state.dataConnectionBusy) return;
+  state.dataConnectionBusy = true;
+  window.afpConnectionTrace = {input_ms: event?.timeStamp, trusted: event?.isTrusted === true,
+    handler_ms: performance.now(), clock_domain: "browser_performance", action: "connect"};
+  synchronizeAcquisitionButtons();
+  try {
+    await acquireRealControl();
+    if (state.hardwareCheckInProgress) throw new Error('接口检查正在进行，请等待完成后连接数据');
+    if (state.hardwareCheckTimer) { clearTimeout(state.hardwareCheckTimer); state.hardwareCheckTimer = null; }
+    window.afpCurveTrace = null;
+    const current = await (await fetch('/api/acquisition/status?acquisition_mode=real', {cache: 'no-store'})).json();
+    const disconnect = current.data_connection && current.data_connection.state !== 'disconnected';
+    afpConnectionTrace.action = disconnect ? "disconnect" : "connect";
+    const config = acquisitionConfig({allowUnverifiedPhysical: true});
+    const fingerprint = hardwareConfigFingerprint(config);
+    const result = await postJson(disconnect ? '/api/acquisition/disconnect' : '/api/acquisition/connect', disconnect ? {} : config, {timeoutMs: 90000});
+    renderAcquisitionStatus(result);
+    if (!disconnect) {
+      state.dataConnectionFingerprint = fingerprint;
+      const deadline = performance.now() + 90000;
+      while (performance.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        const status = await (await fetch('/api/acquisition/status?acquisition_mode=real', {cache: 'no-store'})).json();
+        renderAcquisitionStatus(status);
+        if (status.data_connection?.ready) {
+          afpConnectionTrace.ready_observed_ms = performance.now();
+          afpConnectionTrace.server = status.data_connection;
+          return;
+        }
+        if (status.data_connection?.state !== 'connecting') throw new Error(status.data_connection?.reason || '数据连接未就绪');
+      }
+      throw new Error('设备连接结果尚未确认，请查看连接状态');
+    }
+    if (result.data_connection?.state !== 'disconnected') throw new Error(result.last_error || '设备尚未完成断开');
+    if (result.capture_uuid && !result.finalization_complete) throw new Error(result.last_error || '端口已释放，采集保存仍需恢复处理');
+    afpConnectionTrace.completed_ms = performance.now();
+    state.dataConnectionFingerprint = '';
+  } catch (error) {
+    afpConnectionTrace.error = error.message;
+    toast(error.message);
+    $("acquisitionStatus").textContent = `数据${afpConnectionTrace.action === 'disconnect' ? '断开' : '连接'}失败：${error.message}`;
+  } finally {
+    state.dataConnectionBusy = false;
+    synchronizeAcquisitionButtons();
+  }
+}
+
 async function startAcquisition() {
   const event = arguments[0];
   const handlerEntered = performance.now();
@@ -2899,15 +2984,23 @@ async function startAcquisition() {
         throw new Error("接口与传感器通道检查正在进行，请等待检查完成");
       }
       const fingerprint = hardwareConfigFingerprint();
-      if (!hardwareCheckIsCurrent(fingerprint)) {
+      const connectedLocal = !usesLocalCaptureHelper();
+      if (connectedLocal) {
+        const status = await (await fetch('/api/acquisition/status?acquisition_mode=real', {cache: 'no-store'})).json();
+        if (!status.data_connection?.ready) throw new Error(status.data_connection?.reason || '请先点击“连接数据”并等待接收就绪');
+        if (state.dataConnectionFingerprint && state.dataConnectionFingerprint !== frozenFingerprint) {
+          throw new Error('设备配置已变化，请先断开数据并按当前配置重新连接');
+        }
+      }
+      if (!connectedLocal && !hardwareCheckIsCurrent(fingerprint)) {
         const check = await testSensorConnection({automatic: true});
         if (!check?.ok) {
           throw new Error("接口或传感器通道检查未通过，已阻止开始采集；请按上方异常明细处理后重检");
         }
       }
-      requireUnchangedHardwareCheck();
+      if (!connectedLocal) requireUnchangedHardwareCheck();
       const checkedInterfaces = new Map((state.hardwareCheck?.interfaces || []).map(item => [item.id, item]));
-      frozenConfig.interfaces.forEach(item => {
+      if (!connectedLocal) frozenConfig.interfaces.forEach(item => {
         const proof = checkedInterfaces.get(item.id);
         if (item.enabled !== false && item.physical_interface_id && proof?.ok
             && proof.physical_interface_id === item.physical_interface_id) item.physical_verified = true;
@@ -2956,7 +3049,7 @@ async function startAcquisition() {
     try {
       result = await sendStart();
     } catch (error) {
-      if (simulation || !isRecoverableReadinessError(error)) throw error;
+      if (simulation || !usesLocalCaptureHelper() || !isRecoverableReadinessError(error)) throw error;
       state.hardwareCheck = null;
       state.hardwareCheckFingerprint = "";
       const check = await testSensorConnection({automatic: true});
@@ -3227,7 +3320,7 @@ async function stopAcquisition() {
     }
     renderAcquisitionStatus(result);
     renderMysqlStatus(result.mysql, result.server_target);
-    if (result.running || (!result.capture_saved && result.server_target?.state !== "saved"
+    if (result.running || result.finalization_complete === false || (!result.capture_saved && result.server_target?.state !== "saved"
         && Number(result.mysql?.saved_rows || 0) <= 0)) {
       throw new Error(result.last_error || "停止请求已返回，但本次采集未完成保存；请检查采样点数和数据源");
     }
@@ -3742,7 +3835,8 @@ function closeLiveWebSocket() {
 function expandLivePayload(payload) {
   if (payload?.live_encoding?.version !== 1) return payload;
   const observations = payload.live_encoding.source_observations;
-  for (const channel of payload.channels || []) {
+  const expandChannel = channel => {
+    if (!channel || typeof channel !== "object") return channel;
     for (const field of ["x_observed", "x_future", "actual", "quality_history", "source_observations",
                          "prediction_observed", "prediction_future"]) {
       if (Number.isInteger(channel[field]?.live_array_index)) {
@@ -3752,9 +3846,11 @@ function expandLivePayload(payload) {
     if (Array.isArray(channel.source_observations)) {
       channel.source_observations = channel.source_observations.map(index => index === null ? null : observations[index]);
     }
-  }
+    return channel;
+  };
+  for (const channel of payload.channels || []) expandChannel(channel);
   const resolve = channel => Number.isInteger(channel?.live_channel_index)
-    ? payload.channels[channel.live_channel_index] : channel;
+    ? payload.channels[channel.live_channel_index] : expandChannel(channel);
   payload.selected_channel = resolve(payload.selected_channel);
   if (payload.thermocouple64) {
     payload.thermocouple64.other_channels = payload.thermocouple64.other_channels.map(resolve);
@@ -3769,11 +3865,18 @@ function applyRealtimePayload(payload, renderOptions = {}) {
     throw new Error(payload?.error || "实时数据服务异常");
   }
   if (controls.acquisitionMode?.value === "real" && window.afpCurveTrace
+      && (window.afpCurveTrace.generation || payload.acquisition?.start_request_id === window.afpCurveTrace.id)
       && !window.afpCurveTrace.received(payload)) return;
   const captureStatus = payload.acquisition;
   if (captureStatus?.readiness_session_id === state.acquisitionStatus?.readiness_session_id
       && Number.isFinite(captureStatus?.status_monotonic) && Number.isFinite(state.acquisitionStatus?.status_monotonic)
       && captureStatus.status_monotonic < state.acquisitionStatus.status_monotonic) return;
+  if (controls.acquisitionMode?.value === "real" && captureStatus?.data_connection
+      && (!captureStatus.running || !captureStatus.capture_start_monotonic)) {
+    renderAcquisitionStatus(captureStatus);
+    document.querySelector(".live-dot")?.classList.remove("active");
+    return;
+  }
   const processingStarted = typeof performance !== "undefined" && performance.now
     ? performance.now() : Date.now();
   state.payload = payload;
@@ -5094,7 +5197,8 @@ function renderSensorCardsInto(target, channels, selectedId, {reuse = false} = {
     if (actual) actual.textContent = channel.esr_display?.text ?? fmt(channel.actual_current, 2);
     const name = card.querySelector(".sensor-name");
     if (name) {
-      name.innerHTML = `${channel.display_name || channel.name}<span>${channel.unit}</span>`;
+      const label = `${channel.display_name || channel.name}<span>${channel.unit}</span>`;
+      if (name.innerHTML !== label) name.innerHTML = label;
     }
     card.setAttribute("aria-label", `${channel.display_name || channel.name}，${channel.unit || "无单位"}，查看共享大图`);
     if (predicted) predicted.textContent = fmt(channel.prediction_current, 2);
@@ -5615,6 +5719,7 @@ controls.predictionModelType?.addEventListener("change", () => {
     .catch(() => {});
 });
 $("startAcquisitionButton").addEventListener("click", startAcquisition);
+$("connectDataButton").addEventListener("click", toggleDataConnection);
 $("stopAcquisitionButton").addEventListener("click", stopAcquisition);
 [
   controls.liveSpecimen,
@@ -7478,19 +7583,29 @@ function synchronizeAcquisitionButtons() {
   const publicDemoRunning = Boolean(state.publicDemoPlayback?.snapshot()?.running);
   const acquisitionRunning = Boolean(state.acquisitionStatus?.running);
   const starting = ["starting", "cancelling"].includes(state.acquisitionStatus?.start_operation?.state);
+  const needsFinalization = Boolean(state.acquisitionStatus?.capture_uuid && state.acquisitionStatus?.config
+    && !state.acquisitionStatus.finalization_complete && !acquisitionRunning && !starting);
   const startButton = $("startAcquisitionButton");
   const stopButton = $("stopAcquisitionButton");
+  const connectButton = $("connectDataButton");
+  if (connectButton) {
+    const connection = state.acquisitionStatus?.data_connection;
+    connectButton.classList.toggle("hidden", controls.acquisitionMode?.value !== "real" || usesLocalCaptureHelper());
+    connectButton.textContent = connection && connection.state !== "disconnected" ? "断开数据" : "连接数据";
+    connectButton.disabled = Boolean(state.dataConnectionBusy || state.stopBusy || state.acquisitionStartBusy || acquisitionRunning || starting);
+    connectButton.title = connection?.reason || "连接设备并持续有界接收；开始采集后才保存和展示";
+  }
   if (startButton) {
     startButton.textContent = publicDemo ? "开始演示" : "开始采集";
     startButton.disabled = publicDemo
       ? (!state.publicDemoReady || publicDemoRunning)
-      : (state.acquisitionStartBusy || acquisitionRunning || starting);
+      : (state.dataConnectionBusy || state.acquisitionStartBusy || acquisitionRunning || starting);
   }
   if (stopButton) {
-    stopButton.textContent = publicDemo ? "停止演示" : starting ? "取消启动" : "停止并保存";
+    stopButton.textContent = publicDemo ? "停止演示" : starting ? "取消启动" : needsFinalization ? "完成保存" : "停止并保存";
     stopButton.disabled = publicDemo
       ? !publicDemoRunning
-      : (state.stopBusy || (!acquisitionRunning && !starting));
+      : (state.stopBusy || (!acquisitionRunning && !starting && !needsFinalization));
   }
 }
 
@@ -8405,6 +8520,7 @@ function hardwareConfigFingerprint() {
     return JSON.stringify({
       acquisition_mode: config.acquisition_mode,
       dataset_schema: config.dataset_schema,
+      sample_rate_hz: config.sample_rate_hz,
       selected_sensors: [...(config.selected_sensors || [])].sort(),
       runtime_revision: {
         application_version: state.bootstrap?.application?.version || "",
@@ -8624,6 +8740,13 @@ function renderHardwareCheckResult(result, {automatic = false, live = false} = {
 }
 
 function markHardwareCheckStale(reason = "配置已变化") {
+  if (state.dataConnectionFingerprint && state.dataConnectionFingerprint !== hardwareConfigFingerprint()
+      && state.acquisitionStatus?.data_connection
+      && state.acquisitionStatus.data_connection.state !== "disconnected") {
+    state.acquisitionStatus.data_connection.ready = false;
+    state.acquisitionStatus.data_connection.state = "fault";
+    postJson('/api/acquisition/invalidate-connection', {}).then(renderAcquisitionStatus).catch(error => toast(error.message));
+  }
   window.afpCurveTrace?.event("readiness_invalidated", {reason});
   state.agentRequestId += 1;
   state.agentController?.abort();
@@ -8647,6 +8770,7 @@ function scheduleAutomaticHardwareCheck(delay = 700) {
   if (isPublicPrecomputedSimulationMode()) return;
   if (!controls.autoHardwareCheck?.checked || state.hardwareCheckInProgress) return;
   if (state.acquisitionStatus?.running) return;
+  if (state.acquisitionStatus?.data_connection?.state && state.acquisitionStatus.data_connection.state !== "disconnected") return;
   if (hardwareCheckIsCurrent(hardwareConfigFingerprint())) return;
   if (state.hardwareCheckTimer) window.clearTimeout(state.hardwareCheckTimer);
   state.hardwareCheckTimer = window.setTimeout(() => {

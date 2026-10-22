@@ -207,7 +207,7 @@
       "id": "real-acquisition-local-direct-contracts",
       "title": "local_direct本机设备生命周期与故障隔离无硬件合同",
       "kind": "command",
-      "command": ["{python}", "-m", "unittest", "test_real_acquisition_modes.LocalDirectNoHardwareIntegrationTests", "test_acquisition_start", "-v"],
+      "command": ["{python}", "-m", "unittest", "test_real_acquisition_modes.LocalDirectNoHardwareIntegrationTests", "test_acquisition_start", "test_acquisition_connection", "-v"],
       "cwd": "visualization_app",
       "timeout_seconds": 180,
       "profiles": ["quick", "full", "release"],
