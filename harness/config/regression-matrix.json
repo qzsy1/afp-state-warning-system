@@ -263,7 +263,7 @@
       "id": "thermocouple64-protocol-contracts",
       "title": "64路热电偶Modbus协议、有界扫描时延、组均值和实机证据",
       "kind": "command",
-      "command": ["{python}", "-m", "unittest", "visualization_app.test_thermocouple64_contracts", "visualization_app.test_hp_thermocouple64", "-v"],
+      "command": ["{python}", "-m", "unittest", "visualization_app.test_thermocouple64_contracts", "visualization_app.test_hp_thermocouple64", "visualization_app.test_hp_thermocouple64_pc", "-v"],
       "cwd": ".",
       "timeout_seconds": 120,
       "profiles": ["quick", "full", "release"],
@@ -271,7 +271,7 @@
       "blocking": true,
       "evidence_tier": "automated",
       "requirements": ["THERMOCOUPLE64-PROTOCOL-001"],
-      "change_patterns": ["visualization_app/acquisition.py", "visualization_app/thermocouple64.py", "visualization_app/hp_thermocouple64.py", "visualization_app/test_hp_thermocouple64.py", "visualization_app/test_thermocouple64_contracts.py", "openspec/changes/expand-thermocouple-to-64-channels/**", "openspec/changes/fix-tc64-native-usb-acquisition/**"]
+      "change_patterns": ["visualization_app/acquisition.py", "visualization_app/thermocouple64.py", "visualization_app/hp_thermocouple64.py", "visualization_app/test_hp_thermocouple64.py", "visualization_app/test_hp_thermocouple64_pc.py", "visualization_app/testdata/tc64_vendor_samples.json", "visualization_app/test_thermocouple64_contracts.py", "openspec/changes/expand-thermocouple-to-64-channels/**", "openspec/changes/fix-tc64-native-usb-acquisition/**"]
     },
     {
       "id": "thermocouple64-layer-projection-contracts",

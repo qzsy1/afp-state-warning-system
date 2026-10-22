@@ -196,7 +196,9 @@ class LocalDirectAdapter:
                     device_timestamp=getattr(self.driver, "source_timestamp", None),
                     source_sequence=self.source_sequence,
                     protocol_ok=plc_record["protocol_ok"] if plc_record else getattr(self.driver, "protocol_verified", None),
-                    error=str(plc_record.get("error") or "") if plc_record else "",
+                    error=(str(plc_record.get("error") or "") if plc_record else
+                           str((driver_metadata.get("channel_errors") or {}).get(name) or "")
+                           if isinstance(driver_metadata, Mapping) and driver_metadata.get("driver") == "huipu_tc64_modbus_rtu" else ""),
                     metadata=(
                         driver_metadata if isinstance(driver_metadata, Mapping) else {}
                     ),

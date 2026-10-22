@@ -1236,7 +1236,7 @@ SENSOR_INTERFACE_PROFILES: dict[str, dict[str, Any]] = {
         "historical_only": True,
     },
     THERMOCOUPLE64_ROLE: {
-        "label": "慧谱TCP64热电偶（64路 Modbus RTU）",
+        "label": "慧谱TCP64热电偶（64路 PC / Modbus）",
         "driver": THERMOCOUPLE64_DRIVER,
         "protocol": "modbus_rtu",
         "physical_kind": "serial",
@@ -1244,7 +1244,7 @@ SENSOR_INTERFACE_PROFILES: dict[str, dict[str, Any]] = {
         "baudrate": 115200,
         "slave_id": 1,
         "channels": list(THERMOCOUPLE64_CHANNELS),
-        "processing": "仪表选Modbus模式，115200-8-N-1；FC03读取64路20寄存器记录，温度低字在前；K/F转换为°C；现场验证独立记录",
+        "processing": "115200-8-N-1；显式选择PC温度报文或Modbus读取，须与仪表模式一致；64路原始温度独立保存，K/F转换为°C",
     },
     "plc": {
         "label": "松下PLC过程传感器",
@@ -5317,7 +5317,7 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
             {"id": "simulator", "label": "模拟采集（CSV数据源）"},
             {"id": "serial_json", "label": "串口 JSON Lines"},
             {"id": "smrf_hid", "label": "SMRF八通道温度巡检仪（USB HID）"},
-            {"id": THERMOCOUPLE64_DRIVER, "label": "慧谱TCP64热电偶（64路 Modbus RTU）"},
+            {"id": THERMOCOUPLE64_DRIVER, "label": "慧谱TCP64热电偶（64路 PC / Modbus）"},
             {"id": "tcp_json", "label": "TCP JSON Lines"},
             {"id": "modbus_tcp", "label": "Modbus TCP（松下PLC）"},
             {"id": "abb_robot", "label": "ABB机器人 RWS"},

@@ -7103,7 +7103,7 @@ function renderInterfacePanel(configs) {
     const tcOptions = document.createElement("div"); tcOptions.className = "interface-tc64-options";
     tcOptions.hidden = canonicalRole !== "thermocouple64";
     const readProfile = document.createElement("select"); readProfile.className = "interface-read-profile";
-    readProfile.append(option("channel_temperature", "逐通道温度（默认兼容方式）"), option("full_record_block", "完整记录批量（已验证设备）"));
+    readProfile.append(option("pc_temperature", "PC上位机模式（商家温度报文）"), option("channel_temperature", "Modbus逐通道温度"), option("full_record_block", "Modbus完整记录批量"));
     readProfile.value = item.read_profile || "channel_temperature";
     const timeout = document.createElement("input"); timeout.type = "number"; timeout.className = "interface-timeout"; timeout.min = "0.01"; timeout.max = "2"; timeout.step = "0.01"; timeout.value = String(item.timeout || 0.5);
     const freshness = document.createElement("input"); freshness.type = "number"; freshness.className = "interface-freshness"; freshness.min = "0.1"; freshness.step = "0.1"; freshness.value = String(item.freshness_seconds || 1);
@@ -8712,7 +8712,8 @@ function renderHardwareCheckResult(result, {automatic = false, live = false} = {
     const d = item.driver_diagnostics || {};
     const tx = d.last_transaction || {};
     const sources = new Set(Object.values(d.channel_settings || {}).map(s => s.source));
-    const sourceLabels = {device_readback:"仪表读回",operator_confirmed:"操作者确认",unconfirmed:"未确认"};
+      const sourceLabels = {device_readback:"仪表读回",pc_response:"PC报文",operator_confirmed:"操作者确认",unconfirmed:"未确认"};
+      if (d.read_profile === "pc_temperature") return `${d.endpoint || item.endpoint} · ${d.baudrate || "?"} 8N1 · PC模式 · 仪表标识${d.pc_device_address ?? "?"} · 协议${d.protocol_verified ? "有效" : "未验证"} · 有效温度${d.valid_temperature_count ?? 0}/64 · 环境温度${d.ambient_temperature_c ?? "?"}℃ · 仪表时间${d.device_time_text || "未知"} · TX/RX ${d.tx_bytes || 0}/${d.rx_bytes || 0}字节 · ${d.error_code || "无通信错误"}`;
     return `${d.endpoint || item.endpoint} · ${d.baudrate || "?"} 8N1 · 地址${d.slave_id ?? "?"} · ${d.read_profile || item.read_profile || "channel_temperature"} · 协议${d.protocol_verified ? "有效" : "未验证"} · 有效温度${d.valid_temperature_count ?? 0}/64 · 扫描${Number(d.scan_duration_seconds || 0).toFixed(2)}秒 · 设置${[...sources].map(s=>sourceLabels[s] || s).join("/") || "未确认"} · TX/RX ${d.tx_bytes || 0}/${d.rx_bytes || 0}字节 · CH${tx.channel || "?"}寄存器${tx.start_register ?? "?"}+${tx.register_count || 0} · ${d.error_code || "无通信错误"} · 请求 ${tx.request_hex || "无"} · 响应 ${tx.response_hex || "无"}`;
   });
   appendDetails("异常通道", badSensors, (item) => `${item.name}（${item.message || hardwareStateLabel(item.state)}）`);
@@ -8880,10 +8881,10 @@ function hardwareCheckTimeoutMs(config) {
   const interfaces = (config?.interfaces || []).filter(item => item.enabled !== false);
   let budget = 20000;
   interfaces.filter(item => item.driver === "huipu_tc64_modbus_rtu").forEach(item => {
-    const count = item.read_profile === "full_record_block" ? 11 : 192;
+    const count = item.read_profile === "pc_temperature" ? 1 : item.read_profile === "full_record_block" ? 11 : 192;
     const baudrate = Number(item.baudrate) || 115200;
     const timeout = Math.max(0.01, Math.min(Number(item.timeout) || 0.5, 2));
-    const bytes = count === 11 ? 2703 : 3136;
+    const bytes = count === 1 ? 8193 : count === 11 ? 2703 : 3136;
     const scan = Number(item.scan_timeout_seconds) || count * (timeout + Math.max(0.003, 35 / baudrate) + 0.025) + bytes * 10 / baudrate + 1;
     budget += (scan + 2) * 1000;
   });

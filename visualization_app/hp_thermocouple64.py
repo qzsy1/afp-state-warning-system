@@ -1,4 +1,4 @@
-"""HuiPu TCP8–TCP64, Modbus protocol A (2021-08-02), read-only acquisition."""
+"""HuiPu TCP64 read-only acquisition using explicit Modbus or PC mode."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import struct
 import time
 from acquisition_clock import monotonic
 import threading
+import re
+from datetime import datetime
 from copy import deepcopy
 from typing import Any
 
@@ -57,14 +59,75 @@ def parse_response(frame: bytes, slave_id: int, count: int) -> tuple[int, ...]:
     return struct.unpack(f">{count}H", frame[3:-2])
 
 
-READ_PROFILES = ("channel_temperature", "full_record_block")
+READ_PROFILES = ("channel_temperature", "full_record_block", "pc_temperature")
 
 
 def normalize_read_profile(value: Any = None) -> str:
     profile = str(value or "channel_temperature")
     if profile not in READ_PROFILES:
-        raise ValueError("慧谱读取方式必须为channel_temperature或full_record_block")
+        raise ValueError("慧谱读取方式必须为channel_temperature、full_record_block或pc_temperature")
     return profile
+
+
+def parse_pc_response(frame: bytes) -> dict[str, Any]:
+    """Decode the TCP-64 GB18030 response, including its decimal byte checksum."""
+    if not frame.endswith(b"\r\n") or b"\r\n" in frame[:-2] or len(frame) > 8192:
+        raise HpProtocolError("pc_length", "PC响应必须为一条有界CRLF报文")
+    body, separator, checksum = frame[:-2].rpartition(b",")
+    if not separator or not re.fullmatch(rb"\d{6}", checksum) or sum(body + b",") != int(checksum):
+        raise HpProtocolError("pc_checksum", "PC响应累加校验失败")
+    try:
+        fields = body.decode("gb18030").split(",")
+    except UnicodeDecodeError as exc:
+        raise HpProtocolError("pc_encoding", "PC响应不是有效GB18030文本") from exc
+    if len(fields) != 68 or fields[0] != "TCP-64":
+        raise HpProtocolError("pc_model", "期望TCP-64及完整64路PC响应")
+    if not re.fullmatch(r"\d{3}", fields[-1]):
+        raise HpProtocolError("pc_address", "PC响应仪表标识无效")
+    try:
+        datetime.strptime(fields[1], "T:%Y/%m/%d %H:%M:%S")
+    except ValueError as exc:
+        raise HpProtocolError("pc_timestamp", "PC响应仪表时间无效") from exc
+    if not re.fullmatch(r"[+-]?\d+(?:\.\d+)?", fields[2]):
+        raise HpProtocolError("pc_ambient", "PC响应环境温度无效")
+    ambient = float(fields[2])
+    if not math.isfinite(ambient):
+        raise HpProtocolError("pc_ambient", "PC响应环境温度不是有限数值")
+    values, errors, settings = {}, {}, {}
+    for name, token in zip(THERMOCOUPLE64_CHANNELS, fields[3:67]):
+        parts = token.split("|")
+        if len(parts) != 3:
+            raise HpProtocolError("pc_channel", f"{name}字段结构无效")
+        text, sensor, unit = parts
+        unit_id = {"℃": 0, "K": 1, "℉": 2}.get(unit)
+        input_type = {s: i for i, s in enumerate(("K", "S", "R", "N", "E", "J", "T", "B", "PT100", "PT1000", "Cu50"))}.get(sensor)
+        settings[name] = {"unit": unit_id, "input_type": input_type, "source": "pc_response"}
+        error = ""
+        value = None
+        if unit_id is None:
+            error = "non_temperature_unit"
+        elif input_type is None:
+            error = "non_temperature_input"
+        elif text.casefold() == "open":
+            error = "thermocouple_open"
+        elif text.casefold() == "off":
+            error = "channel_disabled"
+        elif not re.fullmatch(r"[+-]?\d+(?:\.\d+)?", text):
+            error = "unknown_pc_value"
+        else:
+            value = float(text)
+            if not math.isfinite(value):
+                value, error = None, "non_finite"
+            elif unit_id == 1:
+                value -= 273.15
+            elif unit_id == 2:
+                value = (value - 32.0) * 5.0 / 9.0
+        values[name] = value
+        if error:
+            errors[name] = error
+    return {"values": values, "channel_errors": errors, "channel_settings": settings,
+            "ambient_temperature_c": ambient, "device_time_text": fields[1][2:],
+            "pc_device_address": fields[-1], "pc_checksum": int(checksum)}
 
 
 def settings_binding(endpoint: str, baudrate: int, slave_id: int, read_profile: str,
@@ -129,8 +192,8 @@ class HpThermocouple64Driver:
             raise ValueError("慧谱通道设置及channels必须为对象")
         self.device_identity = deepcopy(device_identity or {})
         self.port_provider = port_provider
-        transactions = 192 if self.read_profile == "channel_temperature" else 11
-        wire_bytes = 3136 if self.read_profile == "channel_temperature" else 2703
+        transactions = 1 if self.read_profile == "pc_temperature" else 192 if self.read_profile == "channel_temperature" else 11
+        wire_bytes = 8193 if self.read_profile == "pc_temperature" else 3136 if self.read_profile == "channel_temperature" else 2703
         budget = transactions * (self.timeout + max(0.003, 35 / self.baudrate) + 0.025) + wire_bytes * 10 / self.baudrate + 1
         self.scan_timeout_seconds = float(scan_timeout_seconds or budget)
         if not math.isfinite(self.scan_timeout_seconds) or not 0 < self.scan_timeout_seconds <= 600:
@@ -262,7 +325,7 @@ class HpThermocouple64Driver:
             return None
 
     def _metadata(self) -> dict[str, Any]:
-        return {"driver": THERMOCOUPLE64_DRIVER, "protocol": "modbus_rtu",
+        return {"driver": THERMOCOUPLE64_DRIVER, "protocol": "huipu_pc_serial" if self.read_profile == "pc_temperature" else "modbus_rtu",
                 "endpoint": self.endpoint, "baudrate": self.baudrate, "bytesize": 8,
                 "parity": "N", "stopbits": 1, "slave_id": self.slave_id,
                 "timeout": self.timeout, "read_profile": self.read_profile,
@@ -271,6 +334,37 @@ class HpThermocouple64Driver:
                 "protocol_verified": self.protocol_verified,
                 "last_transaction": dict(self._diagnostic),
                 "tx_bytes": self._tx_bytes, "rx_bytes": self._rx_bytes}
+
+    def _read_pc(self) -> dict[str, Any]:
+        self._check_cancel()
+        port = self.serial
+        if port is None:
+            raise HpProtocolError("port_closed", "串口尚未打开")
+        port.reset_input_buffer()
+        self._diagnostic = {"request_hex": "3a", "response_hex": "", "tx_bytes": 0, "rx_bytes": 0}
+        written = port.write(b":")
+        self._tx_bytes += written
+        self._diagnostic["tx_bytes"] = written
+        if written != 1:
+            raise HpProtocolError("write_incomplete", "温度请求未完整写入串口")
+        deadline = min(self._scan_deadline, time.perf_counter() + self.timeout + 8192 * 10 / self.baudrate)
+        frame = bytearray()
+        while time.perf_counter() < deadline:
+            self._check_cancel()
+            chunk = port.read(8193 - len(frame))
+            if not chunk:
+                time.sleep(0.001)
+                continue
+            frame.extend(chunk)
+            self._rx_bytes += len(chunk)
+            self._diagnostic.update(rx_bytes=len(frame), response_hex=bytes(frame[:8192]).hex(" "))
+            if len(frame) > 8192:
+                raise HpProtocolError("pc_length", "PC响应超出长度限制")
+            if b"\r\n" in frame:
+                parsed = parse_pc_response(bytes(frame))
+                self._verify_silence(frame)
+                return parsed
+        raise HpProtocolError("timeout", f"PC温度请求超时（收到{len(frame)}字节）")
 
     def _scan(self) -> dict[str, float | None]:
         started = time.perf_counter()
@@ -282,7 +376,14 @@ class HpThermocouple64Driver:
         settings_evidence: dict[str, Any] = {}
         verified_settings: dict[str, dict[str, Any] | None] = {}
         refresh_settings = self.read_profile == "channel_temperature" and self._verified_channel_settings is None
+        pc_evidence: dict[str, Any] = {}
         try:
+            if self.read_profile == "pc_temperature":
+                parsed = self._read_pc()
+                values = parsed.pop("values")
+                errors = parsed.pop("channel_errors")
+                settings_evidence = parsed.pop("channel_settings")
+                pc_evidence = parsed
             if self.read_profile == "channel_temperature":
                 for index, name in enumerate(THERMOCOUPLE64_CHANNELS):
                     settings = (
@@ -328,8 +429,9 @@ class HpThermocouple64Driver:
         self.last_error = ""
         self.quality_metadata = {
             **self._metadata(),
-            "driver": THERMOCOUPLE64_DRIVER, "protocol": "modbus_rtu",
-            "protocol_version": "TCP8-TCP64-A-20210802",
+            "driver": THERMOCOUPLE64_DRIVER,
+            "protocol_version": "TCP-64-PC" if self.read_profile == "pc_temperature" else "TCP8-TCP64-A-20210802",
+            **pc_evidence,
             "slave_id": self.slave_id, "channel_errors": errors,
             "observation_count": self.observation_count,
             "valid_temperature_count": sum(v is not None for v in values.values()),
