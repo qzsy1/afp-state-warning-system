@@ -16,6 +16,11 @@ from local_capture_agent import HelperTransport  # noqa: E402
 
 
 class LocalCaptureAgentTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.capture_root = Path(temporary.name)
+
     def test_tc64_short_scan_csv_mysql_and_helper_frames_agree(self):
         from acquisition import AcquisitionConfig, AcquisitionManager, default_capture_interfaces
         from local_capture_helper_entry import helper_capabilities
@@ -62,7 +67,11 @@ class LocalCaptureAgentTests(unittest.TestCase):
                     self.assertEqual(restored.values(), {n:raw[n] for n in THERMOCOUPLE64_CHANNELS})
                     self.assertEqual(restored.target_wall_time, stamp)
                     self.assertEqual(strict_group_means(restored.values())["热电偶均值8"]["value"], 34.875)
-                    self.assertTrue(all(s.source_sequence == 1 for s in restored.channels.values()))
+                    sequences = {sample.source_sequence for sample in restored.channels.values()}
+                    self.assertEqual(len(sequences), 1)
+                    self.assertGreater(next(iter(sequences)), 0)
+                    for index, name in enumerate(THERMOCOUPLE64_CHANNELS):
+                        self.assertEqual(restored.channels[name].source_sequence, frame["source"][str(index)]["source_sequence"])
                 self.assertTrue(agent.ack_sample_batch(batch["capture_uuid"], batch["sequence"]))
             finally:
                 stopped = agent.stop_capture()
@@ -82,7 +91,7 @@ class LocalCaptureAgentTests(unittest.TestCase):
 
     def test_tc64_candidates_use_serial_transport_without_claiming_identity(self):
         for order in ([6, 7], [7, 6]):
-            manager = Mock()
+            manager = Mock(capture_root=self.capture_root)
             manager.discover_interfaces.return_value = {"physical_interfaces": [
                 {"id": f"serial:COM{n}", "endpoint": f"COM{n}", "kind": "serial", "protocol": "serial",
                  "detected": True, "compatible_roles": ["thermocouple64", "esr1001_strain"]}
@@ -105,7 +114,7 @@ class LocalCaptureAgentTests(unittest.TestCase):
             }],
             "devices": [],
         }
-        manager = Mock()
+        manager = Mock(capture_root=self.capture_root)
         manager.discover_interfaces.return_value = {
             "physical_interfaces": [],
             "usb_topology": topology,
@@ -141,7 +150,7 @@ class LocalCaptureAgentTests(unittest.TestCase):
         self.assertNotIn("拓展坞", payload["interface_transport_catalog"]["usb_ports"][0]["label"])
 
     def test_sample_batch_reads_only_incremental_rows_when_manager_supports_cursor(self):
-        manager = Mock()
+        manager = Mock(capture_root=self.capture_root)
         manager.start.return_value = {"running": True}
         manager.status.return_value = {"running": True, "config": {"sample_rate_hz": 10.0}}
         manager.stream_rows_since.side_effect = [
@@ -183,7 +192,7 @@ class LocalCaptureAgentTests(unittest.TestCase):
         manager.numeric_matrix.assert_not_called()
 
     def test_sample_batch_is_replayed_until_ack_then_advances(self):
-        manager = Mock()
+        manager = Mock(capture_root=self.capture_root)
         manager.start.return_value = {"running": True, "config": {"acquisition_mode": "real"}}
         manager.status.return_value = {"running": True, "config": {"acquisition_mode": "real"}}
         manager.numeric_matrix.return_value = (
@@ -206,7 +215,7 @@ class LocalCaptureAgentTests(unittest.TestCase):
         self.assertEqual(second["rows"], [{"温度": 352.0}])
 
     def test_batch_ack_for_other_capture_does_not_advance_cursor(self):
-        manager = Mock()
+        manager = Mock(capture_root=self.capture_root)
         manager.start.return_value = {"running": True}
         manager.status.return_value = {"running": True, "config": {}}
         manager.numeric_matrix.return_value = ([{"压力": 1.0}], [1.0])
@@ -218,7 +227,7 @@ class LocalCaptureAgentTests(unittest.TestCase):
         self.assertEqual(agent.next_sample_batch(), pending)
 
     def test_stop_emits_final_status_batch_even_when_no_new_rows_arrive(self):
-        manager = Mock()
+        manager = Mock(capture_root=self.capture_root)
         manager.start.return_value = {"running": True}
         manager.stop.return_value = {"running": False, "finalization_complete": True}
         manager.numeric_matrix.return_value = ([], [])
@@ -241,7 +250,7 @@ class LocalCaptureAgentTests(unittest.TestCase):
         self.assertFalse(final["status"]["running"])
 
     def test_stop_marks_pending_rows_as_history_and_completes_after_final_ack(self):
-        manager = Mock()
+        manager = Mock(capture_root=self.capture_root)
         manager.start.return_value = {"running": True}
         manager.stop.return_value = {
             "running": False,
@@ -364,6 +373,7 @@ class LocalCaptureAgentTests(unittest.TestCase):
     @patch("local_capture_agent.AcquisitionManager")
     def test_capture_methods_delegate_to_existing_manager(self, manager_cls):
         manager = manager_cls.return_value
+        manager.capture_root = self.capture_root
         manager.status.return_value = {"running": False}
         agent = LocalCaptureAgent(manager=manager)
         config = Mock()
@@ -376,6 +386,7 @@ class LocalCaptureAgentTests(unittest.TestCase):
     @patch("local_capture_agent.AcquisitionManager")
     def test_process_parameter_read_delegates_to_existing_manager(self, manager_cls):
         manager = manager_cls.return_value
+        manager.capture_root = self.capture_root
         manager.read_process_parameters.return_value = {
             "ok": True,
             "values": {"pid_angle_deg": 5.0},
@@ -391,7 +402,7 @@ class LocalCaptureAgentTests(unittest.TestCase):
     @patch("local_capture_agent.select_capture_folder", return_value="D:\\AFP_Capture")
     @patch("local_capture_agent.check_capture_save_root", return_value={"ok": True})
     def test_save_folder_operations_execute_on_helper_computer(self, check_root, select_folder):
-        agent = LocalCaptureAgent(manager=Mock())
+        agent = LocalCaptureAgent(manager=Mock(capture_root=self.capture_root))
 
         selected = agent.select_folder("D:\\")
         checked = agent.check_save_root("D:\\AFP_Capture")
