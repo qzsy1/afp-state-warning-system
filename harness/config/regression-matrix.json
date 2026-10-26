@@ -204,6 +204,20 @@
       "change_patterns": ["visualization_app/acquisition.py", "visualization_app/real_acquisition.py", "visualization_app/*capture*", "visualization_app/test_real_acquisition_modes.py", "harness/**", "openspec/changes/prepare-real-acquisition/**"]
     },
     {
+      "id": "acquisition-pause-contracts",
+      "title": "采集暂停继续、保存边界、执行端状态与隔离验收合同",
+      "kind": "command",
+      "command": ["{python}", "-m", "unittest", "test_acquisition_pause", "test_acquisition_pause_paths", "-v"],
+      "cwd": "visualization_app",
+      "timeout_seconds": 180,
+      "profiles": ["quick", "full", "release"],
+      "environments": ["local", "ci"],
+      "blocking": true,
+      "evidence_tier": "automated",
+      "requirements": ["CAPTURE_PERSISTENCE-001", "REAL_PREP_FRAME-001", "REAL_PREP_MODE-001"],
+      "change_patterns": ["visualization_app/acquisition*.py", "visualization_app/preview_acquisition.py", "visualization_app/local*", "visualization_app/edge_capture.py", "visualization_app/helper_relay.py", "visualization_app/guest_simulation.py", "visualization_app/real_acquisition.py", "visualization_app/static/**", "visualization_app/native_integrated_app.py", "visualization_app/app.py", "visualization_app/web_access.py"]
+    },
+    {
       "id": "real-acquisition-local-direct-contracts",
       "title": "local_direct本机设备生命周期与故障隔离无硬件合同",
       "kind": "command",

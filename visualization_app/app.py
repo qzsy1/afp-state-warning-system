@@ -2878,6 +2878,7 @@ class DashboardData:
         quality_rows: list[dict[str, str]] | None = None,
         source_rows: list[dict] | None = None,
         startup_observations: dict | None = None,
+        timestamps: list[float] | None = None,
     ) -> dict:
         config = config if config is not None else status.get("config") or {}
         source_time_origin = monotonic()
@@ -2908,6 +2909,8 @@ class DashboardData:
             if len(indices)
             else np.asarray([], dtype=float)
         )
+        if status.get("pause_intervals") and timestamps and len(timestamps) == len(rows):
+            observed_time = np.asarray([timestamps[int(index)] - time.time() for index in indices], dtype=float)
         channels: list[dict] = []
         for index, name in enumerate(sensor_columns):
             if config.get("dataset_schema") == THERMOCOUPLE64_MODE_ID and name in THERMOCOUPLE64_CHANNELS:
@@ -3128,6 +3131,11 @@ class DashboardData:
         if standby:
             rows, timestamps, quality_rows, source_rows, startup_observations = [], [], [], [], {}
         config = status.get("config") or {}
+        if config.get("processing_mode") != "capture_only" and status.get("segment_start_index"):
+            offset = max(0, int(status["segment_start_index"]) - max(0, int(status.get("sample_count", len(rows))) - len(rows)))
+            rows, timestamps = rows[offset:], timestamps[offset:]
+            quality_rows = quality_rows[offset:] if quality_rows is not None else None
+            source_rows = source_rows[offset:] if source_rows is not None else None
         requested_schema = (
             dataset_schema
             if dataset_schema in ACQUISITION_SCHEMAS
@@ -3158,7 +3166,7 @@ class DashboardData:
         rho = float(np.clip(rho, 0.0, 1.0))
         prediction_horizon = int(np.clip(prediction_horizon, 1, 600))
         forecast_lead = int(np.clip(forecast_lead, 1, 24))
-        if config.get("processing_mode") == "capture_only" or standby:
+        if config.get("processing_mode") == "capture_only" or standby or status.get("paused") or status.get("capture_phase") in {"pausing", "resuming"}:
             return self._capture_only_live(
                 status=status,
                 rows=rows,
@@ -3171,6 +3179,7 @@ class DashboardData:
                 quality_rows=quality_rows,
                 source_rows=source_rows,
                 startup_observations=startup_observations,
+                timestamps=timestamps,
             )
         new_schema = config.get("dataset_schema") in {"new_collection_v11_3", "new_collection_v12_0", THERMOCOUPLE64_MODE_ID}
         abnormal_states = (
@@ -3345,7 +3354,7 @@ class DashboardData:
         # started_at so cached predictions/results can never leak into a new run.
         session_key = (
             f"{status.get('session_dir') or 'no-session'}|"
-            f"{status.get('started_at') or 0.0}"
+            f"{status.get('started_at') or 0.0}|{status.get('segment_start_index', 0)}"
         )
         completed: list[dict] = []
         # Keep the native 24-point window prediction for warning scores.  The
@@ -5757,7 +5766,7 @@ class AppHandler(BaseHTTPRequestHandler):
             # probe.  Keep its mutex independent so a timed-out/slow model
             # request cannot block reset/recheck of the physical interfaces.
             operation_name = "agent-diagnose"
-        elif parsed.path in {"/api/acquisition/start", "/api/acquisition/stop", "/api/acquisition/connect", "/api/acquisition/disconnect"}:
+        elif parsed.path in {"/api/acquisition/start", "/api/acquisition/stop", "/api/acquisition/pause", "/api/acquisition/resume", "/api/acquisition/connect", "/api/acquisition/disconnect"}:
             operation_name = "acquisition-control"
         elif parsed.path in {"/api/training/start", "/api/training/stop"}:
             operation_name = "training-control"
@@ -5986,6 +5995,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 "/api/acquisition/reset-check",
                 "/api/acquisition/start",
                 "/api/acquisition/stop",
+                "/api/acquisition/pause",
+                "/api/acquisition/resume",
                 "/api/acquisition/connect",
                 "/api/acquisition/disconnect",
                 "/api/acquisition/invalidate-connection",
@@ -5995,7 +6006,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 "/api/training/stop",
             }
             simulation_session_control = (
-                parsed.path in {"/api/acquisition/start", "/api/acquisition/stop"}
+                parsed.path in {"/api/acquisition/start", "/api/acquisition/stop", "/api/acquisition/pause", "/api/acquisition/resume"}
                 and str(payload.get("acquisition_mode") or "").lower() == "simulation"
             )
             if (
@@ -6089,8 +6100,12 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/simulation/stop":
                 self._send_json(
-                    self.guest_manager.stop(self._identity().guest_id)
+                    self.guest_manager.stop(self._identity().guest_id, capture_uuid=payload.get("capture_uuid"), capture_generation=payload.get("capture_generation"))
                 )
+                return
+            if parsed.path in {"/api/simulation/pause", "/api/simulation/resume"}:
+                action = parsed.path.rsplit("/", 1)[-1]
+                self._send_json(self.guest_manager.control_pause(self._identity().guest_id, action, payload))
                 return
             if parsed.path == "/api/agent/diagnose/start":
                 from interface_agent import (
@@ -6887,15 +6902,27 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._replay_put(replay_key, HTTPStatus.OK, result)
                 self._send_json(result)
                 return
+            if parsed.path in {"/api/acquisition/pause", "/api/acquisition/resume"}:
+                identity = self._identity()
+                action = parsed.path.rsplit("/", 1)[-1]
+                if str(payload.get("acquisition_mode") or "").lower() == "simulation" and identity.role != "local_admin":
+                    result = self.guest_manager.control_pause(identity.guest_id, action, payload)
+                else:
+                    result = getattr(self.dashboard.acquisition, action)(capture_uuid=payload.get("capture_uuid"),
+                        capture_generation=payload.get("capture_generation"),
+                        expected_revision=payload.get("expected_revision"))
+                self._replay_put(replay_key, HTTPStatus.OK, result)
+                self._send_json(result)
+                return
             if parsed.path == "/api/acquisition/stop":
                 identity = self._identity()
                 if (
                     str(payload.get("acquisition_mode") or "").lower() == "simulation"
                     and identity.role != "local_admin"
                 ):
-                    result = self.guest_manager.stop(identity.guest_id)
+                    result = self.guest_manager.stop(identity.guest_id, capture_uuid=payload.get("capture_uuid"), capture_generation=payload.get("capture_generation"))
                 else:
-                    result = self.dashboard.acquisition.stop()
+                    result = self.dashboard.acquisition.stop(capture_uuid=payload.get("capture_uuid"), capture_generation=payload.get("capture_generation")) if payload.get("capture_uuid") or payload.get("capture_generation") else self.dashboard.acquisition.stop()
                 self._replay_put(replay_key, HTTPStatus.OK, result)
                 self._send_json(result)
                 return

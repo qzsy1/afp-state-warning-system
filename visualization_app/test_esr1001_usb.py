@@ -329,6 +329,55 @@ class UsbProtocolTests(unittest.TestCase):
         self.assertEqual(stub.writes, [QUERY])
         self.assertFalse(stub.is_open)
 
+    def test_stop_drains_backlog_without_filling_consumer_queue(self):
+        driver, stub = self.driver()
+        driver.open()
+        driver.read_samples()
+        stub.buffer.extend(USB_DATA * 4200)
+        driver.command_timeout = 2
+        driver.close()
+        self.assertEqual(driver.stop_error, "")
+        self.assertEqual(driver.command_evidence[-1]["matched_response_hex"], USB_STOP_RESPONSE.hex())
+        self.assertEqual(driver.sequence, 4203)
+        self.assertEqual(len(driver._pending), 0)
+        self.assertFalse(stub.is_open)
+
+    def test_stop_with_full_consumer_queue_preserves_raw_records(self):
+        with tempfile.TemporaryDirectory() as root:
+            recorder = RawCaptureWriter(root, {"interface_id": "esr"})
+            driver, stub = self.driver(recorder=recorder)
+            driver.open()
+            driver._pending.extend([driver.latest_record] * (4096 - len(driver._pending)))
+            stub.buffer.extend(USB_DATA * 2)
+            driver.close()
+            recorder.close(driver.quality_metadata)
+            self.assertEqual(driver.stop_error, "")
+            self.assertEqual(driver.sequence, 5)
+            self.assertEqual(recorder.rows, 5)
+            self.assertEqual(len(driver._pending), 4096)
+            self.assertFalse(stub.is_open)
+
+    def test_active_consumer_overflow_remains_an_error(self):
+        driver, stub = self.driver()
+        driver.open()
+        try:
+            driver._pending.extend([driver.latest_record] * (4096 - len(driver._pending)))
+            stub.buffer.extend(USB_DATA)
+            with self.assertRaisesRegex(UsbProtocolError, "usb_consumer_overflow"):
+                driver.read_samples()
+        finally:
+            driver.close()
+
+    def test_stop_backlog_without_reply_still_reports_timeout(self):
+        driver, stub = self.driver()
+        driver.open()
+        driver._pending.extend([driver.latest_record] * (4096 - len(driver._pending)))
+        stub.buffer.extend(USB_DATA)
+        stub.ignore_stop = True
+        driver.close()
+        self.assertIn("usb_stop_timeout", driver.stop_error)
+        self.assertFalse(stub.is_open)
+
     def test_probe_preserves_presence_when_open_is_denied_or_protocol_times_out(self):
         import serial
         from esr1001_usb import probe_usb
@@ -456,6 +505,42 @@ class UsbIntegrationTests(unittest.TestCase):
         values = dict(acquisition_mode="real", real_acquisition_mode="local_direct", processing_mode="capture_only", dataset_schema="esr1001_raw_adc", interfaces=[dict(id="esr", role="esr1001_strain", driver="esr1001_usb_ttl", endpoint="COM91", baudrate=9600, data_mode="raw_adc", physical_interface_id="serial:COM91", physical_interface_kind="serial", physical_verified=True)])
         values.update(overrides)
         return AcquisitionConfig(**values)
+
+    def test_connected_usb_disconnect_confirms_stop_after_large_backlog(self):
+        from acquisition import AcquisitionManager
+
+        class BackloggedStopSerial(StreamingSerial):
+            def write(self, data):
+                if data == STOP:
+                    self.buffer.extend(USB_DATA * 4200)
+                super().write(data)
+
+        serials = []
+        def factory(*args, **kwargs):
+            stub = BackloggedStopSerial(*args, **kwargs)
+            serials.append(stub)
+            return stub
+
+        with tempfile.TemporaryDirectory() as root, patch("serial.Serial", side_effect=factory), patch(
+            "serial.tools.list_ports.comports", return_value=[SimpleNamespace(device="COM91")]
+        ):
+            manager = AcquisitionManager(Path(root), recovery_scan=False)
+            manager.connect_data(self.config(save_root=root))
+            manager._connection_thread.join(10)
+            try:
+                self.assertTrue(manager.connection_status()["ready"], manager.connection_status())
+                driver = manager._connection_driver
+                status = manager.disconnect_data()
+                self.assertEqual(status["data_connection"]["state"], "disconnected")
+                self.assertEqual(driver.workers, [])
+                evidence = driver.interface_quality_metadata["esr"]
+                self.assertEqual(evidence["stop_error"], "")
+                self.assertEqual(evidence["commands"][-1]["matched_response_hex"], USB_STOP_RESPONSE.hex())
+                self.assertTrue(all(not stub.is_open for stub in serials))
+                self.assertEqual(list(Path(root).rglob("*")), [])
+            finally:
+                if manager._connection_driver is not None:
+                    manager.disconnect_data()
 
     def test_roundtrip_routing_model_boundary_and_legacy_protocol(self):
         from dataclasses import asdict

@@ -37,3 +37,8 @@ class MonotonicReplayScheduler:
     def effective_rate_hz(self) -> float:
         elapsed = max(0.0, float(self.clock()) - self.started_at)
         return self.emitted_count / elapsed if elapsed > 0 else 0.0
+
+    def rebase(self) -> None:
+        """Start a fresh pacing segment without replaying elapsed deadlines."""
+        self.started_at = float(self.clock())
+        self.emitted_count = 0

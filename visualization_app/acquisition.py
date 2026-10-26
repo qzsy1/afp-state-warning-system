@@ -91,7 +91,9 @@ except ImportError:  # Compatibility with older modular runtimes.
 APP_DIR = Path(os.environ.get("AFP_LEGACY_APP_DIR") or Path(__file__).resolve().parent).resolve()
 RELEASE_CONTRACT = load_release_contract(start=__file__)
 WORKSPACE_DIR = APP_DIR.parents[1]
-DEFAULT_CAPTURE_ROOT = Path("D:/AFP_Capture") if os.name == "nt" else Path(WORKSPACE_DIR.anchor) / "AFP_Capture"
+DEFAULT_CAPTURE_ROOT = Path(os.environ["AFP_CAPTURE_ROOT"]).resolve() if os.environ.get("AFP_CAPTURE_ROOT") else (
+    Path("D:/AFP_Capture") if os.name == "nt" else Path(WORKSPACE_DIR.anchor) / "AFP_Capture"
+)
 _DATA_DIR = Path(os.environ.get("AFP_DATA_DIR") or APP_DIR / "data").resolve()
 _NATIVE_DLL_DIR = Path(os.environ.get("AFP_NATIVE_DLL_DIR") or APP_DIR).resolve()
 _PACKAGED_SIMULATOR_FILE = _DATA_DIR / "原文件.csv"
@@ -1096,6 +1098,9 @@ class BoundedCsvWriter:
                 if item is self._STOP:
                     return
                 if self._error is None:
+                    if callable(item):
+                        item()
+                        continue
                     row, timestamp, valid_sample = item
                     self.row_writer.writerow(row)
                     self.timestamp_writer.writerow(timestamp)
@@ -1127,6 +1132,25 @@ class BoundedCsvWriter:
     @property
     def pending_rows(self) -> int:
         return self._queue.qsize()
+
+    def flush(self, callback, *, timeout_seconds=5.0):
+        completed = threading.Event()
+        def barrier():
+            try:
+                callback()
+            finally:
+                completed.set()
+        deadline = monotonic() + timeout_seconds
+        self._raise_error()
+        try:
+            self._queue.put(barrier, timeout=max(0, deadline - monotonic()))
+        except queue.Full as exc:
+            raise RuntimeError("persistence_flush_timeout") from exc
+        while not completed.wait(min(.02, max(0, deadline - monotonic()))):
+            self._raise_error()
+            if monotonic() >= deadline:
+                raise RuntimeError("persistence_flush_timeout")
+        self._raise_error()
 
     def close(self, *, timeout_seconds: float = 5.0) -> None:
         if not self._closed:
@@ -5032,7 +5056,10 @@ def _append_csv_rows(output, reader, columns, *, extrasaction="raise") -> None:
 from acquisition_connection import AcquisitionConnectionMixin
 
 
-class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
+from acquisition_pause import AcquisitionPauseMixin
+
+
+class AcquisitionManager(AcquisitionPauseMixin, AcquisitionConnectionMixin, AcquisitionStartMixin):
     def __init__(
         self,
         capture_root: Path = DEFAULT_CAPTURE_ROOT,
@@ -5045,6 +5072,7 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
         self._stream_activity = threading.Condition(self.lock)
         self.lifecycle_lock = threading.RLock()
         self.stop_event = threading.Event()
+        self._init_pause()
         self.thread: threading.Thread | None = None
         self.driver: SampleDriver | None = None
         self.config: AcquisitionConfig | None = None
@@ -6557,14 +6585,16 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                 timestamps = list(self.timestamps)
         if not timestamps:
             timestamps = list(self.timestamps)
+        pause_boundaries = {item["row_index"] for item in self.pause_intervals}
+        timestamp_base = max(0, self.total_sample_count - len(timestamps))
         intervals = [
             later - earlier
-            for earlier, later in zip(timestamps, timestamps[1:])
-            if later > earlier
+            for index, (earlier, later) in enumerate(zip(timestamps, timestamps[1:]), 1)
+            if later > earlier and timestamp_base + index not in pause_boundaries
         ]
         duration = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else 0.0
         effective_rate = (
-            (len(timestamps) - 1) / duration if duration > 0 else 0.0
+            len(intervals) / sum(intervals) if intervals and sum(intervals) > 0 else 0.0
         )
         ordered = sorted(intervals)
         p95 = (
@@ -6580,6 +6610,7 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
         sample_count = int(self.total_sample_count)
         selected = list(self.config.selected_sensors or []) if self.config else []
         summary = {
+            "pause_intervals": deepcopy(self.pause_intervals),
             "sample_count": sample_count,
             "duration_seconds": round(max(0.0, duration), 6),
             "configured_sample_rate_hz": (
@@ -6730,6 +6761,12 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
         return event
 
     def start(self, config: AcquisitionConfig) -> dict:
+        with self.lifecycle_lock:
+            if self.thread and self.thread.is_alive() and self.pause_state != "sampling":
+                raise RuntimeError("采集会话仍有效，请继续采集或停止并保存")
+            return self._start_with_preflight(config)
+
+    def _start_with_preflight(self, config: AcquisitionConfig) -> dict:
         """Start one capture while safely replacing an active simulation.
 
         A simulation is disposable and may be left running when a browser is
@@ -6901,6 +6938,8 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                     self.config.acquisition_mode if self.config is not None else ""
                 )
             replaced_simulation = bool(active and active_mode == "simulation")
+            if active and self.pause_state != "sampling":
+                raise RuntimeError("采集会话仍有效，请继续采集或停止并保存")
             if active and not replaced_simulation:
                 raise RuntimeError("真实采集已经在运行，请先停止当前采集")
             if replaced_simulation:
@@ -7227,6 +7266,7 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
             raise
         self._assert_start_not_cancelled()
         self.stop_event.clear()
+        self._reset_pause()
         self.thread = threading.Thread(
             target=self._run,
             name="AFP-Acquisition",
@@ -7502,7 +7542,7 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                     MonotonicReplayScheduler(
                         config.sample_rate_hz,
                         clock=time.perf_counter,
-                        wait=self.stop_event.wait,
+                        wait=self._sampling_interrupt.wait,
                     )
                     if config.driver == "simulator" or config.acquisition_mode == "simulation"
                     else None
@@ -7514,12 +7554,31 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                         _freshness_by_channel(config),
                         clock=monotonic,
                         wall_clock=time.time,
-                        wait=lambda delay: wait_interruptible(self.stop_event, delay),
+                        wait=lambda delay: wait_interruptible(self._sampling_interrupt, delay),
                     )
                     if config.acquisition_mode == "real"
                     else None
                 )
+                def flush_files():
+                    raw_file.flush()
+                    time_file.flush()
+                    if self.save_enabled:
+                        os.fsync(raw_file.fileno())
+                        os.fsync(time_file.fileno())
+
                 while not self.stop_event.is_set():
+                    resumed = self._pause_checkpoint(capture_writer, flush_files)
+                    if self.stop_event.is_set():
+                        break
+                    if self.pause_state != "sampling":
+                        continue
+                    if resumed:
+                        if replay_scheduler is not None:
+                            replay_scheduler.rebase()
+                        if frame_assembler is not None:
+                            frame_assembler.rebase(self.total_sample_count)
+                        if self.quality_metrics is not None:
+                            self.quality_metrics.begin_segment()
                     if isinstance(self.driver, MultiInterfaceDriver):
                         for device in self.driver.drivers:
                             recorder = getattr(device, "recorder", None)
@@ -7530,9 +7589,11 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                     source_times: dict[str, float | None] = {}
                     ages: dict[str, float | None] = {}
                     if frame_assembler is not None:
-                        deadline = frame_assembler.wait_next_deadline(self.stop_event)
+                        deadline = frame_assembler.wait_next_deadline(self._sampling_interrupt)
                         if self.stop_event.is_set():
                             break
+                        if self._sampling_interrupt.is_set():
+                            continue
                         if not isinstance(self.driver, MultiInterfaceDriver):
                             raise RuntimeError("真实采集必须使用独立DriverWorker内核")
                         frame = frame_assembler.assemble(self.driver.cache, deadline)
@@ -7773,6 +7834,12 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                 if self.driver is not None:
                     if self.driver is self._connection_driver and not self._start_cancel.is_set():
                         self._finish_connected_recorders()
+                        if self.pause_state != "sampling":
+                            try:
+                                self._set_sources_paused(False)
+                            except Exception as exc:
+                                with self._connection_lock:
+                                    self._connection.update(state="fault", ready=False, reason=str(exc))
                     else:
                         self.driver.close()
             except Exception as exc:
@@ -8052,13 +8119,23 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
             )
         return destinations
 
-    def stop(self) -> dict:
+    def stop(self, *, capture_uuid=None, capture_generation=None) -> dict:
+        self._check_capture_control(capture_uuid, capture_generation=capture_generation)
         if threading.current_thread() is not self._start_thread:
             pending = self.cancel_start()
             if pending is not None:
                 return pending
         with self.lifecycle_lock:
-            return self._stop_active()
+            self._check_capture_control(capture_uuid, capture_generation=capture_generation)
+            try:
+                return self._stop_active()
+            except Exception as exc:
+                self.last_error = str(exc)
+                self.capture_saved = False
+                self.finalization_complete = False
+                self.persistence_failed = True
+                self.capture_phase = "stop_timed_out" if self.thread and self.thread.is_alive() else "finalization_failed"
+                return self.status()
 
     def _stop_active(self) -> dict:
         states = getattr(self.driver, "worker_status", lambda: [])()
@@ -8072,8 +8149,12 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
         ):
             return self.status()
         self.capture_phase = "stopping_sampling"
+        self.control_revision += 1
         self.record_start_event("stop_requested")
         self.stop_event.set()
+        self._sampling_interrupt.set()
+        with self._pause_condition:
+            self._pause_condition.notify_all()
         thread = self.thread
         if thread is not None:
             sampling_timeout = (
@@ -8569,6 +8650,8 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
         with self.lifecycle_lock:
             if not self.thread or not self.thread.is_alive() or self.config.acquisition_mode != "real":
                 raise ValueError("清零仅适用于当前正在采集的真实会话")
+            if self.pause_state != "sampling":
+                raise ValueError("采集已中断，不能更改清零配置")
             workers = getattr(self.driver, "workers", [])
             worker = next((w for w in workers if w.interface_id == payload.get("interface_id") and isinstance(w.driver, Esr1001UsbDriver)), None)
             if worker is None or worker.state != "running":
@@ -8599,6 +8682,8 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                 observed = int(self.channel_observed[name])
                 if name not in selected:
                     sensor_state = "not_selected"
+                elif running and self.pause_state != "sampling":
+                    sensor_state = "paused"
                 elif observed <= 0 and running and self.started_at is not None and now - self.started_at < 2.0:
                     sensor_state = "waiting"
                 elif observed <= 0:
@@ -8619,6 +8704,7 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                     "state": sensor_state,
                     "message": {
                         "not_selected": "未选择采集", "waiting": "等待首个数据",
+                        "paused": "采样已中断，保留会话数据",
                         "no_data": "未检测到采集数据", "stale": "数据已中断",
                         "ok": "数据正常",
                         "historical": "已停止；保留历史采集证据，不代表当前在线",
@@ -8671,7 +8757,9 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                             name for name in expected
                             if sensor_by_name.get(name, {}).get("state") == "stale"
                         ]
-                        if not running:
+                        if running and self.pause_state != "sampling":
+                            state, message = "paused", "采样已中断；设备缓存不追加到当前采集"
+                        elif not running:
                             state, message = "stopped", "接口已停止；以下计数与数据为历史会话证据"
                         elif healthy:
                             state = "ok"
@@ -8703,7 +8791,7 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                         message += f"；实际帧率 {source_rate:.2f} Hz" if source_rate is not None else "；实际帧率待确认"
                         message += f"；帧龄 {frame_age:.3f}秒" if frame_age is not None else "；尚无新鲜帧"
                         message += f"；{usb_evidence.get('calibration_state')}"
-                        if running and frame_age is not None and frame_age > 0.25:
+                        if running and self.pause_state == "sampling" and frame_age is not None and frame_age > 0.25:
                             state = "stale"
                         if usb_evidence.get("overflows") or usb_evidence.get("writer_error"):
                             state = "usb_overflow"
@@ -8754,8 +8842,10 @@ class AcquisitionManager(AcquisitionConnectionMixin, AcquisitionStartMixin):
                 and self.sensor_last_time[name] is not None
                 for name in model_inputs
             )
+            model_ready = model_ready and self.pause_state == "sampling" and self.total_sample_count - self.segment_start_index >= 24
             return {
                 "running": running,
+                **self.pause_status(),
                 "data_connection": self.connection_status(),
                 "capture_start_monotonic": self._capture_start_monotonic,
                 "status_monotonic": monotonic(),

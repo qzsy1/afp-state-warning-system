@@ -557,9 +557,9 @@ class GuestSimulationManager:
             session.last_access_at = time.time()
             return self._public_status(session, result)
 
-    def stop(self, session_id: str) -> dict[str, Any]:
+    def stop(self, session_id: str, *, capture_uuid=None, capture_generation=None) -> dict[str, Any]:
         session = self.ensure_session(session_id)
-        result = session.acquisition.stop()
+        result = session.acquisition.stop(capture_uuid=capture_uuid, capture_generation=capture_generation)
         session.last_access_at = time.time()
         payload = self._public_status(session, result)
         try:
@@ -567,6 +567,16 @@ class GuestSimulationManager:
         except GuestSimulationError as exc:
             payload["quota_warning"] = exc.code
         return payload
+
+    def control_pause(self, session_id: str, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if action not in {"pause", "resume"}:
+            raise ValueError("invalid_capture_control")
+        session = self.ensure_session(session_id)
+        result = getattr(session.acquisition, action)(capture_uuid=payload.get("capture_uuid"),
+            capture_generation=payload.get("capture_generation"),
+            expected_revision=payload.get("expected_revision"))
+        session.last_access_at = time.time()
+        return self._public_status(session, result)
 
     def status(self, session_id: str) -> dict[str, Any]:
         session = self.ensure_session(session_id)

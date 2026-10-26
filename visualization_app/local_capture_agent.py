@@ -65,7 +65,7 @@ class LocalCaptureAgent:
         simulation_cache_root: str | Path | None = None,
     ) -> None:
         self.manager = manager or AcquisitionManager()
-        default_cache_root = DEFAULT_CAPTURE_ROOT / ".helper" / "simulation-cache"
+        default_cache_root = Path(getattr(self.manager, "capture_root", DEFAULT_CAPTURE_ROOT)) / ".helper" / "simulation-cache"
         self._simulation_cache = SimulationSourceCache(
             simulation_cache_root or default_cache_root
         )
@@ -677,9 +677,22 @@ class LocalCaptureAgent:
     def read_process_parameters(self, config: Any) -> dict[str, Any]:
         return self.manager.read_process_parameters(config)
 
-    def stop_capture(self) -> dict[str, Any]:
-        result = self.manager.stop()
+    def control_pause(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if action not in {"pause", "resume"}:
+            raise ValueError("invalid_capture_control")
+        result = getattr(self.manager, action)(capture_uuid=payload.get("capture_uuid"),
+            capture_generation=payload.get("capture_generation"),
+            expected_revision=payload.get("expected_revision"))
+        with self._stream_lock:
+            self._status_revision += 1
+            self._status_dirty = True
+        return {**result, "execution_host": "helper_local"}
+
+    def stop_capture(self, *, capture_uuid=None, capture_generation=None) -> dict[str, Any]:
+        result = self.manager.stop(capture_uuid=capture_uuid, capture_generation=capture_generation) if capture_uuid or capture_generation else self.manager.stop()
         if isinstance(result, dict) and result.get("capture_phase") == "cancelling_start":
+            return {**result, "execution_host": "helper_local"}
+        if isinstance(result, dict) and (result.get("running") or result.get("save_failed")):
             return {**result, "execution_host": "helper_local"}
         stopped_at = time.time()
         response = dict(result) if isinstance(result, dict) else {"result": result}

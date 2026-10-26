@@ -504,15 +504,19 @@ class AcquisitionPanel(ttk.Frame):
 
         actions = ttk.Frame(parent)
         actions.grid(row=6, column=0, sticky="ew", pady=8)
-        for col in range(4): actions.columnconfigure(col, weight=1)
+        for col in range(5): actions.columnconfigure(col, weight=1)
         self.test_button = ttk.Button(actions, text="检查连接", command=self.test_connection, state="disabled")
         self.start_button = ttk.Button(actions, text="开始采集", command=self.start, state="disabled")
         self.stop_button = ttk.Button(actions, text="停止并保存", command=self.stop, state="disabled")
+        self.pause_button = ttk.Button(actions, text="中断采集", command=self.toggle_pause, state="disabled")
         self.open_button = ttk.Button(actions, text="打开数据目录", command=self.open_folder)
         self.test_button.grid(row=0, column=0, sticky="ew", padx=2)
         self.start_button.grid(row=0, column=1, sticky="ew", padx=2)
         self.stop_button.grid(row=0, column=2, sticky="ew", padx=2)
-        self.open_button.grid(row=0, column=3, sticky="ew", padx=2)
+        self.pause_button.grid(row=0, column=3, sticky="ew", padx=2)
+        self.open_button.grid(row=0, column=4, sticky="ew", padx=2)
+        self._control_busy = False
+        self._locked_widgets = {}
         self.status_text = tk.StringVar(value="正在加载模型与健康指标资源……")
         ttk.Label(parent, textvariable=self.status_text, wraplength=350, foreground=COLORS["muted"]).grid(row=7, column=0, sticky="ew", pady=4)
 
@@ -751,14 +755,25 @@ class AcquisitionPanel(ttk.Frame):
             mysql_local_enabled=bool(self.vars["mysql_local_enabled"].get()), mysql_local_host=str(self.vars["mysql_local_host"].get()), mysql_local_port=_safe_int(self.vars["mysql_local_port"].get(), 3306, 1), mysql_local_user=str(self.vars["mysql_local_user"].get()), mysql_local_password=str(self.vars["mysql_local_password"].get()), mysql_local_database=str(self.vars["mysql_local_database"].get()),
         )
 
-    def _background(self, label: str, work: Callable[[], Any], done: Callable[[Any], None] | None = None) -> None:
+    def _background(self, label: str, work: Callable[[], Any], done: Callable[[Any], None] | None = None, *, capture_control=False) -> None:
         self.status_text.set(label)
+        def complete(result=None, error=None):
+            if capture_control:
+                self._control_busy = False
+                self._sync_capture_controls(self.dashboard.acquisition.status())
+            if error is not None:
+                self.status_text.set(error)
+                messagebox.showerror("操作失败", error)
+            elif done:
+                done(result)
+            else:
+                self.status_text.set("操作完成")
         def runner() -> None:
             try:
                 result = work()
-                self.after(0, lambda: (done(result) if done else self.status_text.set("操作完成")))
+                self.after(0, lambda: complete(result))
             except Exception as exc:
-                self.after(0, lambda e=str(exc): (self.status_text.set(e), messagebox.showerror("操作失败", e)))
+                self.after(0, lambda e=str(exc): complete(error=e))
         threading.Thread(target=runner, daemon=True).start()
 
     def _mysql_settings(self) -> MySQLSettings:
@@ -1006,19 +1021,32 @@ class AcquisitionPanel(ttk.Frame):
         self._background("正在检查传感器与模型兼容性……", work, lambda result: self.status_text.set("连接检查通过" if result.get("ok") else "连接检查未通过：" + "; ".join(result.get("errors", []))))
 
     def start(self) -> None:
+        if self._control_busy:
+            return
         config = self._config()
+        self._control_busy = True
         def work() -> dict[str, Any]:
             self.dashboard.validate_prediction_setup(config, load_model=True)
             return self.dashboard.acquisition.start(config)
         def done(result: dict[str, Any]) -> None:
-            self.start_button.config(state="disabled"); self.stop_button.config(state="normal")
+            self._sync_capture_controls(result)
             self.status_text.set(f"采集中：{result.get('layer_file') or result.get('session_dir')}")
             self.app.set_runtime("采集中 + 实时预测预警" if config.processing_mode == "prediction_warning" else "仅采集中")
-        self._background("正在加载模型并启动采集……", work, done)
+        self._background("正在加载模型并启动采集……", work, done, capture_control=True)
 
     def stop(self) -> None:
+        if self._control_busy:
+            return
+        self._control_busy = True
         def done(result: dict[str, Any]) -> None:
-            self.start_button.config(state="normal"); self.stop_button.config(state="disabled")
+            self._sync_capture_controls(result)
+            if not result.get("finalization_complete") or result.get("running"):
+                self.status_text.set("保存尚未完成：" + (result.get("last_error") or result.get("capture_phase", "")))
+                return
+            if not result.get("sample_count"):
+                self.status_text.set("采集已结束：零样本，未生成层文件")
+                self.app.set_runtime("就绪")
+                return
             mysql = result.get("mysql", {})
             if mysql.get("ok"):
                 suffix = (
@@ -1032,9 +1060,47 @@ class AcquisitionPanel(ttk.Frame):
                 )
             else:
                 suffix = ""
-            self.status_text.set(f"采集已停止并保存{suffix}")
+            self.status_text.set(f"采集已停止并保存{suffix}" if result.get("capture_saved") or mysql.get("ok")
+                else "本次采集已结束；保存开关未启用")
             self.app.set_runtime("就绪")
-        self._background("正在停止并保存完整试样/分层数据……", self.dashboard.acquisition.stop, done)
+        self._background("正在停止并保存完整试样/分层数据……", self.dashboard.acquisition.stop, done, capture_control=True)
+
+    def toggle_pause(self) -> None:
+        if self._control_busy:
+            return
+        status = self.dashboard.acquisition.status()
+        action = "resume" if status.get("paused") else "pause"
+        self._control_busy = True
+        def work():
+            return getattr(self.dashboard.acquisition, action)(capture_uuid=status.get("capture_uuid"),
+                capture_generation=status.get("capture_generation"),
+                expected_revision=status.get("control_revision"))
+        def done(result):
+            self._sync_capture_controls(result)
+            self.status_text.set("采集已中断，数据和层号保留" if result.get("paused") else "已继续同一次采集")
+        self._background("正在确认采样状态……", work, done, capture_control=True)
+
+    def _sync_capture_controls(self, status):
+        active = bool(status.get("session_active") or status.get("running"))
+        locked = active or self._control_busy
+        transition = status.get("capture_phase") in {"pausing", "resuming", "stopping_sampling", "finalizing"}
+        self.start_button.config(state="disabled" if active or self._control_busy else "normal")
+        saving = status.get("saving") or status.get("capture_phase") in {"stopping_sampling", "finalizing"}
+        self.stop_button.config(state="normal" if active and not saving and not self._control_busy else "disabled")
+        self.pause_button.config(text="继续采集" if status.get("paused") else "中断采集",
+            state="normal" if status.get("running") and not transition and not self._control_busy else "disabled")
+        self.test_button.config(state="disabled" if active or self._control_busy else "normal")
+        def visit(parent):
+            for widget in parent.winfo_children():
+                if isinstance(widget, (ttk.Entry, ttk.Combobox, ttk.Checkbutton, tk.Listbox)):
+                    if locked:
+                        if widget not in self._locked_widgets:
+                            self._locked_widgets[widget] = str(widget.cget("state"))
+                        widget.configure(state="disabled")
+                    elif widget in self._locked_widgets:
+                        widget.configure(state=self._locked_widgets.pop(widget))
+                visit(widget)
+        visit(self)
 
     def open_folder(self) -> None:
         path = Path(str(self.vars["save_root"].get()) or r"D:\AFP_Capture")
@@ -1245,6 +1311,7 @@ class AcquisitionPanel(ttk.Frame):
         if self.dashboard is None:
             self.after(500, self._poll); return
         status = self.dashboard.acquisition.status()
+        self._sync_capture_controls(status)
         if status.get("running") and not self._live_busy:
             self._live_busy = True
             sensor_names = list(self.sensor_combo["values"])
@@ -1543,14 +1610,21 @@ class IntegratedApp:
             self.root.after(0, lambda: (self.set_runtime("初始化失败"), messagebox.showerror("初始化失败", details[-4000:])))
 
     def close(self) -> None:
-        try:
-            if self.acquisition_panel.dashboard and self.acquisition_panel.dashboard.acquisition.status().get("running"):
-                if not messagebox.askyesno("确认退出", "采集仍在运行。是否停止、保存并退出？"): return
-                self.acquisition_panel.dashboard.acquisition.stop()
-            if self.training_panel.manager.running:
-                if not messagebox.askyesno("确认退出", "训练仍在运行。是否请求停止并保存后退出？"): return
-                self.training_panel.manager.stop()
-        finally: self.root.destroy()
+        if self.acquisition_panel.dashboard:
+            acquisition = self.acquisition_panel.dashboard.acquisition
+            status = acquisition.status()
+            if status.get("session_active") or status.get("running"):
+                if not messagebox.askyesno("确认退出", "采集会话尚未完成（可能已中断）。是否停止、保存并退出？"):
+                    return
+                result = acquisition.stop()
+                if not result.get("finalization_complete"):
+                    messagebox.showerror("不能退出", result.get("last_error") or "采集保存尚未完成，请核查并重试")
+                    return
+        if self.training_panel.manager.running:
+            if not messagebox.askyesno("确认退出", "训练仍在运行。是否请求停止并保存后退出？"):
+                return
+            self.training_panel.manager.stop()
+        self.root.destroy()
 
     def run(self) -> None: self.root.mainloop()
 

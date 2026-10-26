@@ -622,7 +622,7 @@ class Esr1001UsbDriver:
                     self.recorder.record_event(self.zero_events[-1])
             self.zero = None
 
-    def _read(self):
+    def _read(self, *, enqueue_observations=True):
         pending = int(getattr(self.serial, "in_waiting", 0))
         data = self.serial.read(min(max(pending, 1), 16384))
         skip = min(len(data), getattr(self, '_capture_boundary_skip_bytes', 0))
@@ -662,9 +662,10 @@ class Esr1001UsbDriver:
                 if self.recorder:
                     self.recorder.submit(record)
                 self.latest_record = record
-                if len(self._pending) >= 4096:
-                    raise UsbProtocolError("usb_consumer_overflow", "源观测消费队列过载")
-                self._pending.append(record)
+                if enqueue_observations:
+                    if len(self._pending) >= 4096:
+                        raise UsbProtocolError("usb_consumer_overflow", "源观测消费队列过载")
+                    self._pending.append(record)
 
     def _command(self, command):
         if self._effective_startup_policy != "fixed" and command != STOP:
@@ -681,7 +682,8 @@ class Esr1001UsbDriver:
         while monotonic() < deadline:
             if command != STOP and self._cancel_open.is_set():
                 raise UsbProtocolError("capture_start_cancelled", "设备启动已取消")
-            self._read()
+            # STOP drains and records source frames without queuing work for a stopped consumer.
+            self._read(enqueue_observations=command != STOP)
             if command == QUERY and self._parameter_frames:
                 command_record["matched_response_hex"] = self._parameter_frames[0].hex()
                 return parse_parameters(self._parameter_frames.popleft())

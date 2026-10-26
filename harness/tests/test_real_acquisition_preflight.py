@@ -538,7 +538,7 @@ class RealAcquisitionPreflightTests(unittest.TestCase):
                     interface_id="fast",
                     channel_name="温度",
                     value=42.0,
-                    received_monotonic=time.monotonic(),
+                    received_monotonic=core.monotonic(),
                     source_sequence=1,
                 )
             )

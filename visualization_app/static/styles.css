@@ -362,6 +362,7 @@ output { color: var(--blue); font-weight: 800; }
 }
 .primary-button { color: #fff; background: linear-gradient(135deg, #1767a6, #2189c2); }
 .secondary-button { color: var(--blue); background: #f4f9fc; }
+.primary-button:disabled, .secondary-button:disabled { opacity: .45; cursor: not-allowed; }
 .primary-button:hover, .secondary-button:hover { filter: brightness(.97); box-shadow: 0 2px 8px rgba(28,98,149,.14); }
 .compact-button { flex: 0 0 56px; min-height: 31px; }
 .full-button { width: 100%; }

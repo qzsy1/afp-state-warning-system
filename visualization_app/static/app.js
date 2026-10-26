@@ -1059,6 +1059,10 @@ async function requestLocalHelper(command, payload = {}, {timeoutMs = 30000} = {
 }
 
 function acquisitionDisplayPhase(status) {
+  const phases = {pausing: "正在中断采集", paused: "采集已中断", resuming: "正在建立新采样边界",
+    stopping_sampling: "正在停止采样", finalizing: "正在保存", finalization_failed: "保存失败",
+    database_pending_retry: "数据库保存失败，等待重试", stop_timed_out: "停止尚未确认"};
+  if (phases[status?.capture_phase]) return {key: status.capture_phase, label: phases[status.capture_phase]};
   const startState = status?.start_operation?.state;
   if (startState === "starting") return {key: "starting", label: "正在启动，等待各接口数据"};
   if (startState === "cancelling") return {key: "cancelling_start", label: "正在取消启动并释放接口"};
@@ -1142,7 +1146,7 @@ function renderM3232Matrix(status) {
   const label = document.getElementById("m3232MatrixStatus");
   const stats = document.getElementById("m3232MatrixValues");
   const numbers = document.getElementById("m3232MatrixData");
-  const valid = status.running && evidence?.protocol_verified && status.capture_generation
+  const valid = (status.sampling ?? status.running) && evidence?.protocol_verified && status.capture_generation
     && record?.connection_generation === evidence.connection_generation
     && Number.isFinite(evidence.frame_age_seconds) && evidence.frame_age_seconds <= 2
     && Array.isArray(matrix) && matrix.length === 32
@@ -1153,7 +1157,7 @@ function renderM3232Matrix(status) {
     canvas.getContext("2d").clearRect(0,0,256,256);
     canvas.dataset.frame = "";
     window.afpM3232MatrixEvidence = null;
-    label.textContent = !status.running ? "采集已停止 · 无当前实时矩阵" : "等待当前会话完整新矩阵 · 无数据或数据已过期";
+    label.textContent = status.paused ? "采集已中断 · 等待继续本次采集" : !status.running ? "采集已停止 · 无当前实时矩阵" : "等待当前会话完整新矩阵 · 无数据或数据已过期";
     stats.textContent = ""; numbers.textContent = "";
     return;
   }
@@ -1330,7 +1334,7 @@ function esrSensorDisplayChannels(channels, status) {
     const unique = new Set(observations.filter(source => source?.quality === "measured_new"
       && source.after_start !== false && source.protocol_ok !== false && source.stable !== false)
       .map(source => `${source.interface_id}/${source.source_sequence}`));
-    const fresh = Boolean(status.running && item.adapter_state === "running" && item.state === "ok");
+    const fresh = Boolean((status.sampling ?? status.running) && item.adapter_state === "running" && item.state === "ok");
     return [{...channel, x_observed: series.x_observed, actual, source_observations: observations,
       display_name: `应变${index} · CH${index}`, source_channel_name: channel.name, unit: basis.unit,
       actual_current: basis.values[basis.key(index)] ?? null,
@@ -1348,7 +1352,7 @@ function renderEsrNumeric(status) {
   panel?.classList.toggle("hidden", !item);
   if (!item) return;
   const evidence = item.usb_evidence;
-  const fresh = status.running && item.adapter_state === "running" && item.state === "ok";
+  const fresh = (status.sampling ?? status.running) && item.adapter_state === "running" && item.state === "ok";
   updateEsrRelativeHistory(esrRelativeHistory, evidence, fresh);
   if (state.payload) {
     renderSensorCards(currentOtherSensorChannels(), state.payload.selection.sensor);
@@ -1370,7 +1374,7 @@ function renderEsrNumeric(status) {
   ].join("\n");
   const record = evidence.latest_record || {};
   const candidateState = evidence.vendor_candidate_snapshot ? `｜厂商候选未确认 ${String(evidence.vendor_candidate_digest || "").slice(0, 12)}` : "";
-  document.getElementById("esrNumericState").textContent = `${fresh ? "当前源观测" : status.running ? "当前数据不可用；下列为历史证据" : "已停止；下列为历史证据"}｜${evidence.calibration_state}${candidateState}｜相对零点${evidence.zero ? "已设置" : "关闭"}｜源序号 ${record.receive_sequence ?? "—"}`;
+  document.getElementById("esrNumericState").textContent = `${status.paused ? "采集已中断；下列为中断前证据" : fresh ? "当前源观测" : status.running ? "当前数据不可用；下列为历史证据" : "已停止；下列为历史证据"}｜${evidence.calibration_state}${candidateState}｜相对零点${evidence.zero ? "已设置" : "关闭"}｜源序号 ${record.receive_sequence ?? "—"}`;
   const calibrated = record.calibrated_values || {};
   const relativeUnit = Object.keys(calibrated).length ? "με" : "adc_counts";
   const relativeKey = i => relativeUnit === "με" ? `相对应变${i}` : `CH${i}_ADC_relative`;
@@ -1427,6 +1431,10 @@ function plcMeasurementText(status) {
 }
 
 function renderAcquisitionStatus(status) {
+  if (status.capture_uuid && status.capture_uuid === state.acquisitionStatus?.capture_uuid
+      && status.capture_generation === state.acquisitionStatus?.capture_generation
+      && Number.isFinite(status.control_revision) && Number.isFinite(state.acquisitionStatus?.control_revision)
+      && status.control_revision < state.acquisitionStatus.control_revision) return;
   if (controls.acquisitionMode?.value === "real" && window.afpCurveTrace
       && (window.afpCurveTrace.generation || status.start_request_id === window.afpCurveTrace.id)
       && !window.afpCurveTrace.accepts(status)) return;
@@ -1515,11 +1523,12 @@ function renderAcquisitionStatus(status) {
       ? "预测与预警输入已就绪"
       : `等待全部${expectedInputCount}个模型输入通道，预测至少24点、首次预警至少48点`;
   const predictionCount = selectedPredictionSensors().length;
-  const locked = Boolean(status.running || ["starting", "cancelling"].includes(status.start_operation?.state));
-  // The data scheme belongs to the current acquisition session.  Lock it only
-  // while the stream is actually running; after stop() has completed, both
-  // real and simulated acquisitions must be able to choose a new scheme even
-  // when the previous session left rows/files on disk.
+  const locked = Boolean(status.session_active || status.running || ["starting", "cancelling"].includes(status.start_operation?.state));
+  const configuration = $("acquisitionConfigurationFields");
+  if (configuration) configuration.disabled = locked;
+  document.querySelectorAll('#acquisitionParameterPanel input, #acquisitionParameterPanel select, #interfacePanel input, #interfacePanel select').forEach(input => { input.disabled = locked; });
+  [controls.sampleRate, controls.saveRoot, controls.simulationSourcePath, controls.simulationSourceType,
+    controls.driver, controls.sourceFile].filter(Boolean).forEach(input => { input.disabled = locked; });
   if (controls.datasetSchema) controls.datasetSchema.disabled = locked;
   if (controls.acquisitionMode) controls.acquisitionMode.disabled = locked;
   if (controls.processingMode) controls.processingMode.disabled = locked;
@@ -1711,6 +1720,8 @@ function renderRuntimeStatus(payload = state.payload) {
   let label;
   if (acquisition.last_error) {
     label = `采集错误：${acquisition.last_error}`;
+  } else if (acquisition.paused || ["pausing", "resuming", "stopping_sampling", "finalizing"].includes(acquisition.capture_phase)) {
+    label = `${acquisitionDisplayPhase(acquisition).label} · ${acquisition.sample_count || 0}点`;
   } else if (acquisition.running) {
     if (captureOnly) {
       label = `${simulation ? "模拟采集" : "真实采集"}中（仅保存） · ${acquisition.sample_count || 0}点`;
@@ -1731,7 +1742,7 @@ function renderRuntimeStatus(payload = state.payload) {
     label = "真实采集已停止";
   }
   node.textContent = label;
-  dot.classList.toggle("active", Boolean(acquisition.running));
+  dot.classList.toggle("active", Boolean(acquisition.sampling ?? acquisition.running));
 }
 
 function applyPredictionModelProfile(profile, setSelections = true) {
@@ -2853,6 +2864,10 @@ function stopPublicDemo() {
 
 async function toggleDataConnection(event) {
   if (state.dataConnectionBusy) return;
+  if (controls.acquisitionMode?.value !== "real" || usesLocalCaptureHelper()) {
+    toast(controls.acquisitionMode?.value !== "real" ? "模拟采集不占用真实设备连接" : "设备连接由访问电脑辅助程序管理");
+    return;
+  }
   state.dataConnectionBusy = true;
   window.afpConnectionTrace = {input_ms: event?.timeStamp, trusted: event?.isTrusted === true,
     handler_ms: performance.now(), clock_domain: "browser_performance", action: "connect"};
@@ -2865,8 +2880,8 @@ async function toggleDataConnection(event) {
     const current = await (await fetch('/api/acquisition/status?acquisition_mode=real', {cache: 'no-store'})).json();
     const disconnect = current.data_connection && current.data_connection.state !== 'disconnected';
     afpConnectionTrace.action = disconnect ? "disconnect" : "connect";
-    const config = acquisitionConfig({allowUnverifiedPhysical: true});
-    const fingerprint = hardwareConfigFingerprint(config);
+    const config = disconnect ? null : acquisitionConfig({allowUnverifiedPhysical: true});
+    const fingerprint = disconnect ? "" : hardwareConfigFingerprint(config);
     const result = await postJson(disconnect ? '/api/acquisition/disconnect' : '/api/acquisition/connect', disconnect ? {} : config, {timeoutMs: 90000});
     renderAcquisitionStatus(result);
     if (!disconnect) {
@@ -3302,7 +3317,7 @@ async function stopAcquisition() {
     if (usesLocalCaptureHelper() && (
       mode !== "simulation" || state.acquisitionExecutionHost === "helper_local"
     )) {
-      result = await requestLocalHelper("stop_capture", {}, {timeoutMs: 30000});
+      result = await requestLocalHelper("stop_capture", {capture_uuid: state.acquisitionStatus?.capture_uuid, capture_generation: state.acquisitionStatus?.capture_generation}, {timeoutMs: 30000});
       renderAcquisitionStatus(result);
       result = await waitForHelperFlushComplete(result);
       result = await waitForServerTargetSave(result);
@@ -3310,7 +3325,7 @@ async function stopAcquisition() {
       try {
         result = await postJson(
           state.accessRole === "guest" ? "/api/simulation/stop" : "/api/acquisition/stop",
-          {acquisition_mode: mode},
+          {acquisition_mode: mode, capture_uuid: state.acquisitionStatus?.capture_uuid, capture_generation: state.acquisitionStatus?.capture_generation},
           {timeoutMs: 90000},
         );
       } catch (error) {
@@ -3337,10 +3352,12 @@ async function stopAcquisition() {
     }
     renderAcquisitionStatus(result);
     renderMysqlStatus(result.mysql, result.server_target);
-    if (result.running || result.finalization_complete === false || (!result.capture_saved && result.server_target?.state !== "saved"
+    const persistenceRequired = Boolean(result.save_enabled || result.mysql?.enabled || result.server_target?.mysql_enabled);
+    if (result.running || result.finalization_complete === false || (persistenceRequired && !result.capture_saved && result.server_target?.state !== "saved"
         && Number(result.mysql?.saved_rows || 0) <= 0)) {
       throw new Error(result.last_error || "停止请求已返回，但本次采集未完成保存；请检查采样点数和数据源");
     }
+    if (!persistenceRequired) toast("本次采集已结束；保存开关未启用");
     if (
       Array.isArray(result.completed_layers) &&
       result.completed_layers.includes(completedLayer + 1)
@@ -5746,6 +5763,7 @@ controls.predictionModelType?.addEventListener("change", () => {
 $("startAcquisitionButton").addEventListener("click", startAcquisition);
 $("connectDataButton").addEventListener("click", toggleDataConnection);
 $("stopAcquisitionButton").addEventListener("click", stopAcquisition);
+$("pauseAcquisitionButton")?.addEventListener("click", toggleAcquisitionPause);
 [
   controls.liveSpecimen,
   controls.runId,
@@ -7613,24 +7631,75 @@ function synchronizeAcquisitionButtons() {
   const startButton = $("startAcquisitionButton");
   const stopButton = $("stopAcquisitionButton");
   const connectButton = $("connectDataButton");
+  const status = state.acquisitionStatus || {};
+  const transition = ["pausing", "resuming"].includes(status.capture_phase);
+  const pauseButton = $("pauseAcquisitionButton");
+  if (pauseButton) {
+    const helperBacked = usesLocalCaptureHelper() && (controls.acquisitionMode?.value !== "simulation"
+      || state.acquisitionExecutionHost === "helper_local" || status.execution_host === "helper_local");
+    const supported = !helperBacked || Boolean(state.helperStatus?.capabilities?.capture_pause_v1);
+    pauseButton.classList.toggle("hidden", publicDemo || !supported);
+    pauseButton.textContent = status.paused ? "继续采集" : status.capture_phase === "resuming"
+      ? "正在继续采集…" : state.pauseBusy || status.capture_phase === "pausing" ? "正在中断采集…" : "中断采集";
+    pauseButton.disabled = !supported || publicDemo || state.pauseBusy || state.stopBusy || starting || transition
+      || !acquisitionRunning || !["running", "paused"].includes(status.capture_phase);
+  }
   if (connectButton) {
     const connection = state.acquisitionStatus?.data_connection;
-    connectButton.classList.toggle("hidden", controls.acquisitionMode?.value !== "real" || usesLocalCaptureHelper());
+    const localRealConnection = controls.acquisitionMode?.value === "real" && !usesLocalCaptureHelper();
+    connectButton.classList.toggle("hidden", false);
     connectButton.textContent = connection && connection.state !== "disconnected" ? "断开数据" : "连接数据";
-    connectButton.disabled = Boolean(state.dataConnectionBusy || state.stopBusy || state.acquisitionStartBusy || acquisitionRunning || starting);
-    connectButton.title = connection?.reason || "连接设备并持续有界接收；开始采集后才保存和展示";
+    connectButton.disabled = !localRealConnection || Boolean(state.dataConnectionBusy || state.stopBusy || state.pauseBusy || state.acquisitionStartBusy || acquisitionRunning || starting || status.session_active);
+    connectButton.title = !localRealConnection
+      ? controls.acquisitionMode?.value !== "real" ? "模拟采集不占用真实设备连接；真实采集模式可连接或断开设备" : "设备连接由访问电脑辅助程序管理"
+      : acquisitionRunning || status.session_active ? "请先停止并保存，再断开设备数据连接"
+      : connection?.reason || "连接设备并持续有界接收；开始采集后才保存和展示";
   }
   if (startButton) {
     startButton.textContent = publicDemo ? "开始演示" : "开始采集";
     startButton.disabled = publicDemo
       ? (!state.publicDemoReady || publicDemoRunning)
-      : (state.dataConnectionBusy || state.acquisitionStartBusy || acquisitionRunning || starting);
+      : Boolean(state.dataConnectionBusy || state.acquisitionStartBusy || state.pauseBusy || state.stopBusy || acquisitionRunning || starting || needsFinalization || status.session_active);
   }
   if (stopButton) {
     stopButton.textContent = publicDemo ? "停止演示" : starting ? "取消启动" : needsFinalization ? "完成保存" : "停止并保存";
     stopButton.disabled = publicDemo
       ? !publicDemoRunning
-      : (state.stopBusy || (!acquisitionRunning && !starting && !needsFinalization));
+      : (state.stopBusy || state.pauseBusy || status.saving || (!acquisitionRunning && !starting && !needsFinalization && !status.session_active));
+  }
+}
+
+async function toggleAcquisitionPause() {
+  if (state.pauseBusy || state.stopBusy) return;
+  const before = state.acquisitionStatus || {};
+  const action = before.paused ? "resume" : "pause";
+  const mode = controls.acquisitionMode?.value || "real";
+  const helper = usesLocalCaptureHelper() && (mode !== "simulation" || state.acquisitionExecutionHost === "helper_local"
+    || before.execution_host === "helper_local");
+  const payload = {acquisition_mode: mode, capture_uuid: before.capture_uuid, capture_generation: before.capture_generation, expected_revision: before.control_revision};
+  state.pauseBusy = true;
+  synchronizeAcquisitionButtons();
+  try {
+    const result = helper
+      ? await requestLocalHelper(`${action}_capture`, payload, {timeoutMs: 30000})
+      : await postJson(`/api/${state.accessRole === "guest" ? "simulation" : "acquisition"}/${action}`, payload, {timeoutMs: 30000});
+    renderAcquisitionStatus(result);
+    if (action === "pause" ? !result.paused : !result.sampling) throw new Error(result.pause_error || "执行端尚未确认操作，请查看采集状态");
+    toast(action === "pause" ? "采样已中断，已有数据与保存目标保留" : "已继续同一次、同一层采集");
+  } catch (error) {
+    try {
+      const current = helper ? await requestLocalHelper("status", {}, {timeoutMs: 10000})
+        : await fetch(`/api/${state.accessRole === "guest" ? "simulation" : "acquisition"}/status?acquisition_mode=${mode}`,
+          {cache: "no-store", credentials: "same-origin"}).then(response => {
+            if (!response.ok) throw new Error("状态读取失败");
+            return response.json();
+          });
+      renderAcquisitionStatus(current);
+    } catch (_) { /* The next status poll confirms the execution state. */ }
+    toast(error.message);
+  } finally {
+    state.pauseBusy = false;
+    synchronizeAcquisitionButtons();
   }
 }
 

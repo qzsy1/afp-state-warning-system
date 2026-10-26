@@ -130,6 +130,80 @@ class LocalDirectAdapter:
         self.start_events = []
         self.source_observations: list[dict[str, float | int]] = []
         self.receive_lock = threading.RLock()
+        self.capture_paused = False
+        self._discard_next_payload = False
+        self._sampling_boundary_reset = False
+
+    def _discard_paused_input(self):
+        """Bound receive work without publishing or recording paused samples."""
+        port = getattr(self.driver, "serial", None)
+        if port is not None:
+            reset = getattr(port, "reset_input_buffer", None)
+            if callable(reset):
+                reset()
+            else:
+                pending = int(getattr(port, "in_waiting", 0))
+                if pending:
+                    port.read(min(pending, 16384))
+            return
+        if self.driver.__class__.__name__ == "TcpJsonDriver":
+            self._discard_socket_input()
+            return
+        self.driver.read_sample()
+
+    def _discard_socket_input(self):
+        import select
+        sock = self.driver.sock
+        for _ in range(16):
+            if not select.select([sock], [], [], 0)[0]:
+                return
+            if not sock.recv(16384):
+                raise ConnectionError("数据流连接已关闭")
+        if select.select([sock], [], [], 0)[0]:
+            raise RuntimeError("resume_buffer_overflow: 设备缓存超出有界丢弃容量")
+
+    def reset_sampling_boundary(self):
+        """Discard partial input while preserving session counters and recorders."""
+        device = self.driver
+        self._sampling_boundary_reset = True
+        port = getattr(device, "serial", None)
+        if port is not None:
+            reset = getattr(port, "reset_input_buffer", None)
+            if callable(reset):
+                reset()
+            else:
+                pending = int(getattr(port, "in_waiting", 0))
+                if pending > 16384:
+                    raise RuntimeError("resume_buffer_overflow")
+                if pending:
+                    port.read(pending)
+        kind = _driver_name(device)
+        if kind == _ESR1001_USB_DRIVER:
+            device.parser = type(device.parser)(device.parser.channels)
+            device._pending.clear()
+            device._capture_boundary_skip_bytes = 0
+            device._capture_discard_frames = 1
+            device.last_observation = None
+            device.started_monotonic = self.clock()
+            device.recent_intervals.clear()
+        elif kind == "m3232_pressure":
+            offset = device.parser.offset + len(device.parser.buffer)
+            device.parser = device._parser()
+            device.parser.offset = offset
+            device._boundary_discard_line = True
+            device.last_frame = None
+            device.started = self.clock()
+        if hasattr(device, "_rx_buffer"):
+            device._rx_buffer.clear()
+        if hasattr(device, "_previous_position"):
+            device._previous_position = None
+        if device.__class__.__name__ == "TcpJsonDriver":
+            device.file.close()
+            self._discard_socket_input()
+            device.file = device.sock.makefile("rb")
+        self._discard_next_payload = device.__class__.__name__ in {"SerialJsonDriver", "TcpJsonDriver"}
+        self.source_observations.clear()
+        self._previous_round_start = None
 
     def _event(self, stage):
         if len(self.start_events) < 64:
@@ -148,6 +222,9 @@ class LocalDirectAdapter:
         self.thread.start()
 
     def _publish(self, payload: Mapping[str, Any], record: Mapping[str, Any] | None = None) -> bool:
+        if self._discard_next_payload:
+            self._discard_next_payload = False
+            return False
         accepted = [
             (str(name), raw_value)
             for name, raw_value in payload.items()
@@ -155,6 +232,7 @@ class LocalDirectAdapter:
         ]
         if not accepted:
             return False
+        self._sampling_boundary_reset = False
         received_monotonic = float(record["host_monotonic"]) if record else self.clock()
         received_wall_time = float(record["host_wall_time"]) if record else self.wall_clock()
         plc_record = record if isinstance(record, Mapping) and record.get("measurement_profile") == "fibercontrol_plc_v1" else None
@@ -223,6 +301,11 @@ class LocalDirectAdapter:
     def _safe_close(self) -> None:
         with self._close_lock:
             try:
+                if (self.capture_paused or self._sampling_boundary_reset) and _driver_name(self.driver) == _ESR1001_USB_DRIVER:
+                    self.reset_sampling_boundary()
+                    self.driver._capture_discard_frames = 1 << 60
+                    # Shutdown accepts control replies without publishing any data frames.
+                    self.driver.parser.synced = True
                 self.driver.close()
                 self.release_error = ""
             except Exception as exc:
@@ -258,19 +341,27 @@ class LocalDirectAdapter:
                             self.observed_poll_interval_seconds = round_start - self._previous_round_start
                         self._previous_round_start = round_start
                         with self.receive_lock:
-                            self.read_calls += 1
-                            if hasattr(self.driver, "read_samples"):
+                            paused = self.capture_paused
+                            if paused:
+                                self._discard_paused_input()
+                            else:
+                                self.read_calls += 1
+                            if not paused and hasattr(self.driver, "read_samples"):
                                 for payload, record in self.driver.read_samples():
                                     if self._publish(payload, record):
                                         self.consecutive_failures = 0
                                 if self.fixed_poll_interval_seconds is not None:
                                     self._consecutive_reconnect_attempts = 0
                                     self._reconnect_window_started_monotonic = None
-                            else:
+                            elif not paused:
                                 payload = self.driver.read_sample()
                                 if isinstance(payload, Mapping) and payload:
                                     if self._publish(payload):
                                         self.consecutive_failures = 0
+                        if paused:
+                            self.stop_event.wait(max(.002, self.actual_poll_interval_seconds))
+                            next_poll = self.clock()
+                            continue
                         self.last_round_seconds = max(0.0, self.clock() - round_start)
                         self.successful_read_calls += 1
                         if self.fixed_poll_interval_seconds is not None:

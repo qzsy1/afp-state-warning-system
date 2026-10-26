@@ -585,6 +585,7 @@ def helper_capabilities(server_url: str = "") -> dict[str, Any]:
         "abb_measurement_contract": "fibercontrol_abb_v1",
         "abb_clock_domain": "host_perf_counter",
         "async_capture_start_v1": True,
+        "capture_pause_v1": True,
         "command_lifecycle": "isolated_hardware_check",
         "hardware_check_timeout_seconds": HARDWARE_CHECK_TIMEOUT_SECONDS,
         "hardware_discovery": True,
@@ -1060,7 +1061,9 @@ def dispatch_command(agent: LocalCaptureAgent, raw: str | bytes) -> dict[str, An
                 _config_from_payload(_inject_saved_local_mysql(payload))
             )
         elif name == "stop_capture":
-            result = agent.stop_capture()
+            result = agent.stop_capture(capture_uuid=payload.get("capture_uuid"), capture_generation=payload.get("capture_generation")) if payload.get("capture_uuid") or payload.get("capture_generation") else agent.stop_capture()
+        elif name in {"pause_capture", "resume_capture"}:
+            result = agent.control_pause(name.removesuffix("_capture"), payload)
         elif name == "esr_numeric":
             result = agent.esr_numeric(payload)
         else:  # decode_command already guards this; retain a defensive branch.

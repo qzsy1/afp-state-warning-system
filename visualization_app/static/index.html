@@ -57,6 +57,7 @@
         <details id="acquisitionSection" class="control-section hidden">
           <summary>真实采集与保存</summary>
           <div class="control-content">
+            <fieldset id="acquisitionConfigurationFields" style="border:0;padding:0;margin:0;min-width:0">
             <div id="localHelperPanel" class="local-helper-panel">
               <div class="local-helper-head"><strong>本机采集辅助程序</strong><span id="helperStatus" class="helper-status">未配对</span></div>
               <p id="helperStatusNote" class="control-note">真实采集需要在访问此网页的电脑上运行本地采集辅助程序。</p>
@@ -323,11 +324,13 @@
               <p class="control-note collection-index-note">采集运行期间层号和独立重复编号锁定；只有停止并成功保存本次采集后，才可递增到下一层或下一独立重复。</p>
               </div>
             </details>
+            </fieldset>
             <div class="transport">
               <button id="connectDataButton" class="secondary-button">连接数据</button>
               <button id="startAcquisitionButton" class="primary-button">开始采集</button>
             </div>
-            <button id="stopAcquisitionButton" class="secondary-button full-button">停止并保存</button>
+            <button id="pauseAcquisitionButton" class="secondary-button full-button" disabled>中断采集</button>
+            <button id="stopAcquisitionButton" class="secondary-button full-button" disabled>停止并保存</button>
             <div id="acquisitionStatus" class="acquisition-status">尚未启动真实采集</div>
 
             <div id="persistenceRecoveryPanel" class="control-note hidden">

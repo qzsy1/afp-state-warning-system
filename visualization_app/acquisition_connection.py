@@ -181,6 +181,8 @@ class AcquisitionConnectionMixin:
         return all(len(values) >= 2 for values in counts.values())
 
     def _refresh_connected_readiness(self):
+        if self.thread and self.thread.is_alive() and self.pause_state != "sampling":
+            return
         with self._connection_lock:
             state = self._connection.get('state')
         if state not in {'connected', 'waiting_data'}:
@@ -292,7 +294,9 @@ class AcquisitionConnectionMixin:
             return pending
         with self.lifecycle_lock:
             if self.config is not None and not self.finalization_complete:
-                self._stop_active()
+                self.stop()
+                if not self.finalization_complete:
+                    raise RuntimeError("保存尚未完成，不能断开或退出")
             if self.thread and self.thread.is_alive():
                 raise RuntimeError("采样尚未安全停止，不能断开或退出")
             self._connection_cancel.set()

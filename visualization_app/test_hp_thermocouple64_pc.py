@@ -29,6 +29,11 @@ SAMPLES = json.loads((Path(__file__).parent / "testdata/tc64_vendor_samples.json
 RAW = bytes.fromhex(SAMPLES["pc_responses"][0]["response_hex"])
 
 
+def vendor_logged_response(record):
+    """Restore only lost unit characters; retain the vendor's original checksum."""
+    return record["logged_response"].replace("\ufffd\ufffd", "℃").encode("gb18030") + b"\r\n"
+
+
 def checksummed(body: str) -> bytes:
     """Synthetic fault/edge-case frames; no physical fault acceptance is implied."""
     payload = (body + ",").encode("gb18030")
@@ -60,6 +65,20 @@ class PcSerial:
 
 
 class HpThermocouple64PcTests(unittest.TestCase):
+    def test_vendor_logged_inputs_match_independently_saved_csv_values(self):
+        for record in SAMPLES["vendor_log_csv_pairs"]:
+            with self.subTest(csv=record["vendor_csv_name"], line=record["vendor_csv_line"]):
+                expected = dict(zip(CHANNELS, map(float, record["temperatures"])))
+                port = PcSerial(vendor_logged_response(record), fragment=1)
+                driver = HpThermocouple64Driver("VENDOR-LOG-REPLAY", read_profile="pc_temperature", serial_factory=lambda **kw: port)
+                driver.open()
+                try:
+                    self.assertEqual(driver.read_sample(), expected)
+                    self.assertEqual(driver.quality_metadata["ambient_temperature_c"], float(record["ambient"]))
+                    self.assertEqual(driver.quality_metadata["channel_errors"], {})
+                finally:
+                    driver.close()
+
     def test_six_independent_hardware_responses_preserve_all_decimal_values(self):
         for record in SAMPLES["pc_responses"]:
             parsed = parse_pc_response(bytes.fromhex(record["response_hex"]))
@@ -172,6 +191,7 @@ class HpThermocouple64PcTests(unittest.TestCase):
         assembler = FrameAssembler(CHANNELS, 1, start_monotonic=0, start_wall_time=0, clock=lambda: 0)
         expected_rows = [{c: float(v) for c, v in zip(CHANNELS, r["temperatures"])} for r in SAMPLES["vendor_records"]]
         expected_rows += [parse_pc_response(bytes.fromhex(r["response_hex"]))["values"] for r in SAMPLES["pc_responses"]]
+        expected_rows += [dict(zip(CHANNELS, map(float, r["temperatures"]))) for r in SAMPLES["vendor_log_csv_pairs"]]
         with tempfile.TemporaryDirectory() as root:
             journal = ServerCaptureJournal(Path(root) / "journal.sqlite3")
             mirrors = RemoteAcquisitionRegistry(max_rows=24)

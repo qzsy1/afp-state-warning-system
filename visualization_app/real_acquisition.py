@@ -1159,6 +1159,14 @@ class FrameAssembler:
     def deadline(self, sequence: int) -> float:
         return self.start_monotonic + int(sequence) / self.frame_rate_hz
 
+    def rebase(self, next_sequence: int) -> None:
+        """Keep frame identity while scheduling only future segment deadlines."""
+        self.next_sequence = int(next_sequence)
+        offset = self.next_sequence / self.frame_rate_hz
+        self.start_monotonic = self.clock() - offset
+        self.start_wall_time = self.wall_clock() - offset
+        self.last_source_sequence.clear()
+
     def wait_next_deadline(self, stop_event: threading.Event | None = None) -> float:
         deadline = self.deadline(self.next_sequence)
         delay = deadline - self.clock()
@@ -1252,6 +1260,8 @@ class AcquisitionQualityMetrics:
         self.channels = tuple(channels)
         self.target_rate_hz = float(target_rate_hz)
         self.frame_count = 0
+        self.segment_starts = []
+        self.segment_targets = []
         self.deadline_misses = 0
         self.complete_frames = 0
         self.first_target: float | None = None
@@ -1259,7 +1269,7 @@ class AcquisitionQualityMetrics:
         self.quality_counts = {
             channel: Counter() for channel in self.channels
         }
-        self.update_times: dict[str, list[float]] = {
+        self.update_times: dict[str, list[float | None]] = {
             channel: [] for channel in self.channels
         }
         self.latest_age_seconds: dict[str, float | None] = {
@@ -1267,6 +1277,14 @@ class AcquisitionQualityMetrics:
         }
 
     def observe(self, frame: UnifiedFrame) -> None:
+        if not self.segment_targets or self.segment_targets[-1] is None:
+            self.segment_starts.append(frame.target_monotonic)
+            if self.segment_targets and self.segment_targets[-1] is None:
+                self.segment_targets[-1] = frame.target_monotonic
+            else:
+                self.segment_targets.append(frame.target_monotonic)
+        else:
+            self.segment_targets[-1] = frame.target_monotonic
         self.frame_count += 1
         self.deadline_misses += int(frame.deadline_missed)
         if all(sample.quality in VALID_MODEL_QUALITIES for sample in frame.channels.values()):
@@ -1280,25 +1298,24 @@ class AcquisitionQualityMetrics:
             age = sample.metadata.get("age_seconds")
             self.latest_age_seconds[name] = _finite(age)
 
+    def begin_segment(self):
+        self.segment_targets.append(None)
+        for updates in self.update_times.values():
+            updates.append(None)
+
     def summary(self) -> dict[str, Any]:
-        duration = (
-            self.last_target - self.first_target
-            if self.first_target is not None
-            and self.last_target is not None
-            and self.last_target > self.first_target
-            else 0.0
-        )
-        actual_rate = (self.frame_count - 1) / duration if duration > 0 else 0.0
+        duration = sum(end - start for start, end in zip(self.segment_starts, [v for v in self.segment_targets if v is not None]))
+        actual_rate = max(0, self.frame_count - len(self.segment_starts)) / duration if duration > 0 else 0.0
         channels: dict[str, Any] = {}
         for name in self.channels:
             counts = self.quality_counts.get(name, Counter())
             updates = self.update_times.get(name, [])
-            update_duration = updates[-1] - updates[0] if len(updates) > 1 else 0.0
-            intervals = [right - left for left, right in zip(updates, updates[1:])]
+            intervals = [right - left for left, right in zip(updates, updates[1:]) if right is not None and left is not None]
+            update_duration = sum(intervals)
             denominator = max(1, self.frame_count)
             channels[name] = {
                 "update_rate_hz": (
-                    (len(updates) - 1) / update_duration if update_duration > 0 else 0.0
+                    len(intervals) / update_duration if update_duration > 0 else 0.0
                 ),
                 "latest_age_seconds": self.latest_age_seconds.get(name),
                 "missing_rate": counts[ChannelQuality.MISSING.value] / denominator,

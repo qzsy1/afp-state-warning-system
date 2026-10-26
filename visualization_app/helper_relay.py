@@ -43,6 +43,8 @@ ALLOWED_HELPER_COMMANDS = frozenset(
         "prepare_simulation_source",
         "start_capture",
         "stop_capture",
+        "pause_capture",
+        "resume_capture",
         "esr_numeric",
         "status",
     }
@@ -970,6 +972,8 @@ class HelperRegistry:
                     helper.sender = None
             if not helper.online:
                 return {"ok": False, "queued": False, "error": "helper_offline"}
+            if command in {"pause_capture", "resume_capture"} and not helper.capabilities.get("capture_pause_v1"):
+                return {"ok": False, "queued": False, "error": "helper_capability_missing: capture_pause_v1"}
             if command in {"start_capture", "check_capture"}:
                 from plc_measurement import requires_plc_measurement, PLC_MEASUREMENT_CONTRACT
                 from abb_measurement import requires_abb_measurement, ABB_MEASUREMENT_CONTRACT
