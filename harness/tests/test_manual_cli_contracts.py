@@ -26,10 +26,10 @@ class ProfileAndCmdContractTests(unittest.TestCase):
         cls.profiles = load_profiles(cls.repo / "harness/config/profiles.json")
 
     def test_stable_profile_composition_and_single_selection(self) -> None:
-        self.assertEqual(len(self.profiles["quick"]), 15)
-        self.assertEqual(len(self.profiles["full"]), 28)
-        self.assertEqual(len(self.profiles["release"]), 39)
-        self.assertEqual(self.profiles["release"][:28], self.profiles["full"])
+        self.assertEqual(len(self.profiles["quick"]), 18)
+        self.assertEqual(len(self.profiles["full"]), 31)
+        self.assertEqual(len(self.profiles["release"]), 42)
+        self.assertEqual(self.profiles["release"][:31], self.profiles["full"])
         for profile in ("quick", "full", "release"):
             with self.subTest(profile=profile, check="runtime"):
                 self.assertIn("modular-runtime-contracts", self.profiles[profile])

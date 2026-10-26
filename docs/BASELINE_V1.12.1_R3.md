@@ -4,7 +4,7 @@
 - Source snapshot: `state_monitor_v13/visualization_app`
 - Reference release: `AFP_Integrated_System_SMRF_HID_Restored_20260824_v1.12.1`
 - Development branch: `feature/modular-runtime-v2`
-- Installed Git: `F:\software\Git\cmd\git.exe`
+- Installed Git: use the executable resolved from system `PATH`
 
 ## Acceptance evidence
 

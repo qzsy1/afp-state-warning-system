@@ -15,6 +15,7 @@ def run_candidate_script(assertions: str) -> dict:
     end = source.index("function refreshPhysicalInterfaceOptions", start)
     profiles = {
         "thermocouple": {"label": "八通道热电偶", "physical_kind": "usb_hid"},
+        "thermocouple64": {"label": "慧谱TCP64", "physical_kind": "serial"},
         "thermal_uvc": {"label": "UVC", "physical_kind": "usb_uvc"},
         "pressure": {"label": "M3232", "physical_kind": "serial"},
         "esr1001_strain": {"label": "ESR1001-A四通道应变", "physical_kind": "serial"},
@@ -53,6 +54,148 @@ def run_logical_interface_script(assertions: str) -> dict:
 
 
 class UsbInterfaceCandidateTests(unittest.TestCase):
+    def test_esr_topology_enrichment_preserves_candidate_but_source_change_clears_it(self):
+        result = run_candidate_script(r'''
+state.usbTopology={usb_ports:[{id:'host:9',state:'occupied',user_connectable:true}],devices:[]};
+state.physicalInterfaces=[{id:'serial:COM5',kind:'serial',transport_family:'usb',parent_port_id:'host:9',endpoint:'COM5',detected:true,
+ device_identity:{vid:6790,pid:29987,serial_number:'',location:'1-9'}}];
+const settings={esr_vendor_candidate:{source_sha256:'fixture'},esr_context:{focus_channel:2}};
+const original={id:'esr',role:'esr1001_strain',driver:'esr1001_usb_ttl',endpoint:'COM5',physical_interface_id:'serial:COM5',
+ physical_port_id:'',selection_origin:'manual',protocol_verified:true,channel_settings:settings,
+ device_identity:{vid:6790,pid:29987,serial_number:'',location:'1-9'}};
+const enriched=autoAssignPhysicalInterfaces([structuredClone(original)])[0];
+state.physicalInterfaces[0].device_identity.location='1-8';
+const changed=autoAssignPhysicalInterfaces([structuredClone(original)])[0];
+console.log(JSON.stringify({enriched,changed}));
+''')
+        self.assertIn("esr_vendor_candidate", result["enriched"]["channel_settings"])
+        self.assertEqual(result["enriched"]["physical_port_id"], "host:9")
+        self.assertFalse(result["enriched"]["protocol_verified"])
+        self.assertEqual(result["changed"]["channel_settings"], {})
+
+    def test_esr_unlocated_serial_outweighs_incompatible_saved_port_placeholder(self):
+        result = run_candidate_script(r'''
+state.usbTopology={usb_ports:[{id:'host:9',state:'occupied',user_connectable:true}],devices:[]};
+state.physicalInterfaces=[{id:'serial:COM5',kind:'serial',transport_family:'usb',endpoint:'COM5',detected:true,
+ device_identity:{vid:6790,pid:29987,serial_number:'',location:'1-9'}}];
+const config={id:'esr',role:'esr1001_strain',driver:'esr1001_usb_ttl',endpoint:'COM5',physical_interface_id:'',
+ physical_port_id:'host:9',selection_origin:'manual',channel_settings:{esr_vendor_candidate:{source_sha256:'fixture'}},
+ device_identity:{vid:6790,pid:29987,serial_number:'',location:'1-9'}};
+console.log(JSON.stringify(autoAssignPhysicalInterfaces([config])[0]));
+''')
+        self.assertEqual(result["physical_interface_id"], "serial:COM5")
+        self.assertEqual(result["endpoint"], "COM5")
+        self.assertTrue(result["physical_verified"])
+        self.assertIn("esr_vendor_candidate", result["channel_settings"])
+
+    def test_saved_serial_endpoint_can_recover_an_unlocated_candidate(self):
+        result = run_candidate_script(r'''
+state.usbTopology={usb_ports:[{id:"usb:9",state:"occupied",user_connectable:true}],devices:[]};
+state.physicalInterfaces=[{id:"serial:COM5",kind:"serial",endpoint:"COM5",vid:6790,pid:29987,detected:true}];
+const candidates=physicalCandidatesForRole("esr1001_strain");
+console.log(JSON.stringify({exact:savedSerialCandidate(candidates,"esr1001_strain","COM5"),
+  offline:savedSerialCandidate(candidates,"esr1001_strain","COM7"),
+  empty:candidates.find(c=>c.id==="usb:9")}));
+''')
+        self.assertEqual(result["exact"]["physical_interface_id"], "serial:COM5")
+        self.assertTrue(result["exact"]["detected"])
+        self.assertIsNone(result["offline"])
+        self.assertFalse(result["empty"]["compatible"])
+
+    def test_tc64_check_budget_covers_driver_deadline_and_explicit_block_mode(self):
+        source = APP_JS.read_text(encoding="utf-8")
+        start = source.index("function hardwareCheckTimeoutMs")
+        end = source.index("async function checkSimulationSourceReadiness", start)
+        script = source[start:end] + r'''
+const tc={enabled:true,driver:"huipu_tc64_modbus_rtu",baudrate:115200,timeout:.5};
+console.log(JSON.stringify({normal:hardwareCheckTimeoutMs({interfaces:[tc]}),
+  block:hardwareCheckTimeoutMs({interfaces:[{...tc,read_profile:"full_record_block"}]}),
+  slow:hardwareCheckTimeoutMs({interfaces:[{...tc,baudrate:2400,timeout:2}]}),
+  disabled:hardwareCheckTimeoutMs({interfaces:[{...tc,enabled:false}]}),
+  other:hardwareCheckTimeoutMs({interfaces:[{driver:"modbus_tcp"}]})}));
+'''
+        result = subprocess.run(["node","-e",script],check=True,capture_output=True,text=True)
+        budgets = json.loads(result.stdout)
+        self.assertGreater(budgets["normal"], 104000)
+        self.assertGreater(budgets["normal"], budgets["block"])
+        self.assertGreater(budgets["slow"], 400000)
+        self.assertEqual(budgets["disabled"], 20000)
+        self.assertEqual(budgets["other"], 20000)
+
+    def test_browser_plan_save_keeps_tc64_settings_without_ready_flags(self):
+        source = APP_JS.read_text(encoding="utf-8")
+        start = source.index("function saveDatasetInterfacePreferences")
+        end = source.index("function queueSharedDatasetInterfacePreferences", start)
+        script = r'''
+const controls = {acquisitionMode:{value:"real"},processingMode:{value:"capture_only"}};
+const state = {activeInterfaceSchema:"new_collection_v13_0"};
+const original = {id:"tc",enabled:false,role:"thermocouple64",endpoint:"COM7",read_profile:"full_record_block",timeout:.28,
+ channel_settings:{confirmed:true,channels:{"温度64":{unit:0,input_type:0,switch:0}}},device_identity:{serial_number:"TC64"},freshness_seconds:5,reconnect_window_seconds:60,
+ physical_verified:true,protocol_verified:true,selection_origin:"manual"};
+function interfaceConfigs(){return {interfaces:[original]};}
+let stored;
+function queueSharedDatasetInterfacePreferences(value){stored=value;}
+function datasetInterfacePreferenceKey(){return "test";}
+const localStorage={setItem(key,value){}};
+''' + source[start:end] + '\nsaveDatasetInterfacePreferences(); console.log(JSON.stringify(stored));'
+        completed = subprocess.run(["node", "-e", script],check=True,capture_output=True,text=True,encoding="utf-8")
+        item = json.loads(completed.stdout)["plans"]["new_collection_v13_0"]["interfaces"][0]
+        self.assertEqual(item["read_profile"], "full_record_block")
+        self.assertEqual(item["timeout"], .28)
+        self.assertEqual(item["device_identity"], {"serial_number": "TC64"})
+        self.assertTrue(item["channel_settings"]["confirmed"])
+        self.assertFalse(item["enabled"])
+        self.assertNotIn("physical_verified", item)
+        self.assertNotIn("protocol_verified", item)
+
+    def test_tc64_never_guesses_and_preserves_manual_disabled_bindings(self):
+        result = run_candidate_script(r'''
+const ports = [6,7].map(n => ({id:`serial:COM${n}`,kind:"serial",protocol:"serial",endpoint:`COM${n}`,detected:true,vid:6790,pid:29987,device_identity:{vid:6790,pid:29987,serial_number:""}}));
+state.physicalInterfaces = ports;
+const unknown = {id:"tc",role:"thermocouple64",endpoint:"",enabled:false};
+autoAssignPhysicalInterfaces([unknown]);
+state.physicalInterfaces.reverse();
+autoAssignPhysicalInterfaces([unknown]);
+const offline = {id:"tc",role:"thermocouple64",endpoint:"COM2",physical_interface_id:"serial:COM2",selection_origin:"manual",enabled:false};
+autoAssignPhysicalInterfaces([offline]);
+const manual = {id:"tc",role:"thermocouple64",endpoint:"COM7",physical_interface_id:"serial:COM7",selection_origin:"manual",enabled:false};
+autoAssignPhysicalInterfaces([manual]);
+const occupied = {...manual};
+autoAssignPhysicalInterfaces([occupied,{id:"strain",role:"esr1001_strain",physical_interface_id:"serial:COM7",endpoint:"COM7"}]);
+console.log(JSON.stringify({unknown,offline,manual,occupied}));
+''')
+        self.assertEqual(result["unknown"]["endpoint"], "")
+        self.assertFalse(result["unknown"]["enabled"])
+        self.assertEqual(result["offline"]["endpoint"], "COM2")
+        self.assertFalse(result["offline"]["physical_verified"])
+        self.assertEqual(result["manual"]["endpoint"], "COM7")
+        self.assertFalse(result["manual"]["enabled"])
+        self.assertFalse(result["occupied"]["physical_verified"])
+
+    def test_tc64_stable_identity_restores_endpoint_and_revokes_evidence(self):
+        result = run_candidate_script(r'''
+const identity = {vid:1027,pid:24577,serial_number:"TC64",location:"old"};
+state.physicalInterfaces = [{id:"serial:COM9",kind:"serial",endpoint:"COM9",detected:true,vid:1027,pid:24577,device_identity:{...identity,location:"new"}}];
+const tc = {role:"thermocouple64",endpoint:"COM6",physical_interface_id:"serial:COM6",enabled:false,device_identity:identity,protocol_verified:true,channel_settings:{confirmed:true}};
+autoAssignPhysicalInterfaces([tc]);
+console.log(JSON.stringify(tc));
+''')
+        self.assertEqual(result["endpoint"], "COM9")
+        self.assertFalse(result["protocol_verified"])
+        self.assertFalse(result["enabled"])
+        self.assertEqual(result["channel_settings"], {})
+
+    def test_tc64_lists_usb_serial_and_native_serial_without_hid(self) -> None:
+        result = run_candidate_script(r'''
+state.physicalInterfaces = [
+  {id:"serial:COM3", kind:"serial", endpoint:"COM3", vid:6790, pid:29987, detected:true},
+  {id:"serial:COM1", kind:"serial", endpoint:"COM1", detected:true},
+  {id:"hid:other", kind:"usb_hid", endpoint:"HID", detected:true},
+];
+console.log(JSON.stringify(physicalCandidatesForRole("thermocouple64").filter(x=>x.compatible).map(x=>x.endpoint)));
+''')
+        self.assertEqual(set(result), {"COM3", "COM1"})
+
     def test_unconfirmed_usb_hub_remains_visible_without_dock_label(self) -> None:
         result = run_candidate_script(
             r"""
@@ -276,7 +419,8 @@ console.log(JSON.stringify({
         )
         self.assertEqual(len(set(result["usb"])), 3)
         self.assertEqual(result["network"], ["ethernet:lan", "ethernet:lan"])
-        self.assertEqual(result["origins"], ["auto"] * 5)
+        self.assertEqual(result["origins"], ["auto", "auto", None, "auto", "auto"])
+        self.assertIsNone(result["usb"][2])
         self.assertEqual(result["verified"], [False, False, False])
 
     def test_missing_manual_port_is_preserved_instead_of_migrated(self) -> None:
@@ -290,6 +434,39 @@ console.log(JSON.stringify(configs[0]));
         )
         self.assertEqual(result["physical_port_id"], "dock:manual")
         self.assertEqual(result["selection_origin"], "manual")
+
+    def test_same_hub_esr_endpoint_refresh_and_uvc_stable_identity_relocation(self) -> None:
+        result = run_candidate_script(
+            r"""
+state.usbTopology = {usb_ports:[
+  {id:"hub:port:3", owner_kind:"hub", hub_id:"hub:1", label:"USB扩展设备 · USB-3", state:"occupied", user_connectable:true},
+  {id:"hub:port:4", owner_kind:"hub", hub_id:"hub:1", label:"USB扩展设备 · USB-4", state:"occupied", user_connectable:true},
+], devices:[]};
+state.physicalInterfaces = [
+  {id:"serial:COM10", kind:"serial", transport_family:"usb", parent_port_id:"hub:port:3", endpoint:"COM10", detected:true,
+   device_identity:{vid:6790,pid:29987,serial_number:"",location:"1-9.3"}},
+  {id:"uvc:bsv:current", kind:"usb_uvc", transport_family:"usb", parent_port_id:"hub:port:4", endpoint:"UVC Camera", detected:true,
+   device_identity:{vid:11231,pid:258,container_id:"{stable-container}",instance_id:"current"}},
+];
+const configs = [
+  {id:"strain",role:"esr1001_strain",driver:"esr1001_usb_ttl",endpoint:"COM5",physical_port_id:"hub:port:3",
+   physical_interface_id:"",selection_origin:"saved",protocol_verified:true,device_identity:{vid:6790,pid:29987,location:"1-9"}},
+  {id:"uvc",role:"thermal_uvc",driver:"uvc_thermal",endpoint:"BSV UVC",physical_port_id:"hub:old:4",
+   physical_interface_id:"uvc:bsv:old",selection_origin:"saved",protocol_verified:true,
+   device_identity:{vid:11231,pid:258,container_id:"{stable-container}",instance_id:"old"}},
+];
+autoAssignPhysicalInterfaces(configs);
+console.log(JSON.stringify(configs));
+"""
+        )
+        esr, uvc = result
+        self.assertEqual(esr["endpoint"], "COM10")
+        self.assertEqual(esr["physical_interface_id"], "serial:COM10")
+        self.assertEqual(esr["physical_port_id"], "hub:port:3")
+        self.assertFalse(esr["protocol_verified"])
+        self.assertEqual(uvc["physical_interface_id"], "uvc:bsv:current")
+        self.assertEqual(uvc["physical_port_id"], "hub:port:4")
+        self.assertFalse(uvc["protocol_verified"])
 
 
 if __name__ == "__main__":

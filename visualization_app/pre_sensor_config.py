@@ -7,7 +7,13 @@ environment and are never persisted in the repository templates.
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 import re
+import json
+import hashlib
+import os
+import threading
 import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -25,7 +31,9 @@ from acquisition import (  # noqa: E402
     AcquisitionConfig,
     SENSOR_CHANNEL_METADATA,
     SENSOR_INTERFACE_PROFILES,
+    STRAIN_SENSOR_COLUMNS,
 )
+from esr1001_usb import RAW_CHANNELS
 from release_contract import (  # noqa: E402
     ReleaseContractError,
     assert_helper_contract,
@@ -49,6 +57,88 @@ _ROLE_MAP = {
 _REFERENCE_NAME = re.compile(r"^AFP_[A-Z0-9_]+$")
 _SECRET_KEY = re.compile(r"password|token|secret|credential|api[_-]?key", re.I)
 _T = TypeVar("_T")
+
+
+class InterfacePlanStore:
+    """本机管理员共享非敏感方案；不提供采集就绪授权。"""
+
+    _lock = threading.RLock()
+    fields = frozenset((
+        "id", "enabled", "role", "driver", "endpoint", "baudrate", "slave_id",
+        "protocol_profile", "matrix_rows", "matrix_cols", "first_frame_timeout_seconds", "frame_timeout_seconds", "max_buffer_bytes",
+        "data_mode", "calibration_profile", "bridge", "channel_count", "channel_map", "channels",
+        "physical_interface_id", "physical_port_id", "physical_interface_kind",
+        "physical_transport_family", "selection_origin",
+        "read_profile", "timeout", "channel_settings", "device_identity", "scan_timeout_seconds",
+        "freshness_seconds", "poll_interval_seconds", "reconnect_window_seconds",
+    ))
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+
+    @classmethod
+    def sanitize(cls, payload):
+        if not isinstance(payload, dict) or payload.get("active") not in ACQUISITION_SCHEMAS:
+            raise ValueError("接口方案无效")
+        plans = payload.get("plans")
+        if not isinstance(plans, dict) or len(plans) > len(ACQUISITION_SCHEMAS):
+            raise ValueError("接口方案目录无效")
+        def clean(value):
+            if isinstance(value, dict):
+                return {str(k): clean(v) for k, v in value.items() if not _SECRET_KEY.search(str(k))}
+            if isinstance(value, list):
+                return [clean(v) for v in value]
+            return value
+        result = {}
+        for schema, plan in plans.items():
+            if schema not in ACQUISITION_SCHEMAS or not isinstance(plan, dict):
+                raise ValueError("未知接口方案")
+            interfaces = plan.get("interfaces")
+            if not isinstance(interfaces, list) or not 1 <= len(interfaces) <= 32:
+                raise ValueError("接口数量无效")
+            if not all(isinstance(item, dict) for item in interfaces):
+                raise ValueError("接口配置无效")
+            result[schema] = {
+                "interfaces": [clean({k: v for k, v in item.items() if k in cls.fields}) for item in interfaces],
+                "processingMode": "capture_only" if plan.get("processingMode") == "capture_only" else "prediction_warning",
+                "mysqlEnabled": bool(plan.get("mysqlEnabled")),
+                "mysqlLocalEnabled": bool(plan.get("mysqlLocalEnabled")),
+            }
+        if payload["active"] not in result:
+            raise ValueError("缺少当前接口方案")
+        return {"active": payload["active"], "plans": result}
+
+    def load(self):
+        with self._lock:
+            try:
+                return self.sanitize(json.loads(self.path.read_text(encoding="utf-8")))
+            except (OSError, ValueError, TypeError):
+                return None
+
+    @staticmethod
+    def revision(preferences):
+        rendered = json.dumps(preferences, ensure_ascii=False, sort_keys=True, allow_nan=False)
+        return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+    def load_with_revision(self):
+        with self._lock:
+            preferences = self.load()
+            return preferences, self.revision(preferences)
+
+    def save(self, payload, *, expected_revision=None, require_revision=False):
+        preferences = self.sanitize(payload)
+        rendered = json.dumps(preferences, ensure_ascii=False, allow_nan=False)
+        if len(rendered.encode("utf-8")) > 262144:
+            raise ValueError("接口方案过大")
+        with self._lock:
+            current = self.load()
+            if (expected_revision is not None or (require_revision and current is not None)) and expected_revision != self.revision(current):
+                raise ValueError("interface_plan_conflict: 方案已在其他页面更新，请刷新后重新修改")
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_suffix(".tmp")
+            temporary.write_text(rendered, encoding="utf-8")
+            os.replace(temporary, self.path)
+            return self.revision(preferences)
 
 
 def _object(payload: Mapping[str, Any], name: str) -> Mapping[str, Any]:
@@ -210,8 +300,9 @@ def validate_pre_sensor_config(
         raise PreSensorConfigError("schema_version does not match the release contract")
     if str(payload.get("release_revision") or "") != contract.release_revision:
         raise PreSensorConfigError("release_revision does not match the release contract")
-    if str(payload.get("dataset_schema") or "") != "new_collection_v13_0":
-        raise PreSensorConfigError("dataset_schema must be new_collection_v13_0")
+    dataset_schema = str(payload.get("dataset_schema") or "")
+    if dataset_schema not in {"new_collection_v13_0", "esr1001_raw_adc"}:
+        raise PreSensorConfigError("dataset_schema must be new_collection_v13_0 or esr1001_raw_adc")
 
     mode = str(payload.get("mode") or "").strip()
     if mode not in {"local_direct", "remote_helper"}:
@@ -244,7 +335,7 @@ def validate_pre_sensor_config(
             raise PreSensorConfigError(f"interface {interface_id} role is unsupported")
         expected_driver = str(SENSOR_INTERFACE_PROFILES[role]["driver"])
         driver = str(raw.get("driver") or "").strip()
-        if driver != expected_driver:
+        if driver != expected_driver and not (role == "esr1001_strain" and driver == "esr1001_usb_ttl"):
             raise PreSensorConfigError(
                 f"interface {interface_id} driver must be {expected_driver}"
             )
@@ -260,8 +351,13 @@ def validate_pre_sensor_config(
                 "driver": driver,
                 "endpoint_ref": endpoint_ref,
                 "baudrate": int(raw.get("baudrate") or 0),
-                "slave_id": int(raw.get("slave_id") or 1),
+                "slave_id": int(raw.get("slave_id", 1)),
+                **{k: deepcopy(raw[k]) for k in ("protocol_profile", "matrix_rows", "matrix_cols", "first_frame_timeout_seconds", "frame_timeout_seconds", "max_buffer_bytes", "read_profile", "timeout", "channel_settings", "scan_timeout_seconds", "freshness_seconds", "poll_interval_seconds", "reconnect_window_seconds") if k in raw},
                 "hardware_facts": dict(raw.get("hardware_facts") or {}),
+                "data_mode": raw.get("data_mode", "raw_matrix" if driver == "m3232_pressure" else "microstrain"),
+                "calibration_profile": raw.get("calibration_profile"),
+                "bridge": raw.get("bridge", ""),
+                "device_identity": dict(raw.get("device_identity") or {}),
             }
         )
 
@@ -290,21 +386,29 @@ def validate_pre_sensor_config(
         channels.append(name)
         assignments[interface_id].append(name)
     required_channels = set(
-        (ACQUISITION_SCHEMAS.get("new_collection_v13_0") or {}).get("sensors", [])
+        (ACQUISITION_SCHEMAS.get(dataset_schema) or {}).get("sensors", [])
     )
+    if any(item["driver"] == "m3232_pressure" and item["data_mode"] == "raw_matrix" for item in interface_specs):
+        required_channels.discard("薄膜压力")
+        required_channels.add("薄膜压力原始响应")
+    if dataset_schema == "new_collection_v13_0" and any(
+        item["driver"] == "esr1001_usb_ttl" and item["data_mode"] == "raw_adc"
+        for item in interface_specs
+    ):
+        required_channels.difference_update(STRAIN_SENSOR_COLUMNS)
+        required_channels.update(RAW_CHANNELS)
     if set(channels) != required_channels:
         missing = sorted(required_channels - set(channels))
         raise PreSensorConfigError(f"channel contract is incomplete: {missing}")
     thermocouple_specs = [
         item for item in interface_specs if item["role"] == "thermocouple64"
     ]
-    if len(thermocouple_specs) != 1:
+    if dataset_schema == "new_collection_v13_0" and len(thermocouple_specs) != 1:
         raise PreSensorConfigError("exactly one thermocouple64 interface is required")
-    thermocouple_readiness = hardware_release_readiness(
-        thermocouple_specs[0]["hardware_facts"]
-    )
-    if not thermocouple_readiness["ready"]:
-        raise PreSensorConfigError(str(thermocouple_readiness["message"]))
+    if thermocouple_specs:
+        thermocouple_readiness = hardware_release_readiness(thermocouple_specs[0]["hardware_facts"])
+        if not thermocouple_readiness["ready"]:
+            raise PreSensorConfigError(str(thermocouple_readiness["message"]))
 
     _validate_operational_limits(payload)
     storage = _object(payload, "storage")
@@ -336,8 +440,20 @@ def validate_pre_sensor_config(
             }
         if spec["baudrate"]:
             interface["baudrate"] = spec["baudrate"]
-        if spec["driver"] == "modbus_rtu_esr1001":
+        if spec["driver"] == "esr1001_usb_ttl":
+            if spec["baudrate"] != 115200:
+                raise PreSensorConfigError("原生USB必须使用115200-8-N-1")
+            for key in ("data_mode", "calibration_profile", "bridge", "device_identity"):
+                interface[key] = spec[key]
+        if spec["driver"] in {"modbus_rtu_esr1001", "huipu_tc64_modbus_rtu"}:
             interface["slave_id"] = spec["slave_id"]
+        if spec["driver"] == "m3232_pressure":
+            for key in ("protocol_profile", "matrix_rows", "matrix_cols", "first_frame_timeout_seconds", "frame_timeout_seconds", "max_buffer_bytes", "freshness_seconds", "data_mode", "calibration_profile", "device_identity"):
+                if key in spec: interface[key] = deepcopy(spec[key])
+        if spec["driver"] == "huipu_tc64_modbus_rtu":
+            for key in ("read_profile", "timeout", "channel_settings", "device_identity", "scan_timeout_seconds", "freshness_seconds", "poll_interval_seconds", "reconnect_window_seconds"):
+                if key in spec:
+                    interface[key] = deepcopy(spec[key])
         interfaces.append(interface)
 
     mysql_args: dict[str, Any] = {"mysql_enabled": False}
@@ -409,7 +525,7 @@ def validate_pre_sensor_config(
             acquisition_mode="real",
             real_acquisition_mode=mode,
             processing_mode="capture_only",
-            dataset_schema="new_collection_v13_0",
+            dataset_schema=dataset_schema,
             interfaces=interfaces,
             interface_channel_assignments=assignments,
             selected_sensors=channels,

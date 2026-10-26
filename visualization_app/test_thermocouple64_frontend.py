@@ -3,13 +3,16 @@ from __future__ import annotations
 import sys
 import subprocess
 import unittest
+from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 
 APP_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(APP_DIR))
 
-from app import build_thermocouple64_live_payload  # noqa: E402
+from app import DashboardData, build_thermocouple64_live_payload  # noqa: E402
+from acquisition import SENSOR_COLUMNS  # noqa: E402
 from thermocouple64 import (  # noqa: E402
     THERMOCOUPLE64_AGGREGATION_VERSION,
     THERMOCOUPLE64_DERIVED_CHANNELS,
@@ -79,12 +82,90 @@ class Thermocouple64FrontendContractsTests(unittest.TestCase):
         )
         self.assertFalse(payload["model_support"])
 
-    def test_non_v13_mode_has_no_64_channel_panel_payload(self) -> None:
+    def test_legacy_original_retains_its_channel_view(self) -> None:
         self.assertIsNone(
             build_thermocouple64_live_payload(
-                self._channels(), dataset_schema="new_collection_v12_0"
+                self._channels(), dataset_schema="legacy_original"
             )
         )
+
+    def test_eight_temperature_schemes_keep_thermocouples_separate_without_expanding_capture(self) -> None:
+        channels = self._channels()[:8] + [self._channels()[-1]]
+        original = deepcopy(channels)
+        for schema in ("new_collection_v11_3", "new_collection_v12_0"):
+            with self.subTest(schema=schema):
+                payload = build_thermocouple64_live_payload(channels, dataset_schema=schema)
+                self.assertEqual(payload["source_dataset_schema"], schema)
+                self.assertEqual(payload["selected_raw_channels"], [f"温度{i}" for i in range(1, 9)])
+                self.assertEqual(payload["other_channels"], [channels[-1]])
+                self.assertEqual(payload["raw_history"][0], list(map(float, range(1, 9))) + [None] * 56)
+                self.assertEqual(payload["derived_history"][0], [4.5] + [None] * 7)
+                self.assertFalse(payload["model_support"])
+                self.assertEqual(channels, original)
+                self.assertIsNone(build_thermocouple64_live_payload([channels[-1]], dataset_schema=schema))
+
+    def test_empty_capture_uses_requested_view_without_changing_recovery_status(self) -> None:
+        status = {
+            "running": False,
+            "config": None,
+            "capture_phase": "finalization_failed",
+            "finalization_complete": False,
+            "persistence_recovery": {"blocked": True, "incomplete_files": 3},
+        }
+        original = deepcopy(status)
+        dashboard = DashboardData.__new__(DashboardData)
+        dashboard.sensors = [{"name": name, "unit": ""} for name in SENSOR_COLUMNS]
+        dashboard.acquisition = SimpleNamespace(
+            status=lambda: status,
+            live_curve_snapshot=lambda history: (status, [], [], [], [], {}),
+        )
+        for schema, count in (("new_collection_v13_0", 77), ("new_collection_v12_0", 21)):
+            with self.subTest(schema=schema):
+                payload = dashboard.live(
+                    sensor_id=0, history=240, step=1, threshold=.5, rho=.5,
+                    indicator="TC-HI", model_kind="random_forest", prediction_horizon=24,
+                    processing_mode="capture_only", dataset_schema=schema,
+                )
+                self.assertEqual(len(payload["channels"]), count)
+                self.assertIs(payload["acquisition"], status)
+                self.assertEqual(status, original)
+                if schema == "new_collection_v13_0":
+                    panel = payload["thermocouple64"]
+                    self.assertIsNotNone(panel)
+                    self.assertEqual(len(panel["raw_directory"]["channels"]), 64)
+                    self.assertEqual(len(panel["other_channels"]), 13)
+                    self.assertEqual(panel["raw_history"], [])
+                    self.assertEqual(panel["derived_history"], [])
+                    self.assertTrue(all(item["value"] is None for item in panel["derived_latest"].values()))
+                    self.assertEqual(
+                        {item["unit"] for item in payload["channels"]
+                         if item["name"].startswith("温度") and item["name"] != "温度"},
+                        {"°C"},
+                    )
+                else:
+                    panel = payload["thermocouple64"]
+                    self.assertEqual(panel["selected_raw_channels"], [f"温度{i}" for i in range(1, 9)])
+                    self.assertEqual(len(panel["other_channels"]), 13)
+                    self.assertEqual(panel["raw_history"], [])
+        status["config"] = {"dataset_schema": "new_collection_v13_0"}
+        with self.assertRaisesRegex(ValueError, "界面数据方案与当前采集会话不一致"):
+            dashboard.live(
+                sensor_id=0, history=240, step=1, threshold=.5, rho=.5,
+                indicator="TC-HI", model_kind="random_forest", prediction_horizon=24,
+                processing_mode="capture_only", dataset_schema="new_collection_v12_0",
+            )
+
+    def test_v13_without_selected_temperatures_retains_empty_group_directory(self) -> None:
+        channels = [self._channels()[-1]]
+        original = deepcopy(channels)
+        payload = build_thermocouple64_live_payload(channels, dataset_schema="new_collection_v13_0")
+        self.assertIsNotNone(payload)
+        self.assertEqual(len(payload["raw_directory"]["channels"]), 64)
+        self.assertEqual(len(payload["derived_directory"]["channels"]), 8)
+        self.assertEqual(payload["other_channels"], channels)
+        self.assertEqual(payload["time_axis"], [])
+        self.assertEqual(payload["raw_history"], [])
+        self.assertEqual(channels, original)
 
     def test_page_defines_eight_group_plots_four_normal_cards_and_shared_detail(self) -> None:
         html = (APP_DIR / "static" / "index.html").read_text(encoding="utf-8")
@@ -116,8 +197,38 @@ class Thermocouple64FrontendContractsTests(unittest.TestCase):
         self.assertIn("SENSOR_PANEL_SPLIT_STORAGE_KEY", script)
         self.assertIn("const defaultRatio = 0.42", script)
         self.assertIn('handle.addEventListener("dblclick", resetRatio)', script)
-        self.assertIn("20261017-thermocouple64-v13", html)
-        self.assertIn("20261017-thermocouple64-v6", html)
+        self.assertIn("/app.js?v=20261022-thermocouple-layout-2", html)
+        self.assertIn("/styles.css?v=20261021-strain-cards-1", html)
+
+    def test_standby_renders_empty_layout_and_rejects_samples_outside_capture(self) -> None:
+        script = (APP_DIR / "static" / "app.js").read_text(encoding="utf-8")
+        function = script[script.index("function applyRealtimePayload("):
+                          script.index("const SIMULATION_PLAYBACK_CACHE_ROWS")]
+        executable = r'''
+const assert=require('node:assert/strict');
+const controls={acquisitionMode:{value:'real'}};
+const window={};
+const state={acquisitionStatus:{}};
+const document={querySelector(){return {classList:{remove(){}}};}};
+const expandLivePayload=p=>p;
+const renders=[];const statuses=[];
+function render(p){renders.push(p);}
+function renderAcquisitionStatus(s){statuses.push(s);}
+''' + function + r'''
+for(const connection of ['disconnected','connected']){
+  const empty={channels:[{name:'温度1',actual:[]}],acquisition:{running:false,data_connection:{state:connection}}};
+  applyRealtimePayload(empty);
+  assert.equal(state.payload,empty);
+  assert.equal(renders.at(-1),empty);
+  const count=renders.length;
+  applyRealtimePayload({channels:[{name:'温度1',actual:[24.5]}],acquisition:empty.acquisition});
+  assert.equal(renders.length,count);
+  assert.equal(state.payload,empty);
+}
+assert.equal(statuses.length,4);
+'''
+        completed = subprocess.run(["node", "-e", executable], cwd=APP_DIR, capture_output=True, text=True, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_group_drawing_has_eight_raw_lines_one_mean_and_preserves_gaps(self) -> None:
         script = (APP_DIR / "static" / "app.js").read_text(encoding="utf-8")

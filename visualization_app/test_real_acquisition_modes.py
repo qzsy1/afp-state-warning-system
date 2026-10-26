@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import ast
+import json
 import sys
 import tempfile
 import threading
 import time
 import types
 import unittest
+from acquisition_clock import monotonic
 import struct
 from collections import deque
 from pathlib import Path
@@ -40,7 +42,11 @@ from real_acquisition import (
     UnifiedFrame,
     readiness_config_fingerprint,
 )
-from release_contract import ReleaseContractError, load_release_contract
+from release_contract import (
+    DEVICE_READINESS_CONTRACT,
+    ReleaseContractError,
+    load_release_contract,
+)
 try:
     from real_acquisition import ReadinessSnapshot
 except ImportError:
@@ -57,6 +63,8 @@ def compatible_helper_capabilities(**overrides):
         "build_id": RELEASE_CONTRACT.release_revision,
         "configuration_schema_version": RELEASE_CONTRACT.configuration_schema_version,
         "readiness_schema_version": RELEASE_CONTRACT.readiness_schema_version,
+        "device_readiness_contract": DEVICE_READINESS_CONTRACT,
+        "unified_device_readiness_v1": True,
         "unified_frame_v1": True,
         "unified_frame_v2": True,
         "unified_frame_contract": RELEASE_CONTRACT.unified_frame_contract,
@@ -197,6 +205,85 @@ class AcquisitionModeConfigurationTests(unittest.TestCase):
 
 
 class AcquisitionModeEquivalenceTests(unittest.TestCase):
+    def test_abb_cutoff_hold_expiry_and_both_helper_contracts_keep_source_snapshot(self):
+        from acquisition import AbbRobotDriver
+        from plc_measurement import frame_source_records
+        from thermocouple64 import raw_catalog
+        import copy
+        now = [10.0]
+        positions = iter([(0,0,0),(3,4,0),(6,8,0)])
+        driver = AbbRobotDriver("http://fixture", clock=lambda:now[0], wall_clock=lambda:1000 + now[0])
+        driver._fetch_position = lambda:next(positions)
+        driver.open()
+        names = ["ABB_X", "ABB_Y", "ABB_Z", "线速度"]
+        cache = ChannelSampleCache()
+        adapter = LocalDirectAdapter("abb", driver, names, cache)
+        for values, record in driver.read_samples(): adapter._publish(values,record)
+        assembler = FrameAssembler(names, 10, dict.fromkeys(names,.5), start_monotonic=10,
+                                   start_wall_time=1000, clock=lambda:now[0])
+        first = assembler.assemble(cache,10.0)
+        self.assertIsNone(first.channels["线速度"].value)
+        now[0] = 10.12
+        for values, record in driver.read_samples(): adapter._publish(values,record)
+        early = assembler.assemble(cache,10.1)
+        self.assertEqual(early.channels["ABB_X"].value,0)
+        self.assertIsNone(early.channels["线速度"].value)
+        frame = assembler.assemble(cache,10.2)
+        self.assertEqual(frame.channels["线速度"].value,41.67)
+        old = copy.deepcopy(frame_source_records(frame))
+        held = assembler.assemble(cache,10.3)
+        self.assertEqual(held.channels["线速度"].quality,ChannelQuality.HELD_WITHIN_FRESHNESS)
+        self.assertEqual(held.channels["线速度"].source_sequence,2)
+        stale = assembler.assemble(cache,11)
+        self.assertEqual(stale.channels["线速度"].quality,ChannelQuality.STALE)
+        self.assertIsNone(stale.channels["线速度"].value)
+        now[0] = 11.2
+        for values, record in driver.read_samples(): adapter._publish(values,record)
+        self.assertIsNone(cache.latest("线速度").value)
+        driver.latest_record["xyz"][0] = 999
+        driver.quality_metadata["latest_record"]["xyz"][0] = 999
+        self.assertEqual(frame_source_records(frame),old)
+        for sample in (first,early,frame,held,stale):
+            v1 = UnifiedFrame.from_envelope(json.loads(json.dumps(sample.to_envelope("abb-capture",{}),allow_nan=False)))
+            catalog = raw_catalog(names,{})
+            v2 = UnifiedFrame.from_envelope_v2(json.loads(json.dumps(sample.to_envelope_v2(
+                session_id="abb-capture",mode_id="test",catalog=catalog),allow_nan=False)),
+                expected_session_id="abb-capture",expected_mode_id="test",catalog=catalog)
+            for restored in (v1,v2):
+                self.assertEqual(restored.values(),sample.values())
+                self.assertEqual(restored.quality(),sample.quality())
+                self.assertEqual(frame_source_records(restored),frame_source_records(sample))
+                self.assertEqual(restored.channels["ABB_X"].received_monotonic,sample.channels["ABB_X"].received_monotonic)
+
+    def test_plc_negative_zero_fault_and_held_sources_match_both_frame_contracts(self):
+        from test_plc_modbus_contract import PlcModbusContractTests
+        from plc_measurement import frame_source_records
+        from thermocouple64 import raw_catalog
+        fixture = PlcModbusContractTests()
+        for raw in (-2.5, 0.0, float("inf")):
+            driver = fixture.make_driver({"压力": raw}, clock=lambda: 10.0, wall_clock=lambda: 1000.0)
+            cache = ChannelSampleCache()
+            adapter = LocalDirectAdapter("plc", driver, ["压力"], cache)
+            events = driver.read_samples()
+            payload, record = next(events)
+            adapter._publish(payload, record)
+            assembler = FrameAssembler(["压力"], 10, {"压力": .5}, start_monotonic=10,
+                                       start_wall_time=1000, clock=lambda: 10.1)
+            first = assembler.assemble(cache, 10.1)
+            for frame in (first, assembler.assemble(cache, 10.2)):
+                v1 = frame.to_envelope("plc-capture", {"压力": "N"})
+                restored = UnifiedFrame.from_envelope(v1)
+                self.assertEqual(restored.values(), frame.values())
+                self.assertEqual(restored.quality(), frame.quality())
+                self.assertEqual(frame_source_records(restored), frame_source_records(frame))
+                catalog = raw_catalog(["压力"], {"压力": "N"})
+                v2 = frame.to_envelope_v2(session_id="plc-capture", mode_id="test", catalog=catalog)
+                restored = UnifiedFrame.from_envelope_v2(v2, expected_session_id="plc-capture", expected_mode_id="test", catalog=catalog)
+                self.assertEqual(restored.values(), frame.values())
+                self.assertEqual(restored.quality(), frame.quality())
+                self.assertEqual(frame_source_records(restored), frame_source_records(frame))
+            self.assertEqual(first.channels["压力"].received_monotonic, 10)
+
     def test_local_adapter_and_remote_mirror_normalize_identical_input_equivalently(self) -> None:
         class Driver:
             protocol_verified = True
@@ -318,7 +405,7 @@ class AcquisitionModeEquivalenceTests(unittest.TestCase):
                     interface_id="temperature-device",
                     channel_name="温度",
                     value=42.5,
-                    received_monotonic=time.monotonic(),
+                    received_monotonic=monotonic(),
                     source_sequence=1,
                 )
             )
@@ -656,6 +743,19 @@ class LocalDirectNoHardwareIntegrationTests(unittest.TestCase):
 
 
 class SharedAcquisitionCoreTests(unittest.TestCase):
+    @staticmethod
+    def fresh_temperature_driver(value=20.0):
+        driver = MultiInterfaceDriver([], ["温度"])
+        def publish_current_samples():
+            for sequence in (1, 2):
+                driver.cache.publish(ChannelSample(
+                    interface_id="temperature-device", channel_name="温度",
+                    value=value, source_sequence=sequence,
+                    received_monotonic=monotonic(),
+                ))
+        driver.open = publish_current_samples
+        return driver
+
     class FragmentedSocket:
         def __init__(self, payload: bytes, fragment: int = 2):
             self.payload = bytearray(payload)
@@ -761,15 +861,7 @@ class SharedAcquisitionCoreTests(unittest.TestCase):
                     mysql_database="afp_state_warning",
                 )
             )
-            driver = MultiInterfaceDriver([], ["温度"])
-            driver.cache.publish(
-                ChannelSample(
-                    interface_id="temperature-device",
-                    channel_name="温度",
-                    value=20.0,
-                    source_sequence=1,
-                )
-            )
+            driver = self.fresh_temperature_driver(20.0)
             store = Mock()
             store.preflight.return_value = {"ok": True}
             store.save_layer.return_value = {
@@ -803,15 +895,7 @@ class SharedAcquisitionCoreTests(unittest.TestCase):
             self.assertEqual(manager.status()["capture_phase"], "completed")
             self.assertTrue(manager.status()["mysql"]["ok"])
 
-            next_driver = MultiInterfaceDriver([], ["温度"])
-            next_driver.cache.publish(
-                ChannelSample(
-                    interface_id="temperature-device",
-                    channel_name="温度",
-                    value=21.0,
-                    source_sequence=1,
-                )
-            )
+            next_driver = self.fresh_temperature_driver(21.0)
             next_config = AcquisitionConfig(
                 **real_payload(
                     save_root="",
@@ -845,15 +929,7 @@ class SharedAcquisitionCoreTests(unittest.TestCase):
         config = AcquisitionConfig(
             **real_payload(save_root="", persistence_policy="engineering_preview")
         )
-        driver = MultiInterfaceDriver([], ["温度"])
-        driver.cache.publish(
-            ChannelSample(
-                interface_id="temperature-device",
-                channel_name="温度",
-                value=20.0,
-                source_sequence=1,
-            )
-        )
+        driver = self.fresh_temperature_driver(20.0)
 
         with (
             patch("acquisition.build_driver", return_value=driver),

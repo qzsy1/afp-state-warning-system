@@ -378,6 +378,72 @@ class PublicWebAccessTests(unittest.TestCase):
 
 
 class PublicWebHttpTests(unittest.TestCase):
+    def test_esr_numeric_route_dispatches_locally_and_denies_guest(self):
+        self.request_json("GET", "/api/auth/session")
+        request = {"action": "zero", "interface_id": "esr", "capture_generation": "current",
+                   "connection_generation": 1, "calibration_digest": ""}
+        with patch.object(self.server.dashboard.acquisition, "esr_numeric_action", create=True, return_value={"ok": True, "zero": {"relative_unit": "adc_counts"}}) as action:
+            status, result, _ = self.request_json("POST", "/api/acquisition/esr-numeric", request)
+            self.assertEqual(status, 403, result)
+            action.assert_not_called()
+            with patch.object(self.server.RequestHandlerClass, "access_context", "local_admin"):
+                status, result, _ = self.request_json("POST", "/api/acquisition/esr-numeric", request)
+            self.assertEqual(status, 200, result)
+            self.assertTrue(result["ok"])
+            action.assert_called_once_with(request)
+
+    def test_local_interface_plans_persist_without_credentials_or_readiness(self):
+        route = "/api/admin/acquisition/interface-plans"
+        status, _, _ = self.request_json("GET", route)
+        self.assertEqual(status, 403)
+        plan = {
+            "active": "new_collection_v13_0",
+            "plans": {"new_collection_v13_0": {
+                "interfaces": [{"id": "esr", "role": "esr1001_strain",
+                    "driver": "esr1001_usb_ttl", "data_mode": "raw_adc",
+                    "endpoint": "COM91", "enabled": True, "baudrate": 115200,
+                    "channels": ["CH1_ADC_signed"],
+                    "password": "private-value", "physical_verified": True,
+                    "calibration_profile": {"secret": "private-value", "K": [1, 2, 3, 4]}}],
+                "processingMode": "capture_only", "mysqlEnabled": False,
+                "readiness_snapshot": {"ok": True},
+            }},
+            "token": "private-value",
+        }
+        status, _, _ = self.request_json("POST", route, plan)
+        self.assertEqual(status, 403)
+        with patch.object(self.server.RequestHandlerClass, "access_context", "local_admin"):
+            status, result, _ = self.request_json("POST", route, plan)
+            self.assertEqual(status, 200, result)
+            status, result, _ = self.request_json("GET", route)
+            self.assertEqual(status, 200, result)
+            revision = result["revision"]
+            candidate_plan = json.loads(json.dumps(plan))
+            candidate_plan["expected_revision"] = revision
+            candidate_plan["plans"]["new_collection_v13_0"]["interfaces"][0]["channel_settings"] = {
+                "esr_vendor_candidate": {"source_sha256": "fixture", "channels": [1, 2, 3, 4]}}
+            status, saved, _ = self.request_json("POST", route, candidate_plan)
+            self.assertEqual(status, 200, saved)
+            self.assertNotEqual(saved["revision"], revision)
+            status, rejected, _ = self.request_json("POST", route, plan)
+            self.assertEqual(status, 409, rejected)
+            self.assertIn("interface_plan_conflict", rejected["error"])
+            candidate_plan["expected_revision"] = revision
+            status, rejected, _ = self.request_json("POST", route, candidate_plan)
+            self.assertEqual(status, 409, rejected)
+            status, result, _ = self.request_json("GET", route)
+            self.assertEqual(status, 200, result)
+        from pre_sensor_config import InterfacePlanStore
+        stored = InterfacePlanStore(self.server.security_store.path.parent / "interface-plans.json").load()
+        self.assertEqual(result["preferences"], stored)
+        interface = stored["plans"][stored["active"]]["interfaces"][0]
+        self.assertEqual(interface["driver"], "esr1001_usb_ttl")
+        self.assertEqual(interface["channels"], ["CH1_ADC_signed"])
+        self.assertNotIn("physical_verified", interface)
+        rendered = json.dumps(stored)
+        self.assertNotIn("private-value", rendered)
+        self.assertNotIn("readiness_snapshot", rendered)
+
     def setUp(self) -> None:
         from app import RELEASE_CONTRACT, create_server
         from guest_simulation import GuestSimulationManager
@@ -904,6 +970,8 @@ class PublicWebHttpTests(unittest.TestCase):
                 "unified_frame_contract": contract.unified_frame_contract,
                 "configuration_schema_version": contract.configuration_schema_version,
                 "readiness_schema_version": contract.readiness_schema_version,
+                "device_readiness_contract": "plc_abb_uvc_readiness_v1",
+                "unified_device_readiness_v1": True,
             },
         })
         handler = self.server.RequestHandlerClass
@@ -1113,7 +1181,8 @@ class PublicWebHttpTests(unittest.TestCase):
         encoded = json.dumps(payload, ensure_ascii=False)
         self.assertNotIn("COM-secret", encoded)
         self.assertNotIn("secret driver path", encoded)
-        self.assertEqual(len(payload["interfaces"]), 5)
+        self.assertEqual(len(payload["interfaces"]), 6)
+        self.assertIn("esr1001_strain", {item["role"] for item in payload["interfaces"]})
 
     def test_guest_simulation_uses_server_profile_and_never_starts_hardware(self):
         self.request_json("GET", "/api/auth/session")
@@ -1213,7 +1282,7 @@ class PublicWebHttpTests(unittest.TestCase):
         self.assertEqual(
             {item["role"]: item["driver"] for item in acquisition.get("interface_defaults", [])},
             {
-                "thermocouple64": "thermocouple64_protocol_pending",
+                "thermocouple64": "huipu_tc64_modbus_rtu",
                 "plc": "modbus_tcp",
                 "thermal_uvc": "uvc_thermal",
                 "robot": "abb_robot",

@@ -27,6 +27,12 @@ Use the repository's ordinary Local checkout and the helper at `scripts/local-br
 6. Do not invent commands or results. If the user did not request a commit or PR, leave the work on the local task branch and report its status.
 7. When the user requests a PR, commit only task-owned changes and complete the synchronization and test checks below before pushing and creating or updating a PR targeting `main`. A Draft PR is appropriate only after the branch has a complete, verifiable commit that helps coordinate work; it must pass the same synchronization and test checks.
 
+## Deploy completed changes
+
+- After the task's implementation and relevant checks pass, automatically update `D:\AFP_Runtime\AFP_Integrated_System_Modular` once for the task using the controlled staging and switchover workflow. Routine internal edits and intermediate checks do not require repeated assembly or updates. Documentation-only or test-only changes do not require republishing unchanged runtime content. The user has granted standing authorization for these routine updates; do not request release permission again.
+- Build only under `D:\AFP_Runtime\.afp-staging`, preserve runtime preferences and capture data, and stop acquisition safely before replacing the running release. Launch from the fixed runtime directory and verify the release identity, file digests, process paths, runtime revision, and served page assets. Routine cleanup of verified task-owned staging artifacts and old-runtime swap directories is also authorized. Clean them after success or failure; if permissions, file locks, or automatic approval review block cleanup, list the retained paths and reason without bypassing tool policy or reporting cleanup as passed. Blocked cleanup does not block delivery of software that has passed verification.
+- If verification or deployment fails, acquisition cannot safely stop, or the user explicitly defers deployment, report the actual runtime state and the reason. Report software deployment and physical device acceptance separately. Startup configuration changes still require their own authorization.
+
 ## Prepare a PR or merge a task
 
 1. Before creating or updating a PR, or on an explicit merge request, run the helper with `-Action PrepareMerge`; it rejects `main`, foreign-machine branches, dirty state, and unresolved conflicts, then fetches `origin` and merges `origin/main` when necessary without rebasing. PR authorization does not authorize merging.

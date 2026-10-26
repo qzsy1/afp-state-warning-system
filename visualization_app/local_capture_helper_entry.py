@@ -16,6 +16,7 @@ import queue
 import sys
 import threading
 import time
+from acquisition_clock import monotonic
 import urllib.parse
 from dataclasses import fields
 from pathlib import Path
@@ -24,7 +25,11 @@ from typing import Any
 from acquisition import AcquisitionConfig, MySQLSettings
 from helper_relay import normalize_pairing_code
 from local_capture_agent import HelperTransport, LocalCaptureAgent
-from release_contract import load_release_contract, release_manifest_helper_identity
+from release_contract import (
+    DEVICE_READINESS_CONTRACT,
+    load_release_contract,
+    release_manifest_helper_identity,
+)
 
 
 RELEASE_CONTRACT = load_release_contract(
@@ -125,7 +130,7 @@ class HelperSamplePump:
             transport["helper_ack_rtt_ms"] = self._rtt_ms
             transport["paired_route_type"] = self.route_type
         self._in_flight = (capture_uuid, sequence)
-        self._last_sent_at = time.monotonic() if now is None else float(now)
+        self._last_sent_at = monotonic() if now is None else float(now)
         message = {"type": "sample_batch", "batch": batch}
         if self.ingress_generation is not None:
             message["ingress_generation"] = self.ingress_generation
@@ -145,7 +150,7 @@ class HelperSamplePump:
         accepted = self.agent.ack_sample_batch(str(capture_uuid), int(sequence))
         if accepted:
             self._in_flight = None
-            self._last_ack_at = time.monotonic() if now is None else float(now)
+            self._last_ack_at = monotonic() if now is None else float(now)
             if self._last_sent_at is not None:
                 measured = max(0.0, (self._last_ack_at - self._last_sent_at) * 1000.0)
                 self._rtt_ms = measured if self._rtt_ms is None else (0.75 * self._rtt_ms + 0.25 * measured)
@@ -204,16 +209,14 @@ class HelperResultOutbox:
 
 
 def default_runtime_config_path() -> Path:
-    local_app_data = os.environ.get("LOCALAPPDATA")
-    root = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
-    return root / "AFP_Local_Capture_Helper" / "config.json"
+    return Path("D:/AFP_Runtime/AFP_Local_Capture_Helper/config.json")
 
 
 def default_server_hint_path() -> Path:
     configured = os.environ.get("AFP_PUBLIC_TUNNEL_URL_FILE")
     if configured:
         return Path(configured)
-    return Path("F:/softwawre/tailscale/funnel-url.txt")
+    return Path("D:/softwawre/tailscale/funnel-url.txt")
 
 
 def load_current_server_hint(*, path: str | Path | None = None) -> str:
@@ -576,6 +579,13 @@ def helper_capabilities(server_url: str = "") -> dict[str, Any]:
         "build_id": HELPER_BUILD_ID,
         "configuration_schema_version": RELEASE_CONTRACT.configuration_schema_version,
         "readiness_schema_version": RELEASE_CONTRACT.readiness_schema_version,
+        "device_readiness_contract": DEVICE_READINESS_CONTRACT,
+        "unified_device_readiness_v1": True,
+        "plc_measurement_contract": "fibercontrol_plc_v1",
+        "abb_measurement_contract": "fibercontrol_abb_v1",
+        "abb_clock_domain": "host_perf_counter",
+        "async_capture_start_v1": True,
+        "capture_pause_v1": True,
         "command_lifecycle": "isolated_hardware_check",
         "hardware_check_timeout_seconds": HARDWARE_CHECK_TIMEOUT_SECONDS,
         "hardware_discovery": True,
@@ -586,15 +596,21 @@ def helper_capabilities(server_url: str = "") -> dict[str, Any]:
         "simulation_replay_v1": True,
         "simulation_prefetch_v1": True,
         "unified_frame_v1": True,
+        "unified_frame_v2": True,
         "unified_frame_contract": RELEASE_CONTRACT.unified_frame_contract,
         "esr1001_modbus_rtu": True,
+        "esr1001_usb_ttl": True,
+        "esr1001_raw_adc_capture": True,
+                "m3232_uart_text_v1": True,
+                "m3232_matrix_csv_v1": True,
+        "esr1001_calibration_v1": True,
         "interface_roles": [
             "thermocouple_8ch", "plc_process", "uvc_temperature",
             "abb_motion", "m3232_pressure", "esr1001_strain",
         ],
         "drivers": [
             "smrf_hid", "modbus_tcp", "uvc_thermal", "abb_robot",
-            "m3232_pressure", "modbus_rtu_esr1001",
+            "m3232_pressure", "modbus_rtu_esr1001", "esr1001_usb_ttl",
         ],
         "local_mysql_profile": local_mysql_profile_metadata(),
     }
@@ -1045,7 +1061,11 @@ def dispatch_command(agent: LocalCaptureAgent, raw: str | bytes) -> dict[str, An
                 _config_from_payload(_inject_saved_local_mysql(payload))
             )
         elif name == "stop_capture":
-            result = agent.stop_capture()
+            result = agent.stop_capture(capture_uuid=payload.get("capture_uuid"), capture_generation=payload.get("capture_generation")) if payload.get("capture_uuid") or payload.get("capture_generation") else agent.stop_capture()
+        elif name in {"pause_capture", "resume_capture"}:
+            result = agent.control_pause(name.removesuffix("_capture"), payload)
+        elif name == "esr_numeric":
+            result = agent.esr_numeric(payload)
         else:  # decode_command already guards this; retain a defensive branch.
             raise ValueError("helper命令不在允许列表")
     except Exception as exc:
@@ -1333,7 +1353,7 @@ def run_forever(
                 connection.settimeout(1.0)
             except Exception:
                 pass
-            last_heartbeat = time.monotonic()
+            last_heartbeat = monotonic()
             while True:
                 if sender_errors:
                     raise sender_errors[0]
@@ -1346,9 +1366,9 @@ def run_forever(
                     if exc.__class__.__name__ == "WebSocketTimeoutException":
                         if sender_errors:
                             raise sender_errors[0]
-                        if time.monotonic() - last_heartbeat >= 10.0:
+                        if monotonic() - last_heartbeat >= 10.0:
                             send_json({"type": "heartbeat"})
-                            last_heartbeat = time.monotonic()
+                            last_heartbeat = monotonic()
                         continue
                     raise
                 if raw is None or raw == "" or raw == b"":

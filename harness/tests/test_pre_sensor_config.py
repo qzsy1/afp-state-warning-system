@@ -46,7 +46,7 @@ class PreSensorConfigurationTemplateTests(unittest.TestCase):
 
     def test_two_complete_mutually_exclusive_templates(self) -> None:
         expected_channels = {
-            "温度", "压力", "薄膜压力", "ROI平均温度", "张力", "线速度",
+            "温度", "压力", "薄膜压力原始响应", "ROI平均温度", "张力", "线速度",
             "ABB_X", "ABB_Y", "ABB_Z",
             *{f"温度{index}" for index in range(1, 65)},
             *{f"应变{index}" for index in range(1, 5)},
@@ -175,6 +175,9 @@ class PreSensorConfigurationValidationTests(unittest.TestCase):
     def test_valid_templates_map_to_existing_acquisition_config(self) -> None:
         payload = deepcopy(self.local)
         payload["interfaces"][0]["hardware_facts"] = _hardware_facts()
+        payload["interfaces"][0].update(read_profile="full_record_block", timeout=.28,
+            channel_settings={"confirmed": True, "channels": {"温度64": {"unit": 2, "input_type": 0, "switch": 0}}},
+            freshness_seconds=5, reconnect_window_seconds=45)
         local = validate_pre_sensor_config(
             payload,
             references={
@@ -189,6 +192,10 @@ class PreSensorConfigurationValidationTests(unittest.TestCase):
             },
         )
         self.assertEqual(local.real_acquisition_mode, "local_direct")
+        self.assertEqual(local.interfaces[0]["read_profile"], "full_record_block")
+        self.assertEqual(local.interfaces[0]["timeout"], .28)
+        self.assertEqual(local.interfaces[0]["channel_settings"], payload["interfaces"][0]["channel_settings"])
+        self.assertEqual(local.interfaces[0]["reconnect_window_seconds"], 45)
         self.assertEqual(local.sample_rate_hz, 10.0)
         self.assertEqual(set(local.selected_sensors), {item["name"] for item in self.local["channels"]})
 
@@ -223,8 +230,10 @@ class PreSensorConfigurationValidationTests(unittest.TestCase):
             "unified_frame_contract": contracts["unified_frame_contract"],
             "configuration_schema_version": contracts["configuration_schema_version"],
             "readiness_schema_version": contracts["readiness_schema_version"],
+            "device_readiness_contract": "plc_abb_uvc_readiness_v1",
+            "unified_device_readiness_v1": True,
             "unified_frame_v2": True,
-            "thermocouple64_hardware_gate": True,
+            "huipu_tc64_modbus_rtu": True,
             "real_capture": True,
             "local_csv_save": True,
             "esr1001_modbus_rtu": True,

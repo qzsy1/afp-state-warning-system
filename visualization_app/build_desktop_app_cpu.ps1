@@ -1,5 +1,5 @@
 param(
-    [string]$PythonExecutable = "C:\Users\xlq\AppData\Local\Temp\AFPBuildCPU\Scripts\python.exe",
+    [string]$PythonExecutable = "D:\AFP_Integrated_Modular_v2\.venv\Scripts\python.exe",
     [switch]$SkipArchive
 )
 $ErrorActionPreference = "Stop"

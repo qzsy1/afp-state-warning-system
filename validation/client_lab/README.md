@@ -4,7 +4,7 @@ This directory contains validation-only assets for exercising the public AFP wor
 
 ## Host layout
 
-`New-ClientLabStage.ps1` creates only `F:\AFP_Client_Validation_Lab`. The staged `input` folder is mapped read-only, while `results` is the only writable host mapping. The script pins the delivery helper and simulation fixture by SHA-256, copies only `bin`, `lib`, `share` and `LICENSE` from the portable MySQL tree, and refuses to overwrite an existing staged input or configuration.
+`New-ClientLabStage.ps1` creates only `D:\AFP_Client_Validation_Lab`. The staged `input` folder is mapped read-only, while `results` is the only writable host mapping. The script pins the delivery helper and simulation fixture by SHA-256, copies only `bin`, `lib`, `share` and `LICENSE` from the portable MySQL tree, and refuses to overwrite an existing staged input or configuration.
 
 A clean Sandbox may not contain the Microsoft Visual C++ runtime required by MySQL 8.4. The stage therefore requires the official x64 Redistributable to have a valid Microsoft Corporation Authenticode signature. It is installed only inside Sandbox. MySQL remains bound to `127.0.0.1`; an ephemeral Sandbox-only `init-file` creates `afp_app@127.0.0.1` because `root@127.0.0.1` cannot perform the first login while `skip-name-resolve=1` and only `root@localhost` exists. The bootstrap SQL is deleted after the application account passes its loopback check.
 

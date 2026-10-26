@@ -43,6 +43,9 @@ ALLOWED_HELPER_COMMANDS = frozenset(
         "prepare_simulation_source",
         "start_capture",
         "stop_capture",
+        "pause_capture",
+        "resume_capture",
+        "esr_numeric",
         "status",
     }
 )
@@ -669,15 +672,17 @@ class HelperRegistry:
             record.terminal_error = ""
             self._active_captures.pop(f"unconfirmed-{record.request_id}", None)
             capture_uuid = str(result.get("capture_uuid") or "").strip()
+            start_state = str((result.get("start_operation") or {}).get("state") or "")
+            starting = start_state in {"starting", "cancelling"}
             if record.command == "status" and isinstance(result.get("running"), bool):
                 self._active_captures = {
                     capture_id: owner
                     for capture_id, owner in self._active_captures.items()
                     if owner != session_id
                 }
-            if record.command in {"start_capture", "status"} and result.get("running") is True and capture_uuid:
+            if record.command in {"start_capture", "status"} and (result.get("running") is True or starting) and capture_uuid:
                 self._active_captures[capture_uuid] = session_id
-            if result.get("running") is False and capture_uuid:
+            if result.get("running") is False and not starting and capture_uuid:
                 self._active_captures.pop(capture_uuid, None)
             self._persist_helpers_locked()
         return {"ok": True, "request_id": str(request_id)}
@@ -967,6 +972,18 @@ class HelperRegistry:
                     helper.sender = None
             if not helper.online:
                 return {"ok": False, "queued": False, "error": "helper_offline"}
+            if command in {"pause_capture", "resume_capture"} and not helper.capabilities.get("capture_pause_v1"):
+                return {"ok": False, "queued": False, "error": "helper_capability_missing: capture_pause_v1"}
+            if command in {"start_capture", "check_capture"}:
+                from plc_measurement import requires_plc_measurement, PLC_MEASUREMENT_CONTRACT
+                from abb_measurement import requires_abb_measurement, ABB_MEASUREMENT_CONTRACT
+                if requires_abb_measurement(dict(payload or {})) and (helper.capabilities.get("abb_measurement_contract") != ABB_MEASUREMENT_CONTRACT
+                    or helper.capabilities.get("abb_clock_domain") != "host_perf_counter"):
+                    return {"ok": False, "queued": False, "error": "abb_measurement_incompatible",
+                            "message": "helper requires fibercontrol_abb_v1 with host_perf_counter"}
+                if requires_plc_measurement(dict(payload or {})) and helper.capabilities.get("plc_measurement_contract") != PLC_MEASUREMENT_CONTRACT:
+                    return {"ok": False, "queued": False, "error": "plc_measurement_incompatible",
+                            "required_contract": PLC_MEASUREMENT_CONTRACT}
             if command == "start_capture":
                 mismatches = helper_capability_mismatches(
                     RELEASE_CONTRACT, helper.capabilities

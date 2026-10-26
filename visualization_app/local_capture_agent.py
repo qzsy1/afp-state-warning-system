@@ -22,6 +22,7 @@ from typing import Any
 
 from acquisition import (
     AcquisitionManager,
+    DEFAULT_CAPTURE_ROOT,
     MySQLSettings,
     check_capture_save_root,
     select_capture_folder,
@@ -31,7 +32,11 @@ from mysql_storage import MySQLCaptureStore
 from json_safety import json_safe_value
 from remote_mysql_setup import classify_mysql_error
 from real_acquisition import ReadinessSnapshot
-from release_contract import assert_helper_contract, load_release_contract
+from release_contract import (
+    DEVICE_READINESS_CONTRACT,
+    assert_helper_contract,
+    load_release_contract,
+)
 from simulation_source_transfer import SimulationSourceCache, inspect_csv_source
 from interface_transport_catalog import (
     enrich_interface_transports,
@@ -40,11 +45,11 @@ from interface_transport_catalog import (
 
 
 _ROLE_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("thermocouple64", "unconfirmed", ("thermocouple64_protocol_pending",)),
-    ("plc_process", "ethernet", ("ethernet",)),
-    ("uvc_temperature", "usb_uvc", ("uvc",)),
-    ("abb_motion", "ethernet", ("ethernet",)),
-    ("m3232_pressure", "serial", ("serial",)),
+    ("thermocouple64", "serial", ("serial",)),
+    ("plc", "ethernet", ("ethernet",)),
+    ("thermal_uvc", "usb_uvc", ("uvc",)),
+    ("robot", "ethernet", ("ethernet",)),
+    ("pressure", "serial", ("serial",)),
     ("esr1001_strain", "serial", ("serial",)),
 )
 RELEASE_CONTRACT = load_release_contract(start=__file__)
@@ -60,16 +65,12 @@ class LocalCaptureAgent:
         simulation_cache_root: str | Path | None = None,
     ) -> None:
         self.manager = manager or AcquisitionManager()
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        default_cache_root = (
-            Path(local_app_data)
-            if local_app_data
-            else Path.home() / "AppData" / "Local"
-        ) / "AFP_Local_Capture_Helper" / "simulation-cache"
+        default_cache_root = Path(getattr(self.manager, "capture_root", DEFAULT_CAPTURE_ROOT)) / ".helper" / "simulation-cache"
         self._simulation_cache = SimulationSourceCache(
             simulation_cache_root or default_cache_root
         )
         self._stream_lock = threading.RLock()
+        self._esr_source_cursors = {}
         self._capture_uuid = ""
         self._stream_cursor = 0
         self._stream_sequence = 0
@@ -129,10 +130,15 @@ class LocalCaptureAgent:
         used: set[str] = set()
         for role, kind, protocols in _ROLE_SPECS:
             # Only PLC and ABB are allowed to share an Ethernet adapter.
-            allow_used = role == "abb_motion"
+            allow_used = role == "robot"
             candidate = self._choose_candidate(
                 physical, kind, protocols, used=used, allow_used=allow_used
             )
+            role_candidates = [p for p in physical if p.get("kind") == kind
+                               and p.get("protocol") in protocols
+                               and (not p.get("compatible_roles") or role in p["compatible_roles"])]
+            if role in {"thermocouple64", "pressure", "esr1001_strain"}:
+                candidate = None
             physical_id = str(candidate.get("id") or "") if candidate else ""
             if candidate and not allow_used:
                 used.add(str(candidate.get("parent_port_id") or physical_id))
@@ -141,16 +147,18 @@ class LocalCaptureAgent:
             bindings.append(
                 {
                     "role": role,
+                    "candidates": role_candidates,
+                    "identity_confirmed": False,
                     "physical_interface_id": physical_id or None,
                     "physical_port_id": (candidate or {}).get("parent_port_id") or None,
                     "physical_kind": kind,
                     "protocol": (
-                        "modbus_rtu" if role == "esr1001_strain" else protocols[0]
+                        "modbus_rtu" if role in {"esr1001_strain", "thermocouple64"} else protocols[0]
                     ),
                     "driver": (
                         "modbus_rtu_esr1001"
                         if role == "esr1001_strain"
-                        else None
+                        else "huipu_tc64_modbus_rtu" if role == "thermocouple64" else None
                     ),
                     "interface_detected": detected,
                     "driver_available": driver_available,
@@ -173,6 +181,8 @@ class LocalCaptureAgent:
                 }
             )
         return {
+            "device_readiness_contract": DEVICE_READINESS_CONTRACT,
+            "readiness_schema_version": RELEASE_CONTRACT.readiness_schema_version,
             "interfaces": physical,
             "sensor_bindings": bindings,
             "usb_topology": discovered.get("usb_topology") or {
@@ -193,6 +203,11 @@ class LocalCaptureAgent:
                 "ethernet_interface_ids": [],
             },
             "capabilities": {
+                "device_readiness_contract": DEVICE_READINESS_CONTRACT,
+                "unified_device_readiness_v1": True,
+                "plc_measurement_contract": "fibercontrol_plc_v1",
+                "abb_measurement_contract": "fibercontrol_abb_v1",
+                "abb_clock_domain": "host_perf_counter",
                 "hardware_discovery": True,
                 "usb_topology_v1": bool(discovered.get("usb_topology")),
                 "usb_topology_v2": bool(discovered.get("usb_topology")),
@@ -203,10 +218,17 @@ class LocalCaptureAgent:
                 "local_csv_save": True,
                 "local_mysql_save": True,
                 "esr1001_modbus_rtu": True,
+                "esr1001_usb_ttl": True,
+                "esr1001_raw_adc_capture": True,
+                "m3232_uart_text_v1": True,
+                "m3232_matrix_csv_v1": True,
+                "esr1001_calibration_v1": True,
+                "esr1001_numeric_v1": True,
+                "huipu_tc64_modbus_rtu": True,
                 "interface_roles": [item[0] for item in _ROLE_SPECS],
                 "drivers": [
                     "smrf_hid", "modbus_tcp", "uvc_thermal", "abb_robot",
-                    "m3232_pressure", "modbus_rtu_esr1001",
+                    "m3232_pressure", "modbus_rtu_esr1001", "esr1001_usb_ttl", "huipu_tc64_modbus_rtu",
                 ],
             },
             "warnings": [discovered["error"]] if discovered.get("error") else [],
@@ -371,11 +393,17 @@ class LocalCaptureAgent:
         return result
 
     def start_capture(self, config: Any) -> dict[str, Any]:
+        from esr1001_usb import require_helper_capabilities
+        require_helper_capabilities(config)
+        from m3232_serial import require_helper_capabilities as require_m3232_capabilities
+        require_m3232_capabilities(config)
         if (
             str(getattr(config, "acquisition_mode", "")) == "real"
             and str(getattr(config, "real_acquisition_mode", "")) == "remote_helper"
         ):
             capabilities = getattr(config, "helper_capabilities", None) or {}
+            from plc_measurement import require_helper_measurement
+            require_helper_measurement(config)
             assert_helper_contract(capabilities, RELEASE_CONTRACT)
             required_contract = (
                 "unified_frame_v2"
@@ -400,12 +428,16 @@ class LocalCaptureAgent:
                 snapshot.validate(
                     config,
                     required_capabilities=(required_contract,),
+                    allow_expired=bool(getattr(self.manager, "session_readiness_matches", lambda _: False)(config)),
                 )
             except ValueError as exc:
                 raise RuntimeError(f"remote_readiness_required: {exc}") from exc
         if not str(getattr(config, "capture_uuid", "") or "").strip():
             config.capture_uuid = uuid.uuid4().hex
-        result = self.manager.start(config)
+        if getattr(config, "async_start", False) and config.acquisition_mode == "real":
+            result = self.manager.start_async(config)
+        else:
+            result = self.manager.start(config)
         with self._stream_lock:
             self._capture_uuid = str(
                 (result or {}).get("capture_uuid")
@@ -413,6 +445,7 @@ class LocalCaptureAgent:
                 else ""
             ).strip() or str(config.capture_uuid)
             self._stream_cursor = 0
+            self._esr_source_cursors = {}
             self._stream_sequence = 0
             self._pending_batch = None
             self._status_revision += 1
@@ -436,6 +469,20 @@ class LocalCaptureAgent:
             if self._pending_batch is not None:
                 return dict(self._pending_batch)
             if not self._capture_uuid:
+                return None
+            operation = getattr(self.manager, "start_operation_status", lambda: {})()
+            if not isinstance(operation, dict):
+                operation = {}
+            if operation.get("state") in {"starting", "cancelling"}:
+                return None
+            manager_capture_uuid = str(
+                getattr(self.manager, "capture_uuid", "") or ""
+            )
+            if (
+                operation
+                and manager_capture_uuid
+                and manager_capture_uuid != self._capture_uuid
+            ):
                 return None
             incremental = None
             reader = getattr(self.manager, "stream_rows_since", None)
@@ -463,7 +510,11 @@ class LocalCaptureAgent:
                 frames = []
                 frame_catalog = None
                 total_count = len(all_rows)
-            if end_cursor <= self._stream_cursor and not self._status_dirty:
+            source_reader = getattr(self.manager, "esr_source_evidence_since", None)
+            source_evidence = source_reader(self._esr_source_cursors, 200) if callable(source_reader) else {}
+            if not isinstance(source_evidence, dict):
+                source_evidence = {}
+            if end_cursor <= self._stream_cursor and not self._status_dirty and not source_evidence.get("records"):
                 return None
             frame_contract = str(
                 (frames[0] if frames else {}).get("contract_version")
@@ -479,6 +530,9 @@ class LocalCaptureAgent:
                 "rows": [json_safe_value(dict(row)) for row in rows],
                 "timestamps": [float(value) for value in timestamps],
                 "frames": [json_safe_value(dict(frame)) for frame in frames],
+                "esr_source_records": json_safe_value(source_evidence.get("records", [])),
+                "esr_source_cursors": source_evidence.get("cursors", {}),
+                "esr_source_remaining": source_evidence.get("remaining", 0),
                 "status": json_safe_value(self.status()),
                 "transport": {
                     "helper_batch_created_at": time.time(),
@@ -512,6 +566,7 @@ class LocalCaptureAgent:
                 pending.get("cursor_end", self._stream_cursor + len(pending["rows"]))
             )
             self._stream_sequence += 1
+            self._esr_source_cursors = dict(pending.get("esr_source_cursors", self._esr_source_cursors))
             self._pending_batch = None
             pending_status_revision = self._pending_status_revision
             if self._local_stopped_at is not None and self._flush_state == "flushing":
@@ -526,7 +581,7 @@ class LocalCaptureAgent:
                     total_count = len(all_rows)
                 else:
                     total_count = int(counts.get("total_count", 0))
-                if total_count <= self._stream_cursor:
+                if total_count <= self._stream_cursor and not pending.get("esr_source_remaining", 0):
                     self._flush_state = "completed"
                     self._status_revision += 1
                     self._status_dirty = True
@@ -582,8 +637,16 @@ class LocalCaptureAgent:
             }
 
     def check_capture(self, config: Any) -> dict[str, Any]:
+        from plc_measurement import require_helper_measurement
+        require_helper_measurement(config)
+        from esr1001_usb import require_helper_capabilities
+        require_helper_capabilities(config)
+        from m3232_serial import require_helper_capabilities as require_m3232_capabilities
+        require_m3232_capabilities(config)
         result = self.manager.test_connection(config)
         response = dict(result) if isinstance(result, dict) else {"ok": False, "result": result}
+        response["device_readiness_contract"] = DEVICE_READINESS_CONTRACT
+        response["readiness_schema_version"] = RELEASE_CONTRACT.readiness_schema_version
         snapshot = ReadinessSnapshot.create(
             config,
             response,
@@ -591,22 +654,46 @@ class LocalCaptureAgent:
                 **dict(getattr(config, "helper_capabilities", None) or {}),
                 "unified_frame_v1": True,
                 "unified_frame_v2": True,
-                "thermocouple64_hardware_gate": True,
+                "huipu_tc64_modbus_rtu": True,
                 "unified_frame_contract": "unified_frame_v2",
+                "device_readiness_contract": DEVICE_READINESS_CONTRACT,
+                "unified_device_readiness_v1": True,
+                "plc_measurement_contract": "fibercontrol_plc_v1",
+                "abb_measurement_contract": "fibercontrol_abb_v1",
+                "abb_clock_domain": "host_perf_counter",
             },
         )
         self._readiness_snapshot = snapshot
         response["readiness_snapshot"] = snapshot.to_dict()
+        response["readiness_session_id"] = getattr(self.manager, "readiness_session_id", "")
         return response
 
     def import_readiness_snapshot(self, payload: dict[str, Any]) -> None:
         self._readiness_snapshot = ReadinessSnapshot.from_dict(payload)
+        importer = getattr(self.manager, "import_readiness_snapshot", None)
+        if callable(importer):
+            importer(payload)
 
     def read_process_parameters(self, config: Any) -> dict[str, Any]:
         return self.manager.read_process_parameters(config)
 
-    def stop_capture(self) -> dict[str, Any]:
-        result = self.manager.stop()
+    def control_pause(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if action not in {"pause", "resume"}:
+            raise ValueError("invalid_capture_control")
+        result = getattr(self.manager, action)(capture_uuid=payload.get("capture_uuid"),
+            capture_generation=payload.get("capture_generation"),
+            expected_revision=payload.get("expected_revision"))
+        with self._stream_lock:
+            self._status_revision += 1
+            self._status_dirty = True
+        return {**result, "execution_host": "helper_local"}
+
+    def stop_capture(self, *, capture_uuid=None, capture_generation=None) -> dict[str, Any]:
+        result = self.manager.stop(capture_uuid=capture_uuid, capture_generation=capture_generation) if capture_uuid or capture_generation else self.manager.stop()
+        if isinstance(result, dict) and result.get("capture_phase") == "cancelling_start":
+            return {**result, "execution_host": "helper_local"}
+        if isinstance(result, dict) and (result.get("running") or result.get("save_failed")):
+            return {**result, "execution_host": "helper_local"}
         stopped_at = time.time()
         response = dict(result) if isinstance(result, dict) else {"result": result}
         with self._stream_lock:
@@ -650,8 +737,18 @@ class LocalCaptureAgent:
         )
         return response
 
+    def esr_numeric(self, payload):
+        result = self.manager.esr_numeric_action(payload)
+        self._status_dirty = True
+        self._status_revision += 1
+        return result
+
     def status(self) -> dict[str, Any]:
         value = dict(self.manager.status())
+        if value.get("start_operation", {}).get("state") in {"starting", "cancelling"}:
+            value["capture_uuid"] = self._capture_uuid
+            value["sample_count"] = 0
+            value["running"] = False
         value["execution_host"] = "helper_local"
         value["source_transfer"] = dict(self._source_transfer_status)
         value["transport"] = self.stream_metrics(status=value)

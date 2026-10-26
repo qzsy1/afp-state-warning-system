@@ -85,9 +85,21 @@ function Get-AfpDeploymentPaths {
         $staging = Normalize-AfpPath -Path ([string]$config.staging_root)
     }
 
-    foreach ($child in @($source, $runtime, $evidence, $staging)) {
+    foreach ($child in @($runtime, $evidence, $staging)) {
         if (-not (Test-AfpDescendantPath -Path $child -Parent $workspace)) {
             throw "Configured path is outside the AFP workspace: $child"
+        }
+    }
+
+    if ((Test-AfpSamePath -Left $source -Right $workspace) -or
+        (Test-AfpDescendantPath -Path $workspace -Parent $source)) {
+        throw "Source checkout must not contain the mutable AFP workspace: $source"
+    }
+    foreach ($mutable in @($runtime, $evidence, $staging)) {
+        if ((Test-AfpSamePath -Left $source -Right $mutable) -or
+            (Test-AfpDescendantPath -Path $source -Parent $mutable) -or
+            (Test-AfpDescendantPath -Path $mutable -Parent $source)) {
+            throw "Source checkout must not overlap mutable AFP paths: $source"
         }
     }
 

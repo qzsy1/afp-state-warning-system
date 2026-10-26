@@ -111,6 +111,8 @@ class ReleaseContractTests(unittest.TestCase):
                 "unified_frame_contract": contract.unified_frame_contract,
                 "configuration_schema_version": contract.configuration_schema_version,
                 "readiness_schema_version": contract.readiness_schema_version,
+                "device_readiness_contract": "plc_abb_uvc_readiness_v1",
+                "unified_device_readiness_v1": True,
                 "unified_frame_v2": True,
                 "candidate_id": "candidate-1",
                 "helper_sha256": "b" * 64,

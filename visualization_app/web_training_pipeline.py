@@ -648,7 +648,7 @@ def train_models(
 
     # Source runs use the research workspace.  Frozen desktop builds carry the
     # same model package below ``model_runtime`` so training remains available
-    # on computers that do not have the original F: drive tree.
+    # on computers that do not have the external research workspace.
     packaged_runtime = Path(__file__).resolve().parent / "model_runtime"
     if getattr(sys, "frozen", False):
         xju_root = Path(getattr(sys, "_MEIPASS")) / "model_runtime"
@@ -656,7 +656,7 @@ def train_models(
         xju_root = (
             packaged_runtime
             if (packaged_runtime / "shijie").exists()
-            else Path(r"F:\program\XJUsorceopen")
+            else Path(r"D:\program\XJUsorceopen")
         )
     if False and not (xju_root / "shijie").exists():
         raise FileNotFoundError(f"I-ModernTCN模型源码目录不存在：{xju_root / 'shijie'}")

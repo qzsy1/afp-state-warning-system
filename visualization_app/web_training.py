@@ -151,7 +151,7 @@ class WebTrainingManager:
             raw_output = str(settings.get("output_root", "")).strip()
             output_root = Path(raw_output).expanduser() if raw_output else self.output_root
             if not output_root.is_absolute():
-                raise ValueError("模型保存位置必须是盘符开头的绝对路径，例如 F:\\AFP_Training_Models")
+                raise ValueError("模型保存位置必须是盘符开头的绝对路径，例如 D:\\AFP_Training_Models")
             thread = threading.Thread(
                 target=self._run,
                 args=(data, dict(settings), output_root),

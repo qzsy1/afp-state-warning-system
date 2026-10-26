@@ -22,6 +22,13 @@ from typing import Any, Iterable
 DATABASE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 
 
+def _timestamp_sources(path):
+    if path and Path(path).is_file():
+        with Path(path).open(encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                yield json.loads(row.get("channel_source_record_json") or "{}")
+
+
 def _as_bool(value: Any, default: bool = False) -> bool:
     """Parse UI/configuration booleans without treating ``"false"`` as true."""
     if value is None:
@@ -156,6 +163,16 @@ class MySQLSettings:
 
 
 SCHEMA_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS afp_source_evidence (
+        specimen_key VARCHAR(320) NOT NULL,
+        layer_no INT NOT NULL,
+        interface_id VARCHAR(160) NOT NULL,
+        source_sequence BIGINT NOT NULL,
+        evidence_json LONGTEXT NOT NULL,
+        PRIMARY KEY (specimen_key, layer_no, interface_id, source_sequence)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
     """
     CREATE TABLE IF NOT EXISTS afp_condition (
         condition_id VARCHAR(160) NOT NULL PRIMARY KEY,
@@ -393,6 +410,7 @@ FOREIGN_KEY_DEFINITIONS = (
 
 REQUIRED_SCHEMA_OBJECTS = frozenset(
     {
+        "afp_source_evidence",
         "afp_condition",
         "afp_specimen",
         "afp_layer",
@@ -1229,6 +1247,7 @@ class MySQLCaptureStore:
         timestamp_file: str | None,
         folder_path: str | None,
         summary: dict[str, Any],
+        source_records: Iterable[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Upload one newly completed layer idempotently."""
         if not self.settings.enabled:
@@ -1238,6 +1257,7 @@ class MySQLCaptureStore:
         layer_no = int(getattr(config, "layer", 0)) + 1
         connection = None
         cursor = None
+        timestamp_sources = None
         try:
             driver, connection = self._connect(self.settings.database)
             saved_at = _now_sql()
@@ -1352,6 +1372,10 @@ class MySQLCaptureStore:
 
             sample_values: list[tuple[Any, ...]] = []
             saved_rows = 0
+            cursor.execute("DELETE FROM afp_source_evidence WHERE specimen_key=%s AND layer_no=%s", (specimen_key, layer_no))
+            timestamp_sources = _timestamp_sources(timestamp_file)
+            plc_evidence = []
+            plc_source_count = 0
 
             def write_sample_batch(values: list[tuple[Any, ...]]) -> None:
                 if not values:
@@ -1360,6 +1384,17 @@ class MySQLCaptureStore:
                     cursor.executemany(sample_sql.replace("afp_sensor_sample", target), values)
 
             for index, row in enumerate(rows):
+                records = row.get("_channel_source_records") or next(timestamp_sources, {})
+                for profile, evidence_kind in (("fibercontrol_plc_v1", "plc_frame"), ("fibercontrol_abb_v1", "abb_frame")):
+                    records_for_profile = {name: evidence for name, evidence in records.items()
+                                           if evidence.get("measurement_profile") == profile}
+                    if records_for_profile:
+                        plc_evidence.append((specimen_key, layer_no, evidence_kind, index,
+                                             json.dumps({"frame_sequence": index, "channels": records_for_profile}, ensure_ascii=False, allow_nan=False)))
+                        plc_source_count += 1
+                        if len(plc_evidence) >= 200:
+                            cursor.executemany("INSERT INTO afp_source_evidence VALUES (%s,%s,%s,%s,%s)", plc_evidence)
+                            plc_evidence = []
                 sensor_values = {
                     name: _finite(row.get(name))
                     for name in sensor_names
@@ -1393,6 +1428,49 @@ class MySQLCaptureStore:
             if sample_values:
                 write_sample_batch(sample_values)
                 saved_rows += len(sample_values)
+            timestamp_sources.close()
+            timestamp_sources = None
+            if plc_evidence:
+                cursor.executemany("INSERT INTO afp_source_evidence VALUES (%s,%s,%s,%s,%s)", plc_evidence)
+            source_count = plc_source_count
+            esr_sources = (summary.get("data_quality") or {}).get("esr1001_usb") or {}
+            if source_records is None and esr_sources:
+                def local_sources():
+                    from esr1001_usb import replay_source_capture
+                    for identity, evidence in esr_sources.items():
+                        source_metadata = json.loads(Path(evidence["raw_file"]).with_suffix(".json").read_text(encoding="utf-8"))
+                        count = 0
+                        for record in replay_source_capture(evidence["raw_file"]):
+                            yield {"interface_id": identity, "record": record,
+                                   "measurement_context": source_metadata.get("measurement_context") or {},
+                                   "calibration_snapshot": evidence.get("calibration_snapshot"),
+                                    "vendor_candidate_snapshot": source_metadata.get("vendor_candidate_snapshot"),
+                                   "capture_generation": evidence.get("capture_generation")}
+                            count += 1
+                        if count != evidence.get("saved_source_rows") or evidence.get("writer_error"):
+                            raise ValueError("ESR原始源帧保存数量或写入状态不一致")
+                source_records = local_sources()
+            if source_records is not None:
+                batch = []
+                sequences = {}
+                for evidence in source_records:
+                    from esr1001_usb import verify_source_evidence
+                    verify_source_evidence(evidence)
+                    identity = str(evidence["interface_id"])
+                    source_sequence = int(evidence["record"]["receive_sequence"])
+                    if source_sequence != sequences.get(identity, 0) + 1:
+                        raise ValueError("ESR源帧证据不连续或重复")
+                    sequences[identity] = source_sequence
+                    batch.append((specimen_key, layer_no, identity, source_sequence, json.dumps(evidence, ensure_ascii=False, allow_nan=False)))
+                    source_count += 1
+                    if len(batch) == 200:
+                        cursor.executemany("INSERT INTO afp_source_evidence VALUES (%s,%s,%s,%s,%s)", batch)
+                        batch = []
+                if batch:
+                    cursor.executemany("INSERT INTO afp_source_evidence VALUES (%s,%s,%s,%s,%s)", batch)
+                for identity, evidence in esr_sources.items():
+                    if sequences.get(identity, 0) != int(evidence.get("saved_source_rows", 0)) or evidence.get("writer_error"):
+                        raise ValueError("ESR源帧传输/保存数量与会话证据不一致")
             cursor.execute(
                 """
                 UPDATE afp_layer
@@ -1424,6 +1502,7 @@ class MySQLCaptureStore:
                 "specimen_key": specimen_key,
                 "layer": layer_no,
                 "saved_rows": saved_rows,
+                "saved_source_rows": source_count,
                 "elapsed_seconds": round(time.time() - started, 3),
             }
         except Exception as exc:
@@ -1443,6 +1522,8 @@ class MySQLCaptureStore:
                 "elapsed_seconds": round(time.time() - started, 3),
             }
         finally:
+            if timestamp_sources is not None:
+                timestamp_sources.close()
             if cursor is not None:
                 try:
                     cursor.close()

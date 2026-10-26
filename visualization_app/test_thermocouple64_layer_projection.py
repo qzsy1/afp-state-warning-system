@@ -20,6 +20,23 @@ import acquisition  # noqa: E402
 
 
 class Thermocouple64LayerProjectionTests(unittest.TestCase):
+    def test_csv_projection_preserves_raw_values_means_imputation_and_digests(self) -> None:
+        for scope in ("causal_so_far", "completed_specimen"):
+            with self.subTest(scope=scope):
+                layers = [{"layer_id": 1, "completed": True, "rows": [
+                    {name: str(index) for index, name in enumerate(THERMOCOUPLE64_CHANNELS)},
+                    {name: float(index + 2) for index, name in enumerate(THERMOCOUPLE64_CHANNELS)}]},
+                    {"layer_id": 2, "completed": False, "rows": [
+                        {"温度1": None, "温度2": float("nan"), "温度3": float("inf")}, {}]}]
+                detailed = project_specimen_layers(layers, sensor_columns=THERMOCOUPLE64_CHANNELS, scope=scope)
+                csv_view = project_specimen_layers(layers, sensor_columns=THERMOCOUPLE64_CHANNELS,
+                                                   scope=scope, include_row_metadata=False)
+                self.assertEqual(detailed["manifest"], csv_view["manifest"])
+                for expected_layer, actual_layer in zip(detailed["derived_layers"], csv_view["derived_layers"]):
+                    for expected, actual in zip(expected_layer["rows"], actual_layer["rows"]):
+                        expected.pop("_thermocouple64_derived")
+                        self.assertEqual(expected, actual)
+
     @staticmethod
     def _config(layer: int, selected: list[str]) -> acquisition.AcquisitionConfig:
         return acquisition.AcquisitionConfig(

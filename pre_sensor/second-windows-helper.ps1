@@ -79,7 +79,7 @@ function New-ReadinessEvidence {
     $network = Get-SafeServerEvidence
     $taskState = Get-TaskState
     $helperProcess = Get-Process -Name "AFP_Local_Capture_Helper" -ErrorAction SilentlyContinue
-    $runtimeConfig = Join-Path $env:LOCALAPPDATA "AFP_Local_Capture_Helper\config.json"
+    $runtimeConfig = "D:\AFP_Runtime\AFP_Local_Capture_Helper\config.json"
     $checks = [ordered]@{
         release_manifest = Test-Path -LiteralPath $manifestPath -PathType Leaf
         managed_hashes = [bool]$hashes.ok

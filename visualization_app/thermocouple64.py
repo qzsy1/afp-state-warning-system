@@ -12,7 +12,7 @@ from typing import Any, Iterable, Mapping, Sequence
 THERMOCOUPLE64_MODE_ID = "new_collection_v13_0"
 THERMOCOUPLE64_INTERFACE_ID = "thermocouple_64ch"
 THERMOCOUPLE64_ROLE = "thermocouple64"
-THERMOCOUPLE64_DRIVER = "thermocouple64_protocol_pending"
+THERMOCOUPLE64_DRIVER = "huipu_tc64_modbus_rtu"
 THERMOCOUPLE64_CHANNELS = tuple(f"温度{index}" for index in range(1, 65))
 THERMOCOUPLE64_GROUP_IDS = tuple(f"TC-G{index:02d}" for index in range(1, 9))
 THERMOCOUPLE64_DERIVED_CHANNELS = tuple(
@@ -116,7 +116,7 @@ def hardware_release_readiness(facts: Mapping[str, Any] | None) -> dict[str, Any
         "message": (
             "64路热电偶硬件事实已完整记录"
             if not missing
-            else "64路热电偶真实采集被阻断；缺少硬件事实：" + ", ".join(missing)
+            else "64路热电偶实机验收资料不完整；缺少硬件事实：" + ", ".join(missing)
         ),
     }
 
@@ -298,12 +298,14 @@ def validate_group_mean_model_contract(metadata: Mapping[str, Any]) -> list[str]
 
 def _raw_digest(layers: Sequence[Mapping[str, Any]]) -> str:
     def safe(value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, bool)):
+            return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else {"non_finite": repr(value)}
         if isinstance(value, Mapping):
             return {str(key): safe(item) for key, item in value.items()}
         if isinstance(value, (list, tuple)):
             return [safe(item) for item in value]
-        if isinstance(value, float) and not math.isfinite(value):
-            return {"non_finite": repr(value)}
         return value
 
     canonical = json.dumps(
@@ -321,6 +323,7 @@ def project_specimen_layers(
     *,
     sensor_columns: Iterable[str],
     scope: str,
+    include_row_metadata: bool = True,
 ) -> dict[str, Any]:
     """Build aligned raw and imputed derived views without mutating inputs."""
 
@@ -399,6 +402,11 @@ def project_specimen_layers(
     }
     for layer in derived_layers:
         for row in layer["rows"]:
+            if not include_row_metadata:
+                for name, channels in zip(THERMOCOUPLE64_DERIVED_CHANNELS, THERMOCOUPLE64_GROUPS.values()):
+                    values = [_finite(row.get(channel)) for channel in channels]
+                    row[name] = sum(values) / 8.0 if all(value is not None for value in values) else None
+                continue
             quality = {
                 channel: (
                     "imputed_layer_median"

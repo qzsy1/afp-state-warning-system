@@ -102,6 +102,11 @@ class HelperTransportTests(unittest.TestCase):
             helper_entry.RELEASE_CONTRACT.helper_version,
         )
         self.assertEqual(capabilities["command_lifecycle"], "isolated_hardware_check")
+        self.assertEqual(
+            capabilities["device_readiness_contract"],
+            "plc_abb_uvc_readiness_v1",
+        )
+        self.assertTrue(capabilities["unified_device_readiness_v1"])
         self.assertTrue(capabilities["simulation_replay_v1"])
 
     def test_dispatcher_materializes_simulation_source_before_start(self):
@@ -270,8 +275,8 @@ class HelperTransportTests(unittest.TestCase):
         store.initialize_schema.return_value = {"ok": True, "initialized": True}
         settings = Mock()
 
-        with patch.object(local_capture_agent, "MySQLCaptureStore", return_value=store):
-            result = local_capture_agent.LocalCaptureAgent(Mock()).mysql_preflight(
+        with tempfile.TemporaryDirectory() as root, patch.object(local_capture_agent, "MySQLCaptureStore", return_value=store):
+            result = local_capture_agent.LocalCaptureAgent(Mock(capture_root=Path(root))).mysql_preflight(
                 settings,
                 write_test=True,
                 initialize_if_missing=True,
@@ -297,8 +302,8 @@ class HelperTransportTests(unittest.TestCase):
             "error": "1142 (42000): CREATE command denied",
         }
 
-        with patch.object(local_capture_agent, "MySQLCaptureStore", return_value=store):
-            result = local_capture_agent.LocalCaptureAgent(Mock()).mysql_preflight(
+        with tempfile.TemporaryDirectory() as root, patch.object(local_capture_agent, "MySQLCaptureStore", return_value=store):
+            result = local_capture_agent.LocalCaptureAgent(Mock(capture_root=Path(root))).mysql_preflight(
                 Mock(), initialize_if_missing=True
             )
 
@@ -329,8 +334,8 @@ class HelperTransportTests(unittest.TestCase):
             "database_creation_requested": True,
         }
 
-        with patch.object(local_capture_agent, "MySQLCaptureStore", return_value=store):
-            result = local_capture_agent.LocalCaptureAgent(Mock()).mysql_preflight(
+        with tempfile.TemporaryDirectory() as root, patch.object(local_capture_agent, "MySQLCaptureStore", return_value=store):
+            result = local_capture_agent.LocalCaptureAgent(Mock(capture_root=Path(root))).mysql_preflight(
                 Mock(),
                 write_test=True,
                 initialize_if_missing=True,

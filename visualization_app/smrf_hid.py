@@ -11,6 +11,7 @@ import os
 import queue
 import threading
 import time
+from acquisition_clock import monotonic
 from ctypes import wintypes
 from dataclasses import dataclass
 from typing import Any
@@ -349,7 +350,7 @@ class SmrfHidDriver:
         return True
 
     def read_sample(self) -> dict[str, float] | None:
-        now = time.monotonic()
+        now = monotonic()
         if now >= self._next_poll:
             self._write_command(b"HIDREAD")
             self._next_poll = now + 0.2

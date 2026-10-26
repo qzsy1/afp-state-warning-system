@@ -194,7 +194,7 @@ const fetch = async () => { requests += 1; return {ok: true, json: async () => (
     def test_failed_server_target_mysql_has_a_session_bound_retry_control(self):
         html = (Path(__file__).with_name("static") / "index.html").read_text(encoding="utf-8")
         self.assertIn('id="retryTargetMysqlButton"', html)
-        self.assertRegex(html, r'/app\.js\?v=\d{8}-thermocouple64-v\d+')
+        self.assertRegex(html, r'/app\.js\?v=\d{8}-[a-z0-9]+(?:-[a-z0-9]+)*-\d+')
         text = (Path(__file__).with_name("static") / "app.js").read_text(encoding="utf-8")
         start = text.index("async function retryServerTargetMysql()")
         end = text.index("async function stopAcquisition()", start)
@@ -951,15 +951,35 @@ if (second.checked !== false) process.exit(2);
         self.assertIn("usesLocalCaptureHelper()", body)
         self.assertIn('requestLocalHelper("discover"', body)
 
-    def test_authorized_discovery_enables_every_protocol_bound_interface(self):
+    def test_authorized_discovery_preserves_disabled_bound_interfaces(self):
+        try:
+            from .test_usb_interface_candidates import run_candidate_script
+        except ImportError:
+            from test_usb_interface_candidates import run_candidate_script
         source = Path(__file__).with_name("static") / "app.js"
         text = source.read_text(encoding="utf-8")
         start = text.index("async function discoverInterfaces()")
-        end = text.index("function recognizedInterfacePortsFrom", start)
+        end = text.index("function rememberRealInterfaceSnapshot", start)
         body = text[start:end]
-        self.assertIn("autoAssignPhysicalInterfaces", body)
-        self.assertIn("physical_interface_id: physicalId", body)
-        self.assertIn("enabled: Boolean(physicalId || physicalPortId)", body)
+        result = run_candidate_script(body + r'''
+const controls={acquisitionMode:{value:"real"}};
+state.helperStatus={paired:true};
+const network={id:"ethernet:test",kind:"ethernet",detected:true,auto_eligible:true};
+function usesLocalCaptureHelper(){return true}
+async function requestLocalHelper(){return {interfaces:[network],raw_discovery:{defaults:[
+  {id:"plc",role:"plc",enabled:false,endpoint:"192.168.125.5:502"},
+  {id:"abb",role:"robot",enabled:true,endpoint:"192.168.125.1"}]}}}
+function normalizeUsbTopology(value){return value}
+function recognizedInterfacePortsFrom(value){return value}
+function mergeRememberedInterfaceSelections(value){return value}
+function renderInterfacePanel(){}
+function markHardwareCheckStale(){}
+discoverInterfaces().then(()=>console.log(JSON.stringify(state.interfaceCatalog)));
+''')
+        self.assertFalse(result[0]["enabled"])
+        self.assertTrue(result[1]["enabled"])
+        self.assertEqual(result[0]["physical_interface_id"], "ethernet:test")
+        self.assertEqual(result[1]["physical_interface_id"], "ethernet:test")
 
     def test_initialize_does_not_render_unassigned_defaults_before_discovery(self):
         source = Path(__file__).with_name("static") / "app.js"
@@ -1031,14 +1051,17 @@ if (second.checked !== false) process.exit(2);
         self.assertIn("USB_SENSOR_ROLES", text)
 
     def test_real_mapping_accepts_protocol_driver_placeholder_without_sensor_data(self):
-        source = Path(__file__).with_name("static") / "app.js"
-        text = source.read_text(encoding="utf-8")
-        start = text.index("function autoAssignPhysicalInterfaces")
-        end = text.index("function refreshPhysicalInterfaceOptions", start)
-        body = text[start:end]
-        self.assertIn("const candidates = physicalCandidatesForRole(role)", body)
-        self.assertIn("item.enabled = true", body)
-        self.assertIn("driver_available", text)
+        try:
+            from .test_usb_interface_candidates import run_candidate_script
+        except ImportError:
+            from test_usb_interface_candidates import run_candidate_script
+        result = run_candidate_script(r'''
+state.physicalInterfaces=[{id:"serial:COM91",kind:"serial",endpoint:"COM91",detected:true}];
+console.log(JSON.stringify(autoAssignPhysicalInterfaces([{id:"pressure",role:"pressure",enabled:false}])));
+''')
+        self.assertNotIn("physical_interface_id", result[0])
+        self.assertNotIn("endpoint", result[0])
+        self.assertFalse(result[0]["enabled"])
 
     def test_switching_to_simulation_rebuilds_logical_catalog_instead_of_reusing_real_bindings(self):
         source = Path(__file__).with_name("static") / "app.js"

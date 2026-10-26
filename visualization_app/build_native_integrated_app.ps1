@@ -1,6 +1,6 @@
 param(
     [string]$PythonExecutable = "",
-    [string]$TargetDir = "F:\AFP_Integrated_Native_InterfaceMapped\AFP_Integrated_System_SMRF_HID_Fixed_20260823_v1.12.0\AFP_Integrated_System"
+    [string]$TargetDir = "D:\AFP_Runtime\.afp-staging\native-integrated-v1.12.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,7 +20,7 @@ if (-not $PythonExecutable) {
     throw "Pass -PythonExecutable with the Python environment that contains PyInstaller and pywebview."
 }
 
-$BuildRoot = Join-Path $env:TEMP "AFPIntegratedNativeBuild_v1_12_0"
+$BuildRoot = "D:\AFP_Runtime\.afp-staging\AFPIntegratedNativeBuild_v1_12_0"
 $StageRoot = Join-Path $BuildRoot "stage"
 $StageData = Join-Path $StageRoot "data"
 $StageDemo = Join-Path $StageRoot "new_collection_demo_v11_3"
@@ -42,7 +42,7 @@ foreach ($Required in @(
 
 # Recursive cleanup is restricted to this fixed directory below the Windows
 # temporary folder. Never remove or overwrite an existing user delivery.
-$ResolvedTemp = [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\')
+$ResolvedTemp = [IO.Path]::GetFullPath("D:\AFP_Runtime\.afp-staging").TrimEnd('\')
 $ResolvedBuild = [IO.Path]::GetFullPath($BuildRoot).TrimEnd('\')
 if (-not $ResolvedBuild.StartsWith($ResolvedTemp + '\', [StringComparison]::OrdinalIgnoreCase)) {
     throw "Unsafe build directory: $ResolvedBuild"

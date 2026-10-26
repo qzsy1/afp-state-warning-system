@@ -10,7 +10,9 @@ import re
 import socket
 import threading
 import time
+from acquisition_clock import monotonic, wait_interruptible
 from collections import Counter, deque
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -220,13 +222,14 @@ class ReadinessSnapshot:
         *,
         now: float | None = None,
         required_capabilities: Iterable[str] = (),
+        allow_expired: bool = False,
     ) -> None:
         current = float(time.time() if now is None else now)
         if self.schema_version != 1:
             raise ValueError(f"unsupported readiness snapshot schema: {self.schema_version}")
         if not self.ok:
             raise ValueError("readiness snapshot is not ready")
-        if current > self.expires_at:
+        if current > self.expires_at and not allow_expired:
             raise ValueError("readiness snapshot expired")
         if self.config_fingerprint != readiness_config_fingerprint(config):
             raise ValueError("readiness snapshot fingerprint mismatch")
@@ -278,7 +281,7 @@ class ReadinessSnapshot:
 
 
 def readiness_config_fingerprint(config: Any) -> str:
-    """Hash only readiness-relevant, non-secret configuration fields."""
+    """Hash every fact that can invalidate a hardware readiness result."""
 
     if hasattr(config, "__dict__"):
         source = vars(config)
@@ -290,20 +293,74 @@ def readiness_config_fingerprint(config: Any) -> str:
     for item in source.get("interfaces", []) or []:
         if not isinstance(item, Mapping):
             continue
-        interfaces.append({
+        credential_material = {
+            "username": str(item.get("username") or ""),
+            "password": str(item.get("password") or ""),
+            "credential_id": str(
+                item.get("credential_id")
+                or item.get("credential_identifier")
+                or ""
+            ),
+        }
+        credential_identifier = ""
+        if any(credential_material.values()):
+            credential_canonical = json.dumps(
+                credential_material,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            credential_identifier = hashlib.sha256(
+                credential_canonical.encode("utf-8")
+            ).hexdigest()
+        device_profile = item.get("device_profile")
+        if not isinstance(device_profile, Mapping):
+            device_profile = {
+                "id": item.get("device_profile_id") or item.get("profile_id"),
+                "version": item.get("profile_version"),
+                "approval_status": item.get("profile_approval_status"),
+            }
+        driver_state = item.get("driver_state")
+        if not isinstance(driver_state, Mapping):
+            driver_state = {
+                "available": item.get("driver_available"),
+                "provider": item.get("driver_provider"),
+                "version": item.get("driver_version"),
+                "status": item.get("driver_status"),
+                "service": item.get("driver_service"),
+            }
+        interface_facts = {
             key: item.get(key)
             for key in (
-                "id", "enabled", "role", "driver", "endpoint", "baudrate",
-                "physical_interface_id", "physical_port_id", "physical_verified",
+                "id", "enabled", "role", "driver", "endpoint", "baudrate", "slave_id",
+                "physical_interface_id", "physical_port_id", "physical_interface_kind",
+                "physical_transport_family", "physical_verified",
                 "physical_vid", "physical_pid", "physical_serial", "physical_location",
                 "device_profile_id", "identity_confirmed",
                 "source_address", "device_subnet", "network_interface_name",
                 "profile_id", "profile_version", "protocol_verified",
                 "channel_types", "channel_types_confirmed", "roi", "dll_path",
+                "protocol_profile", "matrix_rows", "matrix_cols", "first_frame_timeout_seconds", "frame_timeout_seconds", "max_buffer_bytes",
+        "data_mode", "channel_count", "calibration_digest", "calibration_profile", "bridge",
+                "read_profile", "timeout", "channel_settings", "scan_timeout_seconds",
+                "freshness_seconds", "poll_interval_seconds", "reconnect_window_seconds",
+                "measurement_profile", "register_map",
             )
+        }
+        interface_facts.update({
+            "credential_identifier": credential_identifier,
+            "device_identity": _sanitize_readiness_evidence(
+                item.get("device_identity") or {}
+            ),
+            "driver_state": _sanitize_readiness_evidence(driver_state),
+            "device_profile": _sanitize_readiness_evidence(device_profile),
         })
+        interfaces.append(interface_facts)
     payload = {
         "config_version": source.get("config_version"),
+        "application_version": source.get("application_version"),
+        "release_revision": source.get("release_revision"),
+        "configuration_schema_version": source.get("configuration_schema_version"),
         "acquisition_mode": source.get("acquisition_mode"),
         "real_acquisition_mode": source.get("real_acquisition_mode"),
         "execution_host": source.get("execution_host"),
@@ -465,7 +522,7 @@ class ChannelSample:
     quality: ChannelQuality = ChannelQuality.MEASURED_NEW
     device_timestamp: float | None = None
     received_wall_time: float = field(default_factory=time.time)
-    received_monotonic: float = field(default_factory=time.monotonic)
+    received_monotonic: float = field(default_factory=monotonic)
     source_sequence: int | None = None
     protocol_ok: bool | None = None
     error: str = ""
@@ -478,6 +535,9 @@ class ChannelSample:
             else ChannelQuality(str(self.quality))
         )
         value = _finite(self.value)
+        if (self.metadata or {}).get("driver") == "abb_robot":
+            from abb_measurement import validate_abb_sample
+            validate_abb_sample(str(self.channel_name), value, self.metadata.get("latest_record"))
         if value is None and quality not in {
             ChannelQuality.MISSING,
             ChannelQuality.STALE,
@@ -490,7 +550,7 @@ class ChannelSample:
         object.__setattr__(self, "device_timestamp", _finite(self.device_timestamp))
         object.__setattr__(self, "received_wall_time", float(self.received_wall_time))
         object.__setattr__(self, "received_monotonic", float(self.received_monotonic))
-        object.__setattr__(self, "metadata", dict(self.metadata or {}))
+        object.__setattr__(self, "metadata", deepcopy(dict(self.metadata or {})))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -551,9 +611,22 @@ class ChannelSampleCache:
             self._latest[sample.channel_name] = sample
             self._updates[sample.channel_name] += 1
 
+    def publish_batch(self, samples: Iterable[ChannelSample]) -> None:
+        """同一次源观测的各通道对快照读者原子可见。"""
+        with self._lock:
+            for sample in samples:
+                self.publish(sample)
+
     def latest(self, channel_name: str) -> ChannelSample | None:
         with self._lock:
             return self._latest.get(channel_name)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._events.clear()
+            self._latest.clear()
+            self._updates.clear()
+            self._dropped_events = 0
 
     def latest_at_or_before(
         self, channel_name: str, deadline_monotonic: float
@@ -573,6 +646,10 @@ class ChannelSampleCache:
     def snapshot(self) -> dict[str, ChannelSample]:
         with self._lock:
             return dict(self._latest)
+
+    def snapshot_at_or_before(self, channels: Iterable[str], deadline: float) -> dict[str, ChannelSample | None]:
+        with self._lock:
+            return {name: self.latest_at_or_before(name, deadline) for name in channels}
 
     def events(self) -> tuple[ChannelSample, ...]:
         """Return the bounded diagnostic window without exposing mutable storage."""
@@ -600,7 +677,7 @@ class DriverWorker:
         cache: ChannelSampleCache,
         *,
         poll_interval_seconds: float = 0.002,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] = monotonic,
         wall_clock: Callable[[], float] = time.time,
     ) -> None:
         self.interface_id = str(interface_id)
@@ -759,7 +836,7 @@ class UnifiedFrame:
                 "quality": sample.quality.value,
                 "source_timestamp": (
                     sample.device_timestamp
-                    if sample.device_timestamp is not None
+                    if sample.device_timestamp is not None or sample.metadata.get("driver") == "abb_robot"
                     else sample.received_wall_time
                 ),
                 "received_timestamp": sample.received_wall_time,
@@ -826,6 +903,26 @@ class UnifiedFrame:
                 "protocol_ok": sample.protocol_ok,
                 "error": sample.error,
             }
+            if sample.metadata.get("driver") == "esr1001_usb_ttl":
+                metadata["adc_source"] = dict(sample.metadata.get("latest_record") or {})
+                metadata["calibration_digest"] = sample.metadata.get("calibration_digest")
+            if sample.metadata.get("driver") == "m3232_pressure":
+                record = sample.metadata.get("latest_record") or {}
+                metadata["matrix_source"] = {k: record.get(k) for k in (
+                    "connection_generation", "receive_sequence", "host_monotonic", "host_wall_time",
+                    "byte_offset", "sha256", "raw_total", "unit", "calibration_digest")}
+                metadata["received_monotonic"] = sample.received_monotonic
+                metadata["received_wall_time"] = sample.received_wall_time
+            if sample.metadata.get("driver") == "modbus_tcp":
+                metadata["plc_source"] = dict(sample.metadata.get("latest_record") or {})
+                metadata["age_seconds"] = sample.metadata.get("age_seconds")
+                metadata["received_monotonic"] = sample.received_monotonic
+                metadata["received_wall_time"] = sample.received_wall_time
+            if sample.metadata.get("driver") == "abb_robot":
+                metadata["abb_source"] = deepcopy(sample.metadata.get("latest_record") or {})
+                metadata["age_seconds"] = sample.metadata.get("age_seconds")
+                metadata["received_monotonic"] = sample.received_monotonic
+                metadata["received_wall_time"] = sample.received_wall_time
             if any(value not in (None, "") for value in metadata.values()):
                 source[str(index)] = metadata
         return {
@@ -879,7 +976,9 @@ class UnifiedFrame:
                 device_timestamp=raw_sample.get("source_timestamp"),
                 received_wall_time=received_wall,
                 received_monotonic=(
-                    target_monotonic - age if age is not None else target_monotonic
+                    raw_sample["metadata"]["latest_record"]["host_monotonic"]
+                    if (raw_sample.get("metadata") or {}).get("driver") == "abb_robot"
+                    else target_monotonic - age if age is not None else target_monotonic
                 ),
                 source_sequence=(
                     int(raw_sample["source_sequence"])
@@ -977,8 +1076,8 @@ class UnifiedFrame:
                 value=value,
                 quality=quality,
                 device_timestamp=item.get("source_timestamp"),
-                received_wall_time=frame_time,
-                received_monotonic=target_monotonic,
+                received_wall_time=float(item.get("received_wall_time", frame_time)),
+                received_monotonic=float(item.get("received_monotonic", target_monotonic)),
                 source_sequence=(
                     int(item["source_sequence"])
                     if item.get("source_sequence") is not None
@@ -986,6 +1085,10 @@ class UnifiedFrame:
                 ),
                 protocol_ok=item.get("protocol_ok"),
                 error=str(item.get("error") or ""),
+                metadata={"adc_source": item.get("adc_source"), "calibration_digest": item.get("calibration_digest"),
+                          **({"driver": "m3232_pressure", "matrix_source": item["matrix_source"]} if item.get("matrix_source") else {}),
+                          **({"driver": "modbus_tcp", "measurement_profile": "fibercontrol_plc_v1", "latest_record": item["plc_source"], "age_seconds": item.get("age_seconds")} if item.get("plc_source") else {}),
+                          **({"driver": "abb_robot", "measurement_profile": "fibercontrol_abb_v1", "latest_record": item["abb_source"], "age_seconds": item.get("age_seconds")} if item.get("abb_source") else {})},
             )
         return cls(
             capture_sequence=sequence,
@@ -1027,7 +1130,7 @@ class FrameAssembler:
         frame_rate_hz: float,
         freshness_by_channel: Mapping[str, float] | None = None,
         *,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] = monotonic,
         wall_clock: Callable[[], float] = time.time,
         wait: Callable[[float], Any] = time.sleep,
         start_monotonic: float | None = None,
@@ -1056,14 +1159,25 @@ class FrameAssembler:
     def deadline(self, sequence: int) -> float:
         return self.start_monotonic + int(sequence) / self.frame_rate_hz
 
+    def rebase(self, next_sequence: int) -> None:
+        """Keep frame identity while scheduling only future segment deadlines."""
+        self.next_sequence = int(next_sequence)
+        offset = self.next_sequence / self.frame_rate_hz
+        self.start_monotonic = self.clock() - offset
+        self.start_wall_time = self.wall_clock() - offset
+        self.last_source_sequence.clear()
+
     def wait_next_deadline(self, stop_event: threading.Event | None = None) -> float:
         deadline = self.deadline(self.next_sequence)
         delay = deadline - self.clock()
-        if delay > 0:
-            if stop_event is not None:
-                stop_event.wait(delay)
+        while delay > 0:
+            if stop_event is not None and stop_event.is_set():
+                break
+            if stop_event is not None and self.wait is time.sleep:
+                wait_interruptible(stop_event, delay, clock=self.clock)
             else:
                 self.wait(delay)
+            delay = deadline - self.clock()
         return deadline
 
     def assemble(
@@ -1082,8 +1196,9 @@ class FrameAssembler:
         if missed:
             self.deadline_misses += 1
         channel_values: dict[str, ChannelSample] = {}
+        sources = cache.snapshot_at_or_before(self.channels, deadline)
         for channel in self.channels:
-            source = cache.latest_at_or_before(channel, deadline)
+            source = sources[channel]
             if source is None:
                 channel_values[channel] = ChannelSample(
                     interface_id="",
@@ -1097,6 +1212,10 @@ class FrameAssembler:
                 continue
             age = max(0.0, deadline - source.received_monotonic)
             freshness = self.freshness_by_channel.get(channel, self.period_seconds * 2.5)
+            if source.metadata.get("driver") == "huipu_tc64_modbus_rtu":
+                duration = _finite(source.metadata.get("scan_duration_seconds")) or 0.0
+                interval = _finite(source.metadata.get("poll_interval_seconds")) or 0.1
+                freshness = max(freshness, duration * 2.5 + interval)
             previous_sequence = self.last_source_sequence.get(channel)
             is_new = source.source_sequence != previous_sequence
             if source.value is None or source.quality == ChannelQuality.INVALID:
@@ -1104,7 +1223,7 @@ class FrameAssembler:
                 value = None
             elif age > freshness:
                 quality = ChannelQuality.STALE
-                value = source.value
+                value = None
             elif is_new:
                 quality = ChannelQuality.MEASURED_NEW
                 value = source.value
@@ -1141,6 +1260,8 @@ class AcquisitionQualityMetrics:
         self.channels = tuple(channels)
         self.target_rate_hz = float(target_rate_hz)
         self.frame_count = 0
+        self.segment_starts = []
+        self.segment_targets = []
         self.deadline_misses = 0
         self.complete_frames = 0
         self.first_target: float | None = None
@@ -1148,7 +1269,7 @@ class AcquisitionQualityMetrics:
         self.quality_counts = {
             channel: Counter() for channel in self.channels
         }
-        self.update_times: dict[str, list[float]] = {
+        self.update_times: dict[str, list[float | None]] = {
             channel: [] for channel in self.channels
         }
         self.latest_age_seconds: dict[str, float | None] = {
@@ -1156,6 +1277,14 @@ class AcquisitionQualityMetrics:
         }
 
     def observe(self, frame: UnifiedFrame) -> None:
+        if not self.segment_targets or self.segment_targets[-1] is None:
+            self.segment_starts.append(frame.target_monotonic)
+            if self.segment_targets and self.segment_targets[-1] is None:
+                self.segment_targets[-1] = frame.target_monotonic
+            else:
+                self.segment_targets.append(frame.target_monotonic)
+        else:
+            self.segment_targets[-1] = frame.target_monotonic
         self.frame_count += 1
         self.deadline_misses += int(frame.deadline_missed)
         if all(sample.quality in VALID_MODEL_QUALITIES for sample in frame.channels.values()):
@@ -1169,25 +1298,24 @@ class AcquisitionQualityMetrics:
             age = sample.metadata.get("age_seconds")
             self.latest_age_seconds[name] = _finite(age)
 
+    def begin_segment(self):
+        self.segment_targets.append(None)
+        for updates in self.update_times.values():
+            updates.append(None)
+
     def summary(self) -> dict[str, Any]:
-        duration = (
-            self.last_target - self.first_target
-            if self.first_target is not None
-            and self.last_target is not None
-            and self.last_target > self.first_target
-            else 0.0
-        )
-        actual_rate = (self.frame_count - 1) / duration if duration > 0 else 0.0
+        duration = sum(end - start for start, end in zip(self.segment_starts, [v for v in self.segment_targets if v is not None]))
+        actual_rate = max(0, self.frame_count - len(self.segment_starts)) / duration if duration > 0 else 0.0
         channels: dict[str, Any] = {}
         for name in self.channels:
             counts = self.quality_counts.get(name, Counter())
             updates = self.update_times.get(name, [])
-            update_duration = updates[-1] - updates[0] if len(updates) > 1 else 0.0
-            intervals = [right - left for left, right in zip(updates, updates[1:])]
+            intervals = [right - left for left, right in zip(updates, updates[1:]) if right is not None and left is not None]
+            update_duration = sum(intervals)
             denominator = max(1, self.frame_count)
             channels[name] = {
                 "update_rate_hz": (
-                    (len(updates) - 1) / update_duration if update_duration > 0 else 0.0
+                    len(intervals) / update_duration if update_duration > 0 else 0.0
                 ),
                 "latest_age_seconds": self.latest_age_seconds.get(name),
                 "missing_rate": counts[ChannelQuality.MISSING.value] / denominator,
@@ -1283,7 +1411,7 @@ def capture_m3232_raw_serial(
     duration_seconds: float = 10.0,
     baudrate: int = 115200,
     serial_instance: Any | None = None,
-    clock: Callable[[], float] = time.monotonic,
+    clock: Callable[[], float] = monotonic,
     wall_clock: Callable[[], float] = time.time,
     wait: Callable[[float], Any] = time.sleep,
     max_bytes: int = 16 * 1024 * 1024,

@@ -45,7 +45,7 @@ _PACKAGED_MODEL_RUNTIME = APP_DIR / "model_runtime"
 XJU_ROOT = (
     _PACKAGED_MODEL_RUNTIME
     if (_PACKAGED_MODEL_RUNTIME / "shijie").exists()
-    else Path(r"F:\program\XJUsorceopen")
+    else Path(r"D:\program\XJUsorceopen")
 )
 COMPARISON_RUNTIME_ROOT = (
     _PACKAGED_MODEL_RUNTIME
@@ -233,7 +233,7 @@ def _schema_key(schema_mode: str = "") -> str:
 
 
 def _selection_history_path() -> Path:
-    root = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "AFP_State_Warning_System"
+    root = Path("D:/AFP_Runtime/AFP_State_Warning_System")
     root.mkdir(parents=True, exist_ok=True)
     return root / "model_selection_history.json"
 

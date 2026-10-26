@@ -16,6 +16,7 @@ param(
     [string[]]$CleanupTargets = @(),
     [string]$PreviewPath = "",
     [switch]$LegacyBootstrap,
+    [switch]$LocalOnly,
     [switch]$AllowPendingHelper
 )
 
@@ -34,8 +35,7 @@ $evidenceDir = Join-Path $paths.EvidenceRoot "SINGLE-RUNTIME-MIGRATION"
 $legacyTargets = @(
     "D:\AFP-Main-Candidate-16e887f",
     "D:\AFP-Main-Candidate-2585ca",
-    "D:\AFP-Main-Evidence\CROSS-20261013-01",
-    "F:\AFP_Integrated_Modular_v2\delivery\AFP_Integrated_System_Modular_v2.0.3_Agentic"
+    "D:\AFP-Main-Evidence\CROSS-20261013-01"
 )
 
 function Write-State([string]$Name, [psobject]$Value) {
@@ -84,6 +84,31 @@ if ($Mode -in @("Stage", "Rollback")) {
 
 if ($Mode -eq "Switchover") {
     if (-not $ApprovedInventoryDigest -or -not $StagingPath) { throw "Switchover requires ApprovedInventoryDigest and StagingPath." }
+    if (-not $PublicUrl -and -not $LocalOnly) {
+        throw "Switchover requires PublicUrl or explicit LocalOnly."
+    }
+    if ($LocalOnly -and $PublicUrl) { throw "LocalOnly cannot be combined with PublicUrl." }
+    $localOnly = [bool]$LocalOnly
+    if ($localOnly) {
+        foreach ($releaseRoot in @($paths.RuntimeRoot, $StagingPath)) {
+            if (Test-Path -LiteralPath (Join-Path $releaseRoot "runtime\public-ingress-state.json")) {
+                throw "LocalOnly cannot replace a runtime with public ingress state."
+            }
+            $runtimeConfig = Get-Content -LiteralPath (Join-Path $releaseRoot "config\runtime.json") -Raw -Encoding UTF8 |
+                ConvertFrom-Json -ErrorAction Stop
+            $web = $runtimeConfig.public_web
+            if ($web.domain -or $web.hostname -or [bool]$web.cloudflare_tunnel_enabled) {
+                throw "LocalOnly requires unconfigured public hostname and tunnel."
+            }
+        }
+    }
+    $currentManifestPath = Join-Path $paths.RuntimeRoot "RELEASE-MANIFEST.json"
+    $currentCandidateId = if (Test-Path -LiteralPath $currentManifestPath -PathType Leaf) {
+        [string](Get-Content -LiteralPath $currentManifestPath -Raw -Encoding UTF8 |
+            ConvertFrom-Json -ErrorAction Stop).candidate.candidate_id
+    } else {
+        ""
+    }
     $inventory = Get-AfpRuntimeInventory -PublicUrl $PublicUrl -FunnelOrigin $FunnelOrigin
     if ($inventory.digest -ne $ApprovedInventoryDigest) { throw "Runtime inventory changed after approval." }
     $exe = Join-Path $paths.RuntimeRoot "AFP_Integrated_System_Modular.exe"
@@ -115,9 +140,6 @@ if ($Mode -eq "Switchover") {
                 return [pscustomobject]@{ allowed = $false; error = "legacy_active_local_capture" }
             }
 
-            $currentManifest = Get-Content -LiteralPath (Join-Path $paths.RuntimeRoot "RELEASE-MANIFEST.json") `
-                -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
-            $currentCandidateId = [string]$currentManifest.candidate.candidate_id
             Import-Module (Join-Path $paths.SourceRoot "visualization_app\PublicIngress.psm1") -Force -ErrorAction Stop
             $legacyPublicEdgeProbe = {
                 param($Name, $Target, $ExpectedHash)
@@ -141,7 +163,7 @@ if ($Mode -eq "Switchover") {
             }
 
             $statePath = Join-Path $paths.RuntimeRoot "runtime\public-ingress-state.json"
-            if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
+            if ($PublicUrl -and -not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
                 $layers = @{}
                 foreach ($check in @($currentServices.checks)) {
                     $layers[[string]$check.name] = @{ ok = [bool]$check.passed; code = [string]$check.detail }
@@ -175,8 +197,15 @@ if ($Mode -eq "Switchover") {
             $script:legacyBootstrapStopped = $true
 
             $python = Join-Path $paths.SourceRoot ".venv\Scripts\python.exe"
-            $reservationText = @(& $python (Join-Path $paths.SourceRoot "pre_sensor\legacy-cutover-reservation.py") `
-                --runtime-root $paths.RuntimeRoot --candidate-id $currentCandidateId --ttl-seconds 600 2>$null)
+            $reservationArguments = @(
+                "--runtime-root", $paths.RuntimeRoot,
+                "--candidate-id", $currentCandidateId,
+                "--ttl-seconds", "600"
+            )
+            if ($localOnly) { $reservationArguments += "--local-only" }
+            $reservationText = @(& $python `
+                (Join-Path $paths.SourceRoot "pre_sensor\legacy-cutover-reservation.py") `
+                @reservationArguments 2>$null)
             $reservationExit = $LASTEXITCODE
             $reservation = if ($reservationText.Count) {
                 ($reservationText -join "`n") | ConvertFrom-Json -ErrorAction Stop
@@ -217,6 +246,7 @@ if ($Mode -eq "Switchover") {
         CurrentInventory = $inventory
         FailureEvidencePath = $failureEvidence
         RollbackEvidencePath = $rollbackEvidence
+        LocalOnly = $localOnly
         AllowPendingHelper = $AllowPendingHelper
     }
     if ($legacyBootstrapRunner) { $transactionParameters.LegacyBootstrapRunner = $legacyBootstrapRunner }
@@ -318,6 +348,25 @@ if ($Mode -eq "Switchover") {
         } `
         -RestoreRunner {
             param($Promotion, $IngressSnapshot, $FailedIngressGeneration, $FailedIngressState)
+            if ($localOnly) {
+                $failedInventory = Get-AfpRuntimeInventory -PublicUrl $PublicUrl -FunnelOrigin $FunnelOrigin
+                Stop-AfpManagedRuntimeProcesses -Inventory $failedInventory -RuntimeExecutable $exe | Out-Null
+                if ($Promotion) { Restore-AfpRuntimePromotion -Promotion $Promotion -Paths $paths }
+                $rollbackPlan = if ($script:oldProcesses.Count) {
+                    $script:oldProcesses
+                } else {
+                    @([pscustomobject]@{ pid = 0; launch_arguments = "--server-only" })
+                }
+                Start-AfpManagedRuntimeProcesses -Processes $rollbackPlan -RuntimeExecutable $exe `
+                    -WorkingDirectory $paths.RuntimeRoot | Out-Null
+                $rollbackServices = Wait-AfpRuntimeServices -RuntimeRoot $paths.RuntimeRoot `
+                    -PublicUrl "" -LanIPv4 $LanIPv4 -ExpectedCandidateId $currentCandidateId `
+                    -FunnelOrigin $FunnelOrigin -TimeoutSeconds 90 -PollIntervalMilliseconds 1000
+                if ([string]$rollbackServices.status -ne "passed") {
+                    throw "rollback_service_gate_failed"
+                }
+                return $rollbackServices
+            }
             if ($null -eq $IngressSnapshot) {
                 if ($FailedIngressState) {
                     Import-Module (Join-Path $paths.RuntimeRoot "PublicIngress.psm1") -Force -ErrorAction Stop

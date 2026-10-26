@@ -13,6 +13,9 @@ class ReleaseContractError(ValueError):
     """Raised when a release identity is missing, malformed, or inconsistent."""
 
 
+DEVICE_READINESS_CONTRACT = "plc_abb_uvc_readiness_v1"
+
+
 @dataclass(frozen=True)
 class ReleaseContract:
     schema_version: int
@@ -147,7 +150,7 @@ def _candidate_paths(start: Path | None) -> tuple[Path, ...]:
     search_roots = [base, *base.parents]
     if getattr(sys, "frozen", False):
         executable_root = Path(sys.executable).resolve().parent
-        search_roots.extend((executable_root, *executable_root.parents))
+        search_roots = [executable_root, *executable_root.parents, *search_roots]
     for parent in dict.fromkeys(search_roots):
         candidates.append(parent / "RELEASE-MANIFEST.json")
         candidates.append(parent / "pre_sensor" / "release-contract.json")
@@ -221,6 +224,8 @@ def helper_capability_mismatches(
         "unified_frame_contract": expected.unified_frame_contract,
         "configuration_schema_version": expected.configuration_schema_version,
         "readiness_schema_version": expected.readiness_schema_version,
+        "device_readiness_contract": DEVICE_READINESS_CONTRACT,
+        "unified_device_readiness_v1": True,
     }
     candidate_id, helper_sha256 = release_manifest_helper_identity(expected)
     if candidate_id:

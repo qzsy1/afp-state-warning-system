@@ -42,6 +42,42 @@ class MutableIngressLoader:
 
 
 class HelperRelayTests(unittest.TestCase):
+    def test_abb_helper_requires_high_resolution_clock_before_dispatch(self):
+        registry = HelperRegistry()
+        paired = self.pair(registry)
+        sent = []
+        config = {"acquisition_mode": "real", "interfaces": [{"driver": "abb_robot"}]}
+        capabilities = {"abb_measurement_contract": "fibercontrol_abb_v1"}
+        for clock in (None, "GetTickCount64", "host_perf_counter"):
+            with self.subTest(clock=clock):
+                registry.attach("session-a", "device-a", paired["pairing_token"], sent.append,
+                                capabilities=dict(capabilities, abb_clock_domain=clock))
+                result = registry.command("session-a", "check_capture", config)
+                self.assertEqual(result["ok"], clock == "host_perf_counter")
+                if clock != "host_perf_counter":
+                    self.assertEqual(result["error"], "abb_measurement_incompatible")
+                    self.assertEqual(sent, [])
+
+    def test_legacy_helper_rejects_abb_measurement_before_queuing(self):
+        registry = HelperRegistry()
+        self.pair(registry)
+        for command in ("start_capture", "check_capture"):
+            result = registry.command("session-a", command, {
+                "acquisition_mode":"real", "interfaces":[{"driver":"abb_robot", "enabled":True}]})
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["error"],"abb_measurement_incompatible")
+            self.assertFalse(result["queued"])
+
+    def test_legacy_helper_rejects_plc_measurement_before_queuing(self):
+        registry = HelperRegistry()
+        self.pair(registry)
+        result = registry.command("session-a", "start_capture", {
+            "acquisition_mode": "real", "interfaces": [{"driver": "modbus_tcp", "enabled": True}],
+        })
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "plc_measurement_incompatible")
+        self.assertFalse(result["queued"])
+
     def setUp(self):
         self.runtime_directory = tempfile.TemporaryDirectory()
 
@@ -246,6 +282,20 @@ class HelperRelayTests(unittest.TestCase):
         self.assertFalse(readiness["allowed"])
         self.assertEqual(readiness["generation"], 1)
         self.assertEqual(readiness["active_capture_uuids"], ["capture-1"])
+
+    def test_async_start_and_cancellation_keep_cutover_reserved(self):
+        for state in ("starting", "cancelling"):
+            with self.subTest(state=state):
+                registry = self.generation_registry(MutableIngressLoader())
+                paired = self.pair(registry)
+                with patch("helper_relay.helper_capability_mismatches", return_value=()):
+                    request = registry.command("session-a", "start_capture", {})
+                registry.accept_result("device-a", paired["pairing_token"], request["request_id"],
+                    {"accepted": True, "running": False, "capture_uuid": "capture-1",
+                     "start_operation": {"id": "operation-1", "state": state}}, ingress_generation=1)
+                readiness = registry.cutover_readiness()
+                self.assertFalse(readiness["allowed"])
+                self.assertEqual(readiness["active_capture_uuids"], ["capture-1"])
 
     def test_cutover_reservation_blocks_new_capture_until_released(self):
         loader = MutableIngressLoader()

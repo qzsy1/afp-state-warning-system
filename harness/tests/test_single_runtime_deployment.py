@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import functools
+import http.server
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -39,6 +43,20 @@ def _run_ps(script: str) -> subprocess.CompletedProcess[str]:
 
 
 class SingleRuntimeDeploymentTests(unittest.TestCase):
+    def test_switchover_requires_explicit_local_only_or_public_url(self) -> None:
+        for extra, expected in (
+            ("", "Switchover requires PublicUrl or explicit LocalOnly"),
+            ("-LocalOnly -PublicUrl 'https://example.test'", "LocalOnly cannot be combined with PublicUrl"),
+        ):
+            with self.subTest(arguments=extra):
+                result = _run_ps(
+                    f"& {_ps_quote(CLI)} -Mode Switchover "
+                    "-StagingPath 'D:\\AFP_Runtime\\.afp-staging\\tc64-tests\\stage' "
+                    f"-ApprovedInventoryDigest 'approved' {extra}"
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected, result.stderr)
+
     def test_legacy_reservation_is_persisted_without_plaintext_token(self) -> None:
         with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
             runtime = Path(temporary) / "runtime-root"
@@ -85,13 +103,126 @@ class SingleRuntimeDeploymentTests(unittest.TestCase):
             )
             self.assertNotIn(payload["reservation_id"], persisted)
 
+    def test_local_only_legacy_reservation_does_not_require_ingress_state(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            runtime = Path(temporary) / "runtime-root"
+            state_root = runtime / "runtime"
+            state_root.mkdir(parents=True)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(LEGACY_RESERVATION),
+                    "--runtime-root",
+                    str(runtime),
+                    "--candidate-id",
+                    "candidate-old",
+                    "--ttl-seconds",
+                    "60",
+                    "--local-only",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["allowed"])
+            self.assertTrue(payload["reservation_id"])
+            persisted = (state_root / "public-ingress-cutover.json").read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn(payload["reservation_id"], persisted)
+
+    def test_local_only_legacy_reservation_blocks_active_capture_and_journal(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            runtime = Path(temporary) / "runtime-root"
+            state_root = runtime / "runtime"
+            state_root.mkdir(parents=True)
+            (state_root / "helper_registry.json").write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "ingress_generation": 0,
+                        "helpers": {},
+                        "commands": {},
+                        "active_captures": {"capture-a": "session-a"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            connection = sqlite3.connect(
+                state_root / "server_target_capture_journal.sqlite3"
+            )
+            try:
+                connection.execute(
+                    "CREATE TABLE captures (final_status TEXT, save_state TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO captures (final_status, save_state) VALUES (NULL, 'receiving')"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(LEGACY_RESERVATION),
+                    "--runtime-root",
+                    str(runtime),
+                    "--candidate-id",
+                    "candidate-old",
+                    "--local-only",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2, msg=result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertFalse(payload["allowed"])
+            self.assertEqual(payload["active_capture_uuids"], ["capture-a"])
+            self.assertIn(
+                "unfinished_capture_count:1", payload["blocking_request_ids"]
+            )
+            self.assertFalse((state_root / "public-ingress-cutover.json").exists())
+
+    def test_local_only_promotion_skips_public_ingress_and_helper_gates(self) -> None:
+        script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(MODULE)} -Force
+$events = [Collections.Generic.List[string]]::new()
+$inventory = [pscustomobject]@{{ digest = 'approved'; processes = @() }}
+$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'D:\AFP_Runtime\.afp-staging\tc64-tests\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='D:\AFP_Runtime\.afp-staging\tc64-tests\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory -LocalOnly `
+    -CutoverReadinessRunner {{ [pscustomobject]@{{ allowed=$true; reservation_id='lease' }} }} `
+    -CutoverReleaseRunner {{ param($ReservationId) $events.Add('release'); [pscustomobject]@{{ released=$true }} }} `
+    -StopRunner {{ $events.Add('stop') }} `
+    -PromotionRunner {{ $events.Add('promote'); [pscustomobject]@{{ status='switched' }} }} `
+    -StartRunner {{ $events.Add('start') }} `
+    -ServiceProbeRunner {{ $events.Add('services'); [pscustomobject]@{{ status='passed' }} }} `
+    -IngressPublisher {{ throw 'public ingress must not run in local-only mode' }} `
+    -HelperReadinessRunner {{ throw 'helper readiness must not run in local-only mode' }} `
+    -IngressCommitter {{ throw 'ingress commit must not run in local-only mode' }} `
+    -CompletionRunner {{ $events.Add('complete') }} `
+    -RestoreRunner {{ $events.Add('restore'); [pscustomobject]@{{ status='passed' }} }}
+if ($result.status -ne 'completed' -or [string]$result.mode -ne 'local_only') {{ throw ($result | ConvertTo-Json -Depth 8) }}
+if (($events -join ',') -ne 'stop,promote,start,services,release,complete') {{ throw ($events -join ',') }}
+"""
+        result = _run_ps(script)
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+
     def test_service_gate_rejects_split_dns_success_without_forced_edge(self) -> None:
         script = rf"""
 $ErrorActionPreference = 'Stop'
 Import-Module {_ps_quote(MODULE)} -Force
 $ordinary = {{ param($Name, $Target) [pscustomobject]@{{ passed = $true; detail = 'ordinary route' }} }}
 $forced = {{ param($Name, $Target) [pscustomobject]@{{ passed = $false; detail = 'forced edge unavailable' }} }}
-$result = Test-AfpRuntimeServices -RuntimeRoot 'F:\runtime' -PublicUrl 'https://example.test/' -LanIPv4 '192.0.2.10' -ExpectedCandidateId 'candidate' -FunnelOrigin 'http://127.0.0.1:8770' -ProbeRunner $ordinary -PublicEdgeProbeRunner $forced
+$result = Test-AfpRuntimeServices -RuntimeRoot 'D:\AFP_Runtime\.afp-staging\tc64-tests\runtime' -PublicUrl 'https://example.test/' -LanIPv4 '192.0.2.10' -ExpectedCandidateId 'candidate' -FunnelOrigin 'http://127.0.0.1:8770' -ProbeRunner $ordinary -PublicEdgeProbeRunner $forced
 if ($result.status -ne 'failed') {{ throw ($result | ConvertTo-Json -Depth 8) }}
 if ($result.issues -notcontains 'service probe failed: public_https') {{ throw ($result | ConvertTo-Json -Depth 8) }}
 """
@@ -105,7 +236,7 @@ Import-Module {_ps_quote(MODULE)} -Force
 $ordinary = {{ param($Name, $Target) [pscustomobject]@{{ passed = $true; detail = 'ok' }} }}
 foreach ($status in @(301, 204)) {{
     $forced = {{ param($Name, $Target, $ExpectedHash) [pscustomobject]@{{ passed = $false; detail = "unexpected_http_status:$status" }} }}
-    $result = Test-AfpRuntimeServices -RuntimeRoot 'F:\runtime' -PublicUrl 'https://example.test/' -LanIPv4 '192.0.2.10' -ExpectedCandidateId 'candidate' -FunnelOrigin 'http://127.0.0.1:8770' -ProbeRunner $ordinary -PublicEdgeProbeRunner $forced
+    $result = Test-AfpRuntimeServices -RuntimeRoot 'D:\AFP_Runtime\.afp-staging\tc64-tests\runtime' -PublicUrl 'https://example.test/' -LanIPv4 '192.0.2.10' -ExpectedCandidateId 'candidate' -FunnelOrigin 'http://127.0.0.1:8770' -ProbeRunner $ordinary -PublicEdgeProbeRunner $forced
     if ($result.status -ne 'failed') {{ throw ($result | ConvertTo-Json -Depth 8) }}
 }}
 """
@@ -118,7 +249,7 @@ $ErrorActionPreference = 'Stop'
 Import-Module {_ps_quote(MODULE)} -Force
 $script:stops = 0
 $inventory = [pscustomobject]@{{ digest = 'approved'; processes = @() }}
-$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='F:\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
+$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'D:\AFP_Runtime\.afp-staging\tc64-tests\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='D:\AFP_Runtime\.afp-staging\tc64-tests\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
     -CutoverReadinessRunner {{ [pscustomobject]@{{ allowed = $false; active_capture_uuids = @('capture-a') }} }} `
     -StopRunner {{ $script:stops++ }} -StartRunner {{ }} -ServiceProbeRunner {{ }} -IngressPublisher {{ }} -CompletionRunner {{ }} -RestoreRunner {{ }}
 if ($result.status -ne 'blocked' -or $script:stops -ne 0) {{ throw ($result | ConvertTo-Json -Depth 8) }}
@@ -132,14 +263,14 @@ $ErrorActionPreference = 'Stop'
 Import-Module {_ps_quote(MODULE)} -Force
 $events = [Collections.Generic.List[string]]::new()
 $inventory = [pscustomobject]@{{ digest = 'approved'; processes = @() }}
-$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='F:\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
+$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'D:\AFP_Runtime\.afp-staging\tc64-tests\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='D:\AFP_Runtime\.afp-staging\tc64-tests\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
     -CutoverReadinessRunner {{ [pscustomobject]@{{ allowed=$false; error='cutover_readiness_unavailable' }} }} `
     -LegacyBootstrapRunner {{ $events.Add('legacy'); [pscustomobject]@{{ allowed=$false; error='legacy_blocked' }} }} `
     -StopRunner {{ $events.Add('stop') }}
 if ($result.status -ne 'blocked' -or ($events -join ',') -ne 'legacy') {{ throw ($result | ConvertTo-Json -Depth 8) }}
 
 $events.Clear()
-$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='F:\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
+$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'D:\AFP_Runtime\.afp-staging\tc64-tests\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='D:\AFP_Runtime\.afp-staging\tc64-tests\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
     -CutoverReadinessRunner {{ [pscustomobject]@{{ allowed=$false; error='active_capture' }} }} `
     -LegacyBootstrapRunner {{ $events.Add('legacy'); [pscustomobject]@{{ allowed=$true }} }} `
     -StopRunner {{ $events.Add('stop') }}
@@ -154,11 +285,11 @@ $ErrorActionPreference = 'Stop'
 Import-Module {_ps_quote(MODULE)} -Force
 $events = [Collections.Generic.List[string]]::new()
 $inventory = [pscustomobject]@{{ digest = 'approved'; processes = @() }}
-$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='F:\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory -AllowPendingHelper `
+$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'D:\AFP_Runtime\.afp-staging\tc64-tests\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='D:\AFP_Runtime\.afp-staging\tc64-tests\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory -AllowPendingHelper `
     -CutoverReadinessRunner {{ [pscustomobject]@{{ allowed=$true; reservation_id='lease' }} }} `
     -CutoverReleaseRunner {{ param($ReservationId) $events.Add('release'); [pscustomobject]@{{ released=$true }} }} `
     -StopRunner {{ $events.Add('stop') }} `
-    -PromotionRunner {{ $events.Add('promote'); [pscustomobject]@{{ status='switched'; swap_path='F:\swap' }} }} `
+    -PromotionRunner {{ $events.Add('promote'); [pscustomobject]@{{ status='switched'; swap_path='D:\AFP_Runtime\.afp-staging\tc64-tests\swap' }} }} `
     -StartRunner {{ $events.Add('start') }} `
     -ServiceProbeRunner {{ $events.Add('edge'); [pscustomobject]@{{ status='passed' }} }} `
     -IngressPublisher {{ $events.Add('ingress'); [pscustomobject]@{{ generation=4 }} }} `
@@ -178,7 +309,7 @@ $ErrorActionPreference = 'Stop'
 Import-Module {_ps_quote(MODULE)} -Force
 $events = [Collections.Generic.List[string]]::new()
 $inventory = [pscustomobject]@{{ digest = 'approved'; processes = @() }}
-$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='F:\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
+$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'D:\AFP_Runtime\.afp-staging\tc64-tests\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='D:\AFP_Runtime\.afp-staging\tc64-tests\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
     -CutoverReadinessRunner {{ [pscustomobject]@{{ allowed = $true }} }} `
     -StopRunner {{ $events.Add('stop') }} `
     -PromotionRunner {{ $events.Add('promote'); [pscustomobject]@{{ status='switched' }} }} `
@@ -203,7 +334,7 @@ foreach ($failure in @('promote','start','edge','ingress','helper','complete')) 
     $script:restores = 0
     $inventory = [pscustomobject]@{{ digest = 'approved'; processes = @() }}
     $throwAt = {{ param($name) if ($failure -eq $name) {{ throw "failure:$name" }} }}
-    $result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='F:\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
+    $result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'D:\AFP_Runtime\.afp-staging\tc64-tests\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='D:\AFP_Runtime\.afp-staging\tc64-tests\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
         -CutoverReadinessRunner {{ [pscustomobject]@{{ allowed = $true }} }} `
         -StopRunner {{ }} `
         -PromotionRunner {{ & $throwAt 'promote'; [pscustomobject]@{{ status='switched' }} }} `
@@ -224,12 +355,12 @@ foreach ($failure in @('promote','start','edge','ingress','helper','complete')) 
 $ErrorActionPreference = 'Stop'
 Import-Module {_ps_quote(MODULE)} -Force
 $inventory = [pscustomobject]@{{ digest = 'approved'; processes = @() }}
-$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='F:\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
-    -FailureEvidencePath 'F:\evidence\promotion.json' -RollbackEvidencePath 'F:\evidence\rollback.json' `
+$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'D:\AFP_Runtime\.afp-staging\tc64-tests\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='D:\AFP_Runtime\.afp-staging\tc64-tests\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
+    -FailureEvidencePath 'D:\AFP_Runtime\.afp-staging\tc64-tests\evidence\promotion.json' -RollbackEvidencePath 'D:\AFP_Runtime\.afp-staging\tc64-tests\evidence\rollback.json' `
     -CutoverReadinessRunner {{ [pscustomobject]@{{ allowed = $true }} }} -StopRunner {{ }} `
     -PromotionRunner {{ throw 'promotion failed' }} -StartRunner {{ }} -ServiceProbeRunner {{ }} -IngressPublisher {{ }} -CompletionRunner {{ }} `
     -RestoreRunner {{ throw 'rollback failed' }}
-if ($result.status -ne 'rollback_failed' -or $result.failure_evidence_path -ne 'F:\evidence\promotion.json' -or $result.rollback_evidence_path -ne 'F:\evidence\rollback.json') {{ throw ($result | ConvertTo-Json -Depth 8) }}
+if ($result.status -ne 'rollback_failed' -or $result.failure_evidence_path -ne 'D:\AFP_Runtime\.afp-staging\tc64-tests\evidence\promotion.json' -or $result.rollback_evidence_path -ne 'D:\AFP_Runtime\.afp-staging\tc64-tests\evidence\rollback.json') {{ throw ($result | ConvertTo-Json -Depth 8) }}
 """
         result = _run_ps(script)
         self.assertEqual(result.returncode, 0, msg=result.stderr)
@@ -283,7 +414,7 @@ if (Test-AfpInventoryUnchanged -Expected $baseline -Current (New-Inventory 42 'D
         script = rf"""
 $ErrorActionPreference = 'Stop'
 Import-Module {_ps_quote(MODULE)} -Force
-$runtimeExe = 'F:\runtime\AFP_Integrated_System_Modular.exe'
+$runtimeExe = 'D:\AFP_Runtime\.afp-staging\tc64-tests\runtime\AFP_Integrated_System_Modular.exe'
 $inventory = Get-AfpRuntimeInventory `
     -ProcessRecords @(
         [pscustomobject]@{{ ProcessId = 41; Name = 'AFP_Integrated_System_Modular.exe'; ExecutablePath = $runtimeExe; CommandLine = ('"' + $runtimeExe + '"') }},
@@ -296,7 +427,7 @@ $stopped = [Collections.Generic.List[int]]::new()
 $plan = Stop-AfpManagedRuntimeProcesses -Inventory $inventory -RuntimeExecutable $runtimeExe -StopRunner {{ param($PidValue) $stopped.Add([int]$PidValue) }}
 if (($stopped -join ',') -ne '41,42') {{ throw "unexpected stop set: $($stopped -join ',')" }}
 $started = [Collections.Generic.List[string]]::new()
-$count = Start-AfpManagedRuntimeProcesses -Processes $plan -RuntimeExecutable $runtimeExe -WorkingDirectory 'F:\runtime' -StartRunner {{ param($Exe, $Arguments, $WorkingDirectory) $started.Add([string]$Arguments) }}
+$count = Start-AfpManagedRuntimeProcesses -Processes $plan -RuntimeExecutable $runtimeExe -WorkingDirectory 'D:\AFP_Runtime\.afp-staging\tc64-tests\runtime' -StartRunner {{ param($Exe, $Arguments, $WorkingDirectory) $started.Add([string]$Arguments) }}
 if ($count -ne 2 -or ($started -join ',') -ne '--server-only,') {{ throw "unexpected restart roles: $($started -join ',')" }}
 """
         result = _run_ps(script)
@@ -358,6 +489,9 @@ if ($migration.disk.free_bytes -ne 123456 -or -not $migration.rollback.ready) {{
             (state_dir / "helper_registry.json").write_text(
                 '{"helpers":{}}', encoding="utf-8"
             )
+            (state_dir / "interface-plans.json").write_text(
+                '{"active":"new_collection_v13_0","plans":{}}', encoding="utf-8"
+            )
             script = rf"""
 $ErrorActionPreference = 'Stop'
 Import-Module {_ps_quote(PATH_MODULE)} -Force
@@ -369,6 +503,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $paths.RuntimeRoot 'new.txt'))) {{ t
 if (Test-Path -LiteralPath (Join-Path $paths.RuntimeRoot 'old.txt')) {{ throw 'mixed runtime contents' }}
 if ((Get-Content -LiteralPath (Join-Path $paths.RuntimeRoot 'runtime\public-ingress-state.json') -Raw) -notmatch '7') {{ throw 'ingress generation state was not preserved' }}
 if (-not (Test-Path -LiteralPath (Join-Path $paths.RuntimeRoot 'runtime\helper_registry.json'))) {{ throw 'helper registry was not preserved' }}
+if ((Get-Content -LiteralPath (Join-Path $paths.RuntimeRoot 'runtime\interface-plans.json') -Raw) -notmatch 'new_collection_v13_0') {{ throw 'interface plans were not preserved' }}
 if (-not (Test-Path -LiteralPath (Join-Path $result.swap_path 'old.txt'))) {{ throw 'rollback material missing' }}
 Restore-AfpRuntimePromotion -Promotion $result -Paths $paths
 if (-not (Test-Path -LiteralPath (Join-Path $paths.RuntimeRoot 'old.txt'))) {{ throw 'old runtime not restored' }}
@@ -388,7 +523,7 @@ Import-Module {_ps_quote(MODULE)} -Force
 foreach ($helperReady in @($true, $false)) {{
     $script:released = ''
     $inventory = [pscustomobject]@{{ digest = 'approved'; processes = @() }}
-    $result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='F:\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
+    $result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'D:\AFP_Runtime\.afp-staging\tc64-tests\stage' -Paths ([pscustomobject]@{{ RuntimeRoot='D:\AFP_Runtime\.afp-staging\tc64-tests\runtime' }}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
         -CutoverReadinessRunner {{ [pscustomobject]@{{ allowed=$true; reservation_id='lease-1' }} }} `
         -CutoverReleaseRunner {{ param($ReservationId) $script:released = $ReservationId; return $true }} `
         -StopRunner {{ }} -PromotionRunner {{ [pscustomobject]@{{ status='switched' }} }} -StartRunner {{ }} `
@@ -410,7 +545,7 @@ $ErrorActionPreference = 'Stop'
 Import-Module {_ps_quote(MODULE)} -Force
 $script:completed = 0
 $inventory = [pscustomobject]@{{ digest='approved'; processes=@() }}
-$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([pscustomobject]@{{RuntimeRoot='F:\runtime'}}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
+$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'D:\AFP_Runtime\.afp-staging\tc64-tests\stage' -Paths ([pscustomobject]@{{RuntimeRoot='D:\AFP_Runtime\.afp-staging\tc64-tests\runtime'}}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
     -CutoverReadinessRunner {{ [pscustomobject]@{{allowed=$true;reservation_id='lease-1'}} }} `
     -CutoverReleaseRunner {{ return $false }} -StopRunner {{ }} `
     -PromotionRunner {{ [pscustomobject]@{{status='switched'}} }} -StartRunner {{ }} `
@@ -430,7 +565,7 @@ if ($script:completed -ne 0) {{ throw 'completion ran before reservation release
 $ErrorActionPreference = 'Stop'
 Import-Module {_ps_quote(MODULE)} -Force
 $inventory = [pscustomobject]@{{ digest='approved'; processes=@() }}
-$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'F:\stage' -Paths ([pscustomobject]@{{RuntimeRoot='F:\runtime'}}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
+$result = Invoke-AfpVerifiedRuntimePromotion -StagingPath 'D:\AFP_Runtime\.afp-staging\tc64-tests\stage' -Paths ([pscustomobject]@{{RuntimeRoot='D:\AFP_Runtime\.afp-staging\tc64-tests\runtime'}}) -ApprovedInventoryDigest 'approved' -CurrentInventory $inventory `
     -CutoverReadinessRunner {{ [pscustomobject]@{{allowed=$true;reservation_id='lease-1'}} }} `
     -CutoverReleaseRunner {{ return $true }} -StopRunner {{ }} `
     -PromotionRunner {{ [pscustomobject]@{{status='switched'}} }} -StartRunner {{ }} `
@@ -533,14 +668,74 @@ if ($result.status -ne 'rollback_failed' -or $result.rollback_error -ne 'rollbac
 $ErrorActionPreference = 'Stop'
 Import-Module {_ps_quote(MODULE)} -Force
 $pass = {{ param($Name, $Target) [pscustomobject]@{{ passed = $true; detail = 'ok' }} }}
-$good = Test-AfpRuntimeServices -RuntimeRoot 'F:\runtime' -PublicUrl 'https://example.test/' -LanIPv4 '192.0.2.10' -ExpectedCandidateId 'candidate' -FunnelOrigin 'http://127.0.0.1:8770' -ProbeRunner $pass
+$good = Test-AfpRuntimeServices -RuntimeRoot 'D:\AFP_Runtime\.afp-staging\tc64-tests\runtime' -PublicUrl 'https://example.test/' -LanIPv4 '192.0.2.10' -ExpectedCandidateId 'candidate' -FunnelOrigin 'http://127.0.0.1:8770' -ProbeRunner $pass
 if ($good.status -ne 'passed' -or $good.checks.Count -ne 7) {{ throw ($good | ConvertTo-Json -Depth 8) }}
 $fail = {{ param($Name, $Target) [pscustomobject]@{{ passed = ($Name -ne 'public_https'); detail = 'probe' }} }}
-$bad = Test-AfpRuntimeServices -RuntimeRoot 'F:\runtime' -PublicUrl 'https://example.test/' -LanIPv4 '192.0.2.10' -ExpectedCandidateId 'candidate' -FunnelOrigin 'http://127.0.0.1:8770' -ProbeRunner $fail
+$bad = Test-AfpRuntimeServices -RuntimeRoot 'D:\AFP_Runtime\.afp-staging\tc64-tests\runtime' -PublicUrl 'https://example.test/' -LanIPv4 '192.0.2.10' -ExpectedCandidateId 'candidate' -FunnelOrigin 'http://127.0.0.1:8770' -ProbeRunner $fail
 if ($bad.status -ne 'failed' -or $bad.issues -notcontains 'service probe failed: public_https') {{ throw ($bad | ConvertTo-Json -Depth 8) }}
 """
         result = _run_ps(script)
         self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+    def test_service_gate_local_only_omits_unconfigured_network_probes(self) -> None:
+        script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(MODULE)} -Force
+$probe = {{
+    param($Name, $Target)
+    [pscustomobject]@{{
+        passed = -not [string]::IsNullOrWhiteSpace([string]$Target)
+        detail = if ($Target) {{ 'ok' }} else {{ 'empty target' }}
+    }}
+}}
+$result = Test-AfpRuntimeServices -RuntimeRoot 'D:\AFP_Runtime\.afp-staging\tc64-tests\runtime' -ExpectedCandidateId 'candidate' -FunnelOrigin 'http://127.0.0.1:8770' -ProbeRunner $probe
+$names = @($result.checks | ForEach-Object {{ [string]$_.name }})
+        $expected = @('listener_8770', 'local_admin_8771', 'localhost_http', 'funnel_origin', 'static_identity')
+if ($result.status -ne 'passed' -or ($names -join ',') -ne ($expected -join ',')) {{
+    throw ($result | ConvertTo-Json -Depth 8)
+}}
+"""
+        result = _run_ps(script)
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+
+    def test_localhost_static_identity_matches_runtime_manifest_and_bytes(self) -> None:
+        with tempfile.TemporaryDirectory(dir=ROOT) as temporary:
+            runtime = Path(temporary) / "runtime"
+            static_root = runtime / "app" / "ui"
+            static_root.mkdir(parents=True)
+            (static_root / "app.js").write_bytes(b"current-local-static-identity")
+            (runtime / "RELEASE-MANIFEST.json").write_text(
+                json.dumps({"candidate": {"candidate_id": "candidate-local"}}),
+                encoding="utf-8",
+            )
+            handler = functools.partial(
+                http.server.SimpleHTTPRequestHandler,
+                directory=str(static_root),
+            )
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                script = rf"""
+$ErrorActionPreference = 'Stop'
+Import-Module {_ps_quote(MODULE)} -Force
+$result = Test-AfpPublicStaticIdentity -RuntimeRoot {_ps_quote(runtime)} -PublicUrl 'http://127.0.0.1:{server.server_port}/' -ExpectedCandidateId 'candidate-local'
+if (-not $result.passed) {{ throw ($result | ConvertTo-Json -Depth 8) }}
+"""
+                result = _run_ps(script)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+            self.assertEqual(
+                result.returncode,
+                0,
+                msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
 
     def test_service_gate_waits_for_delayed_startup_and_reports_attempts(self) -> None:
         script = rf"""
@@ -552,7 +747,7 @@ $probe = {{
     if ($Name -eq 'listener_8770') {{ $script:attempt++ }}
     [pscustomobject]@{{ passed = ($script:attempt -ge 3); detail = "attempt=$script:attempt" }}
 }}
-$result = Wait-AfpRuntimeServices -RuntimeRoot 'F:\runtime' -PublicUrl 'https://example.test/' -LanIPv4 '192.0.2.10' -ExpectedCandidateId 'candidate' -FunnelOrigin 'http://127.0.0.1:8770' -TimeoutSeconds 5 -PollIntervalMilliseconds 1 -ProbeRunner $probe -DelayRunner {{ param($Milliseconds) }}
+$result = Wait-AfpRuntimeServices -RuntimeRoot 'D:\AFP_Runtime\.afp-staging\tc64-tests\runtime' -PublicUrl 'https://example.test/' -LanIPv4 '192.0.2.10' -ExpectedCandidateId 'candidate' -FunnelOrigin 'http://127.0.0.1:8770' -TimeoutSeconds 5 -PollIntervalMilliseconds 1 -ProbeRunner $probe -DelayRunner {{ param($Milliseconds) }}
 if ($result.status -ne 'passed' -or $result.attempts -ne 3) {{ throw ($result | ConvertTo-Json -Depth 8) }}
 if ($result.checks.Count -ne 7) {{ throw ($result | ConvertTo-Json -Depth 8) }}
 """
@@ -602,10 +797,7 @@ if ($same.uri -notmatch '^https://example\.test/app\.js\?afp_identity_check=') {
         self.assertIn('"FinalizeSwitchover"', source)
         self.assertIn("legacy-cutover-reservation.py", source)
         self.assertIn("cutover_reservation_active", source)
-        self.assertIn(
-            r"F:\AFP_Integrated_Modular_v2\delivery\AFP_Integrated_System_Modular_v2.0.3_Agentic",
-            source,
-        )
+        self.assertNotIn("F:\\\\", source)
         self.assertNotIn("previous-runtime", source.lower())
         release = (ROOT / "pre_sensor" / "SingleRuntimeRelease.psm1").read_text(
             encoding="utf-8-sig"

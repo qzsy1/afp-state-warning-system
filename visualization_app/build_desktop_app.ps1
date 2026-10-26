@@ -17,7 +17,7 @@ if (-not (Test-Path -LiteralPath $Python)) { $Python = "python" }
 $LegacyCheckpoint = Join-Path $ProjectRoot "checkpoints\health_i_T_G_MyCustom_ftM_sl24_ll24_pl24_dm128_nh8_el2_dl1_df2048_fc1_ebtimeF_dtTrue_health_v9_conditional_normal_no_param_score_lr0.001_bs128\checkpoint.pth"
 $LegacyReplayDir = Join-Path $StateMonitorDir "outputs_tc_hi_soft_consistency_v13_8"
 $CausalArtifact = Join-Path $StateMonitorDir "outputs_causal_online_consistency_v13_9\causal_online_consistency_artifact.joblib"
-$ModelRuntimeRoot = "F:\program\XJUsorceopen"
+$ModelRuntimeRoot = "D:\program\XJUsorceopen"
 $ModelRuntimeShijie = Join-Path $ModelRuntimeRoot "shijie"
 $ModelRuntimeModernTCN = Join-Path $ModelRuntimeRoot "modern_TCN_models"
 $TrainingCore = Join-Path (Split-Path -Parent $StateMonitorDir) "final_training_packages\new_data_full_pipeline"
@@ -26,11 +26,11 @@ $LegacySource = (
         Where-Object { $_.Length -eq 22912911 } |
         Select-Object -First 1 -ExpandProperty FullName
 )
-$ReleaseDir = Join-Path $AppDir "release"
+$ReleaseDir = "D:\AFP_Runtime\.afp-staging\legacy-desktop-release"
 $ZipPath = Join-Path $ReleaseDir "AFP_State_Warning_System_Windows.zip"
 # PyInstaller expands dependency paths below the output directory.  A short
 # temporary path avoids Windows MAX_PATH failures for scientific DLL names.
-$BuildRoot = Join-Path $env:TEMP "AFPBuild"
+$BuildRoot = "D:\AFP_Runtime\.afp-staging\legacy-desktop-build"
 $DistDir = Join-Path $BuildRoot "dist"
 $WorkDir = Join-Path $BuildRoot "work"
 

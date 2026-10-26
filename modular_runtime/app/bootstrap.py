@@ -6,9 +6,11 @@ import importlib
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -16,6 +18,7 @@ from typing import Any
 
 APP_VERSION = "2.0.1-dev"
 API_VERSION = "2.0"
+_PROCESS_SERVER_STARTUP_LOCK = threading.Lock()
 
 
 def _runtime_revision(root: Path) -> str:
@@ -117,6 +120,52 @@ def _afp_server_available(
     return True
 
 
+@contextmanager
+def _afp_server_startup_lock(name: str, timeout_seconds: float = 60.0):
+    """Serialize the fixed listener probe-and-bind sequence across launchers."""
+
+    timeout = max(0.1, float(timeout_seconds))
+    if os.name != "nt":
+        acquired = _PROCESS_SERVER_STARTUP_LOCK.acquire(timeout=timeout)
+        if not acquired:
+            raise TimeoutError("AFP server startup lock timed out")
+        try:
+            yield
+        finally:
+            _PROCESS_SERVER_STARTUP_LOCK.release()
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    safe_name = "".join(character if character.isalnum() else "_" for character in str(name))
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+    kernel32.ReleaseMutex.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.CreateMutexW(None, False, f"Local\\{safe_name}")
+    if not handle:
+        raise OSError("AFP server startup mutex could not be created")
+    wait_result = kernel32.WaitForSingleObject(
+        handle, min(int(timeout * 1000), 0xFFFFFFFE)
+    )
+    if wait_result not in (0x00000000, 0x00000080):
+        kernel32.CloseHandle(handle)
+        if wait_result == 0x00000102:
+            raise TimeoutError("AFP server startup lock timed out")
+        raise OSError("AFP server startup mutex wait failed")
+    try:
+        yield
+    finally:
+        kernel32.ReleaseMutex(handle)
+        kernel32.CloseHandle(handle)
+
+
 def _stop_stale_local_afp_servers(
     ports: set[int], *, executable: str | Path | None = None
 ) -> list[int]:
@@ -168,13 +217,13 @@ def _stop_stale_local_afp_servers(
     return sorted(seen)
 
 
-def _show_desktop_window(context: Any, url: str) -> None:
+def _show_desktop_window(context: Any, url: str, acquisition=None) -> None:
     try:
         import webview
     except ImportError as exc:
         raise RuntimeError("桌面界面组件缺失，请使用已打包的软件或安装 pywebview。") from exc
     ui_config = context.config.get("ui", {})
-    webview.create_window(
+    window = webview.create_window(
         str(ui_config.get("title", "AFP 实时预测、状态预警与模型训练系统（模块化版）")),
         url,
         width=int(ui_config.get("width", 1660)),
@@ -182,7 +231,27 @@ def _show_desktop_window(context: Any, url: str) -> None:
         min_size=(1180, 760),
         text_select=True,
     )
-    webview.start(debug=False)
+    if acquisition is not None:
+        def close_devices():
+            try:
+                result = acquisition.disconnect_data()
+                empty = result.get("capture_phase") == "idle" and not result.get("capture_uuid")
+                if (result.get("running") or result.get("data_connection", {}).get("state") != "disconnected"
+                        or (not result.get("finalization_complete") and not empty)):
+                    raise RuntimeError(result.get("last_error") or "采集保存或设备释放尚未完成")
+            except Exception as exc:
+                window.create_confirmation_dialog("尚未安全退出", str(exc))
+                return False
+            return True
+        window.events.closing += close_devices
+    storage = context.paths.runtime_dir / "webview"
+    storage.mkdir(parents=True, exist_ok=True)
+    # Separate browser environments prevent concurrent windows with different
+    # WebView2 options from conflicting over the same user data folder.
+    with tempfile.TemporaryDirectory(
+        prefix="session-", dir=storage, ignore_cleanup_errors=True
+    ) as session_storage:
+        webview.start(debug=False, private_mode=True, storage_path=session_storage)
 
 
 def self_test(context: Any, manager: Any) -> dict[str, Any]:
@@ -422,7 +491,7 @@ def functional_smoke(context: Any, manager: Any) -> dict[str, Any]:
 
     dashboard = legacy_app.DashboardData()
     # A packaged diagnostic must never inherit or mutate the operator's
-    # durable F:\\AFP_Capture recovery state.  Use a fresh, candidate-local
+    # durable D:\\AFP_Capture recovery state.  Use a fresh, candidate-local
     # capture root so repeated release checks are independent and reproducible.
     dashboard.acquisition = acquisition.AcquisitionManager(
         capture_root, recovery_scan=True
@@ -579,44 +648,21 @@ def launch(context: Any, manager: Any, *, server_only: bool = False) -> None:
         if not config.open_desktop_window:
             thread.join()
             return
-        try:
-            import webview
-        except ImportError as exc:
-            raise RuntimeError("桌面界面组件缺失，请使用已打包的软件或安装 pywebview。") from exc
-        ui_config = context.config.get("ui", {})
-        webview.create_window(
-            str(ui_config.get("title", "AFP 实时预测、状态预警与模型训练系统（模块化版）")),
-            f"http://127.0.0.1:{config.port}/",
-            width=int(ui_config.get("width", 1660)),
-            height=int(ui_config.get("height", 1040)),
-            min_size=(1180, 760),
-            text_select=True,
-        )
-        webview.start(debug=False)
+        _show_desktop_window(context, f"http://127.0.0.1:{config.port}/")
     finally:
         server.shutdown()
         server.server_close()
 
 
-def _launch_public_web(
-    context: Any, manager: Any, *, server_only: bool = False
-) -> None:
+def _prepare_public_web_servers(context: Any, config: Any):
     from lan_web import discover_lan_endpoints
-    from public_web import PublicWebConfig, public_web_urls
+    from public_web import public_web_urls
 
-    config = PublicWebConfig.from_mapping(context.config.get("public_web", {}))
-    if not config.enabled:
-        return
     existing_admin_url = f"http://127.0.0.1:{config.local_admin_port}/"
     health_url = existing_admin_url + "api/health"
     expected_revision = os.environ.get("AFP_RUNTIME_REVISION") or _runtime_revision(context.root)
     if _afp_server_available(health_url, expected_revision=expected_revision):
-        # The watchdog may already own the shared acquisition server.  A
-        # second desktop launch reuses it instead of creating another server
-        # process that can disagree about capture state or fail on the port.
-        if not server_only and config.open_desktop_window:
-            _show_desktop_window(context, existing_admin_url)
-        return
+        return None
     if _afp_server_available(health_url):
         stopped = _stop_stale_local_afp_servers(
             {config.public_port, config.local_admin_port},
@@ -638,7 +684,7 @@ def _launch_public_web(
     )
     capture_root = Path(getattr(dashboard.acquisition, "capture_root", context.paths.runtime_dir / "capture"))
     source_candidates = [
-        Path(r"F:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv"),
+        Path(r"D:\AFP_Capture\simulation_m3232_new_collection\SIM_PRESSURE_M3232_new_collection.csv"),
         context.paths.legacy_dir / "new_collection_demo_v11_3" / "simulator_stream.csv",
         context.paths.data_dir / "dashboard_candidate_catalog.csv",
     ]
@@ -713,11 +759,36 @@ def _launch_public_web(
         "application_version": str(context.config.get("application_version", APP_VERSION)),
     }
     _persist_lan_web_status(context, status)
+    return servers, threads, urls
+
+
+def _launch_public_web(
+    context: Any, manager: Any, *, server_only: bool = False
+) -> None:
+    from public_web import PublicWebConfig
+
+    config = PublicWebConfig.from_mapping(context.config.get("public_web", {}))
+    if not config.enabled:
+        return
+    lock_name = (
+        f"AFP_Public_Web_Startup_{config.public_port}_{config.local_admin_port}"
+    )
+    with _afp_server_startup_lock(lock_name):
+        prepared = _prepare_public_web_servers(context, config)
+    if prepared is None:
+        # A watchdog or another desktop launch owns the shared acquisition
+        # server.  Every additional desktop window uses that same backend.
+        if not server_only and config.open_desktop_window:
+            _show_desktop_window(
+                context, f"http://127.0.0.1:{config.local_admin_port}/"
+            )
+        return
+    servers, threads, urls = prepared
     try:
         if server_only or not config.open_desktop_window:
             threads[1].join()
             return
-        _show_desktop_window(context, urls["local_admin"])
+        _show_desktop_window(context, urls["local_admin"], servers[1].dashboard.acquisition)
     finally:
         # Closing the desktop webview must not tear down the HTTP origin.  In
         # public mode that origin is also the target of the Cloudflare Tunnel;
@@ -749,6 +820,12 @@ def main(root: Path, arguments: list[str] | None = None) -> None:
     parser.add_argument("--install-patch", default="")
     parser.add_argument("--rollback", action="store_true")
     parser.add_argument("--server-only", action="store_true")
+    parser.add_argument("--industrial-readonly-probe", action="store_true")
+    parser.add_argument("--industrial-interface-id", default="ethernet:以太网")
+    parser.add_argument("--industrial-probe-duration", type=float, default=10.0)
+    parser.add_argument("--industrial-probe-repeat", type=int, default=3)
+    parser.add_argument("--industrial-probe-role", choices=("both", "plc", "robot"), default="both")
+    parser.add_argument("--industrial-probe-output", default="D:/AFP_Capture/diagnostics/fix-plc-abb-uvc-real-acquisition")
     parser.add_argument("--pre-sensor-preflight", action="store_true")
     parser.add_argument("--pre-sensor-retry-mysql", action="store_true")
     parser.add_argument("--pre-sensor-capture-root", default="")
@@ -766,6 +843,21 @@ def main(root: Path, arguments: list[str] | None = None) -> None:
     parser.add_argument("--pre-sensor-output", default="")
     args = parser.parse_args(arguments)
     context, manager = initialize(root)
+
+    if args.industrial_readonly_probe:
+        probe = _legacy_module("industrial_acquisition_probe", context)
+        result, evidence_file = probe.run_probe(
+            args.industrial_probe_output, interface_id=args.industrial_interface_id,
+            duration_seconds=args.industrial_probe_duration, repeat=args.industrial_probe_repeat,
+            roles=probe.ROLE_SELECTION[args.industrial_probe_role],
+        )
+        _emit_command_result(context, "industrial-readonly-probe", {
+            "read_only_probe_passed": result["read_only_probe_passed"],
+            "evidence_file": str(evidence_file), "field_acceptance_passed": False,
+        })
+        if not result["read_only_probe_passed"]:
+            raise SystemExit(2)
+        return
 
     if args.install_patch or args.rollback:
         from update_manager import UpdateManager

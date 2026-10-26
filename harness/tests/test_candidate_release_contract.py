@@ -153,6 +153,10 @@ class CandidateReleaseContractTests(unittest.TestCase):
                 {
                     "id": "local_capture_helper",
                     "path": "local_helper/AFP_Local_Capture_Helper.exe",
+                },
+                {
+                    "id": "uvc_windows_probe",
+                    "path": "native_dll/AFP_UvcWindowsProbe.exe",
                 }
             ],
         )

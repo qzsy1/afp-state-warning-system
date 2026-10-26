@@ -17,6 +17,24 @@ from acquisition import AcquisitionManager
 
 
 class PublicDeviceStatusTests(unittest.TestCase):
+    def test_public_abb_status_never_exposes_position_or_speed_sources(self):
+        payload=self._module().build_public_device_status({}, {}, {"running":True,"interfaces":[{
+            "role":"robot","driver":"abb_robot","ok":True,"state":"ok",
+            "abb_evidence":{"latest_record":{"xyz":[123.456,234.567,345.678],"controller_endpoint":"PRIVATE-ABB",
+                "speed_basis":{"previous":{"xyz":[111,222,333]}}}}}]})
+        encoded=json.dumps(payload)
+        for value in ("abb_evidence","speed_basis","xyz","123.456","PRIVATE-ABB"):
+            self.assertNotIn(value,encoded)
+
+    def test_public_plc_status_never_exposes_measurement_register_evidence(self):
+        payload = self._module().build_public_device_status({}, {}, {
+            "running":True, "interfaces":[{"role":"plc","driver":"modbus_tcp","ok":True,"state":"ok",
+                "plc_evidence":{"measurement_profile":"fibercontrol_plc_v1","channel_records":{"压力":{
+                    "words":[1234,49184],"decoded_value":-2.5,"normalized_value":0,"register_address":37}}}}]})
+        encoded = json.dumps(payload)
+        for key in ("words", "decoded_value", "register_address", "channel_records", "plc_evidence"):
+            self.assertNotIn(key, encoded)
+
     def _module(self):
         spec = importlib.util.find_spec("public_status")
         self.assertIsNotNone(
@@ -66,16 +84,120 @@ class PublicDeviceStatusTests(unittest.TestCase):
         self.assertEqual(pressure["message"], "接口无法打开或设备未连接")
         self.assertEqual(pressure["age_seconds"], 1.0)
 
-    def test_public_status_always_lists_the_five_declared_interfaces(self):
+    def test_public_status_always_lists_the_six_declared_interfaces(self):
         module = self._module()
 
         payload = module.build_public_device_status({}, {}, {"running": False}, now=1.0)
 
         self.assertEqual(
             [item["role"] for item in payload["interfaces"]],
-            ["thermocouple", "plc", "thermal_uvc", "robot", "pressure"],
+            ["thermocouple64", "plc", "thermal_uvc", "robot", "pressure", "esr1001_strain"],
         )
         self.assertTrue(all(item["state"] == "unchecked" for item in payload["interfaces"]))
+
+    def test_public_tc64_state_uses_the_actual_serial_check(self):
+        payload = self._module().build_public_device_status({}, {"interfaces":[{
+            "role":"thermocouple64", "state":"ok", "ok":True,
+            "driver":"huipu_tc64_modbus_rtu", "endpoint":"COM-secret",
+        }]}, {"running":False})
+        tc = payload["interfaces"][0]
+        self.assertEqual(tc["role"], "thermocouple64")
+        self.assertTrue(tc["ok"])
+        self.assertEqual(tc["driver"], "huipu_tc64_modbus_rtu")
+        self.assertNotIn("COM-secret",json.dumps(payload))
+
+    def test_public_status_projects_the_checked_esr_driver_and_protocol(self):
+        module = self._module()
+
+        cases = (
+            ("modbus_rtu_esr1001", "modbus_rtu"),
+            ("esr1001_usb_ttl", "esr1001_usb_ttl"),
+        )
+        for driver, protocol in cases:
+            with self.subTest(driver=driver):
+                payload = module.build_public_device_status(
+                    {},
+                    {
+                        "checked_at": 100.0,
+                        "interfaces": [{
+                            "role": "esr1001_strain",
+                            "driver": driver,
+                            "protocol": protocol,
+                            "state": "data_ready",
+                            "ok": True,
+                        }],
+                    },
+                    {"running": False},
+                    now=101.0,
+                )
+                strain = next(
+                    item for item in payload["interfaces"]
+                    if item["role"] == "esr1001_strain"
+                )
+
+                self.assertEqual(strain["driver"], driver)
+                self.assertEqual(strain["protocol"], protocol)
+
+    def test_public_status_does_not_project_an_unknown_esr_driver(self):
+        module = self._module()
+        payload = module.build_public_device_status(
+            {},
+            {
+                "interfaces": [{
+                    "role": "esr1001_strain",
+                    "driver": "secret-driver-path",
+                    "protocol": "secret-protocol",
+                    "state": "device_open_failed",
+                    "ok": False,
+                }],
+            },
+            {"running": False},
+            now=1.0,
+        )
+        encoded = json.dumps(payload, ensure_ascii=False)
+
+        self.assertNotIn("secret-driver-path", encoded)
+        self.assertNotIn("secret-protocol", encoded)
+
+    def test_public_status_preserves_unknown_failure_and_safe_stage_states(self):
+        module = self._module()
+        payload = module.build_public_device_status(
+            {},
+            {
+                "checked_at": 100.0,
+                "interfaces": [{
+                    "role": "thermal_uvc",
+                    "state": "vendor_specific_failure",
+                    "endpoint": r"USB\VID_SECRET",
+                    "physical_interface_id": "usbport:secret",
+                    "ok": False,
+                    "stages": {
+                        "driver": {"state": "failed", "evidence": "secret"},
+                        "protocol": {"state": "not_reached"},
+                    },
+                }],
+            },
+            {"running": False},
+            now=101.0,
+        )
+        uvc = next(
+            item for item in payload["interfaces"] if item["role"] == "thermal_uvc"
+        )
+        encoded = json.dumps(payload, ensure_ascii=False)
+
+        self.assertEqual(uvc["state"], "vendor_specific_failure")
+        self.assertEqual(uvc["message_code"], "vendor_specific_failure")
+        self.assertIn("vendor_specific_failure", uvc["message"])
+        self.assertEqual(
+            uvc["stages"],
+            [
+                {"name": "driver", "state": "failed"},
+                {"name": "protocol", "state": "not_reached"},
+            ],
+        )
+        self.assertNotIn("VID_SECRET", encoded)
+        self.assertNotIn("usbport:secret", encoded)
+        self.assertNotIn("secret", encoded)
 
     def test_public_status_reads_cached_result_without_reopening_hardware(self):
         with tempfile.TemporaryDirectory() as folder:

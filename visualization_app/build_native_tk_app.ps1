@@ -7,18 +7,18 @@ $ErrorActionPreference = "Stop"
 $AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Python = $PythonExecutable
 if ([string]::IsNullOrWhiteSpace($Python)) {
-    $Python = "F:\program\channel_independent_MTSF-main\.venv\Scripts\python.exe"
+    $Python = "D:\AFP_Integrated_Modular_v2\.venv\Scripts\python.exe"
 }
 if (-not (Test-Path -LiteralPath $Python)) {
     throw "Python environment not found: $Python"
 }
 if ([string]::IsNullOrWhiteSpace($TargetDir)) {
-    $TargetDir = Join-Path $AppDir "release_native_tk_fix"
+    $TargetDir = "D:\AFP_Runtime\.afp-staging\native-tk"
 }
-$ExternalRoot = "F:\program\XJUsorceopen"
+$ExternalRoot = "D:\program\XJUsorceopen"
 $LegacyReplayDir = Join-Path (Split-Path -Parent $AppDir) "outputs_tc_hi_soft_consistency_v13_8"
 $CausalArtifact = Join-Path (Split-Path -Parent $AppDir) "outputs_causal_online_consistency_v13_9\causal_online_consistency_artifact.joblib"
-$BuildRoot = Join-Path $env:TEMP ("AFPNativeTkBuild_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+$BuildRoot = Join-Path "D:\AFP_Runtime\.afp-staging" ("AFPNativeTkBuild_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
 $DistDir = Join-Path $BuildRoot "dist"
 $WorkDir = Join-Path $BuildRoot "work"
 $SpecDir = Join-Path $BuildRoot "spec"

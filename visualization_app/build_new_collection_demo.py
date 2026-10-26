@@ -18,7 +18,7 @@ WORKSPACE_DIR = APP_DIR.parents[1]
 OUTPUT_ROOT = APP_DIR / "new_collection_demo_v12_0"
 CONDITION_FILE = WORKSPACE_DIR / "工艺参数状态标签_v11_2.csv"
 MANIFEST_TEMPLATE = WORKSPACE_DIR / "计划数据集" / "采集清单模板_v11_3.csv"
-XJU_ROOT = Path(r"F:\program\XJUsorceopen")
+XJU_ROOT = Path(r"D:\program\XJUsorceopen")
 
 SENSOR_COLUMNS = [
     "温度",

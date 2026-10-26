@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import sys
 import unittest
+import tempfile
+import time
+import csv
+import json
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -12,6 +16,91 @@ from local_capture_agent import HelperTransport  # noqa: E402
 
 
 class LocalCaptureAgentTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.capture_root = Path(temporary.name)
+
+    def test_tc64_short_scan_csv_mysql_and_helper_frames_agree(self):
+        from acquisition import AcquisitionConfig, AcquisitionManager, default_capture_interfaces
+        from local_capture_helper_entry import helper_capabilities
+        from test_hp_thermocouple64 import InstrumentSerial
+        from real_acquisition import UnifiedFrame
+        from thermocouple64 import THERMOCOUPLE64_CHANNELS, strict_group_means
+        saved = []
+        ports = []
+        class Store:
+            def __init__(self, settings): pass
+            def preflight(self, **kwargs): return {"ok": True}
+            def save_layer(self, config, **kwargs):
+                saved.append(list(kwargs["rows"]))
+                return {"ok": True, "saved_rows": len(saved[-1])}
+        def serial_factory(**kwargs):
+            port = InstrumentSerial()
+            port.short_only = True
+            ports.append(port)
+            self.assertEqual(kwargs["port"], "COM17")
+            return port
+        with tempfile.TemporaryDirectory() as temporary, patch("serial.Serial", side_effect=serial_factory), patch("acquisition.MySQLCaptureStore", Store):
+            root = Path(temporary)
+            interface = default_capture_interfaces()[0]
+            interface.update(endpoint="COM17", physical_interface_id="serial:COM17", physical_interface_kind="serial", physical_verified=True)
+            config = AcquisitionConfig(acquisition_mode="real", real_acquisition_mode="remote_helper", execution_host="helper_local",
+                helper_session_id="fixture", helper_capabilities=helper_capabilities(), dataset_schema="new_collection_v13_0",
+                interfaces=[interface], selected_sensors=list(THERMOCOUPLE64_CHANNELS), processing_mode="capture_only", save_root=str(root), mysql_enabled=True)
+            manager = AcquisitionManager(root, recovery_scan=False)
+            agent = LocalCaptureAgent(manager, simulation_cache_root=root/"cache")
+            checked = agent.check_capture(config)
+            self.assertTrue(checked["ok"], checked)
+            self.assertEqual(checked["interfaces"][0]["driver_diagnostics"]["read_profile"], "channel_temperature")
+            self.assertTrue(checked["interfaces"][0]["protocol_verified"])
+            agent.start_capture(config)
+            try:
+                deadline = time.monotonic()+2
+                while manager.status()["sample_count"] < 3 and time.monotonic()<deadline:
+                    time.sleep(.01)
+                batch = agent.next_sample_batch()
+                self.assertTrue(batch["frames"])
+                self.assertEqual(manager.driver.drivers[0].read_profile, "channel_temperature")
+                for raw, frame, stamp in zip(batch["rows"], batch["frames"], batch["timestamps"]):
+                    restored = UnifiedFrame.from_envelope_v2(frame, expected_session_id=batch["capture_uuid"], expected_mode_id="new_collection_v13_0", catalog=batch["frame_catalog"])
+                    self.assertEqual(restored.values(), {n:raw[n] for n in THERMOCOUPLE64_CHANNELS})
+                    self.assertEqual(restored.target_wall_time, stamp)
+                    self.assertEqual(strict_group_means(restored.values())["热电偶均值8"]["value"], 34.875)
+                    sequences = {sample.source_sequence for sample in restored.channels.values()}
+                    self.assertEqual(len(sequences), 1)
+                    self.assertGreater(next(iter(sequences)), 0)
+                    for index, name in enumerate(THERMOCOUPLE64_CHANNELS):
+                        self.assertEqual(restored.channels[name].source_sequence, frame["source"][str(index)]["source_sequence"])
+                self.assertTrue(agent.ack_sample_batch(batch["capture_uuid"], batch["sequence"]))
+            finally:
+                stopped = agent.stop_capture()
+            self.assertTrue(stopped["finalization_complete"], stopped)
+            with manager.raw_path.open(encoding="gb18030", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(len(rows), len(saved[0]))
+            for csv_row, mysql_row in zip(rows, saved[0]):
+                for i, name in enumerate(THERMOCOUPLE64_CHANNELS):
+                    self.assertEqual(float(csv_row[name]), 20+i/4)
+                    self.assertEqual(float(csv_row[name]), float(mysql_row[name]))
+            with Path(stopped["timestamp_file"]).open(encoding="utf-8-sig", newline="") as handle:
+                timestamps = list(csv.DictReader(handle))
+            self.assertEqual(len(timestamps), len(rows))
+            self.assertTrue(all(json.loads(row["channel_quality_json"])["温度64"] in ("measured_new", "held_within_freshness") for row in timestamps))
+            self.assertTrue(all(p.closed for p in ports))
+
+    def test_tc64_candidates_use_serial_transport_without_claiming_identity(self):
+        for order in ([6, 7], [7, 6]):
+            manager = Mock(capture_root=self.capture_root)
+            manager.discover_interfaces.return_value = {"physical_interfaces": [
+                {"id": f"serial:COM{n}", "endpoint": f"COM{n}", "kind": "serial", "protocol": "serial",
+                 "detected": True, "compatible_roles": ["thermocouple64", "esr1001_strain"]}
+                for n in order]}
+            tc = LocalCaptureAgent(manager=manager).discover()["sensor_bindings"][0]
+            self.assertIsNone(tc["physical_interface_id"])
+            self.assertEqual({p["endpoint"] for p in tc["candidates"]}, {"COM6", "COM7"})
+            self.assertFalse(tc["identity_confirmed"])
+
     def test_discover_forwards_usb_topology_and_keeps_empty_ports_out_of_bindings(self):
         topology = {
             "schema_version": 1,
@@ -25,7 +114,7 @@ class LocalCaptureAgentTests(unittest.TestCase):
             }],
             "devices": [],
         }
-        manager = Mock()
+        manager = Mock(capture_root=self.capture_root)
         manager.discover_interfaces.return_value = {
             "physical_interfaces": [],
             "usb_topology": topology,
@@ -61,7 +150,7 @@ class LocalCaptureAgentTests(unittest.TestCase):
         self.assertNotIn("拓展坞", payload["interface_transport_catalog"]["usb_ports"][0]["label"])
 
     def test_sample_batch_reads_only_incremental_rows_when_manager_supports_cursor(self):
-        manager = Mock()
+        manager = Mock(capture_root=self.capture_root)
         manager.start.return_value = {"running": True}
         manager.status.return_value = {"running": True, "config": {"sample_rate_hz": 10.0}}
         manager.stream_rows_since.side_effect = [
@@ -103,7 +192,7 @@ class LocalCaptureAgentTests(unittest.TestCase):
         manager.numeric_matrix.assert_not_called()
 
     def test_sample_batch_is_replayed_until_ack_then_advances(self):
-        manager = Mock()
+        manager = Mock(capture_root=self.capture_root)
         manager.start.return_value = {"running": True, "config": {"acquisition_mode": "real"}}
         manager.status.return_value = {"running": True, "config": {"acquisition_mode": "real"}}
         manager.numeric_matrix.return_value = (
@@ -126,7 +215,7 @@ class LocalCaptureAgentTests(unittest.TestCase):
         self.assertEqual(second["rows"], [{"温度": 352.0}])
 
     def test_batch_ack_for_other_capture_does_not_advance_cursor(self):
-        manager = Mock()
+        manager = Mock(capture_root=self.capture_root)
         manager.start.return_value = {"running": True}
         manager.status.return_value = {"running": True, "config": {}}
         manager.numeric_matrix.return_value = ([{"压力": 1.0}], [1.0])
@@ -138,7 +227,7 @@ class LocalCaptureAgentTests(unittest.TestCase):
         self.assertEqual(agent.next_sample_batch(), pending)
 
     def test_stop_emits_final_status_batch_even_when_no_new_rows_arrive(self):
-        manager = Mock()
+        manager = Mock(capture_root=self.capture_root)
         manager.start.return_value = {"running": True}
         manager.stop.return_value = {"running": False, "finalization_complete": True}
         manager.numeric_matrix.return_value = ([], [])
@@ -161,7 +250,7 @@ class LocalCaptureAgentTests(unittest.TestCase):
         self.assertFalse(final["status"]["running"])
 
     def test_stop_marks_pending_rows_as_history_and_completes_after_final_ack(self):
-        manager = Mock()
+        manager = Mock(capture_root=self.capture_root)
         manager.start.return_value = {"running": True}
         manager.stop.return_value = {
             "running": False,
@@ -265,20 +354,26 @@ class LocalCaptureAgentTests(unittest.TestCase):
         self.assertEqual(
             [item["role"] for item in result["sensor_bindings"]],
             [
-                "thermocouple64", "plc_process", "uvc_temperature",
-                "abb_motion", "m3232_pressure", "esr1001_strain",
+                "thermocouple64", "plc", "thermal_uvc",
+                "robot", "pressure", "esr1001_strain",
             ],
         )
         self.assertNotIn("thermocouple_8ch", [item["role"] for item in result["sensor_bindings"]])
         self.assertEqual(result["sensor_bindings"][1]["physical_interface_id"], "ethernet:工控网卡")
         self.assertEqual(result["sensor_bindings"][3]["physical_interface_id"], "ethernet:工控网卡")
-        self.assertEqual(result["sensor_bindings"][4]["physical_interface_id"], "serial:COM3")
+        self.assertIsNone(result["sensor_bindings"][4]["physical_interface_id"])
+        self.assertFalse(result["sensor_bindings"][4]["identity_confirmed"])
         self.assertIsNone(result["sensor_bindings"][5]["physical_interface_id"])
         self.assertEqual(result["sensor_bindings"][5]["protocol"], "modbus_rtu")
+        self.assertEqual(
+            [item["id"] for item in result["sensor_bindings"][5]["candidates"]],
+            ["serial:COM3"],
+        )
 
     @patch("local_capture_agent.AcquisitionManager")
     def test_capture_methods_delegate_to_existing_manager(self, manager_cls):
         manager = manager_cls.return_value
+        manager.capture_root = self.capture_root
         manager.status.return_value = {"running": False}
         agent = LocalCaptureAgent(manager=manager)
         config = Mock()
@@ -291,6 +386,7 @@ class LocalCaptureAgentTests(unittest.TestCase):
     @patch("local_capture_agent.AcquisitionManager")
     def test_process_parameter_read_delegates_to_existing_manager(self, manager_cls):
         manager = manager_cls.return_value
+        manager.capture_root = self.capture_root
         manager.read_process_parameters.return_value = {
             "ok": True,
             "values": {"pid_angle_deg": 5.0},
@@ -303,18 +399,18 @@ class LocalCaptureAgentTests(unittest.TestCase):
         self.assertEqual(result["values"]["pid_angle_deg"], 5.0)
         manager.read_process_parameters.assert_called_once_with(config)
 
-    @patch("local_capture_agent.select_capture_folder", return_value="F:\\AFP_Capture")
+    @patch("local_capture_agent.select_capture_folder", return_value="D:\\AFP_Capture")
     @patch("local_capture_agent.check_capture_save_root", return_value={"ok": True})
     def test_save_folder_operations_execute_on_helper_computer(self, check_root, select_folder):
-        agent = LocalCaptureAgent(manager=Mock())
+        agent = LocalCaptureAgent(manager=Mock(capture_root=self.capture_root))
 
-        selected = agent.select_folder("F:\\")
-        checked = agent.check_save_root("F:\\AFP_Capture")
+        selected = agent.select_folder("D:\\")
+        checked = agent.check_save_root("D:\\AFP_Capture")
 
-        self.assertEqual(selected, {"selected": True, "path": "F:\\AFP_Capture"})
+        self.assertEqual(selected, {"selected": True, "path": "D:\\AFP_Capture"})
         self.assertTrue(checked["ok"])
-        select_folder.assert_called_once_with("F:\\")
-        check_root.assert_called_once_with("F:\\AFP_Capture")
+        select_folder.assert_called_once_with("D:\\")
+        check_root.assert_called_once_with("D:\\AFP_Capture")
 
 
 if __name__ == "__main__":

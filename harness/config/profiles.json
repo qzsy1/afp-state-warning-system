@@ -2,6 +2,8 @@
   "schema_version": 1,
   "profiles": {
     "quick": [
+      "acquisition-pause-contracts",
+      "esr1001-native-usb-contracts",
       "harness-contracts",
       "pre-sensor-readiness-contracts",
       "public-ingress-cutover-contracts",
@@ -11,6 +13,7 @@
       "real-acquisition-local-direct-contracts",
       "real-acquisition-remote-helper-contracts",
       "real-acquisition-mode-equivalence-contracts",
+      "plc-abb-uvc-readiness-contracts",
       "modular-runtime-contracts",
       "frontend-behavior-contracts",
       "real-acquisition-protocol-contracts",
@@ -19,6 +22,8 @@
       "thermocouple64-frontend-contracts"
     ],
     "full": [
+      "acquisition-pause-contracts",
+      "esr1001-native-usb-contracts",
       "harness-contracts",
       "pre-sensor-readiness-contracts",
       "public-ingress-cutover-contracts",
@@ -31,6 +36,7 @@
       "real-acquisition-local-direct-contracts",
       "real-acquisition-remote-helper-contracts",
       "real-acquisition-mode-equivalence-contracts",
+      "plc-abb-uvc-readiness-contracts",
       "modular-runtime-contracts",
       "interface-monitor-contracts",
       "usb-dock-topology-contracts",
@@ -49,6 +55,8 @@
       "thermocouple64-frontend-contracts"
     ],
     "release": [
+      "acquisition-pause-contracts",
+      "esr1001-native-usb-contracts",
       "harness-contracts",
       "pre-sensor-readiness-contracts",
       "public-ingress-cutover-contracts",
@@ -61,6 +69,7 @@
       "real-acquisition-local-direct-contracts",
       "real-acquisition-remote-helper-contracts",
       "real-acquisition-mode-equivalence-contracts",
+      "plc-abb-uvc-readiness-contracts",
       "modular-runtime-contracts",
       "interface-monitor-contracts",
       "usb-dock-topology-contracts",

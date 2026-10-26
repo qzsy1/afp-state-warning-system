@@ -2,7 +2,7 @@
 
 > 用途：更换账号、模型或协作者时，直接把本文件提供给新模型，使其在不重复历史试错的前提下继续工作。
 > 更新时间：2026-08-08。
-> 项目根目录：`F:\program\channel_independent_MTSF-main\channel_independent_MTSF-main\auto_fiber_placement\new-state-monitor`。
+> 项目根目录：`D:\AFP_Integrated_Modular_v2`。
 > 最高原则：出现冲突时，以当前可运行代码、`run_manifest.json`、冻结 CSV/JSON 结果为准，不以聊天中的口头数字为准。
 
 ## 1. 一页结论
@@ -248,7 +248,7 @@ CAP 的 AutoPool 公式和 `alpha≤ln(M-1)` 约束来自 McFee et al. (2018)；
 
 ```text
 你正在接手一个自动铺丝AFP实时预测与三级状态预警项目。项目根目录是：
-F:\program\channel_independent_MTSF-main\channel_independent_MTSF-main\auto_fiber_placement\new-state-monitor
+D:\AFP_Integrated_Modular_v2
 
 请先完整阅读：
 1. state_monitor_v13/AFP状态预警项目_新模型接手上下文_v2.md

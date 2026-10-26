@@ -6,9 +6,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-FIXED_RUNTIME = r"F:\new_AFP_exam\AFP_Integrated_System_Modular"
-FIXED_EVIDENCE = r"F:\new_AFP_exam\AFP-Main-Evidence"
-STAGING_ROOT = r"F:\new_AFP_exam\.afp-staging"
+FIXED_RUNTIME = r"D:\AFP_Runtime\AFP_Integrated_System_Modular"
+FIXED_EVIDENCE = r"D:\AFP_Runtime\AFP-Main-Evidence"
+STAGING_ROOT = r"D:\AFP_Runtime\.afp-staging"
 LEGACY_MARKERS = (
     "AFP_Integrated_System_Modular_v2.0.4_Agentic",
     r"F:\AFP_Integrated_Modular_v2",
@@ -16,7 +16,7 @@ LEGACY_MARKERS = (
 
 
 class SingleRuntimeDocumentationTests(unittest.TestCase):
-    def test_operator_docs_define_fixed_runtime_and_two_approval_gates(self) -> None:
+    def test_operator_docs_define_fixed_runtime_and_current_authorization(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         field_ops = (ROOT / "pre_sensor" / "FIELD-OPERATIONS.md").read_text(
             encoding="utf-8"

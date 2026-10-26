@@ -9,7 +9,7 @@
 ### Requirement: Windows USB 拓扑发现
 系统 SHALL 在支持的 Windows 环境中发现 USB Hub、每个下行物理连接器、连接状态、支持的 USB 协议、连接器形态和当前所接设备，并 SHALL 包含没有接入设备的可用端口。电脑本机端口记录 MUST 以 `confirmation` 区分 `observed_current`、`observed_history` 与 `connector_metadata`；`connector_metadata` 只可用于系统明确报告为用户可连接、非 Type-C 且具有 USB2/SuperSpeed 伴随关系的空闲连接器，不得把未配对的控制器逻辑端口发布为物理接口。系统 MUST 将拓扑查询与传感器数据读取分开，发现端口时不得要求传感器正在输出数据。
 
-系统 MUST 以 `connector_form_factor` 区分 `type_a`、`type_c` 与 `unknown`，并 MUST 将该字段与表示协议能力的 `connector_type`/`supported_protocols` 分开。当前热电偶、UVC 和 M3232 的 USB 物理候选池 SHALL 只包含用户可连接的 USB-A 端口；Type-C 及 `internal_function=dock_upstream` SHALL 保留在拓扑诊断中但 MUST NOT 进入该候选池。
+系统 MUST 以 `connector_form_factor` 区分 `type_a`、`type_c` 与 `unknown`，并 MUST 将该字段与表示协议能力的 `connector_type`/`supported_protocols` 分开。当前热电偶、UVC、M3232 和 ESR1001-A 的 USB 物理候选池 SHALL 只包含用户可连接的 USB-A 端口；Type-C 及 `internal_function=dock_upstream` SHALL 保留在拓扑诊断中但 MUST NOT 进入该候选池。
 
 #### Scenario: 显示空闲和占用端口
 - **WHEN** 操作员刷新接口，且一个拓展坞包含空闲端口和已接设备的端口
@@ -107,8 +107,12 @@
 接口界面 SHALL 按物理传输类型和所属位置组织候选项。所有通过 USB 连接的标准传感器 MUST 显示同一个完整用户可连接 USB 端口池，包含电脑原生、普通 USB 扩展设备和拓展坞端口；HID、UVC、COM 等通信端点 SHALL 作为端口当前设备属性表达。以太网接口 MUST 显示所有可用网卡，真正不经过 USB 的主机原生串口 SHALL 作为独立候选保留。
 
 #### Scenario: 三类 USB 传感器显示相同完整端口池
-- **WHEN** 操作员分别为热电偶、UVC 和 M3232 选择实际接口，且电脑原生 USB 口与拓展坞三个外部 USB 口可用
-- **THEN** 三个逻辑接口 MUST 显示相同的完整 USB 物理端口集合，包括空闲端口、已接兼容设备的端口和已接不兼容设备的端口，并显示各自状态
+- **WHEN** 操作员分别为热电偶、UVC、M3232 和 ESR1001-A 选择实际接口，且电脑原生 USB 口与拓展坞外部 USB 口可用
+- **THEN** 四个逻辑接口 MUST 显示相同的完整 USB 物理端口集合，包括空闲端口、已接兼容设备的端口和已接不兼容设备的端口，并显示各自状态
+
+#### Scenario: 同一扩展设备上的UVC和ESR端点独立更新
+- **WHEN** ESR1001-A的CH340和目标UVC分别连接到同一USB扩展设备的不同下游端口，重新枚举导致COM号、实时接口或物理端口标识变化
+- **THEN** 系统 MUST 分别关联两个实时端点；UVC仅在唯一稳定容器身份匹配时迁移，ESR只更新所选物理端口上的串口候选并撤销旧协议就绪，必须经本轮协议检查后才能采集；任一设备失败不得占用或隐藏另一设备
 
 #### Scenario: USB 转串口显示在所属物理端口下
 - **WHEN** M3232 使用的 USB 转串口设备连接在拓展坞端口并由 Windows 枚举为 COM8

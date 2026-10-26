@@ -93,7 +93,7 @@ class ClientLabAssetContractTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         contract = json.loads(completed.stdout)
-        self.assertEqual(contract["lab_root"], "F:\\AFP_Client_Validation_Lab")
+        self.assertEqual(contract["lab_root"], "D:\\AFP_Client_Validation_Lab")
         self.assertEqual(
             contract["helper_sha256"],
             "5216A6D110164BB23D8D1B2D29DBB335D998DA1DB176CB227339054586BCA5D6",

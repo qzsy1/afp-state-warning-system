@@ -1,4 +1,5 @@
 import os
+import json
 import sys
 import tempfile
 import unittest
@@ -47,6 +48,37 @@ class RunnerTests(unittest.TestCase):
         result = run_check(check, self.root, os.environ)
         self.assertEqual((result.status, result.exit_code), ("failed", 7))
         self.assertIn("bad", result.stdout)
+
+    def test_remote_environment_probe_preserves_blocked_status(self) -> None:
+        payload = json.dumps(
+            {
+                "schema_version": 1,
+                "check_id": "environment.second_windows",
+                "status": "blocked",
+                "evidence": "second Windows Helper is not configured",
+                "remediation": "Configure the second Windows Helper and rerun",
+                "external_environment": True,
+            }
+        )
+        check = command_check(
+            ["{python}", "-c", f"import sys; print({payload!r}); sys.exit(2)"],
+            evidence_tier="remote_integration",
+            blocking=False,
+        )
+        result = run_check(check, self.root, os.environ)
+        self.assertEqual((result.status, result.exit_code), ("blocked", 2))
+        self.assertTrue(result.external_environment)
+        self.assertIn("Configure the second Windows Helper", result.remediation)
+
+    def test_remote_environment_probe_rejects_unstructured_exit_two(self) -> None:
+        check = command_check(
+            ["{python}", "-c", "import sys; print('not json'); sys.exit(2)"],
+            evidence_tier="remote_integration",
+            blocking=False,
+        )
+        result = run_check(check, self.root, os.environ)
+        self.assertEqual((result.status, result.exit_code), ("failed", 2))
+        self.assertFalse(result.external_environment)
 
     def test_timeout_is_recorded_and_fail_closed(self) -> None:
         check = command_check(

@@ -35,7 +35,7 @@ SUMMARY_FILE = MODEL_DIR / "new_collection_hi_summary.json"
 XJU_ROOT = (
     Path(getattr(sys, "_MEIPASS")) / "model_runtime"
     if getattr(sys, "frozen", False)
-    else Path(r"F:\program\XJUsorceopen")
+    else Path(r"D:\program\XJUsorceopen")
 )
 MODEL_METADATA = json.loads(METADATA.read_text(encoding="utf-8"))
 MODEL_COLUMNS = [str(name) for name in MODEL_METADATA["model_columns"]]

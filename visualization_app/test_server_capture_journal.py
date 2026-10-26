@@ -56,6 +56,98 @@ def unified_frame(sequence, value, *, timestamp=None):
 
 
 class ServerCaptureJournalTests(unittest.TestCase):
+    def test_abb_motion_source_survives_durable_helper_journal_and_target_mysql(self):
+        import json
+        from real_acquisition import ChannelSampleCache, FrameAssembler
+        from local_direct_acquisition import LocalDirectAdapter
+        from test_mysql_identity import _FakeConnection
+        from mysql_storage import MySQLCaptureStore, MySQLSettings
+        from acquisition import AcquisitionConfig, AbbRobotDriver
+        from unittest.mock import patch
+        now=[10.0]
+        positions=iter([(0,0,0),(3,4,0)])
+        driver=AbbRobotDriver("http://fixture",clock=lambda:now[0],wall_clock=lambda:1000+now[0])
+        driver._fetch_position=lambda:next(positions)
+        driver.open()
+        cache=ChannelSampleCache()
+        names=["ABB_X","ABB_Y","ABB_Z","线速度"]
+        adapter=LocalDirectAdapter("abb",driver,names,cache)
+        for values,record in driver.read_samples(): adapter._publish(values,record)
+        now[0]=10.1
+        for values,record in driver.read_samples(): adapter._publish(values,record)
+        frame=FrameAssembler(names,10,dict.fromkeys(names,1),start_monotonic=10,start_wall_time=1000).assemble(cache,10.2)
+        envelope=frame.to_envelope("abb-remote",dict.fromkeys(names[:3],"mm") | {"线速度":"mm/s"})
+        self.journal.disarm("session-a")
+        self.journal.arm("session-a","selection-a",config={"selected_sensors":names})
+        self.mirrors.configure_capture_contract("session-a","abb-remote",names,{})
+        batch={"capture_uuid":"abb-remote","sequence":0,"rows":[frame.values()],"timestamps":[1000.2],
+               "frames":[envelope],"required_frame_contract":"unified_frame_v1",
+               "status":{"running":False,"finalization_complete":True,"sample_count":1}}
+        ingested=self.journal.ingest("session-a",batch,self.mirrors)
+        self.assertTrue(ingested["ok"],ingested)
+        capture=self.journal.ready_capture("session-a","abb-remote")
+        # 较新驱动状态不能改写已持久化帧的证据。
+        driver.latest_record["xyz"][0]=999
+        row=list(capture.rows)[0]
+        record=row["_channel_source_records"]["线速度"]
+        self.assertEqual(record["speed_basis"]["value_mm_s"],50)
+        self.assertEqual(record["xyz"],[3,4,0])
+        connection=_FakeConnection()
+        store=MySQLCaptureStore(MySQLSettings(enabled=True,database="afp_fixture"))
+        with patch.object(store,"_connect",return_value=("fake",connection)):
+            result=store.save_layer(AcquisitionConfig(dataset_schema="new_collection_v11_3",selected_sensors=names),rows=capture.rows,layer_file=None,
+                full_specimen_file=None,timestamp_file=None,folder_path=None,summary={},source_records=capture.rows.source_records())
+        self.assertTrue(result["ok"],result)
+        evidence=[json.loads(value[4]) for sql,values in connection.cursor_instance.executed
+                  if "INSERT INTO afp_source_evidence" in sql for value in values if value[2]=="abb_frame"]
+        self.assertEqual(evidence[0]["channels"],row["_channel_source_records"])
+
+    def test_plc_source_survives_durable_helper_journal_and_target_mysql(self):
+        import json
+        from real_acquisition import ChannelSampleCache, FrameAssembler
+        from local_direct_acquisition import LocalDirectAdapter
+        from test_plc_modbus_contract import PlcModbusContractTests
+        from test_mysql_identity import _FakeConnection
+        from mysql_storage import MySQLCaptureStore, MySQLSettings
+        from acquisition import AcquisitionConfig
+        from unittest.mock import patch
+        driver = PlcModbusContractTests().make_driver({"压力": -2.5}, clock=lambda:10.0, wall_clock=lambda:1000.0)
+        cache = ChannelSampleCache()
+        adapter = LocalDirectAdapter("plc", driver, ["压力"], cache)
+        for values, record in driver.read_samples():
+            adapter._publish(values, record)
+        frame = FrameAssembler(["压力"], 10, {"压力":.5}, start_monotonic=10, start_wall_time=1000).assemble(cache,10.1)
+        envelope = frame.to_envelope("plc-remote", {"压力":"N"})
+        self.journal.disarm("session-a")
+        self.journal.arm("session-a", "selection-a", config={"selected_sensors":["压力"]})
+        self.mirrors.configure_capture_contract("session-a", "plc-remote", ["压力"], {"压力":"N"})
+        batch = {"capture_uuid":"plc-remote", "sequence":0, "rows":[{"压力":0.0}],
+                 "timestamps":[1000.1], "frames":[envelope], "required_frame_contract":"unified_frame_v1",
+                 "status":{"running":False,"finalization_complete":True,"sample_count":1}}
+        self.assertTrue(self.journal.ingest("session-a", batch, self.mirrors)["ok"])
+        capture = self.journal.ready_capture("session-a", "plc-remote")
+        row = list(capture.rows)[0]
+        self.assertEqual(row["_channel_source_records"]["压力"]["decoded_value"], -2.5)
+        connection = _FakeConnection()
+        store = MySQLCaptureStore(MySQLSettings(enabled=True, database="afp_fixture"))
+        with patch.object(store, "_connect", return_value=("fake",connection)):
+            result = store.save_layer(AcquisitionConfig(selected_sensors=["压力"]), rows=capture.rows,
+                                      layer_file=None,full_specimen_file=None,timestamp_file=None,
+                                      folder_path=None,summary={},source_records=capture.rows.source_records())
+        self.assertTrue(result["ok"], result)
+        evidence = [json.loads(value[4]) for sql, values in connection.cursor_instance.executed
+                    if "INSERT INTO afp_source_evidence" in sql for value in values]
+        self.assertEqual(evidence[0]["channels"], row["_channel_source_records"])
+
+    def test_async_start_binds_target_before_first_sample(self):
+        self.journal.disarm("session-a")
+        self.journal.arm_start("session-a", "request-1", "selection-a", config={"selected_sensors": ["温度"]})
+        self.assertTrue(self.journal.bind_start_result("session-a", "request-1", {
+            "accepted": True, "running": False, "capture_uuid": "capture-1",
+            "start_operation": {"id": "operation-1", "state": "starting"},
+        }))
+        self.assertTrue(self.journal.manages("session-a", "capture-1"))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.journal = ServerCaptureJournal(Path(self.temp.name) / "journal.sqlite3", max_capture_bytes=300000)
@@ -106,6 +198,21 @@ class ServerCaptureJournalTests(unittest.TestCase):
         record = self.journal.ready_capture("session-a", "transport-capture-a")
         self.assertIsNotNone(record)
         self.assertEqual([row["温度"] for row in record.rows], [1])
+
+    def test_esr_source_evidence_is_durable_and_part_of_duplicate_identity(self):
+        from esr1001_usb import RAW_CHANNELS, measurement_record
+        from esr1001_fixtures import USB_DATA, USB_EXPECTED_ADC
+        row = dict(zip(RAW_CHANNELS, USB_EXPECTED_ADC), raw_hex=USB_DATA.hex(), receive_sequence=1,
+                   calibration_digest="", connection_generation=1)
+        row.update(measurement_record(row, None))
+        batch = sample(0, [1], final=True, count=1)
+        batch["esr_source_records"] = [{"interface_id": "esr", "record": row, "calibration_snapshot": None}]
+        self.assertTrue(self.journal.ingest("session-a", batch, self.mirrors)["ok"])
+        record = self.journal.ready_capture("session-a", "transport-capture-a")
+        self.assertEqual(list(record.rows.source_records()), batch["esr_source_records"])
+        self.assertTrue(self.journal.ingest("session-a", batch, self.mirrors)["duplicate"])
+        changed = dict(batch, esr_source_records=[])
+        self.assertEqual(self.journal.ingest("session-a", changed, self.mirrors)["error"], "sample_sequence_conflict")
 
     def test_restart_restores_mirror_before_duplicate_and_next_batch(self):
         for sequence, value in enumerate((1, 2)):

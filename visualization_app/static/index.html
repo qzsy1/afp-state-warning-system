@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AFP 实时预测与状态预警系统</title>
-  <link rel="stylesheet" href="/styles.css?v=20261017-thermocouple64-v6">
+  <link rel="stylesheet" href="/styles.css?v=20261021-strain-cards-1">
 </head>
 <body>
   <div class="app-shell">
@@ -57,6 +57,7 @@
         <details id="acquisitionSection" class="control-section hidden">
           <summary>真实采集与保存</summary>
           <div class="control-content">
+            <fieldset id="acquisitionConfigurationFields" style="border:0;padding:0;margin:0;min-width:0">
             <div id="localHelperPanel" class="local-helper-panel">
               <div class="local-helper-head"><strong>本机采集辅助程序</strong><span id="helperStatus" class="helper-status">未配对</span></div>
               <p id="helperStatusNote" class="control-note">真实采集需要在访问此网页的电脑上运行本地采集辅助程序。</p>
@@ -137,7 +138,7 @@
             </div>
             <label>采集数据保存位置
               <span class="path-picker-row">
-                <input id="saveRootInput" type="text" placeholder="默认：F:\AFP_Capture；为空时不保存">
+                <input id="saveRootInput" type="text" placeholder="默认：D:\AFP_Capture；为空时不保存">
                 <button id="selectSaveRootButton" class="secondary-button compact-button" type="button">选择</button>
               </span>
             </label>
@@ -291,6 +292,12 @@
               <p class="agent-scope-note">覆盖 64 路热电偶、PLC、UVC、ABB、M3232 薄膜压力与 ESR1001-A 应变传感器接口。只展示诊断结论和证据来源，不展示调用轨迹；异常失败时保留本地规则兜底。Key 不保存、不写日志。</p>
               </div>
             </details>
+            <details class="collapsible-subsection"><summary>PLC 压力与来源</summary>
+              <p>真实 PLC 压力保留两位小数后将负值规范为 0 N，原始值保留；缺测留空，无实时三点平均。曲线、CSV、MySQL 与模型使用同一规范值及质量准入。参考状态栏一位小数与两位小数导出可存在末位显示差异。</p>
+              <pre id="plcMeasurementEvidence"></pre>
+              <pre id="abbMeasurementEvidence"></pre>
+              <details><summary>ABB 位置与速度来源诊断</summary><pre id="abbMeasurementSource"></pre></details>
+            </details>
             <details id="acquisitionParameterPanel" class="acquisition-parameter-panel collapsible-subsection" aria-labelledby="acquisitionParameterTitle">
               <summary id="acquisitionParameterTitle" class="sensor-selector-title acquisition-parameter-title">采集参数设置</summary>
               <div class="collapsible-subsection-content">
@@ -317,11 +324,15 @@
               <p class="control-note collection-index-note">采集运行期间层号和独立重复编号锁定；只有停止并成功保存本次采集后，才可递增到下一层或下一独立重复。</p>
               </div>
             </details>
+            </fieldset>
             <div class="transport">
+              <button id="connectDataButton" class="secondary-button">连接数据</button>
               <button id="startAcquisitionButton" class="primary-button">开始采集</button>
             </div>
-            <button id="stopAcquisitionButton" class="secondary-button full-button">停止并保存</button>
+            <button id="pauseAcquisitionButton" class="secondary-button full-button" disabled>中断采集</button>
+            <button id="stopAcquisitionButton" class="secondary-button full-button" disabled>停止并保存</button>
             <div id="acquisitionStatus" class="acquisition-status">尚未启动真实采集</div>
+
             <div id="persistenceRecoveryPanel" class="control-note hidden">
               <span id="persistenceRecoveryStatus"></span>
               <button id="discardPersistenceRecoveryButton" class="secondary-button hidden" type="button">重置并丢弃所列阻塞项</button>
@@ -412,6 +423,17 @@
         <span class="resizer-grip" aria-hidden="true">⋮</span>
       </div>
 
+      <template id="esrDiagnosticsTemplate">
+            <details id="esrNumericPanel" class="esr-import esr-diagnostics hidden">
+              <summary>应变原始数据、标定与零点诊断</summary>
+              <p id="esrNumericState"></p>
+              <details><summary>显示口径与现场依据</summary><p id="esrMeasurementContext" class="control-note"></p></details>
+              <details><summary>查看四路原始值、标定值与量程诊断</summary><pre id="esrNumericValues"></pre></details>
+              <button id="esrZeroButton" type="button">以最新有效四路源帧设置相对零点</button>
+              <button id="esrClearZeroButton" type="button">关闭相对清零</button>
+              <p><span class="esr-relative-note">点击设置零点后，相对变化从该源帧的零点起算；ADC模式显示相对计数，有效标定后显示相对微应变。清零不减小真实波动或漂移，各路趋势独立缩放。相对清零默认关闭，停止、故障、重连或重启后失效。相对值独立保存，不进入模型。未接传感器的通道仅作ADC诊断；合理范围需要接线、标定、量程和参考输入依据。</span></p>
+            </details>
+      </template>
       <main class="main-content">
         <details id="sensorSharedDetail" class="panel chart-panel primary-workbench collapsible-panel">
           <summary class="panel-header collapsible-panel-summary">
@@ -482,6 +504,13 @@
             </div>
             <div class="channel-panel-content">
               <div id="sensorCardsViewport" class="sensor-cards-viewport">
+                <section id="m3232MatrixPanel" class="m3232-matrix-panel hidden" aria-label="M3232 完整原始矩阵">
+                  <div class="m3232-matrix-heading"><strong>M3232 · 32×32 原始矩阵</strong><span>未标定 · 像素值不代表 N/kPa</span></div>
+                  <div class="m3232-matrix-body">
+                    <canvas id="m3232MatrixCanvas" width="256" height="256" aria-label="当前会话32×32原始矩阵热图"></canvas>
+                    <div><p id="m3232MatrixStatus" role="status">等待当前会话完整矩阵</p><p id="m3232MatrixValues"></p><p>曲线“薄膜压力原始响应”为每帧1024个像素的合计；完整空间分布见左图。颜色按当前帧最大绝对值缩放，零值为蓝色。</p><details id="m3232MatrixNumbers"><summary>查看当前帧全部数值（行、列从1计）</summary><pre id="m3232MatrixData"></pre></details></div>
+                  </div>
+                </section>
                 <div id="sensorCards" class="sensor-grid"></div>
               </div>
             </div>
@@ -571,6 +600,7 @@
   <script src="/mysql_visibility.js?v=20260909-mysql-toggle-2"></script>
   <script src="/process_parameters.js?v=20260916-auto-process-1"></script>
   <script src="/public_demo.js?v=20261017-thermocouple64-v2"></script>
-  <script src="/app.js?v=20261017-thermocouple64-v13"></script>
+  <script src="/curve_readiness.js?v=20261020-click-to-curve-5"></script>
+  <script src="/app.js?v=20261022-thermocouple-layout-2"></script>
 </body>
 </html>

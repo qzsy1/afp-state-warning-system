@@ -334,6 +334,15 @@ class UsbDockContractValidatorTests(unittest.TestCase):
         self.assertIn("owner_kind must be host, dock, or hub", issues)
         self.assertIn("serial transport_family must be usb", issues)
 
+    def test_unlocated_usb_serial_keeps_its_hardware_transport_identity(self) -> None:
+        payload = compliant_discovery()
+        payload["physical_interfaces"].append({
+            "id": "serial:COM6", "kind": "serial", "endpoint": "COM6",
+            "vid": 0x0403, "pid": 0x6001, "transport_family": "usb",
+        })
+
+        self.assertEqual(validate_discovery_payload(payload), ())
+
     def test_host_ports_require_physical_observation_evidence(self) -> None:
         payload = compliant_discovery()
         del payload["usb_topology"]["usb_ports"][0]["confirmation"]

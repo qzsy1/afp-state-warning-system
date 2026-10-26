@@ -59,10 +59,28 @@ class JournalRows:
             )
             for (body,) in cursor:
                 payload = json.loads(body)
-                for row, timestamp in zip(payload["rows"], payload["timestamps"]):
+                for index, (row, timestamp) in enumerate(zip(payload["rows"], payload["timestamps"])):
                     recovered = dict(row)
                     recovered.setdefault("timestamp_unix", float(timestamp))
+                    frames = payload.get("frames") or []
+                    if index < len(frames):
+                        from real_acquisition import UnifiedFrame
+                        from plc_measurement import frame_source_records
+                        envelope = frames[index]
+                        frame = (UnifiedFrame.from_envelope_v2(envelope, expected_session_id=envelope["session_id"],
+                                 expected_mode_id=envelope["mode_id"], catalog=payload["frame_catalog"])
+                                 if envelope.get("contract_version") == "unified_frame_v2"
+                                 else UnifiedFrame.from_envelope(envelope))
+                        records = {name: record for name, record in frame_source_records(frame).items()
+                                   if record.get("measurement_profile") in {"fibercontrol_plc_v1", "fibercontrol_abb_v1"}}
+                        if records:
+                            recovered["_channel_source_records"] = records
                     yield recovered
+
+    def source_records(self):
+        with closing(sqlite3.connect(self.path)) as connection:
+            for (body,) in connection.execute("SELECT body FROM batches WHERE session_id=? AND capture_uuid=? ORDER BY sequence", (self.session_id, self.capture_uuid)):
+                yield from json.loads(body).get("esr_source_records", [])
 
 
 @dataclass(frozen=True)
@@ -154,7 +172,8 @@ class ServerCaptureJournal:
         with self._lock:
             pending = self._pending_starts.pop((session_id, request_id), None)
             capture_uuid = str((result or {}).get("capture_uuid") or "").strip()
-            if pending is None or not capture_uuid or not bool((result or {}).get("running")):
+            starting = str((result.get("start_operation") or {}).get("state") or "") in {"starting", "cancelling"}
+            if pending is None or not capture_uuid or not (bool((result or {}).get("running")) or starting):
                 return False
             self._armed[session_id] = (*pending, capture_uuid)
             return True
@@ -274,6 +293,17 @@ class ServerCaptureJournal:
             "rows": rows,
             "timestamps": timestamps,
         }
+        sources = batch.get("esr_source_records", [])
+        if not isinstance(sources, list) or len(sources) > 200 or _without_secrets(sources) != sources:
+            return {"ok": False, "error": "esr_source_evidence_invalid"}
+        try:
+            from esr1001_usb import verify_source_evidence, UsbProtocolError
+            for source in sources:
+                verify_source_evidence(source)
+        except (KeyError, TypeError, ValueError, UsbProtocolError) as exc:
+            return {"ok": False, "error": "esr_source_evidence_invalid", "detail": str(exc)}
+        if sources:
+            journal_payload["esr_source_records"] = sources
         if frames is not None:
             journal_payload["frames"] = frames
         frame_catalog = batch.get("frame_catalog")
@@ -488,6 +518,7 @@ class TargetMySQLSaveCoordinator:
                 "sample_count": record.row_count,
                 "source": "remote_helper_server_journal",
                 "completed_layers": [int(config.layer) + 1],
+                "data_quality": record.status.get("data_quality") or {},
             }
             result = self.store_factory(selection.settings).save_layer(
                 config,
@@ -497,6 +528,7 @@ class TargetMySQLSaveCoordinator:
                 timestamp_file=None,
                 folder_path=None,
                 summary=summary,
+                source_records=record.rows.source_records(),
             )
             result = _without_secrets(result if isinstance(result, dict) else {"ok": False})
         except Exception as exc:

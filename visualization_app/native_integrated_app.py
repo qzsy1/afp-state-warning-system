@@ -13,12 +13,11 @@ import sys
 import threading
 import time
 import traceback
-import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 
 APP_DIR = (
@@ -178,7 +177,10 @@ class LineChart(tk.Canvas):
         actual = self._pairs(xo, payload.get("actual", []))
         predicted = self._pairs(xo, payload.get("prediction_observed", []))
         future = self._pairs(xf, payload.get("prediction_future", []))
+        adc_series = [(item["name"], self._pairs(item.get("x_observed", []), item.get("actual", []))) for item in payload.get("adc_channels", [])]
         all_pairs = actual + predicted + future
+        for _, series in adc_series:
+            all_pairs.extend(series)
         if not all_pairs:
             self.create_text(width / 2, height / 2, text="当前尚无可绘制数据", fill=COLORS["muted"])
             return
@@ -217,12 +219,17 @@ class LineChart(tk.Canvas):
         draw(actual, COLORS["cyan"], 2)
         draw(predicted, COLORS["blue"], 2)
         draw(future, COLORS["orange"], 2)
+        for index, (name, series) in enumerate(adc_series):
+            color = ("#007c91", "#3755a5", "#c87000", "#8b3ba5")[index % 4]
+            draw(series, color, 2)
+            self.create_text(left + index * 140, height - 20, text=name.replace("_ADC_signed", ""), fill=color, anchor="w")
         zero_x = left + (0.0 - xmin) / (xmax - xmin) * (right - left)
         if left <= zero_x <= right:
             self.create_line(zero_x, top, zero_x, bottom, fill=COLORS["orange"], dash=(4, 3))
-        self.create_text(left, height - 20, text="实际", fill=COLORS["cyan"], anchor="w", font=("Microsoft YaHei UI", 9, "bold"))
-        self.create_text(left + 55, height - 20, text="历史预测", fill=COLORS["blue"], anchor="w", font=("Microsoft YaHei UI", 9, "bold"))
-        self.create_text(left + 135, height - 20, text="未来预测", fill=COLORS["orange"], anchor="w", font=("Microsoft YaHei UI", 9, "bold"))
+        if not adc_series:
+            self.create_text(left, height - 20, text="实际", fill=COLORS["cyan"], anchor="w", font=("Microsoft YaHei UI", 9, "bold"))
+            self.create_text(left + 55, height - 20, text="历史预测", fill=COLORS["blue"], anchor="w", font=("Microsoft YaHei UI", 9, "bold"))
+            self.create_text(left + 135, height - 20, text="未来预测", fill=COLORS["orange"], anchor="w", font=("Microsoft YaHei UI", 9, "bold"))
         self.create_text(width / 2, 12, text=f"{payload.get('name', '')}  实际 {_fmt(payload.get('actual_current'), 2)}  预测 {_fmt(payload.get('prediction_current'), 2)}  RMSE {_fmt(payload.get('rmse'), 3)}", fill=COLORS["navy"], font=("Microsoft YaHei UI", 10, "bold"))
 
 
@@ -311,7 +318,7 @@ class AcquisitionPanel(ttk.Frame):
         basic.grid(row=0, column=0, sticky="ew", pady=4)
         basic.columnconfigure(1, weight=1); basic.columnconfigure(3, weight=1)
         ttk.Label(basic, text="数据方案").grid(row=0, column=0, sticky="w", padx=3, pady=3)
-        self.schema_combo = ttk.Combobox(basic, textvariable=self._v("dataset_schema", "new_collection_v13_0"), state="readonly", values=("new_collection_v13_0", "new_collection_v12_0", "new_collection_v11_3", "legacy_original"), width=20)
+        self.schema_combo = ttk.Combobox(basic, textvariable=self._v("dataset_schema", "new_collection_v13_0"), state="readonly", values=("new_collection_v13_0", "new_collection_v12_0", "new_collection_v11_3", "legacy_original", "esr1001_raw_adc"), width=20)
         self.schema_combo.grid(row=0, column=1, columnspan=3, sticky="ew", padx=3, pady=3)
         self.schema_info = tk.StringVar(value="")
         ttk.Label(basic, textvariable=self.schema_info, foreground=COLORS["blue"]).grid(row=0, column=4, sticky="w", padx=4)
@@ -327,11 +334,11 @@ class AcquisitionPanel(ttk.Frame):
         interfaces.grid(row=5, column=0, columnspan=4, sticky="ew", padx=3, pady=4)
         interfaces.columnconfigure(3, weight=1)
         ttk.Button(interfaces, text="自动识别接口", command=self._discover_interfaces).grid(row=0, column=0, sticky="ew", padx=2)
-        ttk.Label(interfaces, text="勾选 / 角色 / 类型 / 地址 / 映射(JSON)").grid(row=0, column=1, columnspan=4, sticky="w")
+        ttk.Label(interfaces, text="勾选 / 角色 / 类型 / 地址 / 映射(JSON) / 波特率 / 仪表地址").grid(row=0, column=1, columnspan=6, sticky="w")
         self.interface_vars: list[dict[str, tk.Variable]] = []
         interface_defaults = default_capture_interfaces()
         role_values = tuple(item["role"] for item in interface_defaults)
-        driver_values = tuple(item["driver"] for item in interface_defaults)
+        driver_values = tuple(item["driver"] for item in interface_defaults) + ("esr1001_usb_ttl",)
         for index, item in enumerate(interface_defaults, start=1):
             values = {
                 "id": self._v(f"interface_{index}_id", item["id"]),
@@ -340,13 +347,35 @@ class AcquisitionPanel(ttk.Frame):
                 "baudrate": self._v(f"interface_{index}_baudrate", int(item.get("baudrate") or 0)),
                 "slave_id": self._v(f"interface_{index}_slave_id", int(item.get("slave_id") or 1)),
                 "map": self._v(f"interface_{index}_map", "{}"),
+                "data_mode": self._v(f"interface_{index}_data_mode", item.get("data_mode", "raw_adc")),
+                "calibration_profile": self._v(f"interface_{index}_calibration", ""),
+                "bridge": self._v(f"interface_{index}_bridge", ""),
             }
+            values["m3232_binding"] = self._v(f"interface_{index}_m3232_binding", "{}")
             self.interface_vars.append(values)
             ttk.Checkbutton(interfaces, variable=values["enabled"]).grid(row=index, column=0)
             ttk.Combobox(interfaces, textvariable=values["role"], values=role_values, state="readonly", width=14).grid(row=index, column=1, padx=2)
-            ttk.Combobox(interfaces, textvariable=values["driver"], values=driver_values, state="readonly", width=20).grid(row=index, column=2, padx=2)
+            protocol_box = ttk.Combobox(interfaces, textvariable=values["driver"], values=driver_values, state="readonly", width=20)
+            protocol_box.grid(row=index, column=2, padx=2)
             ttk.Entry(interfaces, textvariable=values["endpoint"], width=15).grid(row=index, column=3, sticky="ew", padx=2)
             ttk.Entry(interfaces, textvariable=values["map"], width=22).grid(row=index, column=4, sticky="ew", padx=2)
+            ttk.Entry(interfaces, textvariable=values["baudrate"], width=8).grid(row=index, column=5, padx=2)
+            slave_widget = ttk.Entry(interfaces, textvariable=values["slave_id"], width=4)
+            slave_widget.grid(row=index, column=6, padx=2)
+            if item["role"] == "pressure":
+                ttk.Combobox(interfaces, textvariable=values["data_mode"], values=("raw_matrix", "calibrated_force"), state="readonly", width=16).grid(row=index, column=7)
+                ttk.Entry(interfaces, textvariable=values["calibration_profile"], width=20).grid(row=index, column=8)
+                ttk.Button(interfaces, text="确认M3232接线归属", command=lambda v=values: self._confirm_m3232_binding(v)).grid(row=index, column=9)
+            if item["role"] == "esr1001_strain":
+                ttk.Combobox(interfaces, textvariable=values["data_mode"], values=("raw_adc", "microstrain"), state="readonly", width=12).grid(row=index, column=7)
+                ttk.Entry(interfaces, textvariable=values["calibration_profile"], width=20).grid(row=index, column=8)
+                ttk.Entry(interfaces, textvariable=values["bridge"], width=10).grid(row=index, column=9)
+                ttk.Button(interfaces, text="导入K/B候选", command=lambda v=values: self._import_esr_candidate(v)).grid(row=index, column=10)
+                def protocol_changed(_event, value=values, slave=slave_widget):
+                    usb = value["driver"].get() == "esr1001_usb_ttl"
+                    value["baudrate"].set(115200 if usb else 9600)
+                    slave.configure(state="disabled" if usb else "normal")
+                protocol_box.bind("<<ComboboxSelected>>", protocol_changed)
         self._entry(basic, "采样Hz", "sample_rate_hz", 10.0, 2, 2)
         self._entry(basic, "端点/模拟CSV", "endpoint", "", 3, 0, width=30)
         ttk.Button(basic, text="浏览", command=self._pick_endpoint).grid(row=3, column=2, columnspan=2, sticky="ew", padx=3)
@@ -431,7 +460,7 @@ class AcquisitionPanel(ttk.Frame):
         saving = ttk.LabelFrame(parent, text="本地与统一 MySQL 数据库", padding=8)
         saving.grid(row=5, column=0, sticky="ew", pady=4)
         saving.columnconfigure(1, weight=1); saving.columnconfigure(3, weight=1)
-        self._entry(saving, "保存根目录", "save_root", r"F:\AFP_Capture", 0, 0, width=28)
+        self._entry(saving, "保存根目录", "save_root", r"D:\AFP_Capture", 0, 0, width=28)
         ttk.Button(saving, text="选择", command=self._pick_save_root).grid(row=0, column=2, columnspan=2, sticky="ew", padx=3)
         ttk.Checkbutton(saving, text="保存到打开软件这台电脑的 MySQL", variable=self._v("mysql_local_enabled", False)).grid(row=1, column=0, columnspan=4, sticky="w")
         self._entry(saving, "本机地址", "mysql_local_host", "127.0.0.1", 2, 0)
@@ -475,15 +504,19 @@ class AcquisitionPanel(ttk.Frame):
 
         actions = ttk.Frame(parent)
         actions.grid(row=6, column=0, sticky="ew", pady=8)
-        for col in range(4): actions.columnconfigure(col, weight=1)
+        for col in range(5): actions.columnconfigure(col, weight=1)
         self.test_button = ttk.Button(actions, text="检查连接", command=self.test_connection, state="disabled")
         self.start_button = ttk.Button(actions, text="开始采集", command=self.start, state="disabled")
         self.stop_button = ttk.Button(actions, text="停止并保存", command=self.stop, state="disabled")
+        self.pause_button = ttk.Button(actions, text="中断采集", command=self.toggle_pause, state="disabled")
         self.open_button = ttk.Button(actions, text="打开数据目录", command=self.open_folder)
         self.test_button.grid(row=0, column=0, sticky="ew", padx=2)
         self.start_button.grid(row=0, column=1, sticky="ew", padx=2)
         self.stop_button.grid(row=0, column=2, sticky="ew", padx=2)
-        self.open_button.grid(row=0, column=3, sticky="ew", padx=2)
+        self.pause_button.grid(row=0, column=3, sticky="ew", padx=2)
+        self.open_button.grid(row=0, column=4, sticky="ew", padx=2)
+        self._control_busy = False
+        self._locked_widgets = {}
         self.status_text = tk.StringVar(value="正在加载模型与健康指标资源……")
         ttk.Label(parent, textvariable=self.status_text, wraplength=350, foreground=COLORS["muted"]).grid(row=7, column=0, sticky="ew", pady=4)
 
@@ -502,6 +535,8 @@ class AcquisitionPanel(ttk.Frame):
         self.sensor_combo = ttk.Combobox(select, textvariable=self.sensor_display, state="readonly", width=24)
         self.sensor_combo.pack(side="left", padx=6)
         self.sensor_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_chart())
+        ttk.Button(select, text="ESR相对清零（最新源帧）", command=lambda: self._esr_zero_action("zero")).pack(side="left", padx=3)
+        ttk.Button(select, text="关闭相对清零", command=lambda: self._esr_zero_action("clear_zero")).pack(side="left", padx=3)
         self.chart = LineChart(parent, height=410)
         self.chart.grid(row=2, column=0, sticky="nsew")
         table_frame = ttk.LabelFrame(parent, text="全部通道当前值", padding=5)
@@ -549,6 +584,9 @@ class AcquisitionPanel(ttk.Frame):
     def _schema_changed(self) -> None:
         schema = str(self.vars["dataset_schema"].get())
         sensors = list(ACQUISITION_SCHEMAS[schema]["sensors"])
+        if str(self.vars["driver"].get()) != "simulator" and any(v["enabled"].get() and v["driver"].get() == "m3232_pressure" and v["data_mode"].get() == "raw_matrix" for v in getattr(self,"interface_vars",[])):
+            sensors = ["薄膜压力原始响应" if n == "薄膜压力" else n for n in sensors]
+            if "薄膜压力原始响应" not in sensors: sensors.append("薄膜压力原始响应")
         self.schema_info.set(
             f"{len(sensors)} 个传感器通道"
             if schema.startswith("new_collection_")
@@ -596,6 +634,8 @@ class AcquisitionPanel(ttk.Frame):
         ports = result.get("ports", [])
         defaults = result.get("defaults", [])
         for values, item in zip(self.interface_vars, defaults):
+            if values["driver"].get() in {"esr1001_usb_ttl", "m3232_pressure"}:
+                continue
             values["endpoint"].set(item.get("endpoint", ""))
             values["role"].set(item.get("role", "other"))
             if item.get("driver"):
@@ -605,6 +645,19 @@ class AcquisitionPanel(ttk.Frame):
             if item.get("slave_id"):
                 values["slave_id"].set(int(item["slave_id"]))
         self.status_text.set(f"发现 {len(ports)} 个串口；六个逻辑接口配置已更新，可继续核对端点和通道映射")
+
+    def _confirm_m3232_binding(self, values) -> None:
+        from serial.tools import list_ports
+        endpoint = str(values["endpoint"].get()).strip()
+        port = next((p for p in list_ports.comports() if p.device.casefold() == endpoint.casefold()), None)
+        if port is None or not (port.location or port.serial_number):
+            messagebox.showerror("M3232归属", "请填写存在且具有USB位置或序列号的实际端口")
+            return
+        if messagebox.askyesno("M3232归属", f"已通过接线/拔插确认{endpoint}连接M3232？"):
+            binding = {k:getattr(port,k,None) for k in ("vid","pid","serial_number","location")}
+            binding.update(endpoint=endpoint, confirmed=True, confirmation="operator_wiring_unplug")
+            values["m3232_binding"].set(json.dumps(binding))
+            self._schema_changed()
 
     def _pick_endpoint(self) -> None:
         selected = filedialog.askopenfilename(title="选择模拟采集CSV", filetypes=[("CSV", "*.csv"), ("所有文件", "*.*")])
@@ -658,8 +711,19 @@ class AcquisitionPanel(ttk.Frame):
             baudrate = _safe_int(values["baudrate"].get(), 0, 0)
             if baudrate:
                 interface["baudrate"] = baudrate
-            if interface["driver"] in {"modbus_tcp", "modbus_rtu_esr1001"}:
+            if interface["driver"] in {"modbus_tcp", "modbus_rtu_esr1001", "huipu_tc64_modbus_rtu"}:
                 interface["slave_id"] = _safe_int(values["slave_id"].get(), 1, 1)
+            if interface["driver"] == "m3232_pressure":
+                interface.update(data_mode=str(values["data_mode"].get()), calibration_profile=str(values["calibration_profile"].get()).strip() or None,
+                    device_identity=json.loads(str(values["m3232_binding"].get())), physical_interface_id="serial:"+interface["endpoint"], physical_interface_kind="serial")
+            if interface["driver"] == "esr1001_usb_ttl":
+                from serial.tools import list_ports
+                calibration = str(values["calibration_profile"].get()).strip()
+                interface.update(data_mode=str(values["data_mode"].get()), calibration_profile=json.loads(calibration) if calibration.startswith("{") else calibration or None, bridge=str(values["bridge"].get()).strip(), baudrate=115200)
+                ports = [p for p in list_ports.comports() if p.device.casefold() == interface["endpoint"].casefold()]
+                if ports:
+                    port = ports[0]
+                    interface.update(physical_interface_id=f"serial:{port.device.upper()}", physical_interface_kind="serial", physical_verified=True, device_identity={key: getattr(port, key, None) for key in ("vid", "pid", "serial_number", "location", "hwid")})
             interfaces.append(interface)
         simulation_source_type = str(self.vars["simulation_source_type"].get() or "single_csv")
         simulation_source_path = str(self.vars["simulation_source_path"].get()).strip()
@@ -691,14 +755,25 @@ class AcquisitionPanel(ttk.Frame):
             mysql_local_enabled=bool(self.vars["mysql_local_enabled"].get()), mysql_local_host=str(self.vars["mysql_local_host"].get()), mysql_local_port=_safe_int(self.vars["mysql_local_port"].get(), 3306, 1), mysql_local_user=str(self.vars["mysql_local_user"].get()), mysql_local_password=str(self.vars["mysql_local_password"].get()), mysql_local_database=str(self.vars["mysql_local_database"].get()),
         )
 
-    def _background(self, label: str, work: Callable[[], Any], done: Callable[[Any], None] | None = None) -> None:
+    def _background(self, label: str, work: Callable[[], Any], done: Callable[[Any], None] | None = None, *, capture_control=False) -> None:
         self.status_text.set(label)
+        def complete(result=None, error=None):
+            if capture_control:
+                self._control_busy = False
+                self._sync_capture_controls(self.dashboard.acquisition.status())
+            if error is not None:
+                self.status_text.set(error)
+                messagebox.showerror("操作失败", error)
+            elif done:
+                done(result)
+            else:
+                self.status_text.set("操作完成")
         def runner() -> None:
             try:
                 result = work()
-                self.after(0, lambda: (done(result) if done else self.status_text.set("操作完成")))
+                self.after(0, lambda: complete(result))
             except Exception as exc:
-                self.after(0, lambda e=str(exc): (self.status_text.set(e), messagebox.showerror("操作失败", e)))
+                self.after(0, lambda e=str(exc): complete(error=e))
         threading.Thread(target=runner, daemon=True).start()
 
     def _mysql_settings(self) -> MySQLSettings:
@@ -884,7 +959,7 @@ class AcquisitionPanel(ttk.Frame):
         destination = filedialog.asksaveasfilename(
             parent=parent or self,
             title=f"导出{'本机' if local else '目标电脑'} MySQL 数据",
-            initialdir=str(self.vars["save_root"].get() or r"F:\AFP_Capture"),
+            initialdir=str(self.vars["save_root"].get() or r"D:\AFP_Capture"),
             initialfile=time.strftime(f"AFP{'本机' if local else '目标'}数据库导出_%Y%m%d_%H%M%S.csv"),
             defaultextension=".csv",
             filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
@@ -946,19 +1021,32 @@ class AcquisitionPanel(ttk.Frame):
         self._background("正在检查传感器与模型兼容性……", work, lambda result: self.status_text.set("连接检查通过" if result.get("ok") else "连接检查未通过：" + "; ".join(result.get("errors", []))))
 
     def start(self) -> None:
+        if self._control_busy:
+            return
         config = self._config()
+        self._control_busy = True
         def work() -> dict[str, Any]:
             self.dashboard.validate_prediction_setup(config, load_model=True)
             return self.dashboard.acquisition.start(config)
         def done(result: dict[str, Any]) -> None:
-            self.start_button.config(state="disabled"); self.stop_button.config(state="normal")
+            self._sync_capture_controls(result)
             self.status_text.set(f"采集中：{result.get('layer_file') or result.get('session_dir')}")
             self.app.set_runtime("采集中 + 实时预测预警" if config.processing_mode == "prediction_warning" else "仅采集中")
-        self._background("正在加载模型并启动采集……", work, done)
+        self._background("正在加载模型并启动采集……", work, done, capture_control=True)
 
     def stop(self) -> None:
+        if self._control_busy:
+            return
+        self._control_busy = True
         def done(result: dict[str, Any]) -> None:
-            self.start_button.config(state="normal"); self.stop_button.config(state="disabled")
+            self._sync_capture_controls(result)
+            if not result.get("finalization_complete") or result.get("running"):
+                self.status_text.set("保存尚未完成：" + (result.get("last_error") or result.get("capture_phase", "")))
+                return
+            if not result.get("sample_count"):
+                self.status_text.set("采集已结束：零样本，未生成层文件")
+                self.app.set_runtime("就绪")
+                return
             mysql = result.get("mysql", {})
             if mysql.get("ok"):
                 suffix = (
@@ -972,12 +1060,50 @@ class AcquisitionPanel(ttk.Frame):
                 )
             else:
                 suffix = ""
-            self.status_text.set(f"采集已停止并保存{suffix}")
+            self.status_text.set(f"采集已停止并保存{suffix}" if result.get("capture_saved") or mysql.get("ok")
+                else "本次采集已结束；保存开关未启用")
             self.app.set_runtime("就绪")
-        self._background("正在停止并保存完整试样/分层数据……", self.dashboard.acquisition.stop, done)
+        self._background("正在停止并保存完整试样/分层数据……", self.dashboard.acquisition.stop, done, capture_control=True)
+
+    def toggle_pause(self) -> None:
+        if self._control_busy:
+            return
+        status = self.dashboard.acquisition.status()
+        action = "resume" if status.get("paused") else "pause"
+        self._control_busy = True
+        def work():
+            return getattr(self.dashboard.acquisition, action)(capture_uuid=status.get("capture_uuid"),
+                capture_generation=status.get("capture_generation"),
+                expected_revision=status.get("control_revision"))
+        def done(result):
+            self._sync_capture_controls(result)
+            self.status_text.set("采集已中断，数据和层号保留" if result.get("paused") else "已继续同一次采集")
+        self._background("正在确认采样状态……", work, done, capture_control=True)
+
+    def _sync_capture_controls(self, status):
+        active = bool(status.get("session_active") or status.get("running"))
+        locked = active or self._control_busy
+        transition = status.get("capture_phase") in {"pausing", "resuming", "stopping_sampling", "finalizing"}
+        self.start_button.config(state="disabled" if active or self._control_busy else "normal")
+        saving = status.get("saving") or status.get("capture_phase") in {"stopping_sampling", "finalizing"}
+        self.stop_button.config(state="normal" if active and not saving and not self._control_busy else "disabled")
+        self.pause_button.config(text="继续采集" if status.get("paused") else "中断采集",
+            state="normal" if status.get("running") and not transition and not self._control_busy else "disabled")
+        self.test_button.config(state="disabled" if active or self._control_busy else "normal")
+        def visit(parent):
+            for widget in parent.winfo_children():
+                if isinstance(widget, (ttk.Entry, ttk.Combobox, ttk.Checkbutton, tk.Listbox)):
+                    if locked:
+                        if widget not in self._locked_widgets:
+                            self._locked_widgets[widget] = str(widget.cget("state"))
+                        widget.configure(state="disabled")
+                    elif widget in self._locked_widgets:
+                        widget.configure(state=self._locked_widgets.pop(widget))
+                visit(widget)
+        visit(self)
 
     def open_folder(self) -> None:
-        path = Path(str(self.vars["save_root"].get()) or r"F:\AFP_Capture")
+        path = Path(str(self.vars["save_root"].get()) or r"D:\AFP_Capture")
         path.mkdir(parents=True, exist_ok=True)
         os.startfile(path)
 
@@ -1185,6 +1311,7 @@ class AcquisitionPanel(ttk.Frame):
         if self.dashboard is None:
             self.after(500, self._poll); return
         status = self.dashboard.acquisition.status()
+        self._sync_capture_controls(status)
         if status.get("running") and not self._live_busy:
             self._live_busy = True
             sensor_names = list(self.sensor_combo["values"])
@@ -1200,10 +1327,47 @@ class AcquisitionPanel(ttk.Frame):
             threading.Thread(target=work, daemon=True).start()
         self.after(250, self._poll)
 
+    def _import_esr_candidate(self, values):
+        try:
+            if self.dashboard.acquisition.status().get("running"):
+                raise ValueError("请先停止采集再更改标定")
+            path = filedialog.askopenfilename(parent=self, title="只读选择厂商Config.xml", filetypes=[("XML", "*.xml")])
+            if not path:
+                return
+            candidate = self.dashboard.acquisition.esr_numeric_action({"action": "candidate", "path": path})["candidate"]
+            text = simpledialog.askstring("厂商系数待确认", json.dumps(candidate, ensure_ascii=False, indent=2) +
+                "\n输入含gain_code、bridge、device_binding和四路channels适用条件的JSON；未接通道不能确认标定。", parent=self)
+            if not text:
+                return
+            confirmation = dict(json.loads(text), confirmed=True)
+            result = self.dashboard.acquisition.esr_numeric_action({"action": "confirm", "candidate": candidate, "confirmation": confirmation})
+            values["calibration_profile"].set(json.dumps(result["profile"], ensure_ascii=False))
+            values["bridge"].set(result["profile"]["bridge"])
+            self._hardware_check = None
+            self.monitor_status.set("已选择标定档案，设备参数未改动；请明确选择微应变并重新检查")
+        except Exception as exc:
+            messagebox.showerror("标定未确认", str(exc), parent=self)
+
+    def _esr_zero_action(self, action):
+        try:
+            item = next(x for x in self.dashboard.acquisition.status().get("interfaces", []) if x.get("usb_evidence"))
+            evidence = item["usb_evidence"]
+            self.dashboard.acquisition.esr_numeric_action({"action": action, "interface_id": item["id"],
+                **{k: evidence[k] for k in ("capture_generation", "connection_generation", "calibration_digest")}})
+            self.monitor_status.set("相对零点已设置；绝对值保留" if action == "zero" else "相对清零已关闭")
+        except Exception as exc:
+            messagebox.showerror("相对清零未执行", str(exc), parent=self)
+
     def _apply_live(self, payload: dict[str, Any]) -> None:
         self._last_live = payload
         acquisition = payload.get("acquisition", {})
         self.monitor_status.set(f"已采集 {acquisition.get('sample_count', 0)} 点｜窗口实时更新")
+        usb = next((item.get("usb_evidence") for item in acquisition.get("interfaces", []) if item.get("usb_evidence")), None)
+        if usb:
+            rate = usb.get("actual_source_rate_hz")
+            rate_text = f"{rate:.2f} Hz" if rate is not None else "帧率待确认"
+            record = usb.get("latest_record") or {}
+            self.monitor_status.set(f"{'当前采集' if acquisition.get('running') else '已停止，历史证据'}｜源帧 {usb.get('source_frames', 0)}｜{rate_text}｜{usb.get('unit')}｜{usb.get('calibration_state')}｜标定 {record.get('display_values', {})}｜相对 {record.get('display_relative_values', {}) if usb.get('zero') else '关闭'}")
         names = [item.get("name") for item in payload.get("channels", [])]
         if tuple(self.sensor_combo["values"]) != tuple(names): self.sensor_combo["values"] = names
         if self.sensor_display.get() not in names and names: self.sensor_display.set(names[0])
@@ -1228,6 +1392,10 @@ class AcquisitionPanel(ttk.Frame):
 
     def _refresh_chart(self) -> None:
         if not self._last_live: return
+        adc = [item for item in self._last_live.get("channels", []) if item.get("unit") == "adc_counts"]
+        if adc:
+            self.chart.set_channel({"name": "四通道原始ADC（adc_counts，标定未确认）", "adc_channels": adc})
+            return
         name = self.sensor_display.get()
         channel = next((item for item in self._last_live.get("channels", []) if item.get("name") == name), None)
         self.chart.set_channel(channel)
@@ -1237,7 +1405,7 @@ class TrainingPanel(ttk.Frame):
     def __init__(self, parent: tk.Misc, app: "IntegratedApp") -> None:
         super().__init__(parent, padding=8)
         self.app = app
-        self.manager = WebTrainingManager(Path(r"F:\AFP_Training_Models"))
+        self.manager = WebTrainingManager(Path(r"D:\AFP_Training_Models"))
         self.vars: dict[str, tk.Variable] = {}
         self.last_seq = 0
         self.loss_history: list[dict[str, Any]] = []
@@ -1302,7 +1470,7 @@ class TrainingPanel(ttk.Frame):
         self._field(train, "随机种子", "seed", 20260813, 2, 0); self._field(train, "任务名称", "task_name", "AFP训练任务", 2, 1, width=22)
         self._field(train, "已有模型（可留空）", "pretrained_model", "", 3, 0, width=35)
         ttk.Button(train, text="选择已有模型", command=self._pick_pretrained).grid(row=7, column=1, sticky="ew", padx=4)
-        self._field(train, "模型及整合CSV保存位置", "output_root", r"F:\AFP_Training_Models", 4, 0, width=38)
+        self._field(train, "模型及整合CSV保存位置", "output_root", r"D:\AFP_Training_Models", 4, 0, width=38)
         ttk.Button(train, text="选择保存位置", command=self._pick_output).grid(row=9, column=1, sticky="ew", padx=4)
         self.train_button = ttk.Button(train, text="开始训练", command=self.toggle_training, state="disabled"); self.train_button.grid(row=9, column=2, columnspan=2, sticky="ew", padx=4)
         self.precheck = tk.StringVar(value="尚未导入数据。")
@@ -1434,19 +1602,29 @@ class IntegratedApp:
             self.root.after(0, lambda: (self.acquisition_panel.attach_dashboard(dashboard, bootstrap), self.set_runtime("就绪")))
         except Exception:
             details = traceback.format_exc()
-            try: (Path.home() / "AFP_native_startup_error.log").write_text(details, encoding="utf-8")
+            try:
+                error_path = Path("D:/AFP_Runtime/logs/AFP_native_startup_error.log")
+                error_path.parent.mkdir(parents=True, exist_ok=True)
+                error_path.write_text(details, encoding="utf-8")
             except Exception: pass
             self.root.after(0, lambda: (self.set_runtime("初始化失败"), messagebox.showerror("初始化失败", details[-4000:])))
 
     def close(self) -> None:
-        try:
-            if self.acquisition_panel.dashboard and self.acquisition_panel.dashboard.acquisition.status().get("running"):
-                if not messagebox.askyesno("确认退出", "采集仍在运行。是否停止、保存并退出？"): return
-                self.acquisition_panel.dashboard.acquisition.stop()
-            if self.training_panel.manager.running:
-                if not messagebox.askyesno("确认退出", "训练仍在运行。是否请求停止并保存后退出？"): return
-                self.training_panel.manager.stop()
-        finally: self.root.destroy()
+        if self.acquisition_panel.dashboard:
+            acquisition = self.acquisition_panel.dashboard.acquisition
+            status = acquisition.status()
+            if status.get("session_active") or status.get("running"):
+                if not messagebox.askyesno("确认退出", "采集会话尚未完成（可能已中断）。是否停止、保存并退出？"):
+                    return
+                result = acquisition.stop()
+                if not result.get("finalization_complete"):
+                    messagebox.showerror("不能退出", result.get("last_error") or "采集保存尚未完成，请核查并重试")
+                    return
+        if self.training_panel.manager.running:
+            if not messagebox.askyesno("确认退出", "训练仍在运行。是否请求停止并保存后退出？"):
+                return
+            self.training_panel.manager.stop()
+        self.root.destroy()
 
     def run(self) -> None: self.root.mainloop()
 
@@ -1464,7 +1642,7 @@ def main() -> None:
         report_root = (
             Path(sys.executable).resolve().parent / "verification"
             if getattr(sys, "frozen", False)
-            else Path(tempfile.gettempdir()) / "AFP_Integrated_Native_Verification"
+            else Path("D:/AFP_Runtime/.afp-staging/AFP_Integrated_Native_Verification")
         )
         report_root.mkdir(parents=True, exist_ok=True)
         dashboard = DashboardData()
